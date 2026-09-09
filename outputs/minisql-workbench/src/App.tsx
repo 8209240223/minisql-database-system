@@ -25,11 +25,10 @@ JOIN enrollments e ON e.student_id = s.id
 WHERE e.score >= 90
 ORDER BY e.score DESC
 LIMIT 12;`;
-const connections: Connection[] = [{ mode: 'demo', name: 'MiniSQL Demo', url: 'local' }, { mode: 'api', name: 'MiniSQL C++', url: import.meta.env.VITE_MINISQL_API ?? 'http://127.0.0.1:8081/api' }];
+const connection: Connection = { mode: 'api', name: 'MiniSQL C++', url: import.meta.env.VITE_MINISQL_API ?? 'http://127.0.0.1:8081/api' };
 const editorExtensions = [sql(), lintGutter()];
 
 function App() {
-  const [connection, setConnection] = useState(connections[0]);
   const [tables, setTables] = useState<Table[]>([]);
   const [tabs, setTabs] = useState<QueryTab[]>(() => restoreTabs([{ id: 'q1', name: 'query_1.sql', sql: starter }]));
   const [active, setActive] = useState(tabs[0].id);
@@ -64,6 +63,7 @@ function App() {
   const [storageInfo, setStorageInfo] = useState<Awaited<ReturnType<typeof getStorage>>>();
   const [health, setHealth] = useState<string>();
   const historyDialog = useRef<HTMLDialogElement>(null);
+  const autoConnectStarted = useRef(false);
   const visibleHistory = useMemo(() => filterHistory(history, historyQuery), [history, historyQuery]);
   useEffect(() => {
     if (historyDialogOpen && !historyDialog.current?.open) historyDialog.current?.showModal();
@@ -73,6 +73,11 @@ function App() {
     const closeOnWide = () => { if (wide.matches) historyDialog.current?.close(); };
     wide.addEventListener('change', closeOnWide);
     return () => wide.removeEventListener('change', closeOnWide);
+  }, []);
+  useEffect(() => {
+    if (autoConnectStarted.current) return;
+    autoConnectStarted.current = true;
+    void connect();
   }, []);
   useEffect(() => {
     const sidebar = document.querySelector<HTMLElement>('.sidebar');
@@ -135,10 +140,10 @@ function App() {
   const [expanded, setExpanded] = useState<Record<string, boolean>>({ students: true, courses: false, enrollments: false });
   const [sessionId, setSessionId] = useState<string>();
   useEffect(() => {
-    if (connection.mode !== 'api' || !sessionId) return;
+    if (!sessionId) return;
     const timer = window.setInterval(() => { void getHealth(connection).then(value => setHealth(value.status)).catch(() => setHealth('degraded')); }, 15000);
     return () => window.clearInterval(timer);
-  }, [connection.mode, connection.url, sessionId]);
+  }, [connection.url, sessionId]);
   const [transactionState, setTransactionState] = useState('IDLE');
   const busy = useRef(false);
   const effectiveConnection = { ...connection, sessionId };
@@ -156,7 +161,7 @@ function App() {
 
   function handleFailure(error: unknown) {
     const details = error as { transactionState?: string; status?: number; commitState?: string };
-    if (connection.mode === 'api' && sessionId) {
+    if (sessionId) {
       if (details.transactionState === 'ABORTED') settlePending('rolledBack');
       if (details.commitState === 'unknown') settlePending('unknown');
       if (details.status === 404) { setSessionId(undefined); setTransactionState('EXPIRED'); setTables([]); setViews({}); }
@@ -165,8 +170,7 @@ function App() {
     setNotice(error instanceof Error ? error.message : String(error));
   }
   async function refresh() { try { setTables(await getCatalog(effectiveConnection)); } catch (e) { handleFailure(e); } }
-  async function refreshStorage() { if (connection.mode === 'api' && sessionId) { try { setStorageInfo(await getStorage(effectiveConnection)); } catch (e) { handleFailure(e); } } }
-  useEffect(() => { if (connection.mode === 'demo') void refresh(); else setTables([]); }, [connection.mode]);
+  async function refreshStorage() { if (sessionId) { try { setStorageInfo(await getStorage(effectiveConnection)); } catch (e) { handleFailure(e); } } }
   useEffect(() => {
     try { localStorage.setItem(DRAFT_KEY, JSON.stringify(tabs)); setDraftSaved(true); }
     catch { setDraftSaved(false); }
@@ -197,7 +201,7 @@ function App() {
     } catch (e) { handleFailure(e); if (openedId) setTransactionState('UNKNOWN'); }
     finally { busy.current = false; setRunning(false); }
   }
-  async function disconnect(switchMode = false) {
+  async function disconnect() {
     if (busy.current) return;
     if (sessionId && transactionState !== 'IDLE' && !window.confirm(transactionState === 'UNKNOWN' ? '提交结果未知，断开不会撤销已提交的数据。确认断开？' : '断开会话将撤销未提交修改。确认断开？')) return;
     busy.current = true; setRunning(true);
@@ -205,7 +209,6 @@ function App() {
       await closeApiSession(effectiveConnection);
       setSessionId(undefined); setTransactionState('IDLE'); setTables([]); setViews({});
       setHealth(undefined); setStorageInfo(undefined);
-      if (switchMode) setConnection(connection.mode === 'demo' ? connections[1] : connections[0]);
     } catch (e) { handleFailure(e); }
     finally { busy.current = false; setRunning(false); }
   }
@@ -219,8 +222,8 @@ function App() {
     const documentSource = selection ? editor.current!.state.doc.toString() : current.sql;
     const submittedFrom = selection ? range!.from : 0;
     const submittedTo = selection ? range!.to : documentSource.length;
-    if (busy.current || !source.trim() || (connection.mode === 'api' && (!sessionId || transactionState === 'UNKNOWN'))) return;
-    if (compile && connection.mode === 'api' && transactionState === 'ABORTED') return;
+    if (busy.current || !source.trim() || !sessionId || transactionState === 'UNKNOWN') return;
+    if (compile && transactionState === 'ABORTED') return;
     const warning = compile ? undefined : mutationWarning(source);
     if (warning && !window.confirm(warning)) return;
     busy.current = true;
@@ -229,7 +232,7 @@ function App() {
     const started = Date.now();
     try {
       const data = await runSql(effectiveConnection, source, compile, controller.current.signal);
-      if (connection.mode === 'api' && data.transactionState) setTransactionState(data.transactionState);
+      if (data.transactionState) setTransactionState(data.transactionState);
       for (const item of data.results ?? []) {
         if (item.kind === 'Commit') settlePending('committed');
         if (item.kind === 'Rollback') settlePending('rolledBack');
@@ -240,7 +243,7 @@ function App() {
     } catch (e) {
       const message = e instanceof Error ? e.message : String(e); handleFailure(e);
       if ((e as { transactionState?: string }).transactionState === 'ABORTED') await refresh();
-      if (command === undefined && connection.mode === 'api') {
+      if (command === undefined) {
         const position = e as { line?: number; column?: number };
         updateView({ diagnostic: mapDiagnostic(documentSource, submittedFrom, submittedTo, position.line ?? 0, position.column ?? 0) });
       }
@@ -308,7 +311,7 @@ function App() {
     else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
   }
 
-  const historyContent = <><div className="right-head"><span>查询历史</span><button className="icon-btn" title="清空历史" disabled={!history.length} onClick={() => { if (window.confirm('清除全部本地查询历史？')) setHistory([]); }}><Trash2 size={14}/></button></div><div className="history-search"><Search size={14}/><input aria-label="检索查询历史" placeholder="检索 SQL、连接、错误" value={historyQuery} onChange={event => setHistoryQuery(event.target.value)}/></div>{visibleHistory.length === 0 ? <div className="empty-history"><History size={25}/><p>{history.length ? '没有匹配记录' : '暂无查询历史'}</p></div> : <div className="history-list">{visibleHistory.map(item => <button className="history-item" key={item.id} title="载入 SQL（不执行）" onClick={() => { updateSql(item.sql); if (historyDialog.current?.open) { historyDialog.current.close(); editor.current?.focus(); } }}><div><span className={item.error !== undefined ? 'history-dot failed' : 'history-dot'}/><time>{new Date(item.at).toLocaleString([], { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })}</time><small>{item.durationMs.toFixed(0)} ms</small></div><div className="history-origin">{item.mode === 'demo' ? '演示' : '真实'} · {item.connection} · {item.action === 'compile' ? '编译' : '执行'} · {item.error !== undefined ? '失败' : '成功'}</div><p>{item.sql.replace(/\s+/g, ' ').slice(0, 80)}</p>{item.error && <em>{item.error}</em>}</button>)}</div>}</>;
+  const historyContent = <><div className="right-head"><span>查询历史</span><button className="icon-btn" title="清空历史" disabled={!history.length} onClick={() => { if (window.confirm('清除全部本地查询历史？')) setHistory([]); }}><Trash2 size={14}/></button></div><div className="history-search"><Search size={14}/><input aria-label="检索查询历史" placeholder="检索 SQL、连接、错误" value={historyQuery} onChange={event => setHistoryQuery(event.target.value)}/></div>{visibleHistory.length === 0 ? <div className="empty-history"><History size={25}/><p>{history.length ? '没有匹配记录' : '暂无查询历史'}</p></div> : <div className="history-list">{visibleHistory.map(item => <button className="history-item" key={item.id} title="载入 SQL（不执行）" onClick={() => { updateSql(item.sql); if (historyDialog.current?.open) { historyDialog.current.close(); editor.current?.focus(); } }}><div><span className={item.error !== undefined ? 'history-dot failed' : 'history-dot'}/><time>{new Date(item.at).toLocaleString([], { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })}</time><small>{item.durationMs.toFixed(0)} ms</small></div><div className="history-origin">真实 · {item.connection} · {item.action === 'compile' ? '编译' : '执行'} · {item.error !== undefined ? '失败' : '成功'}</div><p>{item.sql.replace(/\s+/g, ' ').slice(0, 80)}</p>{item.error && <em>{item.error}</em>}</button>)}</div>}</>;
 
   return <div className={darkMode ? 'app-shell dark-mode' : 'app-shell'} onKeyDownCapture={shortcut}>
     <dialog className="settings-dialog" open={settingsOpen} aria-label="设置"><div className="settings-body"><button className="icon-btn settings-close" aria-label="关闭设置" onClick={() => setSettingsOpen(false)}><X size={17}/></button><h2>工作台设置</h2><label>结果显示上限<input type="number" min="100" max="10000" step="100" value={resultLimit} onChange={event => { const value=Math.max(100,Math.min(10000,Number(event.target.value)||100));setResultLimit(value);localStorage.setItem('minisql-result-limit',String(value)); }}/></label><label className="settings-check"><input type="checkbox" checked={darkMode} onChange={event => {setDarkMode(event.target.checked);localStorage.setItem('minisql-theme',String(event.target.checked?'dark':'light'));}}/>深色主题</label><button className="settings-reset" onClick={() => { localStorage.removeItem('minisql-result-limit');localStorage.removeItem('minisql-theme');setResultLimit(1000);setDarkMode(false); }}>恢复默认设置</button><button className="settings-refresh" onClick={() => void refreshStorage()}>刷新存储统计</button>{storageInfo ? <StorageStatisticsView value={storageInfo} disabled={running || transactionState !== 'IDLE'} onConfigure={async action => { const buffer = await configureBuffer(effectiveConnection, action); setStorageInfo(previous => previous ? { ...previous, buffer } : previous); }}/> : <div className="storage-info">连接真实 C++ 数据库后可查看存储统计。</div>}</div></dialog>
@@ -317,18 +320,18 @@ function App() {
     {!draftSaved && <div className="draft-alert" role="alert">草稿保存失败：当前修改仅保留在此页面，请导出 SQL 后再关闭。</div>}
     {!historySaved && <div className="draft-alert" role="alert">历史保存失败：本次历史修改尚未写入本地存储。</div>}
     {historyOmitted && <div className="draft-alert" role="status">本次 SQL 超过历史单条容量，未加入历史；执行结果不受影响。</div>}
-    <header className="topbar"><div className="brand"><div className="brand-mark"><Database size={17}/></div><span>MiniSQL</span><b>Studio</b></div><div className="top-actions"><button className="connection-select" disabled={running} onClick={() => disconnect(true)}><span className={health === 'ok' ? 'status-dot' : 'status-dot status-warn'}/>{connection.name}<ChevronDown size={14}/></button>{health && <span className="health-label" title="C++ bridge 健康状态">{health === 'ok' ? '服务正常' : '服务降级'}</span>}<button className="history-toggle" title="打开查询历史" aria-haspopup="dialog" onClick={() => setHistoryDialogOpen(true)}><History size={17}/></button><button className="settings-toggle" title="打开设置" aria-label="打开设置" onClick={() => setSettingsOpen(true)}><Settings2 size={17}/></button><button className="avatar">M</button></div></header>
-    {connection.mode === 'api' && <div className="transaction-toolbar" aria-label="事务控制">
+    <header className="topbar"><div className="brand"><div className="brand-mark"><Database size={17}/></div><span>MiniSQL</span><b>Studio</b></div><div className="top-actions"><button className="connection-select" disabled={running} onClick={() => void connect()}><span className={health === 'ok' ? 'status-dot' : 'status-dot status-warn'}/>{connection.name}<ChevronDown size={14}/></button>{health && <span className="health-label" title="C++ bridge 健康状态">{health === 'ok' ? '服务正常' : '服务降级'}</span>}<button className="history-toggle" title="打开查询历史" aria-haspopup="dialog" onClick={() => setHistoryDialogOpen(true)}><History size={17}/></button><button className="settings-toggle" title="打开设置" aria-label="打开设置" onClick={() => setSettingsOpen(true)}><Settings2 size={17}/></button><button className="avatar">M</button></div></header>
+    <div className="transaction-toolbar" aria-label="事务控制">
       <span role="status" data-testid="transaction-state">{!sessionId ? transactionState === 'EXPIRED' ? '会话已过期' : '未连接' : ({ IDLE: '自动提交', ACTIVE: '事务进行中 · 未提交', ABORTED: '事务失败 · 必须回滚', UNKNOWN: '提交状态未知' }[transactionState] ?? transactionState)}</span>
       <button className="icon-btn" title="连接会话" aria-label="连接会话" disabled={running || !!sessionId} onClick={connect}><Plug size={16}/></button>
       <button className="icon-btn" title="断开会话" aria-label="断开会话" disabled={running || !sessionId} onClick={() => disconnect()}><Unplug size={16}/></button>
       <button className="icon-btn" title="开始事务" aria-label="开始事务" disabled={running || !sessionId || transactionState !== 'IDLE'} onClick={() => execute(false, 'BEGIN;')}><CirclePlay size={16}/></button>
       <button className="icon-btn" title="提交事务" aria-label="提交事务" disabled={running || !sessionId || transactionState !== 'ACTIVE'} onClick={() => execute(false, 'COMMIT;')}><Check size={16}/></button>
       <button className="icon-btn" title="回滚事务" aria-label="回滚事务" disabled={running || !sessionId || !['ACTIVE', 'ABORTED'].includes(transactionState)} onClick={() => execute(false, 'ROLLBACK;')}><Undo2 size={16}/></button>
-    </div>}
+    </div>
     <div className="workspace">
-      <aside className="sidebar"><div className="side-head"><span>DATABASE</span><button className="icon-btn" title="刷新目录" onClick={refresh}><RefreshCw size={15}/></button></div><div className="database-node"><Database size={15}/><span>{connection.name}</span><span className="online">●</span></div><div className="tree-content"><div className="tree-section"><ChevronDown size={14}/><FolderTree size={15}/><span>SCHEMAS</span></div><div className="schema"><ChevronDown size={14}/><span className="schema-dot">◈</span><span>main</span></div><div className="tree-section nested"><ChevronDown size={14}/><Table2 size={15}/><span>TABLES <em>{tables.length}</em></span><button className="tree-add" title="新建查询" onClick={addTab}><Plus size={13}/></button></div>{visibleTables.map(table => <div className="table-node" key={table.name}><button className="tree-chevron" onClick={() => setExpanded(v => ({ ...v, [table.name]: !v[table.name] }))}>{expanded[table.name] ? <ChevronDown size={13}/> : <ChevronRight size={13}/>}</button><Table2 size={14}/><button className="tree-label" onClick={() => insertTable(table)}>{table.name}</button><span className="row-count">{table.rowCount}</span>{expanded[table.name] && <div className="columns">{table.columns.map(column => { const isPrimary = column.primaryKey || table.keys?.some(key => key.primary && key.columns.includes(column.name)); return <div className="column-node" key={column.name}><span className={isPrimary ? 'pk' : 'col-dot'}>{isPrimary ? '◆' : '·'}</span><span>{column.name}</span><small>{column.type}</small></div>; })}</div>}</div>)}</div><div className="sidebar-bottom"><button><CircleHelp size={15}/> Documentation</button><span>v0.1.0 · Demo database</span></div></aside>
-      <main className="main"><div className="query-tabs">{tabs.map(tab => <button className={tab.id === active ? 'query-tab active' : 'query-tab'} key={tab.id} onClick={() => setActive(tab.id)}><FileCode2 size={14}/>{tab.name}<X size={13} onClick={e => { e.stopPropagation(); closeTab(tab.id); }}/></button>)}<button className="new-tab" title="新建查询" onClick={addTab}><Plus size={16}/></button><div className="tab-spacer"/><button className="toolbar-btn" disabled={running || (connection.mode === 'api' && (!sessionId || ['UNKNOWN','ABORTED'].includes(transactionState)))} onClick={() => execute(true)}><Braces size={15}/> Explain</button><button className="run-btn" onClick={() => execute(false)} disabled={running || (connection.mode === 'api' && (!sessionId || transactionState === 'UNKNOWN'))}><Play size={15} fill="currentColor"/>{running ? 'Running...' : 'Run'}</button></div>
+      <aside className="sidebar"><div className="side-head"><span>DATABASE</span><button className="icon-btn" title="刷新目录" onClick={refresh}><RefreshCw size={15}/></button></div><div className="database-node"><Database size={15}/><span>{connection.name}</span><span className="online">●</span></div><div className="tree-content"><div className="tree-section"><ChevronDown size={14}/><FolderTree size={15}/><span>SCHEMAS</span></div><div className="schema"><ChevronDown size={14}/><span className="schema-dot">◈</span><span>main</span></div><div className="tree-section nested"><ChevronDown size={14}/><Table2 size={15}/><span>TABLES <em>{tables.length}</em></span><button className="tree-add" title="新建查询" onClick={addTab}><Plus size={13}/></button></div>{visibleTables.map(table => <div className="table-node" key={table.name}><button className="tree-chevron" onClick={() => setExpanded(v => ({ ...v, [table.name]: !v[table.name] }))}>{expanded[table.name] ? <ChevronDown size={13}/> : <ChevronRight size={13}/>}</button><Table2 size={14}/><button className="tree-label" onClick={() => insertTable(table)}>{table.name}</button><span className="row-count">{table.rowCount}</span>{expanded[table.name] && <div className="columns">{table.columns.map(column => { const isPrimary = column.primaryKey || table.keys?.some(key => key.primary && key.columns.includes(column.name)); return <div className="column-node" key={column.name}><span className={isPrimary ? 'pk' : 'col-dot'}>{isPrimary ? '◆' : '·'}</span><span>{column.name}</span><small>{column.type}</small></div>; })}</div>}</div>)}</div><div className="sidebar-bottom"><button><CircleHelp size={15}/> Documentation</button><span>v0.1.0 · C++ engine</span></div></aside>
+      <main className="main"><div className="query-tabs">{tabs.map(tab => <button className={tab.id === active ? 'query-tab active' : 'query-tab'} key={tab.id} onClick={() => setActive(tab.id)}><FileCode2 size={14}/>{tab.name}<X size={13} onClick={e => { e.stopPropagation(); closeTab(tab.id); }}/></button>)}<button className="new-tab" title="新建查询" onClick={addTab}><Plus size={16}/></button><div className="tab-spacer"/><button className="toolbar-btn" disabled={running || (!sessionId || ['UNKNOWN','ABORTED'].includes(transactionState))} onClick={() => execute(true)}><Braces size={15}/> Explain</button><button className="run-btn" onClick={() => execute(false)} disabled={running || (!sessionId || transactionState === 'UNKNOWN')}><Play size={15} fill="currentColor"/>{running ? 'Running...' : 'Run'}</button></div>
         <div className="query-state"><span title={current.name}>{current.name}</span><button className="icon-btn" aria-label="重命名查询" title="重命名查询" onClick={renameTab}><Pencil size={14}/></button>{current.dirty && <small>已修改</small>}{runningTab === active && <small role="status">执行中</small>}{result && resultSource !== current.sql && <small data-testid="stale-result">结果对应旧 SQL</small>}{['pending','rolledBack','unknown'].includes(outcome ?? '') && <small data-testid="result-outcome">{outcome === 'pending' ? '未提交结果' : outcome === 'rolledBack' ? '事务已回滚' : '提交状态未知'}</small>}</div>
         <div className="file-toolbar"><button className="icon-btn" aria-label="导入 SQL" title="导入 SQL" onClick={() => fileInput.current?.click()}><Upload size={15}/></button><button className="icon-btn" aria-label="导出 SQL" title="导出 SQL" onClick={exportSql}><Download size={15}/></button>{selectedResult && <small data-testid="selection-result">选区结果</small>}{diagnostic && <><button className="icon-btn" aria-label="定位错误" title={`第 ${diagnostic.line} 行，第 ${diagnostic.column} 列`} disabled={current.sql.replace(/\r\n|\r/g, '\n') !== diagnostic.source} onClick={locateDiagnostic}><Search size={15}/></button><small data-testid="diagnostic-position">第 {diagnostic.line} 行，第 {diagnostic.column} 列{current.sql.replace(/\r\n|\r/g, '\n') !== diagnostic.source ? ' · 原 SQL 已修改' : ''}</small></>}</div>
         <section className="editor-wrap"><CodeMirror key={active} onCreateEditor={view => { editor.current = view; setEditorInstance(view); }} value={current?.sql ?? ''} height="100%" theme="light" extensions={editorExtensions} onChange={updateSql} basicSetup={{ lineNumbers: true, foldGutter: true, highlightActiveLine: true, autocompletion: true }} /></section>

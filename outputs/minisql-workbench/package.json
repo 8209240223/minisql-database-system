@@ -18,16 +18,12 @@
     "@uiw/react-codemirror": "^4.25.0",
     "csv-stringify": "6.6.0",
     "lucide-react": "^0.468.0",
-    "node-sql-parser": "^5.3.0",
     "react": "^19.0.0",
-    "react-dom": "^19.0.0",
-    "sql-formatter": "^15.6.0",
-    "sql.js": "^1.13.0"
+    "react-dom": "^19.0.0"
   },
   "devDependencies": {
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",
-    "@types/sql.js": "^1.4.9",
     "@vitejs/plugin-react": "^4.3.4",
     "typescript": "~5.7.3",
     "vite": "^6.1.0"

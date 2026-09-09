@@ -26,7 +26,7 @@ export interface QueryResult {
   tokens?: SqlToken[];
   stages?: Record<string, string>;
 }
-export interface Connection { mode: 'demo' | 'api'; name: string; url: string; sessionId?: string }
+export interface Connection { mode: 'api'; name: string; url: string; sessionId?: string }
 export interface QueryTab { id: string; name: string; sql: string; dirty?: boolean }
 export interface HistoryItem { id: string; sql: string; at: number; durationMs: number; rows: number; error?: string; mode: Connection['mode']; connection: string; action: 'compile' | 'execute' }
 export interface SqlToken { type: string; text: string; line: number; column: number }

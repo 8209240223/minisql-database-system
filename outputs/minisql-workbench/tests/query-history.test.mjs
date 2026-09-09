@@ -5,8 +5,8 @@ import { parseHistory, limitHistory, filterHistory, MAX_HISTORY_SQL } from '../s
 const sample = { id: '1', sql: "SELECT '中文;DELETE';", at: 1234, durationMs: 1.5, rows: 2, mode: 'api', connection: 'MiniSQL C++', action: 'execute' };
 test('roundtrip preserves SQL and real connection identity', () => assert.deepEqual(parseHistory(JSON.stringify([sample])), [sample]));
 test('only approved fields survive restore', () => assert.deepEqual(parseHistory(JSON.stringify([{...sample,sessionId:'secret',password:'secret'}])), [sample]));
-test('compile/demo/error restore', () => {
-  const value = {...sample,mode:'demo',action:'compile',error:'语法错误'};
+test('compile/error restore', () => {
+  const value = {...sample,action:'compile',error:'语法错误'};
   assert.deepEqual(parseHistory(JSON.stringify([value])), [value]);
 });
 for (const raw of [null, '', '{bad', '{}', '[null]', JSON.stringify([sample,sample]), ' '.repeat(300000)]) {
@@ -26,10 +26,10 @@ test('text budget retains complete SQL, never truncates it', () => {
   assert.ok(result.every(item=>item.sql.length===MAX_HISTORY_SQL));
   assert.deepEqual(parseHistory(JSON.stringify(result)),result);
 });
-test('search source, SQL, mode and errors without modifying history', () => {
-  const items=[sample,{...sample,id:'2',mode:'demo',action:'compile',sql:'SELECT missing;',error:'missing column'}];
-  for(const query of ['演示','编译','MISSING']) assert.deepEqual(filterHistory(items,query),[items[1]]);
-  assert.deepEqual(filterHistory(items,'真实'),[sample]);
+test('search source, SQL and errors without modifying history', () => {
+  const items=[sample,{...sample,id:'2',action:'compile',sql:'SELECT missing;',error:'missing column'}];
+  for(const query of ['编译','MISSING']) assert.deepEqual(filterHistory(items,query),[items[1]]);
+  assert.deepEqual(filterHistory(items,'真实'),items);
   assert.deepEqual(filterHistory(items,'  '),items);
   assert.deepEqual(filterHistory(items,'not-present'),[]);
 });

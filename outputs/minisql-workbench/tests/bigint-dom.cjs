@@ -38,7 +38,6 @@ const assert = require('node:assert/strict');
       await route.fulfill({ response });
     });
     await page.goto(process.env.MINISQL_UI_URL ?? 'http://127.0.0.1:4173');
-    await page.getByRole('button', { name: 'MiniSQL Demo', exact: true }).click();
     await page.locator('.cm-content').fill("CREATE TABLE exact_values(n BIGINT); INSERT INTO exact_values(n) VALUES(CAST('9223372036854775807' AS BIGINT)); SELECT n,n-1 AS previous FROM exact_values;");
     const responsePromise = page.waitForResponse(response => response.url().endsWith('/api/execute'));
     await page.getByRole('button', { name: 'Run', exact: true }).click();

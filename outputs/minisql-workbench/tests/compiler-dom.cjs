@@ -8,7 +8,6 @@ const assert = require('node:assert/strict');
     const errors = [];
     page.on('pageerror', error => errors.push(error.message));
     await page.goto(process.env.MINISQL_UI_URL ?? 'http://127.0.0.1:4173');
-    await page.getByRole('button', { name: 'MiniSQL Demo', exact: true }).click();
     await page.locator('.cm-content').fill('CREATE TABLE inspect_only(id INT NOT NULL); SELECT s.id+1 AS next FROM inspect_only AS s LEFT JOIN inspect_only AS r ON s.id=r.id WHERE 1=1 ORDER BY next DESC NULLS LAST LIMIT 2;');
     const compiled = page.waitForResponse(response => response.url().endsWith('/api/compile'));
     await page.getByRole('button', { name: 'Compile', exact: true }).click();

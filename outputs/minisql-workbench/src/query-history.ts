@@ -28,7 +28,7 @@ export function parseHistory(raw: string | null): HistoryItem[] {
           !Number.isFinite(item.at) || item.at < 0 || item.at > 8640000000000000 ||
           !Number.isFinite(item.durationMs) || item.durationMs < 0 ||
           !Number.isSafeInteger(item.rows) || item.rows < 0 ||
-          !['demo', 'api'].includes(item.mode) || !['compile', 'execute'].includes(item.action) ||
+          item.mode !== 'api' || !['compile', 'execute'].includes(item.action) ||
           typeof item.connection !== 'string' || item.connection.length > 100 ||
           (item.error !== undefined && (typeof item.error !== 'string' || item.error.length > 1000))) return [];
       ids.add(item.id);
@@ -47,5 +47,5 @@ export function restoreHistory(): HistoryItem[] {
 
 export function filterHistory(items: HistoryItem[], query: string): HistoryItem[] {
   const needle = query.trim().toLowerCase();
-  return items.filter(item => `${item.sql}\n${item.connection}\n${item.error ?? ''}\n${item.mode === 'demo' ? '演示' : '真实'}\n${item.action === 'compile' ? '编译' : '执行'}`.toLowerCase().includes(needle));
+  return items.filter(item => `${item.sql}\n${item.connection}\n${item.error ?? ''}\n真实\n${item.action === 'compile' ? '编译' : '执行'}`.toLowerCase().includes(needle));
 }
