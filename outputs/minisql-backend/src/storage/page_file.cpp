@@ -5,6 +5,7 @@
 #include <map>
 #include <random>
 #include <cstdlib>
+#include <chrono>
 
 namespace minisql::storage {
 namespace {
@@ -12,6 +13,7 @@ constexpr std::uint32_t fileMagic = 0x4644534d;
 constexpr std::uint32_t freeMagic = 0x4652534d;
 constexpr std::uint32_t journalMagic = 0x4a44534d;
 constexpr std::uint32_t recordMagic = 0x5244534d;
+constexpr std::uint32_t checkpointMagic = 0x4d595043;
 constexpr std::size_t maxBatchPages = 16384;
 [[noreturn]] void fail(const char* message) { throw MiniSqlError(ErrorCode::Storage, message); }
 void seal(PageBytes& bytes) { writeUnsigned(bytes, 4, 4, checksum(bytes)); }
@@ -79,6 +81,7 @@ PageFile::PageFile(const std::filesystem::path& path, CommitObserver observer)
             owners_.emplace(id, page.owner());
         }
     }
+    loadCheckpointRecord();
 }
 PageBytes PageFile::readRaw(PageId id) {
     if (failed_) fail("Page file disabled after I/O failure; reopen required");
@@ -246,6 +249,7 @@ void PageFile::commitWriteBatch() {
         batch_->published = true;
         notify("published");
         recoverJournal(false);
+        ++committedSequence_;
         batch_.reset();
     } catch (...) {
         std::error_code error;
@@ -255,9 +259,18 @@ void PageFile::commitWriteBatch() {
         throw;
     }
 }
-void PageFile::checkpoint() {
+void PageFile::checkpoint(const CheckpointOptions& options) {
     if (batch_) throw MiniSqlError(ErrorCode::Transaction, "Cannot checkpoint during a write batch");
+    // WAL 截止位置 = 本次检查点吸收/截至的 WAL 字节；当前整批镜像提交后立即截断，故为 0（无未检查点剩余日志）。
+    checkpointRecord_.present = true;
+    checkpointRecord_.walCutoffBytes = walBytes();
+    checkpointRecord_.dirtyWatermark = count_;
+    dirtyWatermark_ = count_;
+    checkpointRecord_.catalogVersion = options.catalogVersion;
+    checkpointRecord_.indexVersion = options.indexVersion;
+    checkpointRecord_.committedSequence = committedSequence_;
     checkpointJournal();
+    writeCheckpointRecord();
 }
 void PageFile::checkpointJournal() {
     const auto journal = sidecar(path_, ".wal");
@@ -335,5 +348,45 @@ std::vector<PageRef> PageFile::pagesFor(std::uint64_t owner) const {
     for (const auto& [id, value] : owners_) if (value == owner) result.push_back({id, active_.at(id)});
     std::sort(result.begin(), result.end(), [](const PageRef& a, const PageRef& b) { return a.id < b.id; });
     return result;
+}
+void PageFile::writeCheckpointRecord() {
+    const auto elapsed = std::chrono::system_clock::now().time_since_epoch();
+    checkpointRecord_.timestampMs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count());
+    PageBytes bytes{};
+    writeUnsigned(bytes, 0, 4, checkpointMagic);
+    writeUnsigned(bytes, 8, 4, 1);
+    writeUnsigned(bytes, 16, 8, checkpointRecord_.walCutoffBytes);
+    writeUnsigned(bytes, 24, 8, checkpointRecord_.dirtyWatermark);
+    writeUnsigned(bytes, 32, 8, checkpointRecord_.catalogVersion);
+    writeUnsigned(bytes, 40, 8, checkpointRecord_.indexVersion);
+    writeUnsigned(bytes, 48, 8, checkpointRecord_.committedSequence);
+    writeUnsigned(bytes, 56, 8, checkpointRecord_.timestampMs);
+    writeUnsigned(bytes, 4, 4, checksum(bytes));
+    const auto ckpt = sidecar(path_, ".ckpt");
+    std::ofstream output(ckpt, std::ios::binary | std::ios::trunc);
+    output.write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+    if (!output) fail("Checkpoint record write failed");
+    output.close();
+    if (!output) fail("Cannot close checkpoint record");
+    syncFile(ckpt);
+}
+void PageFile::loadCheckpointRecord() {
+    const auto ckpt = sidecar(path_, ".ckpt");
+    if (!std::filesystem::exists(ckpt)) return;
+    if (std::filesystem::file_size(ckpt) != kPageSize) fail("STORAGE_CORRUPTION: checkpoint record");
+    std::ifstream input(ckpt, std::ios::binary);
+    PageBytes bytes{};
+    input.read(reinterpret_cast<char*>(bytes.data()), bytes.size());
+    if (!input || input.gcount() != kPageSize || readUnsigned(bytes, 0, 4) != checkpointMagic ||
+        readUnsigned(bytes, 4, 4) != checksum(bytes)) fail("STORAGE_CORRUPTION: checkpoint record");
+    checkpointRecord_.present = true;
+    checkpointRecord_.walCutoffBytes = readUnsigned(bytes, 16, 8);
+    checkpointRecord_.dirtyWatermark = readUnsigned(bytes, 24, 8);
+    checkpointRecord_.catalogVersion = readUnsigned(bytes, 32, 8);
+    checkpointRecord_.indexVersion = readUnsigned(bytes, 40, 8);
+    checkpointRecord_.committedSequence = readUnsigned(bytes, 48, 8);
+    checkpointRecord_.timestampMs = readUnsigned(bytes, 56, 8);
+    dirtyWatermark_ = checkpointRecord_.dirtyWatermark;
+    committedSequence_ = checkpointRecord_.committedSequence;
 }
 }

@@ -346,7 +346,7 @@ nlohmann::json Database::checkpoint() {
     requireAvailable();
     if (transaction_ != TransactionState::Idle) throw MiniSqlError(ErrorCode::Transaction, "CHECKPOINT requires an idle transaction");
     buffer_.flushAll();
-    file_->checkpoint();
+    file_->checkpoint({catalogVersion_, indexVersion_});
     pendingAutoCheckpointWrites_ = 0;
     pendingAutoCheckpointWalBytes_ = 0;
     lastCheckpointAt_ = std::chrono::steady_clock::now();
@@ -573,12 +573,18 @@ nlohmann::json Database::statistics() {
     }
     const auto dirtyPages = buffer_.dirtyPages();
     const auto dirtyRatio = buffer_.capacity() == 0 ? 0.0 : static_cast<double>(dirtyPages) / static_cast<double>(buffer_.capacity());
+    const auto& record = file_->checkpointRecord();
     return {{"success", true}, {"tables", tables}, {"scope", "table-and-column"}, {"source", "on-demand-scan"},
         {"checkpointCount", checkpointCount_}, {"autoCheckpointWrites", autoCheckpointWrites_},
         {"autoCheckpointWalBytes", autoCheckpointWalBytes_}, {"autoCheckpointDirtyPages", autoCheckpointDirtyPages_},
         {"autoCheckpointDirtyRatio", autoCheckpointDirtyRatio_}, {"autoCheckpointIntervalMs", autoCheckpointIntervalMs_},
         {"pendingAutoCheckpointWrites", pendingAutoCheckpointWrites_}, {"pendingAutoCheckpointWalBytes", pendingAutoCheckpointWalBytes_},
         {"walBytes", file_->walBytes()}, {"dirtyPages", dirtyPages}, {"dirtyPageRatio", dirtyRatio},
+        {"committedSequence", file_->committedSequence()}, {"dirtyWatermark", file_->dirtyWatermark()},
+        {"checkpointRecord", {{"present", record.present}, {"walCutoffBytes", record.walCutoffBytes},
+            {"dirtyWatermark", record.dirtyWatermark}, {"catalogVersion", record.catalogVersion},
+            {"indexVersion", record.indexVersion}, {"committedSequence", record.committedSequence},
+            {"timestampMs", record.timestampMs}}},
         {"lastCheckpointAtMs", lastCheckpointAtMs_}, {"lastAutoCheckpointAtMs", lastAutoCheckpointAtMs_},
         {"lastAutoCheckpointReasons", lastAutoCheckpointReasons_}};
 }
@@ -1335,7 +1341,7 @@ nlohmann::json Database::runStatement(const sql::LogicalPlan& plan) {
     if (plan.kind == "Checkpoint") {
         if (transaction_ != TransactionState::Idle) throw MiniSqlError(ErrorCode::Transaction, "CHECKPOINT requires an idle transaction");
         buffer_.flushAll();
-        file_->checkpoint();
+        file_->checkpoint({catalogVersion_, indexVersion_});
         ++checkpointCount_;
         pendingAutoCheckpointWrites_ = 0;
         pendingAutoCheckpointWalBytes_ = 0;

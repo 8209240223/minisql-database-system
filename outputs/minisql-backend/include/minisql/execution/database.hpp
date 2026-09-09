@@ -59,6 +59,8 @@ private:
     std::uint64_t lastCheckpointAtMs_ = 0;
     std::uint64_t lastAutoCheckpointAtMs_ = 0;
     std::vector<std::string> lastAutoCheckpointReasons_;
+    std::uint64_t catalogVersion_ = 1;   // 目录版本（写入持久化检查点记录）
+    std::uint64_t indexVersion_ = 1;     // 索引版本（写入持久化检查点记录）
     std::filesystem::path sortTempDirectory_;
     std::filesystem::path cancelFile_;
     std::string sessionId_ = "local";
