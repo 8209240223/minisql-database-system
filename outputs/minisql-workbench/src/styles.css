@@ -33,3 +33,5 @@ button:disabled{opacity:.45;cursor:not-allowed}
 .sidebar-resizer::after{content:"";position:absolute;top:0;bottom:0;left:3px;width:2px;background:transparent;transition:background .15s}
 .sidebar-resizer:hover::after,.sidebar-resizer.dragging::after{background:#1c6d63}
 .sidebar-resizing{cursor:col-resize;user-select:none}
+.tree-toggle{width:16px;height:20px;display:grid;place-items:center;flex:0 0 16px;border:0;background:none;color:#8b959d;padding:0;cursor:pointer}
+.tree-toggle:hover{color:#1c6d63}

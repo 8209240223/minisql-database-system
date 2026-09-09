@@ -138,6 +138,7 @@ function App() {
   }
   const [filter, setFilter] = useState('');
   const [expanded, setExpanded] = useState<Record<string, boolean>>({ students: true, courses: false, enrollments: false });
+  const [treeExpanded, setTreeExpanded] = useState({ schemas: true, schema: true, tables: true });
   const [sessionId, setSessionId] = useState<string>();
   useEffect(() => {
     if (!sessionId) return;
@@ -330,7 +331,33 @@ function App() {
       <button className="icon-btn" title="回滚事务" aria-label="回滚事务" disabled={running || !sessionId || !['ACTIVE', 'ABORTED'].includes(transactionState)} onClick={() => execute(false, 'ROLLBACK;')}><Undo2 size={16}/></button>
     </div>
     <div className="workspace">
-      <aside className="sidebar"><div className="side-head"><span>DATABASE</span><button className="icon-btn" title="刷新目录" onClick={refresh}><RefreshCw size={15}/></button></div><div className="database-node"><Database size={15}/><span>{connection.name}</span><span className="online">●</span></div><div className="tree-content"><div className="tree-section"><ChevronDown size={14}/><FolderTree size={15}/><span>SCHEMAS</span></div><div className="schema"><ChevronDown size={14}/><span className="schema-dot">◈</span><span>main</span></div><div className="tree-section nested"><ChevronDown size={14}/><Table2 size={15}/><span>TABLES <em>{tables.length}</em></span><button className="tree-add" title="新建查询" onClick={addTab}><Plus size={13}/></button></div>{visibleTables.map(table => <div className="table-node" key={table.name}><button className="tree-chevron" onClick={() => setExpanded(v => ({ ...v, [table.name]: !v[table.name] }))}>{expanded[table.name] ? <ChevronDown size={13}/> : <ChevronRight size={13}/>}</button><Table2 size={14}/><button className="tree-label" onClick={() => insertTable(table)}>{table.name}</button><span className="row-count">{table.rowCount}</span>{expanded[table.name] && <div className="columns">{table.columns.map(column => { const isPrimary = column.primaryKey || table.keys?.some(key => key.primary && key.columns.includes(column.name)); return <div className="column-node" key={column.name}><span className={isPrimary ? 'pk' : 'col-dot'}>{isPrimary ? '◆' : '·'}</span><span>{column.name}</span><small>{column.type}</small></div>; })}</div>}</div>)}</div><div className="sidebar-bottom"><button><CircleHelp size={15}/> Documentation</button><span>v0.1.0 · C++ engine</span></div></aside>
+      <aside className="sidebar"><div className="side-head"><span>DATABASE</span><button className="icon-btn" title="刷新目录" onClick={refresh}><RefreshCw size={15}/></button></div><div className="database-node"><Database size={15}/><span>{connection.name}</span><span className="online">●</span></div><div className="tree-content">
+        <div className="tree-section">
+          <button className="tree-toggle" aria-label={treeExpanded.schemas ? '折叠 SCHEMAS' : '展开 SCHEMAS'} aria-expanded={treeExpanded.schemas} onClick={() => setTreeExpanded(value => ({ ...value, schemas: !value.schemas }))}>{treeExpanded.schemas ? <ChevronDown size={14}/> : <ChevronRight size={14}/>}</button>
+          <FolderTree size={15}/><span>SCHEMAS</span>
+        </div>
+        {treeExpanded.schemas && <>
+          <div className="schema">
+            <button className="tree-toggle" aria-label={treeExpanded.schema ? '折叠 main' : '展开 main'} aria-expanded={treeExpanded.schema} onClick={() => setTreeExpanded(value => ({ ...value, schema: !value.schema }))}>{treeExpanded.schema ? <ChevronDown size={14}/> : <ChevronRight size={14}/>}</button>
+            <span className="schema-dot">◈</span><span>main</span>
+          </div>
+          {treeExpanded.schema && <>
+            <div className="tree-section nested">
+              <button className="tree-toggle" aria-label={treeExpanded.tables ? '折叠 TABLES' : '展开 TABLES'} aria-expanded={treeExpanded.tables} onClick={() => setTreeExpanded(value => ({ ...value, tables: !value.tables }))}>{treeExpanded.tables ? <ChevronDown size={14}/> : <ChevronRight size={14}/>}</button>
+              <Table2 size={15}/><span>TABLES <em>{tables.length}</em></span>
+              <button className="tree-add" title="新建查询" onClick={addTab}><Plus size={13}/></button>
+            </div>
+            {treeExpanded.tables && visibleTables.map(table => <div className="table-node" key={table.name}>
+              <button className="tree-chevron" aria-label={expanded[table.name] ? '折叠表 ' + table.name : '展开表 ' + table.name} onClick={() => setExpanded(v => ({ ...v, [table.name]: !v[table.name] }))}>{expanded[table.name] ? <ChevronDown size={13}/> : <ChevronRight size={13}/>}</button>
+              <Table2 size={14}/><button className="tree-label" onClick={() => insertTable(table)}>{table.name}</button><span className="row-count">{table.rowCount}</span>
+              {expanded[table.name] && <div className="columns">{table.columns.map(column => {
+                const isPrimary = column.primaryKey || table.keys?.some(key => key.primary && key.columns.includes(column.name));
+                return <div className="column-node" key={column.name}><span className={isPrimary ? 'pk' : 'col-dot'}>{isPrimary ? '◆' : '·'}</span><span>{column.name}</span><small>{column.type}</small></div>;
+              })}</div>}
+            </div>)}
+          </>}
+        </>}
+      </div><div className="sidebar-bottom"><button><CircleHelp size={15}/> Documentation</button><span>v0.1.0 · C++ engine</span></div></aside>
       <main className="main"><div className="query-tabs">{tabs.map(tab => <button className={tab.id === active ? 'query-tab active' : 'query-tab'} key={tab.id} onClick={() => setActive(tab.id)}><FileCode2 size={14}/>{tab.name}<X size={13} onClick={e => { e.stopPropagation(); closeTab(tab.id); }}/></button>)}<button className="new-tab" title="新建查询" onClick={addTab}><Plus size={16}/></button><div className="tab-spacer"/><button className="toolbar-btn" disabled={running || (!sessionId || ['UNKNOWN','ABORTED'].includes(transactionState))} onClick={() => execute(true)}><Braces size={15}/> Explain</button><button className="run-btn" onClick={() => execute(false)} disabled={running || (!sessionId || transactionState === 'UNKNOWN')}><Play size={15} fill="currentColor"/>{running ? 'Running...' : 'Run'}</button></div>
         <div className="query-state"><span title={current.name}>{current.name}</span><button className="icon-btn" aria-label="重命名查询" title="重命名查询" onClick={renameTab}><Pencil size={14}/></button>{current.dirty && <small>已修改</small>}{runningTab === active && <small role="status">执行中</small>}{result && resultSource !== current.sql && <small data-testid="stale-result">结果对应旧 SQL</small>}{['pending','rolledBack','unknown'].includes(outcome ?? '') && <small data-testid="result-outcome">{outcome === 'pending' ? '未提交结果' : outcome === 'rolledBack' ? '事务已回滚' : '提交状态未知'}</small>}</div>
         <div className="file-toolbar"><button className="icon-btn" aria-label="导入 SQL" title="导入 SQL" onClick={() => fileInput.current?.click()}><Upload size={15}/></button><button className="icon-btn" aria-label="导出 SQL" title="导出 SQL" onClick={exportSql}><Download size={15}/></button>{selectedResult && <small data-testid="selection-result">选区结果</small>}{diagnostic && <><button className="icon-btn" aria-label="定位错误" title={`第 ${diagnostic.line} 行，第 ${diagnostic.column} 列`} disabled={current.sql.replace(/\r\n|\r/g, '\n') !== diagnostic.source} onClick={locateDiagnostic}><Search size={15}/></button><small data-testid="diagnostic-position">第 {diagnostic.line} 行，第 {diagnostic.column} 列{current.sql.replace(/\r\n|\r/g, '\n') !== diagnostic.source ? ' · 原 SQL 已修改' : ''}</small></>}</div>
