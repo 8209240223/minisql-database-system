@@ -164,6 +164,8 @@ async function seed(api) {
     await settings.getByText('全量备份已创建', { exact: true }).waitFor({ timeout: 30000 });
     const backupRow = settings.locator('.backup-row').filter({ hasText: '.pages' }).last();
     await backupRow.waitFor();
+    await backupRow.getByRole('button', { name: '校验迁移', exact: true }).click();
+    await settings.getByTestId('backup-migration-status').filter({ hasText: '迁移校验通过' }).waitFor({ timeout: 30000 });
     const restorePrompt = page.waitForEvent('dialog').then(dialog => dialog.accept());
     await backupRow.getByRole('button', { name: '恢复', exact: true }).click();
     await restorePrompt;
@@ -179,10 +181,12 @@ async function seed(api) {
     await settings.getByRole('button', { name: '刷新', exact: true }).click();
     const corruptRow = settings.locator('.backup-row').filter({ hasText: `${corruptName}.pages` });
     await corruptRow.waitFor();
+    await corruptRow.getByRole('button', { name: '校验迁移', exact: true }).click();
+    await settings.getByTestId('backup-migration-status').filter({ hasText: '迁移校验失败' }).waitFor({ timeout: 30000 });
     const corruptRestorePrompt = page.waitForEvent('dialog').then(dialog => dialog.accept());
     await corruptRow.getByRole('button', { name: '恢复', exact: true }).click();
     await corruptRestorePrompt;
-    await settings.getByText(/checksum|校验/i).waitFor({ timeout: 30000 });
+    await settings.locator('.access-message').filter({ hasText: /checksum|校验/i }).waitFor({ timeout: 30000 });
     await page.getByRole('button', { name: '关闭设置' }).click();
 
     await page.getByRole('button', { name: '连接会话' }).click();

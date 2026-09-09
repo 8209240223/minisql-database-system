@@ -92,4 +92,14 @@ export interface BackupEntry {
   manifestVersion?: number;
   pageFormatVersion?: number;
   walBytes?: number;
+  migrationState?: 'pending' | 'ready' | 'unknown';
+}
+
+export interface BackupValidation {
+  name: string;
+  kind: string;
+  migrated: boolean;
+  manifestVersion: number;
+  pageFormatVersion: number;
+  pages: number;
 }
