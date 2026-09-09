@@ -72,6 +72,7 @@ export async function openSession(executable, database, { timeoutMs = 30000, max
     return result;
   }
   return {
+    pid: child.pid,
     request,
     closed,
     async close() {

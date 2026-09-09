@@ -51,6 +51,7 @@
 - **失败样本重放**：状态机差分失败时保存完整 `program` 到 `failure-*.json`；设置 `FUZZ_STATE_REPLAY` 后可直接按 artifact 重放并检查故障分类，`fuzz-state-machine-replay-contract.mjs` 已验证入口。
 - **长跑回归**：新增 `fuzz-state-machine-long-run.mjs`，使用固定种子 `20260908`、`42` 各执行 512 步真实 C++ session；本轮发现并修复 DATE/TRUE 字面量被误判为 FLOAT 的规划器缺陷，`date-literal-process.mjs` 13 项回归通过。
 - **崩溃恢复组合**：新增 `fuzz-state-machine-crash-recovery.mjs`，固定种子 `20260908`、40 步状态机基线，在 `prepared`、`published`、`applied-page`、`data-synced`、`checkpointed` 五个提交故障点注入进程崩溃；5 个故障点均能重启恢复、重复读取一致，并能继续提交。
+- **高压与资源回归**：新增 `fuzz-state-machine-pressure.mjs`，使用固定种子 `20260908 / 42 / 7 / 11`，每个种子执行 512 步、准备 4096 条压力数据，并强制外部排序/聚合溢写；检查临时文件无泄漏，同时记录数据库大小、进程 RSS 和耗时。4 个种子本机全部通过。
 - **取消回归修复**：修正 bridge 空闲会话定时器在长请求期间误删会话的问题，并将单次引擎请求超时改为可配置项；`cancel-smoke.mjs` 在 30000 行数据和 120 秒请求上限下 20 项检查通过。
 - 更新 `outputs/minisql-backend/docs/fuzz-progress.md`（新增 X27 状态机语料章节、运行方式、验证结果与边界）。
 
@@ -60,7 +61,7 @@
 - **新增权限与审计面板**（`outputs/minisql-workbench/src/AccessControl.tsx`）：用户/角色/会话/审计四个标签页，支持建/删用户与角色、对象级授权/撤销、改密、绑定/解绑角色、会话列表、审计过滤。
 - **客户端与类型**：`client.ts` 补齐 access/audit/session 客户端函数与原子端点调用；`types.ts` 新增 `AccessState`/`AccessUser`/`AccessRole`/`AuditEntry`/`SessionEntry` 类型。
 - **入口**：`App.tsx` 顶栏新增「权限与审计」按钮并渲染面板；`styles.css` 新增面板样式（含深色适配）。
-- **连接与浏览器回归**：工作台支持连接配置保存/删除、用户身份和密码输入，密码不进入 localStorage；`tests/c2-dom.cjs` 已覆盖连接测试失败与恢复、身份请求头、权限/审计/会话、设置、边界拖动和 390px 移动端无横向溢出；`tests/c2-resilience-dom.cjs` 进一步覆盖成功查询、语义失败、活动请求取消、全量备份、替换恢复和恢复后查询。
+- **连接与浏览器回归**：工作台支持连接配置保存/删除、用户身份和密码输入，密码不进入 localStorage；`tests/c2-dom.cjs` 已覆盖连接测试失败与恢复、身份请求头、权限/审计/会话、设置、边界拖动和 390px 移动端无横向溢出；`tests/c2-resilience-dom.cjs` 进一步覆盖成功查询、语义失败、客户端超时、活动请求取消、全量备份、替换恢复、损坏备份失败隔离和恢复后查询。
 - 构建 `tsc -b && vite build` 通过；全部工作台单元/契约测试通过。
 
 ### C4 · X01-X27 全量验收（进度）
@@ -87,6 +88,7 @@
 | `node tests/date-literal-process.mjs` | X27 DATE/BOOL 字面量与索引 UPDATE 回归 | 13 项通过 |
 | `node tests/fuzz-state-machine-long-run.mjs` | X27 真实 C++ 长跑 | 2 种子 × 512 步通过 |
 | `node tests/fuzz-state-machine-crash-recovery.mjs` | X27 状态机崩溃恢复组合 | 5 个提交故障点全部通过 |
+| `node tests/fuzz-state-machine-pressure.mjs` | X27 高压状态机与资源采样 | 4 种子 × 512 步、4096 条压力数据、临时文件清理通过 |
 | `npm run test:safety`（工作台） | 整表变异提示 | 22 项通过 |
 | `npm run test:history`（工作台） | 查询历史 | 24 项通过 |
 | `npm run test:csv`（工作台） | CSV 导出 | 21 项通过 |
@@ -103,8 +105,8 @@
 | X 编号 | 状态 | 说明 |
 | --- | --- | --- |
 | X24 | 部分实现 | 访问目录、角色继承、对象授权、加盐密码、跨会话身份、元数据过滤、审计过滤、原子 HTTP 端点和权限感知 CLI 均已验证；工作台已携带当前身份。仍缺：访问目录进入 C++ 页式 Catalog、直接二进制入口鉴权。 |
-| X27 | 部分实现 | SELECT 固定种子差分 500 项、DDL/DML 状态机生成与持久化、真实 C++ session 差分、3 种固定种子各 96 步回归、2 种固定种子各 512 步长跑、DATE/BOOL 字面量回归、模型缩减、故障分类和五阶段跨进程崩溃恢复组合均已验证。仍缺：更高压力输入和长期资源趋势。 |
-| C2 工作台 | 部分实现 | 已接入真实 C++ 编译、Token/AST/计划展示、诊断、事务、历史、CSV、存储统计、身份、权限/审计/会话、锁等待取消、资源预算和备份入口；真实 Edge 浏览器已覆盖成功/失败查询、活动请求取消、全量备份、替换恢复和恢复后查询。仍缺：前端独立超时与失败恢复专项，以及恢复失败回滚的浏览器级断言。 |
+| X27 | 部分实现 | SELECT 固定种子差分 500 项、DDL/DML 状态机生成与持久化、真实 C++ session 差分、3 种固定种子各 96 步回归、2 种固定种子各 512 步长跑、DATE/BOOL 字面量回归、模型缩减、故障分类、五阶段跨进程崩溃恢复组合，以及 4 种子 × 512 步 × 4096 条压力数据的溢写/资源回归均已验证。仍缺：无限输入和多小时长期资源趋势。 |
+| C2 工作台 | 部分实现 | 已接入真实 C++ 编译、Token/AST/计划展示、诊断、事务、历史、CSV、存储统计、身份、权限/审计/会话、锁等待取消、资源预算、客户端超时和备份入口；真实 Edge 浏览器已覆盖成功/失败查询、客户端超时、活动请求取消、全量备份、替换恢复、损坏备份失败隔离和恢复后查询。仍缺：迁移失败专用 UI 流程建模与验收。 |
 | C4 全量验收 | 部分完成 | 已定稿 `outputs/V3_feature_matrix.md` 与 `outputs/V3最终验收报告.md`，但 X01-X27 中仍有部分实现项，不能关闭整体 V3 验收。 |
 
 ---
@@ -115,6 +117,7 @@
 - `outputs/minisql-backend/tests/fuzz/generate-corpus.mjs` —— X27 语料生成脚本
 - `outputs/minisql-backend/tests/fuzz-state-machine-long-run.mjs` —— X27 固定种子长跑契约
 - `outputs/minisql-backend/tests/fuzz-state-machine-crash-recovery.mjs` —— X27 五阶段提交故障注入与重启恢复组合
+- `outputs/minisql-backend/tests/fuzz-state-machine-pressure.mjs` —— X27 固定种子高压溢写与资源泄漏回归
 - `outputs/minisql-backend/tests/date-literal-process.mjs` —— DATE/BOOL 字面量规划回归
 - `outputs/minisql-backend/tests/fuzz/manifest.json` —— 固定种子语料清单（SHA-256）
 - `outputs/minisql-backend/tests/fuzz/fixture.sql`、`corpus-select-*.sql`、`corpus-state-*.sql` —— 生成语料
@@ -145,14 +148,14 @@
 
 **成员 C 待完成**
 - 在 C++ 内部 Catalog 中落地访问目录页式系统表，并为直接二进制入口补齐身份校验。
-- 补齐前端独立超时、失败恢复和恢复失败回滚的浏览器真实流程验收。
+- 补齐迁移失败专用 UI 流程建模与浏览器验收。
 - 访问目录进入 C++ 页式 Catalog（需与成员 B 接口协作）。
-- C4 全量 feature matrix 与最终验收报告定稿（依赖各专项回归完成）。
+- 在无限输入和多小时运行条件下补充 X27 资源趋势证据。
 
 ## 八、2026-09-10 合并后结论
 
 - C1、C2、C3 的主路径、接口和专项回归已完成本轮收口；A/B 的最新提交（含结构化相关子查询执行、页级索引、WAL/检查点）也已合并并通过回归；C4 的矩阵和报告已更新为合并后的真实证据。
-- C 任务不能标记为“全部完成”：X24 仍未把访问目录接入 C++ 内部 Catalog，C2 仍缺前端独立超时/失败回滚专项，X27 仍缺更高压力输入和长期资源趋势。
+- C 任务不能标记为“全部完成”：X24 仍未把访问目录接入 C++ 内部 Catalog，C2 仍缺迁移失败专用 UI 流程，X27 仍缺无限输入和多小时长期资源趋势。
 - X01-X27 中仍有多个“部分实现”项，因此整体 V3 最终验收继续保持未通过，不把 A/B/C 的专项测试通过等同于全部需求完成。
 
 ---

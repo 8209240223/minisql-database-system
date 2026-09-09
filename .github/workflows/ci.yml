@@ -133,6 +133,9 @@ jobs:
       - name: 状态机崩溃恢复组合回归
         run: node tests/fuzz-state-machine-crash-recovery.mjs
         working-directory: outputs/minisql-backend
+      - name: DDL/DML 状态机高压资源回归
+        run: node tests/fuzz-state-machine-pressure.mjs
+        working-directory: outputs/minisql-backend
       - name: 状态机样本重放契约
         run: node tests/fuzz-state-machine-replay-contract.mjs
         working-directory: outputs/minisql-backend
