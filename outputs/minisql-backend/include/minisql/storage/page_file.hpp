@@ -4,6 +4,7 @@
 #include <filesystem>
 #include <fstream>
 #include <unordered_map>
+#include <map>
 #include <memory>
 #include <functional>
 #include <string_view>
@@ -75,6 +76,7 @@ private:
         std::unordered_map<PageId, std::uint64_t> active, owners;
         std::vector<PageRef> free;
         std::unordered_map<PageId, PageBytes> pages;
+        std::uint64_t startLsn = 0;   // 批次在 WAL 中的起始字节偏移，回滚时截断其后未提交的预备扩展
         bool published = false;
     };
     std::unique_ptr<WriteBatch> batch_;
@@ -83,6 +85,7 @@ private:
     void writeDiskRaw(PageId id, const PageBytes& bytes);
     void ensureIdentity();
     void recoverJournal(bool recovering);
+    void applyExtent(const std::map<PageId, PageBytes>& pages, std::uint64_t finalCount, bool recovering);
     void checkpointJournal();
     void writeCheckpointRecord();
     void loadCheckpointRecord();

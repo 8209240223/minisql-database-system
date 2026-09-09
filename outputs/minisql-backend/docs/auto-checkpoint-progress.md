@@ -23,7 +23,9 @@
 
 ### 后续增量（本轮已实现部分）
 - **后台检查点调度线程**：`Database` 新增 `std::recursive_mutex mu_` 串行化全部公共入口（execute/compile/statistics/checkpoint/catalog/diagnostics/indexInspect/configureBuffer/executeScript/runCorrelatedSubquery）与后台线程，杜绝与语句执行竞争。`MINISQL_BACKGROUND_CHECKPOINT_MS` 环境变量设为正值时启动调度线程；线程按该周期评估五类阈值（writes/wal-bytes/dirty-pages/dirty-ratio/interval），**仅当事务空闲（Idle）且无写批时执行 `file_->checkpoint()`**，绝不在活动事务提交点前截断未提交日志；命中阈值但事务忙碌时计入 `deferredReasons` 延后执行。析构时置停止标志、通知并 join 线程。`statistics()` 的 `backgroundScheduler` 暴露 enabled/intervalMs/lastEvaluateMs/lastRunMs/deferredReasons。默认（未设变量）不启动线程，行为与原先完全一致。
-- **WAL 记录内嵌提交序号/事务 id/起始-结束 LSN/恢复起点** 的二进制格式，以及**累积多提交日志 + 非零截止位置重做**（当前整批镜像提交后立即截断 `.wal`，故截止位置为 0；需改缓冲刷新模型使其累积安全）。
+- **WAL 记录内嵌 LSN 二进制格式与累积多提交日志**：`commitWriteBatch` 不再逐提交截断 `.wal`，而是**追加**独立提交扩展（日志扩展头内嵌提交序号 seq、事务/批起始 count、起始 LSN、恢复起点；提交标记独立页面内嵌相同 seq），使多条提交在 `.wal` 中累积。`recoverJournal` 支持**非零截止位置重做**（优先从 `.ckpt` 的 `walCutoffBytes` 跳过已落盘前缀，仅重做其后已提交扩展），并以提交标记判定已提交/未提交尾部（未提交尾被丢弃）。每次成功提交自增 `committedSequence`（LSN 语义）。
+- **LSN 跨重启单调**：新增修复——`recoverJournal` 重做后把所达最后 `committedSequence` 持久化回 `.ckpt`，保证干净重启不再回退/复用旧 LSN；无 `.ckpt` 的纯日志重放也会推进提交序号。
+- 新增隔离契约测试 `page_file_wal_lsn_contract.cpp`（`.tools/harness`，`build-wal-lsn.ps1`）：覆盖累积多提交后 `.wal` 持续增长且不逐提交截断、提交序号自增、无 `.ckpt` 恢复后 LSN 连续并单调递增、**非零截止位置重做**（主文件回退后仅补其后已提交扩展且 LSN=2）、重做幂等、恢复后 `.ckpt` LSN 推进。隔离编译 + 运行 12 项全绿；原检查点契约 21 项无回归。
 
 ### 待验证/接入
 - 新路径的跨进程故障注入与 node 全量回归（`auto-checkpoint-smoke`/`x22-fault-injection`/`journal-process`，以及后台调度线程启用路径）需在有 vcpkg + node 环境验证；`database.cpp` 改动在本隔离环境无法编译断言，需在完整构建中确认。

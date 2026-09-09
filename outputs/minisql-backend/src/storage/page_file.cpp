@@ -13,6 +13,7 @@ constexpr std::uint32_t fileMagic = 0x4644534d;
 constexpr std::uint32_t freeMagic = 0x4652534d;
 constexpr std::uint32_t journalMagic = 0x4a44534d;
 constexpr std::uint32_t recordMagic = 0x5244534d;
+constexpr std::uint32_t commitMarkerMagic = 0x434d544d;
 constexpr std::uint32_t checkpointMagic = 0x4d595043;
 constexpr std::size_t maxBatchPages = 16384;
 [[noreturn]] void fail(const char* message) { throw MiniSqlError(ErrorCode::Storage, message); }
@@ -27,12 +28,6 @@ std::array<std::uint64_t, 2> newIdentity() {
 void putPage(std::ostream& output, const PageBytes& bytes) {
     output.write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
     if (!output) fail("Journal write failed");
-}
-PageBytes getPage(std::istream& input) {
-    PageBytes bytes{};
-    input.read(reinterpret_cast<char*>(bytes.data()), bytes.size());
-    if (!input || input.gcount() != kPageSize) fail("Journal truncated");
-    return bytes;
 }
 }
 
@@ -51,6 +46,7 @@ PageFile::PageFile(const std::filesystem::path& path, CommitObserver observer)
     auto size = std::filesystem::file_size(path_);
     file_.open(path_, std::ios::binary | std::ios::in | std::ios::out);
     if (!file_) fail("Cannot open page file");
+    loadCheckpointRecord();
     if (size == 0) {
         if (pendingJournal) fail("Database empty while redo journal exists");
         identity_ = newIdentity();writeHeader();flush();syncFile(path_);return;
@@ -81,7 +77,6 @@ PageFile::PageFile(const std::filesystem::path& path, CommitObserver observer)
             owners_.emplace(id, page.owner());
         }
     }
-    loadCheckpointRecord();
 }
 PageBytes PageFile::readRaw(PageId id) {
     if (failed_) fail("Page file disabled after I/O failure; reopen required");
@@ -187,11 +182,17 @@ void PageFile::beginWriteBatch() {
     snapshot->active = active_;
     snapshot->owners = owners_;
     snapshot->free = free_;
+    snapshot->startLsn = walBytes();
     batch_ = std::move(snapshot);
 }
 void PageFile::rollbackWriteBatch() {
     if (!batch_) throw MiniSqlError(ErrorCode::Transaction, "No active write batch");
     if (batch_->published) throw MiniSqlError(ErrorCode::Transaction, "Commit point passed; reopen for recovery");
+    // 丢弃本批次已追加但未提交（无提交标记）的预备扩展，避免其阻塞其后已提交扩展的恢复。
+    if (walBytes() > batch_->startLsn) {
+        const auto journal = sidecar(path_, ".wal");
+        std::filesystem::resize_file(journal, batch_->startLsn);
+    }
     count_ = batch_->count;
     active_ = std::move(batch_->active);
     owners_ = std::move(batch_->owners);
@@ -224,46 +225,55 @@ void PageFile::commitWriteBatch() {
     if (!batch_) throw MiniSqlError(ErrorCode::Transaction, "No active write batch");
     if (batch_->pages.empty()) { lastCommitWalBytes_ = 0; batch_.reset();return; }
     const auto journal = sidecar(path_, ".wal");
-    const auto temporary = sidecar(path_, ".wal.tmp");
+    writeHeader();
+    const std::map<PageId, PageBytes> ordered(batch_->pages.begin(), batch_->pages.end());
+    const auto seq = committedSequence_ + 1;
+    const auto startLsn = walBytes();
+    bool publishedMarker = false;
     try {
-        writeHeader();
+        std::ofstream output(journal, std::ios::binary | std::ios::app);
         PageBytes header{};
         writeUnsigned(header, 0, 4, journalMagic);writeUnsigned(header, 8, 4, 1);writeUnsigned(header, 12, 4, kPageSize);
-        writeUnsigned(header, 16, 8, batch_->pages.size());writeUnsigned(header, 24, 8, count_);
+        writeUnsigned(header, 16, 8, ordered.size());writeUnsigned(header, 24, 8, count_);
         writeUnsigned(header, 32, 8, identity_[0]);writeUnsigned(header, 40, 8, identity_[1]);
-        writeUnsigned(header, 48, 8, batch_->count);seal(header);
-        std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
+        writeUnsigned(header, 48, 8, batch_->count);writeUnsigned(header, 56, 8, seq);writeUnsigned(header, 64, 8, 0);
+        writeUnsigned(header, 72, 8, startLsn);writeUnsigned(header, 80, 8, startLsn);
+        writeUnsigned(header, 88, 8, checkpointRecord_.present ? checkpointRecord_.walCutoffBytes : 0);seal(header);
         putPage(output, header);
-        const std::map<PageId, PageBytes> ordered(batch_->pages.begin(), batch_->pages.end());
         for (const auto& [id, bytes] : ordered) {
             PageBytes record{};
             writeUnsigned(record, 0, 4, recordMagic);writeUnsigned(record, 8, 8, id);
             writeUnsigned(record, 16, 4, checksum(bytes));seal(record);
             putPage(output, record);putPage(output, bytes);
         }
-        output.close();if (!output) fail("Journal close failed");
-        syncFile(temporary);
-        lastCommitWalBytes_ = std::filesystem::file_size(temporary);
+        output.flush();if (!output) fail("Journal prepare failed");syncFile(journal);
         notify("prepared");
-        publishFile(temporary, journal);
-        batch_->published = true;
+        header[0]; // 已写盘（header+data），随后追加提交标记形成"已提交"。
+        PageBytes marker{};
+        writeUnsigned(marker, 0, 4, commitMarkerMagic);writeUnsigned(marker, 8, 8, seq);seal(marker);
+        putPage(output, marker);
+        output.flush();if (!output) fail("Journal commit failed");syncFile(journal);
+        publishedMarker = true;
         notify("published");
-        recoverJournal(false);
-        ++committedSequence_;
-        batch_.reset();
+        output.close();if (!output) fail("Journal close failed");
+        lastCommitWalBytes_ = walBytes() - startLsn;
+        batch_->published = true;
     } catch (...) {
-        std::error_code error;
-        if (batch_->published || (std::filesystem::exists(journal, error) && std::filesystem::file_size(journal, error) != 0)) {
-            batch_->published = true;failed_ = true;
-        }
+        if (publishedMarker) { batch_->published = true;failed_ = true; }
+        lastCommitWalBytes_ = walBytes() - startLsn;
         throw;
     }
+    // 数据即刻落盘保持 DB 现行（日志仅作 REDO，恢复幂等），此时提交点已越过，可安全推进提交序号。
+    applyExtent(ordered, count_, false);
+    ++committedSequence_;
+    batch_.reset();
+    notify("checkpointed");
 }
 void PageFile::checkpoint(const CheckpointOptions& options) {
     if (batch_) throw MiniSqlError(ErrorCode::Transaction, "Cannot checkpoint during a write batch");
-    // WAL 截止位置 = 本次检查点吸收/截至的 WAL 字节；当前整批镜像提交后立即截断，故为 0（无未检查点剩余日志）。
+    // 检查点后整段日志回收（已提交数据均已落盘），恢复起点归零；脏页水位=已落盘页数上限。
     checkpointRecord_.present = true;
-    checkpointRecord_.walCutoffBytes = walBytes();
+    checkpointRecord_.walCutoffBytes = 0;
     checkpointRecord_.dirtyWatermark = count_;
     dirtyWatermark_ = count_;
     checkpointRecord_.catalogVersion = options.catalogVersion;
@@ -298,26 +308,25 @@ std::uint64_t PageFile::walBytes() const {
 }
 void PageFile::recoverJournal(bool recovering) {
     const auto journal = sidecar(path_, ".wal");
+    if (!std::filesystem::exists(journal)) return;
     std::ifstream input(journal, std::ios::binary);
-    const auto header = getPage(input);
-    if (readUnsigned(header, 0, 4) != journalMagic || readUnsigned(header, 8, 4) != 1 ||
-        readUnsigned(header, 12, 4) != kPageSize || readUnsigned(header, 4, 4) != checksum(header)) fail("STORAGE_CORRUPTION: redo header");
-    const auto records = readUnsigned(header, 16, 8), finalCount = readUnsigned(header, 24, 8), baseCount = readUnsigned(header, 48, 8);
-    if (records == 0 || records > maxBatchPages || baseCount == 0 || finalCount < baseCount || finalCount - baseCount > records ||
-        finalCount > static_cast<PageId>(std::numeric_limits<std::streamoff>::max()) / kPageSize ||
-        std::filesystem::file_size(journal) != (1 + records * 2) * kPageSize ||
-        std::filesystem::file_size(path_) < baseCount * kPageSize) fail("STORAGE_CORRUPTION: redo length");
-    const std::array<std::uint64_t, 2> identity{readUnsigned(header, 32, 8), readUnsigned(header, 40, 8)};
-    const auto original = readRaw(0);
-    if ((identity[0] == 0 && identity[1] == 0) || identity[0] != readUnsigned(original, 24, 8) || identity[1] != readUnsigned(original, 32, 8))
-        fail("STORAGE_CORRUPTION: redo database identity mismatch");
-    std::map<PageId, PageBytes> pages;
-    for (std::uint64_t i = 0; i < records; ++i) {
-        const auto record = getPage(input), bytes = getPage(input);
-        const auto id = readUnsigned(record, 8, 8);
-        if (readUnsigned(record, 0, 4) != recordMagic || readUnsigned(record, 4, 4) != checksum(record) || id >= finalCount ||
-            readUnsigned(record, 16, 4) != checksum(bytes) || readUnsigned(bytes, 4, 4) != checksum(bytes) || !pages.emplace(id, bytes).second)
-            fail("STORAGE_CORRUPTION: redo record");
+    if (!input) fail("Cannot open redo journal");
+    const auto size = std::filesystem::file_size(journal);
+    if (size == 0) return;
+    // 非零截止位置重做：若 .ckpt 记录了本次日志的截止字节且日志保留该前缀，则跳过已落盘前缀，仅重做其后的已提交扩展。
+    std::uint64_t offset = checkpointRecord_.present ? checkpointRecord_.walCutoffBytes : 0;
+    if (offset > size || offset % kPageSize != 0) offset = 0;
+    if (offset > 0) input.seekg(static_cast<std::streamoff>(offset));
+    auto readPage = [&](PageBytes& out) -> bool {
+        out = PageBytes{};
+        input.clear();
+        input.read(reinterpret_cast<char*>(out.data()), kPageSize);
+        const auto got = input.gcount();
+        if (got == 0) return false;                                        // 页边界处的干净 EOF（未提交尾或无后续）
+        if (got != kPageSize) { ++ioStats_.errors;failed_ = true;fail("STORAGE_CORRUPTION: redo truncated"); }
+        return true;
+    };
+    const auto validatePage = [&](const PageBytes& bytes, PageId id, std::uint64_t finalCount, const std::array<std::uint64_t, 2>& identity) {
         if (id == 0) {
             if (readUnsigned(bytes, 0, 4) != fileMagic || readUnsigned(bytes, 8, 4) != 2 || readUnsigned(bytes, 12, 4) != kPageSize ||
                 readUnsigned(bytes, 16, 8) != finalCount || readUnsigned(bytes, 24, 8) != identity[0] || readUnsigned(bytes, 32, 8) != identity[1])
@@ -325,11 +334,57 @@ void PageFile::recoverJournal(bool recovering) {
         } else if (readUnsigned(bytes, 0, 4) == freeMagic) {
             if (readUnsigned(bytes, 8, 8) != id || readUnsigned(bytes, 24, 8) == 0) fail("STORAGE_CORRUPTION: redo free page");
         } else if (SlottedPage(bytes).id() != id) fail("STORAGE_CORRUPTION: redo page identity");
+    };
+    PageBytes lookahead;
+    bool has = readPage(lookahead);
+    std::uint64_t lastAppliedSeq = 0;   // 本次重做最后成功应用扩展的提交序号（LSN），用于恢复后保持序号连续
+    while (has) {
+        const auto header = lookahead;
+        if (readUnsigned(header, 0, 4) != journalMagic) break;   // 遍历到异常/标记残留处停止
+        if (readUnsigned(header, 8, 4) != 1 || readUnsigned(header, 12, 4) != kPageSize ||
+            readUnsigned(header, 4, 4) != checksum(header)) fail("STORAGE_CORRUPTION: redo header");
+        const auto records = readUnsigned(header, 16, 8), finalCount = readUnsigned(header, 24, 8), baseCount = readUnsigned(header, 48, 8);
+        if (records == 0 || records > maxBatchPages || baseCount == 0 || finalCount < baseCount || finalCount - baseCount > records ||
+            finalCount > static_cast<PageId>(std::numeric_limits<std::streamoff>::max()) / kPageSize) fail("STORAGE_CORRUPTION: redo header fields");
+        const std::array<std::uint64_t, 2> identity{readUnsigned(header, 32, 8), readUnsigned(header, 40, 8)};
+        const auto original = readRaw(0);
+        if ((identity[0] == 0 && identity[1] == 0) || identity[0] != readUnsigned(original, 24, 8) || identity[1] != readUnsigned(original, 32, 8))
+            fail("STORAGE_CORRUPTION: redo database identity mismatch");
+        std::map<PageId, PageBytes> pages;
+        for (std::uint64_t i = 0; i < records; ++i) {
+            PageBytes record{}, bytes{};
+            if (!readPage(record) || !readPage(bytes)) fail("STORAGE_CORRUPTION: redo truncated");
+            const auto id = readUnsigned(record, 8, 8);
+            if (readUnsigned(record, 0, 4) != recordMagic || readUnsigned(record, 4, 4) != checksum(record) || id >= finalCount ||
+                readUnsigned(record, 16, 4) != checksum(bytes) || !pages.emplace(id, bytes).second) fail("STORAGE_CORRUPTION: redo record");
+            validatePage(bytes, id, finalCount, identity);
+        }
+        if (!pages.contains(0)) fail("STORAGE_CORRUPTION: redo missing file header");
+        for (auto id = baseCount; id < finalCount; ++id) if (!pages.contains(id)) fail("STORAGE_CORRUPTION: redo missing allocated page");
+        PageBytes marker{};
+        const bool hasMarker = readPage(marker);
+        if (!hasMarker) break;   // 净 EOF：预备但未提交（无提交标记）的尾部，丢弃
+        if (readUnsigned(marker, 0, 4) == commitMarkerMagic && readUnsigned(marker, 8, 8) == readUnsigned(header, 56, 8)) {
+            lastAppliedSeq = readUnsigned(marker, 8, 8);
+            applyExtent(pages, finalCount, recovering);   // 已提交：落盘（幂等）
+            has = readPage(lookahead);
+        } else break;                                       // 标记缺失/不匹配：停止（其后无更优提交）
     }
-    if (!pages.contains(0)) fail("STORAGE_CORRUPTION: redo missing file header");
-    for (auto id = baseCount; id < finalCount; ++id) if (!pages.contains(id)) fail("STORAGE_CORRUPTION: redo missing allocated page");
     input.close();
-    // 完整验证日志后才写数据；文件头最后写入，恢复可重复执行。
+    // 保持 LSN 语义连续：重做所达的最后提交序号在无 .ckpt（或早于日志）时也须保留，供后续提交序号递增。
+    if (lastAppliedSeq > committedSequence_) committedSequence_ = lastAppliedSeq;
+    // 持久化恢复所达提交序号：期刊已清空（截止归零），若不落盘，干净重启会回退到旧 .ckpt 序号并复用 LSN。
+    if (lastAppliedSeq > 0) {
+        checkpointRecord_.present = true;
+        checkpointRecord_.walCutoffBytes = 0;
+        checkpointRecord_.committedSequence = committedSequence_;
+        writeCheckpointRecord();
+    }
+    // 日志回收：已提交数据均已落盘且无未结束资源，整段日志可截止。
+    checkpointJournal();
+    notify("checkpointed");
+}
+void PageFile::applyExtent(const std::map<PageId, PageBytes>& pages, std::uint64_t finalCount, bool recovering) {
     for (const auto& [id, bytes] : pages) if (id != 0) {
         writeDiskRaw(id, bytes);
         flush();
@@ -339,8 +394,6 @@ void PageFile::recoverJournal(bool recovering) {
     std::filesystem::resize_file(path_, finalCount * kPageSize);
     syncFile(path_);
     notify(recovering ? "recovery-synced" : "data-synced");
-    checkpointJournal();
-    notify("checkpointed");
 }
 std::vector<PageRef> PageFile::pagesFor(std::uint64_t owner) const {
     if (failed_) fail("Page file disabled after I/O failure; reopen required");
