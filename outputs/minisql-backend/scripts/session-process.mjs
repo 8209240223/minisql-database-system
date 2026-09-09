@@ -56,6 +56,8 @@ export async function openSession(executable, database, { timeoutMs = 30000, max
       ...(context.cancelFile === undefined ? {} : { cancelFile: context.cancelFile }),
       ...(context.table === undefined ? {} : { table: context.table }),
       ...(context.index === undefined ? {} : { index: context.index }),
+      ...(context.user === undefined ? {} : { user: context.user }),
+      ...(context.password === undefined ? {} : { password: context.password }),
     });
     if (Buffer.byteLength(frame) > 8 * 1024 * 1024) return Promise.reject(new Error('Session request exceeds 8 MiB'));
     if (operation === 'close') closing = true;
@@ -75,9 +77,9 @@ export async function openSession(executable, database, { timeoutMs = 30000, max
     pid: child.pid,
     request,
     closed,
-    async close() {
+    async close(context = {}) {
       const timer = setTimeout(() => fail(new Error('Session close timed out')), timeoutMs);
-      try { return await request('close'); }
+      try { return await request('close', undefined, context); }
       finally { if (!closing) child.kill(); await closed; clearTimeout(timer); }
     },
     async terminate() { fail(new Error('Session terminated; commit state may be unknown')); await closed; },

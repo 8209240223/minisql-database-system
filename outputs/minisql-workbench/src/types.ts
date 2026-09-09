@@ -76,6 +76,9 @@ export interface Capabilities {
   backupManifestVersions: number[];
   permissions: boolean;
   audit: boolean;
+  engineAuthorization?: boolean;
+  directBinaryAuth?: boolean;
+  accessCatalogHotReload?: boolean;
   indexPageStorage: boolean;
   capabilities: string[];
 }
