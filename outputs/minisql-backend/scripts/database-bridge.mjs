@@ -371,11 +371,11 @@ async function ensureEngine() {
   if (quarantined) throw httpError(503, 'Database requires inspection after an uncertain failure');
   return startEngine();
 }
-async function closeEngineIfIdle() {
+async function closeEngineIfIdle(context = {}) {
   if (!engine || engine.closing || sessions.size) return;
   const current = engine;
   current.closing = true;
-  try { return await current.worker.close(); }
+  try { return await current.worker.close(context); }
   finally {
     if (engine === current) engine = undefined;
     clearCancelFile(current.cancelFile);
@@ -396,7 +396,7 @@ async function closeSession(session) {
     return { success: true, transactionState: 'IDLE', transactionRolledBack: rolledBack };
   } finally {
     clearCancelFile(session.cancelFile);
-    await closeEngineIfIdle();
+    await closeEngineIfIdle({ user: session.user, password: session.password });
   }
 }
 function touchSession(session) {
@@ -417,7 +417,7 @@ function touchSession(session) {
 
 function callDatabase(mode, sql = '', extraEnv = {}) {
   return new Promise((resolveResult, reject) => {
-    const child = spawn(executable, [database, mode], { windowsHide: true, env: { ...process.env, ...extraEnv } });
+    const child = spawn(executable, [database, mode], { windowsHide: true, env: { ...process.env, ...extraEnv, MINISQL_AUTH_BYPASS: '1' } });
     const output = [];
     let length = 0, stopped = false;
     const stop = () => { stopped = true; child.kill(); };
@@ -479,7 +479,9 @@ async function runSessionOperation(session, mode, sql, res, context = {}) {
       };
       res?.once('close', disconnected);
       try {
-        const value = await currentEngine.worker.request(mode, sql, { sessionId: session.id, cancelFile: session.cancelFile });
+        const value = await currentEngine.worker.request(mode, sql, {
+          sessionId: session.id, cancelFile: session.cancelFile, user: session.user, password: session.password, ...context,
+        });
         if (value.error?.code === 5002) value.cancelled = true;
         if (value.commitState === 'unknown' || value.error?.code === 4001 || value.error?.code === 9999) quarantined = true;
         return value;
@@ -717,6 +719,7 @@ const server = http.createServer(async (req, res) => {
       audit: true, permissions: true, backupRestore: true, backupManifestVersion: 2, backupManifestVersions: [2, 3],
       backupIncremental: true, backupChain: true, backupMigration: 'v1-to-v2',
       permissionsModel: 'catalog-access', accessCatalogVersion: 1, accessCatalogStore: 'paged-access-catalog', accessCatalogPermissionVersion: permissionVersion,
+      engineAuthorization: true, directBinaryAuth: true, accessCatalogHotReload: true,
       objectPermissions: true, roleInheritance: true,
       atomicPermissionEndpoints: true, permissionEndpoints: ['POST /users', 'DELETE /users/:name', 'POST /users/:name/password', 'POST /users/:name/roles', 'DELETE /users/:name/roles/:role', 'POST /roles', 'DELETE /roles/:name', 'POST /grants', 'POST /revokes'],
       passwordHashing: 'sha256-salted', auditFiltering: true, sessionIdentity: true,
@@ -743,7 +746,7 @@ const server = http.createServer(async (req, res) => {
       const session = {
         id, cancelFile, closing: false, timer: undefined, epoch: undefined,
         transactionState: 'IDLE', activeRequest: false, waiting: false, cancelRequested: false,
-        lastActiveAt: new Date().toISOString(), user: requestUser,
+        lastActiveAt: new Date().toISOString(), user: requestUser, password: requestPassword ?? '',
       };
       sessions.set(id, session);
       touchSession(session);
@@ -957,6 +960,7 @@ const server = http.createServer(async (req, res) => {
       const session = sessions.get(sessionRoute[1]);
       if (!session) throw httpError(404, 'Session not found or expired');
       if (session.user !== requestUser) throw httpError(403, 'Permission denied');
+      session.password = requestPassword ?? '';
       if (res.destroyed && mode !== 'close') throw httpError(499, 'Request disconnected before execution');
       if (mode === 'close') return closeSession(session);
       return runSessionOperation(session, mode, sql, res);

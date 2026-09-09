@@ -36,7 +36,8 @@ configure_file(cmake/version.hpp.in generated/minisql/common/version.hpp @ONLY)
 add_library(minisql_common STATIC
     src/common/error.cpp
     src/common/config.cpp
-    src/common/logger.cpp)
+    src/common/logger.cpp
+    src/security/access_catalog.cpp)
 target_include_directories(minisql_common PUBLIC include "${CMAKE_CURRENT_BINARY_DIR}/generated")
 target_link_libraries(minisql_common PUBLIC minisql_options fmt::fmt
     spdlog::spdlog nlohmann_json::nlohmann_json Boost::multiprecision)
