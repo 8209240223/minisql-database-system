@@ -20,6 +20,7 @@ public:
     nlohmann::json catalog();
     nlohmann::json statistics();
     nlohmann::json checkpoint();
+    nlohmann::json indexInspect(const std::string& table, const std::string& index);   // 页级索引结构校验（页类型/height/keyCount/兄弟指针/叶链/根可达）
     ~Database();
     void setSessionContext(const std::string& sessionId, const std::filesystem::path& cancelFile);
     nlohmann::json configureBuffer(const std::string& action);
@@ -66,6 +67,7 @@ private:
     std::uint64_t sortSequence_ = 0;
     std::uint64_t aggregateSequence_ = 0;
     struct RuntimeIndex;
+    bool pageFileIndexes_ = true;   // 索引主路径引擎：true=页级 PageBPlusTree，false=内存 BPlusTree（MINISQL_INDEX_ENGINE=memory 时关闭）
     std::vector<std::unique_ptr<RuntimeIndex>> indexes_;
     void rebuildIndexes(std::uint64_t tableId);
     std::string tableFingerprint(std::uint64_t tableId);

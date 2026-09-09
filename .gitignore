@@ -21,3 +21,16 @@ outputs/minisql-workbench/*.tsbuildinfo
 .vscode/*.user
 *.user
 *.log
+
+# Compiled object files
+*.obj
+
+# Local harness test output
+/tests/
+
+# Office lock/scratch files
+~$*
+
+# Course reference materials (not part of the repository deliverable)
+*.pptx
+*.pdf

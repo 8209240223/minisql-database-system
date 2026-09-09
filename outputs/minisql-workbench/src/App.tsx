@@ -4,9 +4,11 @@ import { EditorView } from '@codemirror/view';
 import { lintGutter, setDiagnostics } from '@codemirror/lint';
 import { sql } from '@codemirror/lang-sql';
 import { Activity, Braces, ChevronDown, ChevronRight, CircleHelp, Database, FileCode2, FolderTree, History, Play, Plus, RefreshCw, Search, Settings2, Shield, Table2, Terminal, Trash2, X } from 'lucide-react';
-import { getCatalog, getHealth, getStorage, runSql, openApiSession, closeApiSession, releaseApiSession } from './client';
+import { getCatalog, getHealth, getStorage, runSql, openApiSession, closeApiSession, releaseApiSession, inspectIndex } from './client';
+import type { IndexInspect } from './client';
 import { AccessControl } from './AccessControl';
 import { StorageStatisticsView } from './StorageStatistics';
+import { IndexInspectView } from './IndexInspect';
 import { configureBuffer } from './client';
 import { Plug, Unplug, Check, Undo2, CirclePlay, Pencil, Upload, Download } from 'lucide-react';
 import { Plan, Diagnostics } from './CompilerViews';
@@ -64,6 +66,7 @@ const [accessOpen, setAccessOpen] = useState(false);
   const [darkMode, setDarkMode] = useState(() => localStorage.getItem('minisql-theme') === 'dark');
   const [storageInfo, setStorageInfo] = useState<Awaited<ReturnType<typeof getStorage>>>();
   const [health, setHealth] = useState<string>();
+  const [inspectInfo, setInspectInfo] = useState<IndexInspect>();
   const historyDialog = useRef<HTMLDialogElement>(null);
   const autoConnectStarted = useRef(false);
   const visibleHistory = useMemo(() => filterHistory(history, historyQuery), [history, historyQuery]);
@@ -174,6 +177,13 @@ const [accessOpen, setAccessOpen] = useState(false);
   }
   async function refresh() { try { setTables(await getCatalog(effectiveConnection)); } catch (e) { handleFailure(e); } }
   async function refreshStorage() { if (sessionId) { try { setStorageInfo(await getStorage(effectiveConnection)); } catch (e) { handleFailure(e); } } }
+  async function inspectTableIndex(table: string, index: string) {
+    if (busy.current || connection.mode !== 'api' || !sessionId) return;
+    busy.current = true; setRunning(true);
+    try { setInspectInfo(await inspectIndex(effectiveConnection, table, index)); setOutput('inspect'); }
+    catch (error) { handleFailure(error); }
+    finally { busy.current = false; setRunning(false); }
+  }
   useEffect(() => {
     try { localStorage.setItem(DRAFT_KEY, JSON.stringify(tabs)); setDraftSaved(true); }
     catch { setDraftSaved(false); }
@@ -356,8 +366,7 @@ const [accessOpen, setAccessOpen] = useState(false);
               {expanded[table.name] && <div className="columns">{table.columns.map(column => {
                 const isPrimary = column.primaryKey || table.keys?.some(key => key.primary && key.columns.includes(column.name));
                 return <div className="column-node" key={column.name}><span className={isPrimary ? 'pk' : 'col-dot'}>{isPrimary ? '◆' : '·'}</span><span>{column.name}</span><small>{column.type}</small></div>;
-              })}</div>}
-            </div>)}
+              })}</div>}{expanded[table.name] && table.indexes?.length ? <div className="indexes">{table.indexes.map(index => <button className="index-node" key={index.name} title="检查索引页级结构" onClick={() => inspectTableIndex(table.name, index.name)}><span className="pk">⌗</span><span>{index.name}</span><small>{index.columns.join(', ')}</small></button>)}</div> : null}</div>)}
           </>}
         </>}
       </div><div className="sidebar-bottom"><button><CircleHelp size={15}/> Documentation</button><span>v0.1.0 · C++ engine</span></div></aside>
@@ -365,7 +374,7 @@ const [accessOpen, setAccessOpen] = useState(false);
         <div className="query-state"><span title={current.name}>{current.name}</span><button className="icon-btn" aria-label="重命名查询" title="重命名查询" onClick={renameTab}><Pencil size={14}/></button>{current.dirty && <small>已修改</small>}{runningTab === active && <small role="status">执行中</small>}{result && resultSource !== current.sql && <small data-testid="stale-result">结果对应旧 SQL</small>}{['pending','rolledBack','unknown'].includes(outcome ?? '') && <small data-testid="result-outcome">{outcome === 'pending' ? '未提交结果' : outcome === 'rolledBack' ? '事务已回滚' : '提交状态未知'}</small>}</div>
         <div className="file-toolbar"><button className="icon-btn" aria-label="导入 SQL" title="导入 SQL" onClick={() => fileInput.current?.click()}><Upload size={15}/></button><button className="icon-btn" aria-label="导出 SQL" title="导出 SQL" onClick={exportSql}><Download size={15}/></button>{selectedResult && <small data-testid="selection-result">选区结果</small>}{diagnostic && <><button className="icon-btn" aria-label="定位错误" title={`第 ${diagnostic.line} 行，第 ${diagnostic.column} 列`} disabled={current.sql.replace(/\r\n|\r/g, '\n') !== diagnostic.source} onClick={locateDiagnostic}><Search size={15}/></button><small data-testid="diagnostic-position">第 {diagnostic.line} 行，第 {diagnostic.column} 列{current.sql.replace(/\r\n|\r/g, '\n') !== diagnostic.source ? ' · 原 SQL 已修改' : ''}</small></>}</div>
         <section className="editor-wrap"><CodeMirror key={active} onCreateEditor={view => { editor.current = view; setEditorInstance(view); }} value={current?.sql ?? ''} height="100%" theme="light" extensions={editorExtensions} onChange={updateSql} basicSetup={{ lineNumbers: true, foldGutter: true, highlightActiveLine: true, autocompletion: true }} /></section>
-        <section className="output"><div className="output-tabs"><button className={output === 'results' ? 'selected' : ''} onClick={() => setOutput('results')}><Table2 size={14}/> Result <span>{result?.rows.length ?? 0}</span></button><button className={output === 'plan' ? 'selected' : ''} onClick={() => setOutput('plan')}><Activity size={14}/> Plan <span>{result?.plan.length ?? 0}</span></button><button className={output === 'ast' ? 'selected' : ''} onClick={() => setOutput('ast')}><Braces size={14}/> AST</button><button className={output === 'tokens' ? 'selected' : ''} onClick={() => setOutput('tokens')}><Terminal size={14}/> Diagnostics</button><div className="output-spacer"/><span className="query-meta">{result ? `${result.durationMs.toFixed(1)} ms · ${result.affectedRows} affected` : 'Ready'}</span></div><div className="output-body">{notice ? <div className="error-state"><span>!</span><div><strong>Query failed</strong><p>{notice}</p><button onClick={() => setNotice('')}>Dismiss</button></div></div> : output === 'results' ? <Results result={result}/> : output === 'plan' ? <Plan result={result}/> : output === 'ast' ? <pre className="json-view">{result?.ast ? JSON.stringify(result.ast, null, 2) : 'Compile a query to inspect its AST.'}</pre> : <Diagnostics result={result}/>}</div></section>
+        <section className="output"><div className="output-tabs"><button className={output === 'results' ? 'selected' : ''} onClick={() => setOutput('results')}><Table2 size={14}/> Result <span>{result?.rows.length ?? 0}</span></button><button className={output === 'plan' ? 'selected' : ''} onClick={() => setOutput('plan')}><Activity size={14}/> Plan <span>{result?.plan.length ?? 0}</span></button><button className={output === 'ast' ? 'selected' : ''} onClick={() => setOutput('ast')}><Braces size={14}/> AST</button><button className={output === 'tokens' ? 'selected' : ''} onClick={() => setOutput('tokens')}><Terminal size={14}/> Diagnostics</button><button className={output === 'inspect' ? 'selected' : ''} onClick={() => setOutput('inspect')}><Database size={14}/> Inspect</button><div className="output-spacer"/><span className="query-meta">{result ? `${result.durationMs.toFixed(1)} ms · ${result.affectedRows} affected` : 'Ready'}</span></div><div className="output-body">{notice ? <div className="error-state"><span>!</span><div><strong>Query failed</strong><p>{notice}</p><button onClick={() => setNotice('')}>Dismiss</button></div></div> : output === 'results' ? <Results result={result}/> : output === 'plan' ? <Plan result={result}/> : output === 'ast' ? <pre className="json-view">{result?.ast ? JSON.stringify(result.ast, null, 2) : 'Compile a query to inspect its AST.'}</pre> : output === 'tokens' ? <Diagnostics result={result}/> : <IndexInspectView info={inspectInfo}/>}</div></section>
       </main>
       <aside className="rightbar">{historyContent}<div className="right-bottom"><Search size={14}/><input placeholder="Search tables" value={filter} onChange={e => setFilter(e.target.value)}/></div></aside>
     </div>

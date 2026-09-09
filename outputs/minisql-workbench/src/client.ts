@@ -111,7 +111,6 @@ export async function getStorage(connection: Connection): Promise<StorageStatist
 export async function getHealth(connection: Connection): Promise<{ status: string; engine: string }> {
   return api(connection, '/health');
 }
-
 // X24 权限、审计与多会话面板客户端。
 const ACCESS_PERMISSIONS = ['*', 'connect', 'read', 'select', 'insert', 'update', 'delete', 'create', 'drop', 'transaction', 'checkpoint', 'compile', 'grant', 'audit'];
 
@@ -176,6 +175,42 @@ export async function getSessions(connection: Connection): Promise<SessionEntry[
   if (!Array.isArray(data.entries)) throw new Error('会话响应缺少 entries 数组。');
   return data.entries;
 }
+
+export interface IndexPageInspect {
+  page: { id: number; generation: number };
+  leaf: boolean;
+  height: number;
+  keyCount: number;
+  parent: { id: number; generation: number };
+  left: { id: number; generation: number };
+  right: { id: number; generation: number };
+}
+export interface IndexInspect {
+  kind: string;
+  table: string;
+  index: string;
+  present: boolean;
+  root: { id: number; generation: number };
+  height: number;
+  nodeCount: number;
+  leafCount: number;
+  rowCount: number;
+  leafChainLength: number;
+  rootReachable: boolean;
+  leafChainLinked: boolean;
+  parentLinksValid: boolean;
+  storage?: string;
+  message?: string;
+  problems: string[];
+  pages: IndexPageInspect[];
+}
+export async function inspectIndex(connection: Connection, table: string, index: string): Promise<IndexInspect> {
+  if (connection.mode !== 'api' || !connection.sessionId) throw new Error('需要真实数据库会话。');
+  return api(connection, sessionPath(connection, '/index-inspect'), {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ table, index }),
+  });
+}
+
 export async function runSql(connection: Connection, sql: string, compile: boolean, signal: AbortSignal): Promise<QueryResult> {
   if (!compile && /^\s*SELECT\b/i.test(sql)) {
     const data = await streamApi(connection, sessionPath(connection, '/execute/stream'), sql, signal);

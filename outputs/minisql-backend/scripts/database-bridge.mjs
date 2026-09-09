@@ -426,7 +426,7 @@ function enqueue(operation, allowQuarantined = false) {
   return result;
 }
 
-async function runSessionOperation(session, mode, sql, res) {
+async function runSessionOperation(session, mode, sql, res, context = {}) {
   await acquireTurn(session);
   try {
     const result = await enqueue(async () => {
@@ -827,6 +827,26 @@ const server = http.createServer(async (req, res) => {
       writeFileSync(activeOperation.cancelFile, 'cancel\n', 'utf8');
       send(202, { success: false, cancelled: true, commitState: 'unknown', error: { code: 5002, message: 'Cancellation requested' } });
     } catch (error) { send(503, { success: false, error: { message: error instanceof Error ? error.message : String(error) } }); }
+    return;
+  }
+  const inspectRoute = req.url?.match(/^\/api\/sessions\/([a-zA-Z0-9-]+)\/index-inspect$/);
+  if (inspectRoute) {
+    req.resume();
+    if (req.method !== 'POST') { send(405, { success: false, error: { code: 405, message: 'Index inspection requires POST' } }); return; }
+    const session = sessions.get(inspectRoute[1]);
+    if (!session) { send(404, { success: false, error: { code: 404, message: 'Session not found or expired' } }); return; }
+    if (session.user !== requestUser) { send(403, { success: false, error: { code: 7001, message: 'Permission denied' } }); return; }
+    try {
+      const chunks = [];
+      for await (const chunk of req) chunks.push(chunk);
+      const body = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks)));
+      if (typeof body.table !== 'string' || typeof body.index !== 'string') throw httpError(400, 'Expected table and index strings');
+      if (!can(access, requestUser, 'READ', body.table)) throw httpError(403, 'Permission denied');
+      auditSql = `INDEX INSPECT ${body.table}.${body.index}`;
+      auditObjects = [body.table.toLowerCase()];
+      const data = await runSessionOperation(session, 'indexInspect', '', res, { table: body.table, index: body.index });
+      send(data.success === false ? (quarantined ? 503 : 422) : 200, data);
+    } catch (error) { send(error.status ?? 400, { success: false, error: { message: error instanceof Error ? error.message : String(error) } }); }
     return;
   }
   const sessionRoute = req.url?.match(/^\/api\/sessions\/([a-zA-Z0-9-]+)\/(execute|compile|diagnostics|statistics|catalog|close|buffer)(\/stream)?$/);

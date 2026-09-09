@@ -5,6 +5,7 @@
 #include "minisql/common/decimal.hpp"
 #include "minisql/common/float.hpp"
 #include "minisql/storage/bplus_tree.hpp"
+#include "minisql/storage/page_bplus_tree.hpp"
 #include "minisql/execution/external_sort.hpp"
 #include "minisql/sql/serialization.hpp"
 #include <algorithm>
@@ -212,13 +213,27 @@ storage::RowSchema rowSchema(const sql::Statement& definition) {
 }
 }
 struct Database::RuntimeIndex {
-    RuntimeIndex(std::string indexName, std::string tableName, std::vector<std::size_t> columnIndices, bool isUnique)
-        : name(std::move(indexName)), table(std::move(tableName)), columns(std::move(columnIndices)), unique(isUnique), tree(64, isUnique) {}
+    RuntimeIndex(std::string indexName, std::string tableName, std::vector<std::size_t> columnIndices, bool isUnique, bool usePage)
+        : name(std::move(indexName)), table(std::move(tableName)), columns(std::move(columnIndices)), unique(isUnique),
+          pageFile(usePage), tree(64, isUnique) {}
     std::string name;
     std::string table;
     std::vector<std::size_t> columns;
     bool unique;
-    storage::BPlusTree tree;
+    bool pageFile;
+    storage::BPlusTree tree;                                        // memory 引擎
+    std::unique_ptr<storage::PageBPlusTree> pageTree{nullptr};      // page-file 引擎
+    std::vector<storage::RowRef> search(const storage::IndexKey& key) const {
+        return pageFile ? pageTree->search(key) : tree.search(key);
+    }
+    std::vector<storage::RowRef> range(const std::optional<storage::IndexKey>& lower, bool lowerInclusive,
+                                       const std::optional<storage::IndexKey>& upper, bool upperInclusive) const {
+        return pageFile ? pageTree->range(lower, lowerInclusive, upper, upperInclusive)
+                        : tree.range(lower, lowerInclusive, upper, upperInclusive);
+    }
+    std::size_t height() const { return pageFile ? pageTree->height() : tree.height(); }
+    std::size_t size() const { return pageFile ? pageTree->size() : tree.size(); }
+    bool validate() const { return pageFile ? pageTree->validate() : tree.validate(); }
 };
 Database::Database(const std::filesystem::path& path, std::size_t frames, storage::PageFile::CommitObserver observer)
     : file_(std::make_shared<storage::PageFile>(path, std::move(observer))), buffer_(file_, frames, storage::ReplacementPolicy::LRU),
@@ -226,6 +241,7 @@ Database::Database(const std::filesystem::path& path, std::size_t frames, storag
     lastCheckpointAt_ = std::chrono::steady_clock::now();
     lastCheckpointAtMs_ = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count());
+    if (const char* engine = std::getenv("MINISQL_INDEX_ENGINE"); engine && std::string(engine) == "memory") pageFileIndexes_ = false;
     if (const char* configured = std::getenv("MINISQL_SORT_MEMORY_ROWS")) {
         char* end = nullptr;const auto parsed = std::strtoull(configured, &end, 10);
         if (end && *end == '\0' && parsed > 0 && parsed <= 1000000) sortMemoryRows_ = static_cast<std::size_t>(parsed);
@@ -314,7 +330,7 @@ nlohmann::json Database::catalog() {
                 for (const auto& runtime : indexes_)
                     if (key(runtime->table) == key(table.definition.table) && key(runtime->name) == key(index.name)) {
                         entry["pageCount"] = file_->pagesFor(indexOwnerId(runtime->table, runtime->name)).size();
-                        entry["height"] = runtime->tree.height();
+                        entry["height"] = runtime->height();
                     }
                 indexes.push_back(std::move(entry));
             }
@@ -337,6 +353,31 @@ nlohmann::json Database::checkpoint() {
     lastCheckpointAtMs_ = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count());
     return {{"success", true}, {"kind", "Checkpoint"}, {"wal", "truncated"}};
+}
+nlohmann::json Database::indexInspect(const std::string& table, const std::string& index) {
+    requireAvailable();
+    const RuntimeIndex* found = nullptr;
+    for (const auto& candidate : indexes_)
+        if (key(candidate->table) == key(table) && key(candidate->name) == key(index)) { found = candidate.get(); break; }
+    if (!found) throw MiniSqlError(ErrorCode::Catalog, "Index not found: " + index);
+    if (!found->pageFile)
+        return {{"kind", "IndexInspect"}, {"table", found->table}, {"index", found->name}, {"present", false},
+                {"storage", "memory"}, {"message", "page-level structure only available on the page-file engine"}};
+    const auto state = found->pageTree->inspect();
+    std::vector<nlohmann::json> pages;
+    pages.reserve(state.pages.size());
+    const auto refJson = [](const storage::PageRef& ref) { return nlohmann::json{{"id", ref.id}, {"generation", ref.generation}}; };
+    for (const auto& info : state.pages)
+        pages.push_back({{"page", refJson(info.page)}, {"leaf", info.leaf}, {"height", info.height}, {"keyCount", info.keyCount},
+                         {"parent", refJson(info.parent)}, {"left", refJson(info.left)}, {"right", refJson(info.right)}});
+    nlohmann::json problems = nlohmann::json::array();
+    for (const auto& problem : state.problems) problems.push_back(problem);
+    return {{"kind", "IndexInspect"}, {"table", found->table}, {"index", found->name},
+            {"present", state.present}, {"root", refJson(state.root)}, {"height", state.height},
+            {"nodeCount", state.nodeCount}, {"leafCount", state.leafCount}, {"rowCount", state.rowCount},
+            {"leafChainLength", state.leafChainLength}, {"rootReachable", state.rootReachable},
+            {"leafChainLinked", state.leafChainLinked}, {"parentLinksValid", state.parentLinksValid},
+            {"problems", std::move(problems)}, {"pages", std::move(pages)}};
 }
 void Database::evaluateAutoCheckpoint(std::size_t committedWriteStatements, std::size_t committedDirtyPages) {
     if (committedWriteStatements == 0) return;
@@ -461,8 +502,21 @@ void Database::rebuildIndexes(std::uint64_t tableId) {
     for (const auto& index : definition->indexes) {
         std::vector<std::size_t> columns;
         for (const auto& name : index.columns) columns.push_back(catalog::resolveColumnIndex(*definition, name));
-        auto runtime = std::make_unique<RuntimeIndex>(index.name, stored->definition.table, columns, index.unique);
+        auto runtime = std::make_unique<RuntimeIndex>(index.name, stored->definition.table, columns, index.unique, pageFileIndexes_);
         const auto owner = indexOwnerId(stored->definition.table, index.name);
+        if (pageFileIndexes_) {
+            // 页级引擎主路径：每次重建清旧页后从堆全量建树，索引页与堆页同属一个
+            // PageFile/WAL，随写批次原子落盘/回滚，因而总是与堆一致（无需指纹复用来判断陈旧）。
+            clearIndexPages(owner);
+            runtime->pageTree = std::make_unique<storage::PageBPlusTree>(file_, buffer_, owner, 64, index.unique);
+            if (!runtime->pageTree->create()) throw MiniSqlError(ErrorCode::Catalog, "Failed to create page index: " + index.name);
+            heap_.scan(tableId, schema, [&](storage::RowRef ref, const storage::Row& row) {
+                storage::IndexKey key;
+                for (const auto column : columns) key.values.push_back(row[column]);
+                if (!runtime->pageTree->insert(std::move(key), ref)) throw MiniSqlError(ErrorCode::Execution, "UNIQUE index violation: " + index.name);
+            });
+            indexes_.push_back(std::move(runtime));continue;
+        }
         if (!std::getenv("MINISQL_REBUILD_INDEXES") && loadIndexPages(runtime->tree, owner, fingerprint)) {
             indexes_.push_back(std::move(runtime));continue;
         }
@@ -483,7 +537,7 @@ void Database::validateUniqueIndexes(std::uint64_t tableId, const storage::Row& 
         if (key(index->table) != key(stored->definition.table) || !index->unique) continue;
         storage::IndexKey key;
         for (const auto column : index->columns) key.values.push_back(row[column]);
-        const auto matches = index->tree.search(key);
+        const auto matches = index->search(key);
         for (const auto& match : matches) {
             if (ignored && match.page.id == ignored->page.id && match.page.generation == ignored->page.generation &&
                 match.slot.slot == ignored->slot.slot && match.slot.generation == ignored->slot.generation) continue;
@@ -957,15 +1011,15 @@ nlohmann::json Database::runNode(const sql::LogicalPlan& plan) {
                 key.values.push_back(indexValue(value.at("value"), value.at("type").get<std::string>()));
             key.values.push_back(indexValue(plan.indexRangeValue.at("value"), plan.indexRangeValue.at("type").get<std::string>()));
             const auto& op = plan.indexRangeOperator;
-            if (op == ">") refs = index->tree.range(key, false, std::nullopt, true);
-            else if (op == ">=") refs = index->tree.range(key, true, std::nullopt, true);
-            else if (op == "<") refs = index->tree.range(std::nullopt, true, key, false);
-            else refs = index->tree.range(std::nullopt, true, key, true);
+            if (op == ">") refs = index->range(key, false, std::nullopt, true);
+            else if (op == ">=") refs = index->range(key, true, std::nullopt, true);
+            else if (op == "<") refs = index->range(std::nullopt, true, key, false);
+            else refs = index->range(std::nullopt, true, key, true);
         } else if (!plan.indexValues.empty()) {
             storage::IndexKey key;
             for (const auto& value : plan.indexValues)
                 key.values.push_back(indexValue(value.at("value"), value.at("type").get<std::string>()));
-            refs = index->tree.search(key);
+            refs = index->search(key);
         } else {
         const auto& predicate = plan.predicate;
         if (!predicate.is_object()) fail("IndexScan requires a predicate");
@@ -974,11 +1028,11 @@ nlohmann::json Database::runNode(const sql::LogicalPlan& plan) {
         const auto& right = predicate.at("right");
         if (!right.is_object() || right.value("kind", "") != "Literal") fail("IndexScan requires a literal key");
         const auto key = storage::IndexKey{{indexValue(right.at("value"), right.at("type").get<std::string>())}};
-        if (op == "=") refs = index->tree.search(key);
-        else if (op == ">") refs = index->tree.range(key, false, std::nullopt, true);
-        else if (op == ">=") refs = index->tree.range(key, true, std::nullopt, true);
-        else if (op == "<") refs = index->tree.range(std::nullopt, true, key, false);
-        else refs = index->tree.range(std::nullopt, true, key, true);
+        if (op == "=") refs = index->search(key);
+        else if (op == ">") refs = index->range(key, false, std::nullopt, true);
+        else if (op == ">=") refs = index->range(key, true, std::nullopt, true);
+        else if (op == "<") refs = index->range(std::nullopt, true, key, false);
+        else refs = index->range(std::nullopt, true, key, true);
         }
         for (const auto ref : refs) result["rows"].push_back(rowJson(heap_.read(table->id, schema, ref)));
         for (const auto& column : plan.output) result["columns"].push_back(column.name);
@@ -1277,6 +1331,7 @@ nlohmann::json Database::run(const sql::LogicalPlan& plan) {
     return result;
 }
 nlohmann::json Database::runStatement(const sql::LogicalPlan& plan) {
+    if (plan.kind == "IndexInspect") return indexInspect(plan.table, plan.indexName);
     if (plan.kind == "Checkpoint") {
         if (transaction_ != TransactionState::Idle) throw MiniSqlError(ErrorCode::Transaction, "CHECKPOINT requires an idle transaction");
         buffer_.flushAll();
