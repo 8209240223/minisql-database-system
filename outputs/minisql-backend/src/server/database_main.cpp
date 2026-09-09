@@ -70,7 +70,12 @@ int session(minisql::execution::Database& database) {
                 result = database.diagnostics(request["sql"].get<std::string>());
             } else if (operation == "statistics") result = database.statistics();
             else if (operation == "catalog") result = database.catalog();
-            else if (operation == "close") {
+            else if (operation == "indexInspect") {
+                if (!request.contains("table") || !request["table"].is_string() ||
+                    !request.contains("index") || !request["index"].is_string())
+                    throw minisql::MiniSqlError(minisql::ErrorCode::InvalidArgument, "Expected table and index strings");
+                result = database.indexInspect(request["table"].get<std::string>(), request["index"].get<std::string>());
+            } else if (operation == "close") {
                 close = true;
                 if (std::string(database.transactionState()) == "ACTIVE" || std::string(database.transactionState()) == "ABORTED")
                     result = database.execute("ROLLBACK;");

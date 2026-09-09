@@ -32,7 +32,7 @@
 
 ## 限制
 
-- 当前访问目录是数据库目录旁的版本化 JSON 文件（`access.catalog.json`）或由 `access-store.mjs` 写入的页式 `access.catalog.pages`，尚未作为用户表存入 C++ 页式 Catalog。
-- CLI 直接调用 `minisql_database.exe` 时仍未强制身份校验；目前权限检查集中在 HTTP bridge，面向用户的入口是工作台 HTTP API。
+- 当前访问目录是数据库目录旁的版本化页文件（`access.catalog.pages`），尚未作为用户表存入 C++ 页式 Catalog；旧版 `access.catalog.json` 仅用于迁移读取。
+- 权限感知 CLI（`scripts/minisql-cli.mjs`）已经通过 HTTP bridge 强制携带身份；直接调用 `minisql_database.exe` 仍不接受身份参数并执行权限检查，因此不作为面向用户的入口。
 - SQL 表名识别是轻量正则扫描，尚未覆盖派生表、CTE 和复杂子查询的精确对象身份；DELETE 中的子查询也可能被保守地要求主表的 DELETE 权限。
-- 工作台权限/审计面板已接入（`AccessControl.tsx`），但尚不携带用户身份头（默认以 admin 身份访问）；多会话面板已列出会话，锁等待提示与取消按钮仍需结合并发返回字段完善。
+- 工作台权限/审计面板已接入（`AccessControl.tsx`），请求会携带当前连接的用户和密码；多会话面板已列出会话、锁等待和持锁状态，并提供活动请求取消。基础浏览器 DOM 流程和移动端无溢出检查已通过；活动查询取消、备份替换与恢复失败回滚等破坏性浏览器流程仍未纳入自动化验收。

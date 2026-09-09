@@ -14,12 +14,14 @@
 
 import { writeFileSync, mkdirSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { dirname, join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { createHash } from 'node:crypto';
 import { generate, render, fixture } from '../fuzz-model.mjs';
 import { generateProgram, renderProgram, validateProgram } from '../fuzz-state-machine.mjs';
 
-const directory = fileURLToPath(new URL('.', import.meta.url));
+const directory = process.env.FUZZ_CORPUS_DIR
+  ? resolve(process.env.FUZZ_CORPUS_DIR)
+  : fileURLToPath(new URL('.', import.meta.url));
 const seeds = (process.env.FUZZ_SEEDS ?? '20260908,42,7').split(',').map(value => Number(value)).filter(Number.isInteger);
 const selectCount = Number(process.env.FUZZ_SELECT_COUNT ?? 100);
 const stateSteps = Number(process.env.FUZZ_STATE_STEPS ?? 96);

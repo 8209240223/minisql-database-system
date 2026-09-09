@@ -9,6 +9,7 @@
 - HTTP bridge 为每个 session 创建独立取消文件，并提供 `POST /api/sessions/:id/cancel`。
 - 取消请求只在对应 session 有活动请求时生效；空闲会话返回 409。
 - 取消不会终止 session 进程，取消后的会话可以继续执行查询。
+- 会话空闲回收不会中断活动请求；长 INSERT/SELECT 完成后仍保留会话并重新开始空闲计时，避免取消端点因会话被误删返回 404。
 - 外部排序和外部聚合的 run/meta 文件在取消异常路径中由 RAII 清理。
 - 能力接口新增 `cancellation`、`cancellationMode: cancel-file` 和 `cancelledErrorCode: 5002`。
 

@@ -3,7 +3,7 @@ import { fileURLToPath } from 'node:url';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
-import initSqlJs from '../../minisql-workbench/node_modules/sql.js/dist/sql-wasm.js';
+import { DatabaseSync } from 'node:sqlite';
 import { generate, minimize, render, fixture } from './fuzz-model.mjs';
 import { invoke } from './fuzz-process.mjs';
 
@@ -15,13 +15,12 @@ const directory = mkdtempSync(fileURLToPath(new URL('./artifacts/fuzz-', import.
 const database = join(directory, 'database.pages');
 const executable = fileURLToPath(new URL('../bin/minisql_database.exe', import.meta.url));
 const digest = bytes => createHash('sha256').update(bytes).digest('hex');
-const SQL = await initSqlJs({ locateFile: name => fileURLToPath(new URL(`../../minisql-workbench/node_modules/sql.js/dist/${name}`, import.meta.url)) });
-const reference = new SQL.Database();
+const reference = new DatabaseSync(':memory:');
 const stats = { passed: 0, wrongResult: 0, wrongAccept: 0, wrongReject: 0, errorLocation: 0, crash: 0, timeout: 0, resourceLimit: 0, harnessError: 0 };
 const cases = generate(seed, count);
 const report = { seed, count, timeoutMs: 5000, outputBytes: 8388608, executableSha256: digest(readFileSync(executable)),
   corpusSha256: digest(cases.map(render).join('\n')), generatorSha256: digest(readFileSync(new URL('./fuzz-model.mjs', import.meta.url))),
-  referenceVersion: reference.exec('SELECT sqlite_version();')[0].values[0][0],
+  referenceVersion: reference.prepare('SELECT sqlite_version() AS version').get().version,
   coverage: { predicateCounts: [...new Set(cases.map(model => model.predicates.length))].sort(),
     distinctModes: [...new Set(cases.map(model => model.distinct))], sortDirections: [...new Set(cases.map(model => model.descending))],
     expressionVariants: new Set(cases.map(model => model.expression)).size }, fixture, stats, failures: [] };
@@ -33,7 +32,11 @@ function run(sql) {
 function compare(model) {
   const sql = render(model);
   let expected;
-  try { expected = reference.exec(sql)[0]; }
+  try {
+    const statement = reference.prepare(sql);
+    const columns = statement.columns().map(column => column.name);
+    expected = { columns, values: statement.all().map(row => columns.map(column => row[column])) };
+  }
   catch (error) { return { category: 'harnessError', detail: error.message }; }
   const actual = run(sql);
   if (actual.category) return actual;
@@ -54,7 +57,7 @@ function saveFailure(index, model, outcome) {
   writeFileSync(join(directory, `failure-${index}.json`), JSON.stringify({ seed, fixture, ...failure }, null, 2));
 }
 try {
-  reference.run(fixture);
+  reference.exec(fixture);
   const setup = run(fixture);
   if (!setup.data?.success) throw new Error(`Fixture failed: ${JSON.stringify(setup)}`);
   for (let i = 0; i < cases.length; ++i) {

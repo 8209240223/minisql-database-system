@@ -1,7 +1,7 @@
 # MiniSQL 扩展功能实施清单
 
 版本：V1.0
-日期：2026-09-08
+日期：2026-09-10
 用途：将最终需求文档中的所有扩展拆分为可实现、可验证的功能项，并记录当前工程状态。
 
 ## 一、状态定义
@@ -42,7 +42,7 @@
 | EXT-SQL-006 | GROUP BY、聚合、HAVING | NULL、Aggregate | 部分实现：五种聚合及 GROUP BY/HAVING 已可执行；整数、DECIMAL 表达式与持久化列聚合已有真实结果检查，低内存阈值下的外部分组、多 run 归并和状态合并专项检查通过。FLOAT 完整组合、流式输入、完整资源预算和 X06 全量验收仍待完成，详见 aggregate-progress.md、external-aggregate-progress.md、decimal-progress.md 与 decimal-storage-progress.md | X06 |
 | EXT-SQL-007 | DISTINCT | Project、哈希/排序 | 部分实现：完整投影行去重、表达式、NULL、排序分页及重启已有检查；外存溢写和完整组合验收待完成 | X07 |
 | EXT-SQL-008 | INNER/LEFT JOIN | 多表作用域、NULL | 部分实现：INNER/LEFT JOIN、多表/自连接、ON 绑定、补 NULL 与歧义检查；哈希连接、外存及完整组合验证待完成 | X08 |
-| EXT-SQL-009 | 子查询、IN、EXISTS、标量子查询 | 多层作用域、Apply | 部分实现：非相关 IN/NOT IN、EXISTS、标量子查询和限定名相关子查询已接通，覆盖 NULL、空结果、投影、UPDATE/DELETE、ANALYZE 和错误拒绝；派生表、未限定相关作用域和 Apply/SemiJoin 待完成 | X09 |
+| EXT-SQL-009 | 子查询、IN、EXISTS、标量子查询 | 多层作用域、Apply | 部分实现：非相关 IN/NOT IN、EXISTS、标量子查询、限定名相关子查询和派生表已接通，覆盖 NULL、空结果、投影、UPDATE/DELETE、ANALYZE 和错误拒绝；未限定相关作用域、Apply/SemiJoin 和全量组合待完成 | X09 |
 | EXT-SQL-010 | 投影表达式和别名 | 表达式、Schema | 部分实现：表达式、输出/表别名、限定列、INNER JOIN 后混合限定星号及歧义检查已接；嵌套作用域及稳定计算列身份待完成 | X10 |
 | EXT-SQL-011 | NOT NULL、DEFAULT、PRIMARY KEY、UNIQUE、CHECK、外键、多行 VALUES | Catalog、约束、事务 | 已接入 NOT NULL、DEFAULT、单列/复合键、CHECK、具名约束及外键；新增多行 VALUES 单语句原子提交、批内键检查与自引用最终状态检查，111 项专项检查通过；完整验收及未关闭稳定性风险仍需跟进 | X11 |
 
@@ -51,7 +51,7 @@
 | 编号 | 功能 | 依赖 | 当前状态 | 验收编号 |
 | --- | --- | --- | --- | --- |
 | EXT-CMP-001 | 错误恢复、批量诊断、智能纠错 | Parser、Catalog | 部分实现：新增语句级批量诊断接口，可返回多语句语法/语义错误且不执行写操作；Token 级恢复、单语句多诊断和智能纠错待完成 | X12 |
-| EXT-CMP-002 | 可扩展 AST、LR/生成器方案 | AST 接口、序列化 | 待实现 | X13 |
+| EXT-CMP-002 | 可扩展 AST、LR/生成器方案 | AST 接口、序列化 | 部分实现：AST/Plan/Catalog schema versioning 与迁移入口已接入，并有解析器回归；完整 AST 扩展机制、LR/生成器方案和稳定迁移契约待完成 | X13 |
 | EXT-CMP-003 | AST/Plan JSON、结构展示、版本迁移 | AST、Plan | 部分实现：AST 与 Plan 均支持数组/版本包装反序列化和序列化往返，损坏 ID、父链和表达式会拒绝；完整 Schema 迁移、稳定列身份和 X14 验收待完成 | X14 |
 
 ## 五、优化器扩展
@@ -68,9 +68,9 @@
 
 | 编号 | 功能 | 依赖 | 当前状态 | 验收编号 |
 | --- | --- | --- | --- | --- |
-| EXT-SYS-001 | B+ 树、复合/唯一索引、IndexScan | Page、RowId、Catalog | 部分实现：索引镜像已由 JSON sidecar 迁移到页文件 owner 页，Catalog 暴露 page-file/pageCount/height，支持根分裂、范围查询、删除、重启恢复和强制重建，44 项专项检查通过；页级节点遍历、索引页类型编号与页内借位/合并未完成，完整 X20 验收待收口 | X20 |
+| EXT-SYS-001 | B+ 树、复合/唯一索引、IndexScan | Page、RowId、Catalog | 部分实现：页级 B+ 树已成为默认索引主路径，支持元页/节点页、根到叶遍历、根分裂、范围查询、删除借位/合并、重启恢复、结构 inspect 和强制重建；29+41+44 项索引检查通过。更高规模组合、性能/资源曲线和完整 X20 验收待完成 | X20 |
 | EXT-SYS-002 | BEGIN、COMMIT、ROLLBACK、原子性 | WAL、锁或版本 | 部分实现：显式事务、事务化 DDL、常驻 HTTP 会话及工作台事务控制；进程/HTTP 测试和真实浏览器提交、回滚、失败、过期、响应丢失检查通过；多逻辑会话采用数据库级排他两阶段锁，锁等待、超时和关闭回滚已接通，行级隔离/MVCC 和 X21 全量组合验收未完成 | X21 |
-| EXT-SYS-003 | WAL、恢复、检查点、故障注入 | Page、事务 | 部分实现：整页重做日志、同步、独占锁、身份校验、重复恢复、提交后截断、显式 CHECKPOINT，以及按写语句/WAL 累计大小/提交脏页数量/脏页比例/时间窗口触发的自动 CHECKPOINT 已接通；事务 COMMIT 统一评估，新增五阶段跨进程故障注入和 30 项检查；当前仍为提交事件驱动，后台调度、独立 WAL 截止位置语义和 X22 全量组合验收待完成，详见 `docs/auto-checkpoint-progress.md` | X22 |
+| EXT-SYS-003 | WAL、恢复、检查点、故障注入 | Page、事务 | 部分实现：整页重做日志、同步、独占锁、身份校验、重复恢复、显式/自动/后台 CHECKPOINT、持久化 checkpoint 记录、累积 WAL/LSN、非零截止位置重做和五阶段故障注入已接通；62+30+88 项检查通过。在线备份、复杂并发恢复和完整 X22 组合验收待完成，详见 `docs/auto-checkpoint-progress.md` | X22 |
 | EXT-SYS-004 | 并发控制、锁、死锁、MVCC 替代方案 | Executor、事务 | 已实现：选择保守数据库级两阶段锁并固定为交付方案；SessionRegistry 多会话、事务锁等待/超时、关闭回滚和同记录 UPDATE 竞争 44 项检查通过，详见 concurrency-progress.md。非 MVCC，不并行读写，前端多会话面板未收口 | X23 |
 | EXT-SYS-005 | 用户、角色、对象权限、审计 | Catalog、会话 | 部分实现：访问目录已支持用户/角色/角色继承/对象授权、加盐密码、跨会话身份、元数据过滤、审计 object 字段与过滤，37 项专项检查通过；新增 `createUser`/`dropUser`/`createRole`/`dropRole`/`setPassword`/`grant`/`revoke` 纯函数原子接口（27 项契约）并映射为独立 HTTP 资源端点（39 项集成，2026-09-09），工作台新增用户/角色/会话/审计面板。访问目录尚未进入页式 Catalog、CLI 强制身份校验待完成 | X24 |
 | EXT-SYS-006 | 外部排序、大结果集、取消和资源预算 | Sort、Buffer | 部分实现：ORDER BY 超过内存行预算时写入带 sessionId、查询/排序序号和 FNV-1a 校验的 JSONL run 并多路归并，临时文件结束或异常清理，专项检查 13 项通过；分组输入超过预算时按分组键外部排序并合并状态，外部聚合专项检查 8 项通过；新增只读 NDJSON 流式接口和 TCP drain 背压路径，12 项 X25 流式检查通过。执行器级迭代、提前停止、完整资源预算和 X25 全量验收待完成，详见 `docs/streaming-progress.md` | X25 |
@@ -80,7 +80,7 @@
 
 | 编号 | 功能 | 依赖 | 当前状态 | 验收编号 |
 | --- | --- | --- | --- | --- |
-| EXT-QA-001 | 固定种子 SQL 生成、变异、最小化、回归 | Lexer、Parser、Executor | 部分实现：SELECT 固定种子生成、4 类变异、SQLite 差分、模型缩减、故障分类及报告；新增 DDL/DML 状态机生成器、固定种子语料持久化（`tests/fuzz/generate-corpus.mjs` + `manifest.json`）与 `.github/workflows/ci.yml` 可重复回归入口（2026-09-09）。依赖 C++ 引擎的差分、跨进程组合与崩溃恢复回归仍待引擎构建后启用 | X27 |
+| EXT-QA-001 | 固定种子 SQL 生成、变异、最小化、回归 | Lexer、Parser、Executor | 部分实现：SELECT 固定种子生成、4 类变异、SQLite 差分、模型缩减、故障分类及报告；DDL/DML 状态机生成器、固定种子语料持久化、失败 artifact 重放、DATE/BOOL 回归、真实 C++ 状态机差分与 512 步长跑已接入，`.github/workflows/ci.yml` 已包含 Windows 引擎回归。无限压力、崩溃恢复组合和长期资源趋势仍待完成 | X27 |
 
 ## 八、实施顺序
 

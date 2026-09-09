@@ -54,6 +54,8 @@ export async function openSession(executable, database, { timeoutMs = 30000, max
       id, operation, ...(sql === undefined ? {} : { sql }),
       ...(context.sessionId === undefined ? {} : { sessionId: context.sessionId }),
       ...(context.cancelFile === undefined ? {} : { cancelFile: context.cancelFile }),
+      ...(context.table === undefined ? {} : { table: context.table }),
+      ...(context.index === undefined ? {} : { index: context.index }),
     });
     if (Buffer.byteLength(frame) > 8 * 1024 * 1024) return Promise.reject(new Error('Session request exceeds 8 MiB'));
     if (operation === 'close') closing = true;

@@ -7,6 +7,8 @@
     "test:safety": "node --test tests/sql-safety.test.mjs",
     "test:history": "node --test tests/query-history.test.mjs",
     "test:csv": "node --test tests/result-csv.test.mjs",
+    "test:dom": "node tests/c2-dom.cjs",
+    "test:browser": "node tests/compiler-dom.cjs && node tests/c2-dom.cjs",
     "dev": "vite --host 127.0.0.1",
     "build": "tsc -b && vite build",
     "preview": "vite preview --host 127.0.0.1"
@@ -25,6 +27,7 @@
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",
     "@vitejs/plugin-react": "^4.3.4",
+    "playwright": "^1.60.0",
     "typescript": "~5.7.3",
     "vite": "^6.1.0"
   }

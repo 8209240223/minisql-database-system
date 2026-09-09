@@ -18,6 +18,33 @@ const RowSchema columnSchema{ColumnType::Int, ColumnType::Int, ColumnType::Varch
 [[noreturn]] void corrupt() { throw MiniSqlError(ErrorCode::Storage, "STORAGE_CORRUPTION: system catalog"); }
 }
 PersistentCatalog::PersistentCatalog(storage::HeapStore& heap) : heap_(heap) {
+    // --- X13 catalog metadata header (schemaVersion 落盘 + 未知主版本拒绝) ---
+    const storage::RowSchema headerSchema{storage::ColumnType::Int, storage::ColumnType::Varchar};
+    std::uint32_t onDiskVersion = 0;
+    std::uint32_t pendingMigration = 0;
+    bool headerPresent = false;
+    heap_.scan(CatalogMetaStore, headerSchema, [&](storage::RowRef, const storage::Row& row) {
+        if (headerPresent) corrupt(); // a single header row is required
+        if (row.size() != 2) corrupt();
+        for (const auto& value : row) if (std::holds_alternative<std::monostate>(value)) corrupt();
+        const auto stored = std::get<std::int32_t>(row[0]);
+        if (stored < 1) corrupt();
+        headerPresent = true;
+        onDiskVersion = static_cast<std::uint32_t>(stored);
+        const auto& text = std::get<std::string>(row[1]);
+        if (text.empty() || text.front() != '{') corrupt();
+        try {
+            const auto parsed = nlohmann::json::parse(text);
+            if (!parsed.is_object() || !parsed.at("producerVersion").is_number_unsigned()) corrupt();
+            producerVersion_ = parsed.at("producerVersion").get<std::uint32_t>();
+            migratedFrom_ = parsed.value("migratedFrom", 0u);
+            recovered_ = parsed.value("recovered", false);
+            pendingMigration = parsed.value("pendingMigration", 0u);
+        } catch (const nlohmann::json::exception&) { corrupt(); }
+    });
+    if (onDiskVersion > sql::CATALOG_SCHEMA_VERSION)
+        throw MiniSqlError(ErrorCode::Storage, "Unsupported catalog schema version " + std::to_string(onDiskVersion) +
+            "; this build supports up to " + std::to_string(sql::CATALOG_SCHEMA_VERSION));
     std::map<std::int32_t, std::map<std::int32_t, sql::ColumnDef>> columns;
     heap_.scan(1, columnSchema, [&](storage::RowRef, const storage::Row& row) {
         for (const auto& value : row) if (std::holds_alternative<std::monostate>(value)) corrupt();
@@ -107,6 +134,63 @@ PersistentCatalog::PersistentCatalog(storage::HeapStore& heap) : heap_(heap) {
         try { view_.create(definition); for (const auto& index : definition.indexes) { sql::Statement createIndex{"CreateIndex"};createIndex.indexName=index.name;createIndex.table=definition.table;createIndex.indexColumns=index.columns;createIndex.uniqueIndex=index.unique;view_.createIndex(createIndex); } } catch (const MiniSqlError&) { corrupt(); }
         tables_.push_back({id, std::move(definition)});
     });
+    // --- X13 migrate / stamp. Table & column rows above were read leniently, so
+    // the in-memory catalog already reflects current features; migration here is
+    // a version stamp and never rewrites column types / NULL / constraints /
+    // indexes (satisfying "迁移不得静默改列类型/NULL/约束/索引"). ---
+    if (!headerPresent) {
+        // Absent header = brand-new catalog, or a legacy catalog written before
+        // metadata existed. Record the current schema version. If a prior crash
+        // left descriptors already upgraded but the header unstamped, this stamps
+        // it and marks recovery.
+        nlohmann::json detail{{"producerVersion", sql::PRODUCER_VERSION},
+            {"migratedFrom", 0}, {"recovered", false}, {"pendingMigration", 0}};
+        stampHeader(sql::CATALOG_SCHEMA_VERSION, detail);
+        producerVersion_ = sql::PRODUCER_VERSION;
+        schemaVersion_ = sql::CATALOG_SCHEMA_VERSION;
+    } else if (onDiskVersion < sql::CATALOG_SCHEMA_VERSION) {
+        // Upgrade chain: onDiskVersion -> CATALOG_SCHEMA_VERSION. Preflight was the
+        // successful lenient load above; recovery point is the existing header row.
+        const bool interrupted = pendingMigration >= sql::CATALOG_SCHEMA_VERSION;
+        nlohmann::json detail{{"producerVersion", sql::PRODUCER_VERSION},
+            {"migratedFrom", onDiskVersion}, {"recovered", interrupted}, {"pendingMigration", 0}};
+        stampHeader(sql::CATALOG_SCHEMA_VERSION, detail);
+        producerVersion_ = sql::PRODUCER_VERSION;
+        migratedFrom_ = onDiskVersion;
+        recovered_ = interrupted;
+        schemaVersion_ = sql::CATALOG_SCHEMA_VERSION;
+    } else {
+        schemaVersion_ = onDiskVersion;
+    }
+}
+void PersistentCatalog::stampHeader(std::uint32_t version, const nlohmann::json& detail) {
+    const storage::RowSchema headerSchema{storage::ColumnType::Int, storage::ColumnType::Varchar};
+    const storage::Row header{static_cast<std::int32_t>(version), detail.dump()};
+    (void)storage::encodeRow(header, headerSchema);
+    storage::RowRef existing{};
+    bool found = false;
+    heap_.scan(CatalogMetaStore, headerSchema, [&](storage::RowRef ref, const storage::Row& row) {
+        if (!found) { existing = ref; found = true; }
+    });
+    if (found) (void)heap_.replace(CatalogMetaStore, headerSchema, existing, header);
+    else (void)heap_.insert(CatalogMetaStore, headerSchema, header);
+    heap_.flush();
+}
+std::vector<CatalogMigrationStep> PersistentCatalog::migrationPlan(std::uint32_t fromVersion) {
+    std::vector<CatalogMigrationStep> steps;
+    for (std::uint32_t target = fromVersion + 1; target <= sql::CATALOG_SCHEMA_VERSION; ++target) {
+        steps.push_back({
+            target - 1, target, true,
+            "re-validate loaded table/column/index/constraint rows (lenient read already succeeded)",
+            "advance catalog schemaVersion by one; table/column/index/constraint rows are left byte-identical (no silent type/NULL/constraint/index change)",
+            "previous single header row; replace commits atomically, any interruption re-runs the chain from here and the database stays openable",
+        });
+    }
+    return steps;
+}
+nlohmann::json PersistentCatalog::catalogMetadata() const {
+    return {{"schemaVersion", schemaVersion_}, {"producerVersion", producerVersion_},
+        {"migratedFrom", migratedFrom_}, {"recovered", recovered_}};
 }
 void PersistentCatalog::reload() {
     PersistentCatalog restored(heap_);

@@ -471,6 +471,13 @@ void validate(const std::vector<sql::Statement>& statements, Catalog& catalog) {
             catalog.create(statement);
             continue;
         }
+        // X09 3.3: 派生表基座。内层 select 仍在真实 catalog 上校验；外层列绑定、
+        // 类型与 WHERE 校验交由 planner 的 Scope 链完成（catalog 未知派生别名）。
+        if (statement.fromSubquery != nullptr) {
+            if (statement.kind != "Select") fail("DELETE/UPDATE is not supported over a derived table", statement.location);
+            validate({*statement.fromSubquery}, catalog);
+            continue;
+        }
         auto binding = queryScope(statement, catalog);
         const auto* table = &binding;
         if (statement.kind == "Insert") {

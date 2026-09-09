@@ -32,6 +32,8 @@ if (!$env:VCPKG_BINARY_SOURCES) {
     $env:VCPKG_BINARY_SOURCES = "clear;files,$binaryCache,readwrite"
 }
 $env:VCPKG_DISABLE_METRICS = '1'
-# The pinned library ports support our CMake 3.25+ requirement. Reuse the
-# detected CMake instead of downloading another large tool bundle.
-if (!$env:VCPKG_FORCE_SYSTEM_BINARIES) { $env:VCPKG_FORCE_SYSTEM_BINARIES = '1' }
+# Reuse the detected CMake instead of downloading another large tool bundle.
+# Do not force system binaries: vcpkg may download a pinned PowerShell (pwsh)
+# for its toolchain bootstrap through the configured proxy when the host lacks
+# pwsh, which the old FORCE flag silently prevented and broke "vcpkg install".
+# Git and CMake still come from the system PATH.

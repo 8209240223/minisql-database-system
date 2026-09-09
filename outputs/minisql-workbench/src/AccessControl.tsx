@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import type { AccessState, AccessUser, AccessRole, AuditEntry, Connection, SessionEntry } from './types';
 import { getAccess, getAudit, getSessions, createUser, dropUser, createRole, dropRole,
-  grantAccess, revokeAccess, setUserPassword, addUserRole, removeUserRole } from './client';
+  grantAccess, revokeAccess, setUserPassword, addUserRole, removeUserRole, cancelSession } from './client';
 import { X, Shield, Users, FileSearch, Activity } from 'lucide-react';
 
 const PERMISSIONS = ['*', 'connect', 'read', 'select', 'insert', 'update', 'delete', 'create', 'drop', 'transaction', 'checkpoint', 'compile', 'grant', 'audit'];
@@ -40,6 +40,7 @@ export function AccessControl({ connection, open, onClose }: { connection: Conne
   const [sessions, setSessions] = useState<SessionEntry[]>([]);
   const [tab, setTab] = useState<Tab>('users');
   const [error, setError] = useState<string>();
+  const [sessionMessage, setSessionMessage] = useState<string>();
   const [newUser, setNewUser] = useState({ name: '', password: '', roles: '' });
   const [newRole, setNewRole] = useState({ name: '', inherits: '', grants: '' });
 
@@ -53,6 +54,11 @@ export function AccessControl({ connection, open, onClose }: { connection: Conne
   }, [connection]);
 
   useEffect(() => { if (open) void refresh(); }, [open, refresh]);
+  useEffect(() => {
+    if (!open || tab !== 'sessions') return;
+    const timer = window.setInterval(() => void refresh(), 2000);
+    return () => window.clearInterval(timer);
+  }, [open, tab, refresh]);
 
   if (!open) return null;
   const apiMode = connection.mode === 'api';
@@ -62,6 +68,11 @@ export function AccessControl({ connection, open, onClose }: { connection: Conne
     try { await run(); setNewUser({ name: '', password: '', roles: '' }); setNewRole({ name: '', inherits: '', grants: '' }); await refresh(); }
     catch (e) { setError(e instanceof Error ? e.message : String(e)); }
     void success;
+  };
+  const cancel = async (sessionId: string) => {
+    setSessionMessage(undefined);
+    try { await cancelSession(connection, sessionId); setSessionMessage('已发送取消请求'); await refresh(); }
+    catch (failure) { setSessionMessage(failure instanceof Error ? failure.message : String(failure)); }
   };
 
   return <dialog className="settings-dialog access-dialog" open aria-label="权限与审计"><div className="settings-body access-body">
@@ -96,7 +107,8 @@ export function AccessControl({ connection, open, onClose }: { connection: Conne
     </div>}
 
     {tab === 'sessions' && <div className="access-panel">
-      {sessions.length === 0 ? <p className="access-empty">暂无活动会话。</p> : <table className="access-table"><thead><tr><th>会话</th><th>用户</th><th>事务</th><th>活动</th><th>锁等待</th><th>最后活动</th></tr></thead><tbody>{sessions.map(s => <tr key={s.sessionId}><td>{s.sessionId.slice(0, 8)}…</td><td>{s.user}</td><td>{s.transactionState}</td><td>{s.activeRequest ? '是' : '否'}</td><td>{s.waitingForLock ? '是' : '否'}</td><td>{new Date(s.lastActiveAt).toLocaleTimeString()}</td></tr>)}</tbody></table>}
+      {sessionMessage && <div className="access-message">{sessionMessage}</div>}
+      {sessions.length === 0 ? <p className="access-empty">暂无活动会话。</p> : <table className="access-table"><thead><tr><th>会话</th><th>用户</th><th>事务</th><th>活动</th><th>锁等待</th><th>最后活动</th><th>操作</th></tr></thead><tbody>{sessions.map(s => <tr key={s.sessionId} className={s.sessionId === connection.sessionId ? 'current-session' : ''}><td title={s.sessionId}>{s.sessionId === connection.sessionId ? '当前 · ' : ''}{s.sessionId.slice(0, 8)}…</td><td>{s.user}</td><td>{s.transactionState}{s.ownsTransactionLock ? ' · 持锁' : ''}</td><td>{s.activeRequest ? '执行中' : '空闲'}</td><td>{s.waitingForLock ? '等待事务锁' : '否'}</td><td>{new Date(s.lastActiveAt).toLocaleTimeString()}</td><td><button className="revoke" disabled={!s.activeRequest && !s.waitingForLock} onClick={() => void cancel(s.sessionId)}>取消</button></td></tr>)}</tbody></table>}
     </div>}
 
     {tab === 'audit' && <AuditPanel entries={audit} connection={connection} onChanged={refresh}/>}

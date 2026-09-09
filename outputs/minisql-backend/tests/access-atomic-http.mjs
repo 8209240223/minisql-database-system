@@ -6,12 +6,13 @@
 
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
-import { mkdtempSync, readFileSync } from 'node:fs';
+import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { join } from 'node:path';
 import assert from 'node:assert/strict';
 import { can, roleNames, verifyUser } from '../scripts/access-catalog.mjs';
+import { pagesPathFor, readStore } from '../scripts/access-store.mjs';
 
 const directory = mkdtempSync(join(tmpdir(), 'minisql-access-atomic-'));
 const accessPath = join(directory, 'access.catalog.json');
@@ -35,7 +36,7 @@ server.stderr.on('data', chunk => { errors += chunk; });
 function equal(actual, expected) { assert.deepEqual(actual, expected); ++checks; }
 function ok(value, message) { assert.ok(value, message); ++checks; }
 
-const loadAccessFile = () => JSON.parse(readFileSync(accessPath, 'utf8'));
+const loadAccessFile = () => readStore(pagesPathFor(accessPath)).catalog;
 
 try {
   const url = await new Promise((resolve, reject) => {

@@ -6,7 +6,12 @@
 #include <cstdint>
 
 namespace minisql::sql {
-struct Expr { std::string kind; std::string value; std::shared_ptr<Expr> left; std::shared_ptr<Expr> right; SourceLocation location{}; std::string subquerySql{}; };
+struct Statement;
+// X09: Expr carries either the raw SQL text (subquerySql, interim) or a
+// structured query node (subquery). Migration to structured object identity is
+// underway; subquerySql stays until planner/execution (3.3-3.5) consume the
+// structured node, then it is removed.
+struct Expr { std::string kind; std::string value; std::shared_ptr<Expr> left; std::shared_ptr<Expr> right; SourceLocation location{}; std::string subquerySql{}; std::shared_ptr<Statement> subquery{}; };
 struct ColumnDef { std::string name; std::string type; bool nullable = true; std::optional<std::string> defaultValue{}; bool primaryKey = false; bool unique = false; std::optional<std::pair<std::string,std::string>> references{}; };
 struct SelectItem { std::shared_ptr<Expr> expression; std::string alias; };
 struct OrderItem { std::shared_ptr<Expr> expression; bool descending = false; std::optional<bool> nullsFirst{}; };
@@ -33,6 +38,8 @@ struct Statement {
     std::vector<Assignment> assignments{};
     std::string tableAlias{};
     std::vector<Join> joins{};
+    // X09: FROM 派生表 `( SELECT ... ) AS alias` —— 结构化子查询节点 + 显式别名。
+    std::shared_ptr<Statement> fromSubquery{};
     std::vector<std::shared_ptr<Expr>> valueExpressions{};
     bool defaultValues = false;
     std::vector<std::vector<std::shared_ptr<Expr>>> valueRows{};
@@ -46,6 +53,7 @@ struct Statement {
     bool uniqueIndex = false;
     std::vector<std::string> indexColumns{};
     std::vector<IndexDef> indexes{};
+    bool invalid = false;
 };
 inline std::string constraintSuffix(const std::vector<ConstraintName>& names, const std::string& kind, std::size_t index) {
     for (const auto& binding : names)
@@ -69,4 +77,10 @@ inline std::vector<ForeignKey> allForeignKeys(const Statement& statement) {
     return result;
 }
 std::vector<Statement> parse(const std::vector<Token>& tokens);
+// Recovery-mode parser: instead of throwing on the first syntax error it
+// collects every recoverable syntax error into `errors` (with
+// endLine/endColumn spans), synchronizes to the next statement boundary, and
+// marks the offending Statement invalid so callers can reject it without
+// aborting the whole batch. Valid statements still come back.
+std::vector<Statement> parseRecoverable(const std::vector<Token>& tokens, std::vector<MiniSqlError>& errors);
 }

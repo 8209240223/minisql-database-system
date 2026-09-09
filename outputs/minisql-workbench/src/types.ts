@@ -26,7 +26,20 @@ export interface QueryResult {
   tokens?: SqlToken[];
   stages?: Record<string, string>;
 }
-export interface Connection { mode: 'api'; name: string; url: string; sessionId?: string }
+export interface Connection {
+  mode: 'api';
+  name: string;
+  url: string;
+  user: string;
+  password: string;
+  sessionId?: string;
+}
+export interface ConnectionProfile {
+  mode: 'api';
+  name: string;
+  url: string;
+  user: string;
+}
 export interface QueryTab { id: string; name: string; sql: string; dirty?: boolean }
 export interface HistoryItem { id: string; sql: string; at: number; durationMs: number; rows: number; error?: string; mode: Connection['mode']; connection: string; action: 'compile' | 'execute' }
 export interface SqlToken { type: string; text: string; line: number; column: number }
@@ -44,4 +57,36 @@ export interface AuditEntry {
 export interface SessionEntry {
   sessionId: string; user: string; transactionState: string; activeRequest: boolean;
   waitingForLock: boolean; ownsTransactionLock: boolean; lastActiveAt: string;
+}
+
+export interface Capabilities {
+  engine: string;
+  persistence: boolean;
+  maxSessions: number;
+  sessionIdleMs: number;
+  transactionLockTimeoutMs: number;
+  cancellation: boolean;
+  streamingResults: boolean;
+  maxResultRows: number;
+  externalSort: boolean;
+  externalAggregate: boolean;
+  backupRestore: boolean;
+  backupIncremental: boolean;
+  backupMigration: string;
+  backupManifestVersions: number[];
+  permissions: boolean;
+  audit: boolean;
+  indexPageStorage: boolean;
+  capabilities: string[];
+}
+
+export interface BackupEntry {
+  name: string;
+  kind: string;
+  base?: string;
+  bytes: number;
+  createdAt?: string;
+  manifestVersion?: number;
+  pageFormatVersion?: number;
+  walBytes?: number;
 }
