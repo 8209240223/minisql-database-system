@@ -3,8 +3,9 @@ import CodeMirror from '@uiw/react-codemirror';
 import { EditorView } from '@codemirror/view';
 import { lintGutter, setDiagnostics } from '@codemirror/lint';
 import { sql } from '@codemirror/lang-sql';
-import { Activity, Braces, ChevronDown, ChevronRight, CircleHelp, Database, FileCode2, FolderTree, History, Play, Plus, RefreshCw, Search, Settings2, Table2, Terminal, Trash2, X } from 'lucide-react';
+import { Activity, Braces, ChevronDown, ChevronRight, CircleHelp, Database, FileCode2, FolderTree, History, Play, Plus, RefreshCw, Search, Settings2, Shield, Table2, Terminal, Trash2, X } from 'lucide-react';
 import { getCatalog, getHealth, getStorage, runSql, openApiSession, closeApiSession, releaseApiSession } from './client';
+import { AccessControl } from './AccessControl';
 import { StorageStatisticsView } from './StorageStatistics';
 import { configureBuffer } from './client';
 import { Plug, Unplug, Check, Undo2, CirclePlay, Pencil, Upload, Download } from 'lucide-react';
@@ -58,6 +59,7 @@ function App() {
   const [historyOmitted, setHistoryOmitted] = useState(false);
   const [historyDialogOpen, setHistoryDialogOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+const [accessOpen, setAccessOpen] = useState(false);
   const [resultLimit, setResultLimit] = useState(() => Number(localStorage.getItem('minisql-result-limit') ?? 1000));
   const [darkMode, setDarkMode] = useState(() => localStorage.getItem('minisql-theme') === 'dark');
   const [storageInfo, setStorageInfo] = useState<Awaited<ReturnType<typeof getStorage>>>();
@@ -316,12 +318,13 @@ function App() {
 
   return <div className={darkMode ? 'app-shell dark-mode' : 'app-shell'} onKeyDownCapture={shortcut}>
     <dialog className="settings-dialog" open={settingsOpen} aria-label="设置"><div className="settings-body"><button className="icon-btn settings-close" aria-label="关闭设置" onClick={() => setSettingsOpen(false)}><X size={17}/></button><h2>工作台设置</h2><label>结果显示上限<input type="number" min="100" max="10000" step="100" value={resultLimit} onChange={event => { const value=Math.max(100,Math.min(10000,Number(event.target.value)||100));setResultLimit(value);localStorage.setItem('minisql-result-limit',String(value)); }}/></label><label className="settings-check"><input type="checkbox" checked={darkMode} onChange={event => {setDarkMode(event.target.checked);localStorage.setItem('minisql-theme',String(event.target.checked?'dark':'light'));}}/>深色主题</label><button className="settings-reset" onClick={() => { localStorage.removeItem('minisql-result-limit');localStorage.removeItem('minisql-theme');setResultLimit(1000);setDarkMode(false); }}>恢复默认设置</button><button className="settings-refresh" onClick={() => void refreshStorage()}>刷新存储统计</button>{storageInfo ? <StorageStatisticsView value={storageInfo} disabled={running || transactionState !== 'IDLE'} onConfigure={async action => { const buffer = await configureBuffer(effectiveConnection, action); setStorageInfo(previous => previous ? { ...previous, buffer } : previous); }}/> : <div className="storage-info">连接真实 C++ 数据库后可查看存储统计。</div>}</div></dialog>
+    <AccessControl connection={effectiveConnection} open={accessOpen} onClose={() => setAccessOpen(false)} />
     <dialog className="history-dialog" aria-label="查询历史" ref={historyDialog} onKeyDown={historyKeys} onClose={() => setHistoryDialogOpen(false)}><div className="history-dialog-body"><div className="history-dialog-close"><button className="icon-btn" title="关闭查询历史" autoFocus onClick={() => historyDialog.current?.close()}><X size={18}/></button></div>{historyDialogOpen && historyContent}</div></dialog>
     <input ref={fileInput} type="file" accept=".sql" hidden aria-label="导入 SQL 文件" onChange={event => { const file = event.target.files?.[0];event.target.value = '';void importSql(file); }}/>
     {!draftSaved && <div className="draft-alert" role="alert">草稿保存失败：当前修改仅保留在此页面，请导出 SQL 后再关闭。</div>}
     {!historySaved && <div className="draft-alert" role="alert">历史保存失败：本次历史修改尚未写入本地存储。</div>}
     {historyOmitted && <div className="draft-alert" role="status">本次 SQL 超过历史单条容量，未加入历史；执行结果不受影响。</div>}
-    <header className="topbar"><div className="brand"><div className="brand-mark"><Database size={17}/></div><span>MiniSQL</span><b>Studio</b></div><div className="top-actions"><button className="connection-select" disabled={running} onClick={() => void connect()}><span className={health === 'ok' ? 'status-dot' : 'status-dot status-warn'}/>{connection.name}<ChevronDown size={14}/></button>{health && <span className="health-label" title="C++ bridge 健康状态">{health === 'ok' ? '服务正常' : '服务降级'}</span>}<button className="history-toggle" title="打开查询历史" aria-haspopup="dialog" onClick={() => setHistoryDialogOpen(true)}><History size={17}/></button><button className="settings-toggle" title="打开设置" aria-label="打开设置" onClick={() => setSettingsOpen(true)}><Settings2 size={17}/></button><button className="avatar">M</button></div></header>
+    <header className="topbar"><div className="brand"><div className="brand-mark"><Database size={17}/></div><span>MiniSQL</span><b>Studio</b></div><div className="top-actions"><button className="connection-select" disabled={running} onClick={() => void connect()}><span className={health === 'ok' ? 'status-dot' : 'status-dot status-warn'}/>{connection.name}<ChevronDown size={14}/></button>{health && <span className="health-label" title="C++ bridge 健康状态">{health === 'ok' ? '服务正常' : '服务降级'}</span>}<button className="history-toggle" title="打开查询历史" aria-haspopup="dialog" onClick={() => setHistoryDialogOpen(true)}><History size={17}/></button><button className="settings-toggle" title="打开权限与审计" aria-label="打开权限与审计" onClick={() => setAccessOpen(true)}><Shield size={17}/></button><button className="settings-toggle" title="打开设置" aria-label="打开设置" onClick={() => setSettingsOpen(true)}><Settings2 size={17}/></button><button className="avatar">M</button></div></header>
     <div className="transaction-toolbar" aria-label="事务控制">
       <span role="status" data-testid="transaction-state">{!sessionId ? transactionState === 'EXPIRED' ? '会话已过期' : '未连接' : ({ IDLE: '自动提交', ACTIVE: '事务进行中 · 未提交', ABORTED: '事务失败 · 必须回滚', UNKNOWN: '提交状态未知' }[transactionState] ?? transactionState)}</span>
       <button className="icon-btn" title="连接会话" aria-label="连接会话" disabled={running || !!sessionId} onClick={connect}><Plug size={16}/></button>

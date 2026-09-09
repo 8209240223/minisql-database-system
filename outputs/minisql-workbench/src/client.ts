@@ -1,4 +1,4 @@
-import type { Connection, QueryResult, Table } from './types';
+import type { AccessState, AuditEntry, Connection, QueryResult, SessionEntry, Table } from './types';
 
 async function api(connection: Connection, path: string, options?: RequestInit) {
   const url = `${connection.url.replace(/\/$/, '')}${path}`;
@@ -112,6 +112,70 @@ export async function getHealth(connection: Connection): Promise<{ status: strin
   return api(connection, '/health');
 }
 
+// X24 权限、审计与多会话面板客户端。
+const ACCESS_PERMISSIONS = ['*', 'connect', 'read', 'select', 'insert', 'update', 'delete', 'create', 'drop', 'transaction', 'checkpoint', 'compile', 'grant', 'audit'];
+
+export async function getAccess(connection: Connection): Promise<AccessState> {
+  const data = await api(connection, '/access');
+  if (!data.access) throw new Error('权限响应缺少 access 字段。');
+  return data.access;
+}
+export async function getUsers(connection: Connection): Promise<AccessState['users']> {
+  const data = await api(connection, '/users');
+  if (!Array.isArray(data.users)) throw new Error('用户响应缺少 users 数组。');
+  return data.users;
+}
+export async function createUser(connection: Connection, body: { name: string; password?: string; roles?: string[]; grants?: { object: string; permissions: string[] }[] }): Promise<AccessState> {
+  const data = await api(connection, '/users', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  return data.access;
+}
+export async function dropUser(connection: Connection, name: string): Promise<AccessState> {
+  const data = await api(connection, `/users/${encodeURIComponent(name)}`, { method: 'DELETE' });
+  return data.access;
+}
+export async function setUserPassword(connection: Connection, name: string, password: string): Promise<AccessState> {
+  const data = await api(connection, `/users/${encodeURIComponent(name)}/password`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ password }) });
+  return data.access;
+}
+export async function addUserRole(connection: Connection, name: string, role: string): Promise<AccessState> {
+  const data = await api(connection, `/users/${encodeURIComponent(name)}/roles`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ role }) });
+  return data.access;
+}
+export async function removeUserRole(connection: Connection, name: string, role: string): Promise<AccessState> {
+  const data = await api(connection, `/users/${encodeURIComponent(name)}/roles/${encodeURIComponent(role)}`, { method: 'DELETE' });
+  return data.access;
+}
+export async function createRole(connection: Connection, body: { name: string; inherits?: string[]; grants?: { object: string; permissions: string[] }[] }): Promise<AccessState> {
+  const data = await api(connection, '/roles', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  return data.access;
+}
+export async function dropRole(connection: Connection, name: string): Promise<AccessState> {
+  const data = await api(connection, `/roles/${encodeURIComponent(name)}`, { method: 'DELETE' });
+  return data.access;
+}
+export async function grantAccess(connection: Connection, body: { subject: { type: 'user' | 'role'; name: string }; object?: string; permissions: string[] }): Promise<AccessState> {
+  const data = await api(connection, '/grants', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  return data.access;
+}
+export async function revokeAccess(connection: Connection, body: { subject: { type: 'user' | 'role'; name: string }; object?: string; permissions?: string[] }): Promise<AccessState> {
+  const data = await api(connection, '/revokes', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  return data.access;
+}
+export async function getAudit(connection: Connection, filters: { user?: string; object?: string; limit?: number } = {}): Promise<{ entries: AuditEntry[]; count: number }> {
+  const params = new URLSearchParams();
+  if (filters.user) params.set('user', filters.user);
+  if (filters.object) params.set('object', filters.object);
+  if (filters.limit) params.set('limit', String(filters.limit));
+  const query = params.toString();
+  const data = await api(connection, `/audit${query ? '?' + query : ''}`);
+  if (!Array.isArray(data.entries)) throw new Error('审计响应缺少 entries 数组。');
+  return { entries: data.entries, count: data.count ?? data.entries.length };
+}
+export async function getSessions(connection: Connection): Promise<SessionEntry[]> {
+  const data = await api(connection, '/sessions');
+  if (!Array.isArray(data.entries)) throw new Error('会话响应缺少 entries 数组。');
+  return data.entries;
+}
 export async function runSql(connection: Connection, sql: string, compile: boolean, signal: AbortSignal): Promise<QueryResult> {
   if (!compile && /^\s*SELECT\b/i.test(sql)) {
     const data = await streamApi(connection, sessionPath(connection, '/execute/stream'), sql, signal);
