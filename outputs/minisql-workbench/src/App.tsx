@@ -5,7 +5,7 @@ import { lintGutter, setDiagnostics } from '@codemirror/lint';
 import { sql } from '@codemirror/lang-sql';
 import { Activity, Braces, ChevronDown, ChevronRight, CircleHelp, Database, FileCode2, FolderTree, History, MoreHorizontal, Play, Plus, RefreshCw, Search, Settings2, Shield, Table2, Terminal, Trash2, X } from 'lucide-react';
 import { getCatalog, getHealth, getStorage, runSql, openApiSession, closeApiSession, releaseApiSession, cancelSession,
-  getCapabilities, getBackups, createBackup, restoreBackup, inspectIndex } from './client';
+  getCapabilities, getBackups, createBackup, restoreBackup, validateBackup, inspectIndex } from './client';
 import type { IndexInspect } from './client';
 import { AccessControl } from './AccessControl';
 import { StorageStatisticsView } from './StorageStatistics';
@@ -574,10 +574,22 @@ function SystemSettings({ connection, capabilities, backups, error, busy, connec
   onRefresh: () => Promise<void>;
 }) {
   const [message, setMessage] = useState<string>();
+  const [migrationStatus, setMigrationStatus] = useState<{ name: string; state: 'checking' | 'success' | 'error'; message: string }>();
   const run = async (operation: () => Promise<unknown>, success: string) => {
     setMessage(undefined);
     try { await operation(); setMessage(success); await onRefresh(); }
     catch (failure) { setMessage(failure instanceof Error ? failure.message : String(failure)); }
+  };
+  const checkMigration = async (backup: BackupEntry) => {
+    setMessage(undefined);
+    setMigrationStatus({ name: backup.name, state: 'checking', message: '正在校验备份迁移...' });
+    try {
+      const result = await validateBackup(connection, backup.name);
+      setMigrationStatus({ name: backup.name, state: 'success', message: result.migrated ? '迁移校验通过 · v1 已迁移为 v2' : `迁移校验通过 · manifest v${result.manifestVersion}` });
+      await onRefresh();
+    } catch (failure) {
+      setMigrationStatus({ name: backup.name, state: 'error', message: `迁移校验失败 · ${failure instanceof Error ? failure.message : String(failure)}` });
+    }
   };
   return <section className="system-settings" data-testid="system-settings">
     <div className="system-settings-head"><strong>系统能力与资源预算</strong><button className="settings-refresh" disabled={busy} onClick={() => void onRefresh()}>{busy ? '读取中...' : '刷新'}</button></div>
@@ -595,12 +607,14 @@ function SystemSettings({ connection, capabilities, backups, error, busy, connec
       <span>{connected ? '断开全部会话后可创建备份。' : '备份与恢复要求没有活动会话。'}</span>
     </div>
     {backups.length === 0 ? <p className="access-empty">暂无备份。</p> : <div className="backup-list">
-      <div className="backup-row backup-head"><span>名称</span><span>类型</span><span>大小</span><span>操作</span></div>
+      <div className="backup-row backup-head"><span>名称</span><span>类型</span><span>大小</span><span>迁移</span><span>操作</span></div>
       {backups.map(backup => <div className="backup-row" key={backup.name}>
         <span title={backup.name}>{backup.name}</span><span>{backup.kind}</span><span>{Math.ceil(backup.bytes / 1024)} KiB</span>
-        <button className="revoke" disabled={busy || connected} onClick={() => { if (window.confirm(`恢复备份 ${backup.name}？当前数据库文件会被替换。`)) void run(() => restoreBackup(connection, backup.name), '备份已恢复'); }}>恢复</button>
+        <span className={`migration-badge ${backup.migrationState === 'ready' ? 'ready' : backup.migrationState === 'pending' ? 'pending' : 'unknown'}`}>{backup.migrationState === 'ready' ? '已校验' : backup.migrationState === 'pending' ? '待迁移' : '未知'}</span>
+        <span className="backup-actions"><button className="revoke" data-testid={`validate-migration-${backup.name}`} disabled={busy || connected || migrationStatus?.state === 'checking'} onClick={() => void checkMigration(backup)}>校验迁移</button><button className="revoke" disabled={busy || connected} onClick={() => { if (window.confirm(`恢复备份 ${backup.name}？当前数据库文件会被替换。`)) void run(() => restoreBackup(connection, backup.name), '备份已恢复'); }}>恢复</button></span>
       </div>)}
     </div>}
+    {migrationStatus && <div className={`backup-migration-status ${migrationStatus.state}`} data-testid="backup-migration-status"><strong>{migrationStatus.state === 'checking' ? '迁移校验中' : migrationStatus.state === 'success' ? '迁移校验通过' : '迁移校验失败'}</strong><span>{migrationStatus.name} · {migrationStatus.message}</span></div>}
     {message && <div className="access-message">{message}</div>}
   </section>;
 }

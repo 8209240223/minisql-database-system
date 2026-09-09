@@ -42,8 +42,15 @@ try {
   assert.ok(manifest.pageFormatVersion === 1 || manifest.pageFormatVersion === 2); ++checks;
   equal(manifest.walBytes, 0);
   writeFileSync(manifestPath, JSON.stringify({ ...manifest, version: 99 }), 'utf8');
+  const unsupported = await request('/backup/validate', { name: 'snap1' });
+  equal(unsupported.status, 422);
+  equal(unsupported.data.operation, 'backup-migration');
   equal((await request('/restore', { name: 'snap1' })).status, 422);
   writeFileSync(manifestPath, JSON.stringify({ version: 1, name: manifest.name, createdAt: manifest.createdAt, bytes: manifest.bytes, sha256: manifest.sha256 }), 'utf8');
+  const migration = await request('/backup/validate', { name: 'snap1' });
+  equal(migration.status, 200);
+  equal(migration.data.validation.migrated, true);
+  equal(migration.data.validation.manifestVersion, 2);
   equal((await request('/restore', { name: 'snap1' })).status, 200);
   equal(JSON.parse(readFileSync(manifestPath, 'utf8')).version, 2);
   equal((await request('/execute', { sql: 'INSERT INTO t VALUES(3);' })).status, 200);
@@ -55,6 +62,7 @@ try {
   const listed = list.data.entries.find(entry => entry.name === 'snap1.pages');
   assert.ok(listed); ++checks;
   equal(listed.manifestVersion, 2);
+  equal(listed.migrationState, 'ready');
   assert.ok(listed.pageFormatVersion === 1 || listed.pageFormatVersion === 2); ++checks;
   equal(listed.walBytes, 0);
 

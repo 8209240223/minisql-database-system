@@ -25,8 +25,16 @@ const equal = (actual, expected, message) => {
 const access = createUser(defaultAccess(), {
   name: 'alice',
   password: 'alice-secret',
-  roles: ['readers'],
+  roles: [],
 });
+access.users.alice.roles = ['limited-readers'];
+access.roles['limited-readers'] = {
+  inherits: [],
+  grants: [
+    { object: '*', permissions: ['CONNECT', 'READ'] },
+    { object: 'public_records', permissions: ['SELECT', 'COMPILE'] },
+  ],
+};
 writeStore(accessPages, access, { permissionVersion: 1 });
 
 const admin = { sessionId: 'engine-admin', user: 'admin', password: '' };
@@ -39,8 +47,16 @@ try {
     'administrator can create a table through the session process');
   equal((await session.request('execute', 'INSERT INTO public_records VALUES(1);', admin)).success, true,
     'administrator can insert through the session process');
+  equal((await session.request('execute', 'CREATE TABLE secret_records(id INT);', admin)).success, true,
+    'administrator can create a second object for nested authorization checks');
   equal((await session.request('execute', 'SELECT * FROM public_records;', alice)).success, true,
     'reader can select an object through the session process');
+
+  const deniedNestedRead = await session.request('execute', 'SELECT * FROM public_records WHERE id IN (SELECT id FROM secret_records);', alice);
+  equal(deniedNestedRead.success, false, 'nested subquery object without SELECT permission is denied');
+  equal(deniedNestedRead.error.code, 7001, 'nested subquery denial is a PermissionError');
+  equal((await session.request('execute', "SELECT * FROM public_records WHERE 'FROM secret_records' = 'x';", alice)).success, true,
+    'object names inside string literals do not trigger authorization');
 
   const deniedWrite = await session.request('execute', 'INSERT INTO public_records VALUES(2);', alice);
   equal(deniedWrite.success, false, 'reader write is denied inside the C++ process');

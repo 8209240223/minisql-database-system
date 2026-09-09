@@ -1,4 +1,4 @@
-import type { AccessState, AuditEntry, BackupEntry, Capabilities, Connection, QueryResult, SessionEntry, Table } from './types';
+import type { AccessState, AuditEntry, BackupEntry, BackupValidation, Capabilities, Connection, QueryResult, SessionEntry, Table } from './types';
 
 function requestHeaders(connection: Connection, initial?: HeadersInit) {
   const headers = new Headers(initial);
@@ -211,6 +211,14 @@ export async function createBackup(connection: Connection, body: { name?: string
 
 export async function restoreBackup(connection: Connection, name: string) {
   return api(connection, '/restore', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name }) });
+}
+
+export async function validateBackup(connection: Connection, name: string): Promise<BackupValidation> {
+  const data = await api(connection, '/backup/validate', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name }),
+  });
+  if (!data.validation) throw new Error('备份迁移校验响应缺少 validation 字段。');
+  return data.validation;
 }
 export interface IndexPageInspect {
   page: { id: number; generation: number };
