@@ -54,27 +54,78 @@ const turnWaiters = [];
 function firstKeyword(sql) {
   return String(sql ?? '').replace(/^\s+|\s+$/g, '').match(/^(?:\/\*[\s\S]*?\*\/\s*|--[^\r\n]*\r?\n\s*)*([a-zA-Z]+)/)?.[1]?.toUpperCase() ?? '';
 }
-function tableReferences(sql, keyword) {
-  const stripped = String(sql ?? '').replace(/^EXPLAIN(?:\s+ANALYZE)?/i, '');
-  const tables = [];
-  const add = pattern => {
-    const expression = new RegExp(pattern, 'gi');
-    let match;
-    while ((match = expression.exec(stripped))) {
-      const name = match[1]?.toLowerCase();
-      if (name && !tables.includes(name)) tables.push(name);
+function sqlWords(sql) {
+  const words = [];
+  const source = String(sql ?? '');
+  for (let index = 0; index < source.length;) {
+    const character = source[index];
+    if (/\s/.test(character)) { ++index; continue; }
+    if (source.startsWith('--', index)) {
+      index = source.indexOf('\n', index + 2);
+      if (index < 0) break;
+      continue;
     }
+    if (source.startsWith('/*', index)) {
+      const end = source.indexOf('*/', index + 2);
+      index = end < 0 ? source.length : end + 2;
+      continue;
+    }
+    if (character === "'") {
+      ++index;
+      while (index < source.length) {
+        if (source[index] !== "'") { ++index; continue; }
+        if (source[index + 1] === "'") { index += 2; continue; }
+        ++index;
+        break;
+      }
+      continue;
+    }
+    const identifier = source.slice(index).match(/^[A-Za-z_][A-Za-z0-9_]*/);
+    if (identifier) {
+      words.push(identifier[0].toLowerCase());
+      index += identifier[0].length;
+      continue;
+    }
+    words.push(character);
+    ++index;
+  }
+  return words;
+}
+function tableReferences(sql, keyword) {
+  const words = sqlWords(sql);
+  const tables = [];
+  const ctes = new Set();
+  const identifier = value => /^[a-z_][a-z0-9_]*$/.test(value ?? '');
+  const add = value => { if (identifier(value) && !ctes.has(value) && !tables.includes(value)) tables.push(value); };
+  const addAfter = (index, allowParenthesized = true) => {
+    let cursor = index + 1;
+    if (allowParenthesized && words[cursor] === '(') return;
+    if (words[cursor] === 'lateral') ++cursor;
+    add(words[cursor]);
   };
-  if (keyword === 'SELECT') {
-    add('\\b(?:FROM|JOIN)\\s+([A-Za-z_][A-Za-z0-9_]*)');
-    add('\\bUPDATE\\s+([A-Za-z_][A-Za-z0-9_]*)');
-  } else if (keyword === 'INSERT') add('\\bINTO\\s+([A-Za-z_][A-Za-z0-9_]*)');
-  else if (keyword === 'UPDATE') add('\\bUPDATE\\s+([A-Za-z_][A-Za-z0-9_]*)');
-  else if (keyword === 'DELETE') add('\\bFROM\\s+([A-Za-z_][A-Za-z0-9_]*)');
-  else if (keyword === 'DROP') add('\\bTABLE\\s+([A-Za-z_][A-Za-z0-9_]*)');
-  else if (keyword === 'CREATE') {
-    add('\\bTABLE\\s+([A-Za-z_][A-Za-z0-9_]*)');
-    add('\\bON\\s+([A-Za-z_][A-Za-z0-9_]*)');
+  if (words[0] === 'with') {
+    let cursor = words[1] === 'recursive' ? 2 : 1;
+    for (;;) {
+      if (!identifier(words[cursor])) break;
+      ctes.add(words[cursor++]);
+      if (words[cursor] !== 'as' || words[cursor + 1] !== '(') break;
+      cursor += 2;
+      let depth = 1;
+      while (cursor < words.length && depth) {
+        if (words[cursor] === '(') ++depth;
+        else if (words[cursor] === ')') --depth;
+        ++cursor;
+      }
+      if (words[cursor] !== ',') break;
+      ++cursor;
+    }
+  }
+  const effectiveKeyword = keyword === 'EXPLAIN' ? (words.find(word => word === 'select' || word === 'insert' || word === 'update' || word === 'delete') ?? keyword) : keyword.toLowerCase();
+  for (let index = 0; index < words.length; ++index) {
+    const word = words[index];
+    if (word === 'from' || word === 'join' || word === 'into' || word === 'update' || word === 'references') addAfter(index);
+    if (effectiveKeyword === 'drop' && word === 'table') addAfter(index, false);
+    if (effectiveKeyword === 'create' && (word === 'table' || word === 'on')) addAfter(index, false);
   }
   return tables;
 }
@@ -785,10 +836,38 @@ const server = http.createServer(async (req, res) => {
           manifestVersion: metadata.version,
           pageFormatVersion: metadata.pageFormatVersion,
           walBytes: metadata.walBytes,
+          migrationState: metadata.version === 1 ? 'pending' : metadata.version === 2 || metadata.version === 3 ? 'ready' : 'unknown',
         };
       });
       send(200, { success: true, entries });
     } catch (error) { send(503, { success: false, error: { message: error.message } }); }
+    return;
+  }
+  if (req.method === 'POST' && req.url === '/api/backup/validate') {
+    try {
+      const chunks = [];
+      for await (const chunk of req) chunks.push(chunk);
+      const body = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks)));
+      if (sessions.size) throw httpError(409, 'Database reserved by active sessions');
+      const result = await enqueue(async () => {
+        const artifact = backupArtifactFile(body?.name);
+        if (!artifact) throw httpError(404, 'Backup not found');
+        const before = JSON.parse(readFileSync(artifact.manifest, 'utf8'));
+        const reconstructed = await reconstructBackup(body.name);
+        return {
+          name: artifact.name,
+          kind: artifact.kind,
+          migrated: before.version === 1 && reconstructed.manifest.version === 2,
+          manifestVersion: reconstructed.manifest.version,
+          pageFormatVersion: reconstructed.manifest.pageFormatVersion,
+          pages: reconstructed.pages,
+        };
+      });
+      send(200, { success: true, operation: 'backup-migration', phase: 'migration', validation: result });
+    } catch (error) {
+      send(error.status ?? 422, { success: false, operation: 'backup-migration', phase: 'migration',
+        error: { code: 'BACKUP_MIGRATION_FAILED', message: error instanceof Error ? error.message : String(error) } });
+    }
     return;
   }
   if ((req.method === 'POST' && req.url === '/api/backup') || (req.method === 'POST' && req.url === '/api/restore')) {

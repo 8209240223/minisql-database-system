@@ -92,6 +92,22 @@ node tests/fuzz-state-machine-long-run.mjs
 
 本机 4 个种子全部通过。每个案例记录执行耗时、数据库字节数和进程 RSS 最小/最大采样值；该证据覆盖固定的高压溢写与资源泄漏回归，但不等同于无限输入或多小时长期运行资源曲线。
 
+## 九、重复长跑入口
+
+新增 `tests/fuzz-state-machine-soak.mjs`，使用相同的固定种子、状态机步数和资源限制重复启动 `fuzz-state-machine-differential.mjs`，每轮仍然使用独立数据库和 C++ session。默认执行 `20260908,42` 两个种子、每种子 512 步、两轮；每轮都检查 Wrong Result、Wrong Accept、Wrong Reject、错误定位、Crash、Timeout、Resource Limit 和 harness error，最终保存 `report.json`。
+
+短验收可以使用：
+
+```powershell
+$env:FUZZ_SOAK_ROUNDS = '1'
+$env:FUZZ_SOAK_STEPS = '30'
+node tests/fuzz-state-machine-soak.mjs
+Remove-Item Env:FUZZ_SOAK_ROUNDS
+Remove-Item Env:FUZZ_SOAK_STEPS
+```
+
+长期或夜间回归可设置 `FUZZ_SOAK_ROUNDS`、`FUZZ_SOAK_STEPS`、`FUZZ_SOAK_SEEDS` 和 `FUZZ_SOAK_TIMEOUT_MS`。该入口提供可重复的多轮证据，但本机当前只执行了短 smoke；它不替代无限输入或多小时资源趋势验收。
+
 ### 失败样本重放
 
 `fuzz-state-machine-differential.mjs` 在 Wrong Result、Wrong Reject、错误定位、崩溃、超时或资源限制等故障发生时，向报告目录写入 `failure-<n>.json`。文件包含种子、故障分类、完整状态机 `program` 和（适用时）缩减程序。重放命令如下：

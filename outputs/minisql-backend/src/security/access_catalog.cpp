@@ -7,7 +7,6 @@
 #include <cstdlib>
 #include <fstream>
 #include <functional>
-#include <regex>
 #include <string_view>
 #include <unordered_set>
 #include <vector>
@@ -173,23 +172,94 @@ std::string firstKeyword(std::string_view source) {
     }
 }
 
-std::vector<std::string> tableReferences(std::string_view source, const std::string& keyword) {
-    std::string sql(source);
-    if (sql.size() >= 7 && lower(sql.substr(0, 7)) == "explain") sql.erase(0, 7);
-    std::vector<std::string> result;
-    const auto add = [&](const char* pattern) {
-        const std::regex expression(pattern, std::regex_constants::icase);
-        for (std::sregex_iterator it(sql.begin(), sql.end(), expression), end; it != end; ++it) {
-            const auto name = normalized((*it)[1].str());
-            if (!name.empty() && std::find(result.begin(), result.end(), name) == result.end()) result.push_back(name);
+std::vector<std::string> sqlWords(std::string_view source) {
+    std::vector<std::string> words;
+    const auto alpha = [](char value) { return std::isalpha(static_cast<unsigned char>(value)) || value == '_'; };
+    const auto digit = [](char value) { return std::isdigit(static_cast<unsigned char>(value)); };
+    for (std::size_t index = 0; index < source.size();) {
+        const char character = source[index];
+        if (std::isspace(static_cast<unsigned char>(character))) { ++index; continue; }
+        if (index + 1 < source.size() && source[index] == '-' && source[index + 1] == '-') {
+            index += 2;
+            while (index < source.size() && source[index] != '\n' && source[index] != '\r') ++index;
+            continue;
         }
+        if (index + 1 < source.size() && source[index] == '/' && source[index + 1] == '*') {
+            index += 2;
+            while (index + 1 < source.size() && !(source[index] == '*' && source[index + 1] == '/')) ++index;
+            index = std::min(source.size(), index + 2);
+            continue;
+        }
+        if (character == '\'') {
+            ++index;
+            while (index < source.size()) {
+                if (source[index] != '\'') { ++index; continue; }
+                if (index + 1 < source.size() && source[index + 1] == '\'') { index += 2; continue; }
+                ++index;
+                break;
+            }
+            continue;
+        }
+        if (alpha(character)) {
+            const auto begin = index++;
+            while (index < source.size() && (alpha(source[index]) || digit(source[index]))) ++index;
+            words.push_back(lower(std::string(source.substr(begin, index - begin))));
+            continue;
+        }
+        words.emplace_back(1, character);
+        ++index;
+    }
+    return words;
+}
+
+std::vector<std::string> tableReferences(std::string_view source, const std::string& keyword) {
+    const auto words = sqlWords(source);
+    std::vector<std::string> result;
+    std::unordered_set<std::string> ctes;
+    const auto identifier = [](const std::string& value) {
+        return !value.empty() && (std::isalpha(static_cast<unsigned char>(value.front())) || value.front() == '_') &&
+            std::all_of(value.begin() + 1, value.end(), [](char character) {
+                return std::isalnum(static_cast<unsigned char>(character)) || character == '_';
+            });
     };
-    if (keyword == "select") { add(R"(\b(?:FROM|JOIN)\s+([A-Za-z_][A-Za-z0-9_]*))"); add(R"(\bUPDATE\s+([A-Za-z_][A-Za-z0-9_]*))"); }
-    else if (keyword == "insert") add(R"(\bINTO\s+([A-Za-z_][A-Za-z0-9_]*))");
-    else if (keyword == "update") add(R"(\bUPDATE\s+([A-Za-z_][A-Za-z0-9_]*))");
-    else if (keyword == "delete") add(R"(\bFROM\s+([A-Za-z_][A-Za-z0-9_]*))");
-    else if (keyword == "drop") add(R"(\bTABLE\s+([A-Za-z_][A-Za-z0-9_]*))");
-    else if (keyword == "create") { add(R"(\bTABLE\s+([A-Za-z_][A-Za-z0-9_]*))"); add(R"(\bON\s+([A-Za-z_][A-Za-z0-9_]*))"); }
+    const auto add = [&](const std::string& value) {
+        if (identifier(value) && !ctes.contains(value) && std::find(result.begin(), result.end(), value) == result.end()) result.push_back(value);
+    };
+    const auto addAfter = [&](std::size_t index, bool allowParenthesized) {
+        auto cursor = index + 1;
+        if (allowParenthesized && cursor < words.size() && words[cursor] == "(") return;
+        if (cursor < words.size() && words[cursor] == "lateral") ++cursor;
+        if (cursor < words.size()) add(words[cursor]);
+    };
+    if (!words.empty() && words.front() == "with") {
+        std::size_t cursor = words.size() > 1 && words[1] == "recursive" ? 2 : 1;
+        for (;;) {
+            if (cursor >= words.size() || !identifier(words[cursor])) break;
+            ctes.insert(words[cursor++]);
+            if (cursor + 1 >= words.size() || words[cursor] != "as" || words[cursor + 1] != "(") break;
+            cursor += 2;
+            std::size_t depth = 1;
+            while (cursor < words.size() && depth) {
+                if (words[cursor] == "(") ++depth;
+                else if (words[cursor] == ")") --depth;
+                ++cursor;
+            }
+            if (cursor >= words.size() || words[cursor] != ",") break;
+            ++cursor;
+        }
+    }
+    const auto effectiveKeyword = keyword == "explain"
+        ? std::find_if(words.begin(), words.end(), [](const std::string& value) {
+            return value == "select" || value == "insert" || value == "update" || value == "delete";
+        })
+        : words.end();
+    const auto command = keyword == "explain" && effectiveKeyword != words.end() ? *effectiveKeyword : keyword;
+    for (std::size_t index = 0; index < words.size(); ++index) {
+        const auto& word = words[index];
+        if (word == "from" || word == "join" || word == "into" || word == "update" || word == "references") addAfter(index, true);
+        if (command == "drop" && word == "table") addAfter(index, false);
+        if (command == "create" && (word == "table" || word == "on")) addAfter(index, false);
+    }
     return result;
 }
 
