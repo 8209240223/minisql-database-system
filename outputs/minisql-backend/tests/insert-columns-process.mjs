@@ -23,7 +23,6 @@ for (const sql of [
   'INSERT INTO t(missing) VALUES(4);', 'INSERT INTO t() VALUES();',
   'INSERT INTO t VALUES();', 'INSERT INTO t(id) VALUES(NULL);',
   'INSERT INTO t(id) VALUES(CAST(NULL AS INT));',
-  'INSERT INTO t(id) VALUES(4),(5);',
 ]) {
   const before = rows();equal(run(sql).success, false);equal(rows(), before);
 }
@@ -36,6 +35,8 @@ const positional = run("INSERT INTO t VALUES(5,6,'five');", 'compile');
 equal(positional.plan[0].columnMapping, [0, 1, 2]);
 equal(positional.ast.names, []);
 equal(rows().length, 3);
+equal(run('INSERT INTO t(id) VALUES(4),(5);').success, true);
+equal(rows().length, 5);
 equal(run('CREATE TABLE nullable_only(a INT,b VARCHAR); INSERT INTO nullable_only(b) VALUES(NULL);').success, true);
 equal(run('SELECT * FROM nullable_only;').results[0].rows, [[null, null]]);
 console.log(`${checks} INSERT column/default-null checks passed across fresh processes`);
