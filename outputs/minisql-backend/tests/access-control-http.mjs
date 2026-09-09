@@ -98,6 +98,7 @@ try {
   equal(inspected.data.storage, 'page-file');
   equal((await request(alicePrefix + '/execute', 'SELECT * FROM public_records;', 'POST', 'alice', 'alice-secret')).status, 200);
   equal((await request(alicePrefix + '/execute', 'SELECT * FROM public_records WHERE id IN (SELECT id FROM secret_records);', 'POST', 'alice', 'alice-secret')).status, 403);
+  equal((await request(alicePrefix + '/execute', 'SELECT * FROM (SELECT id FROM secret_records) AS hidden;', 'POST', 'alice', 'alice-secret')).status, 403);
   equal((await request(alicePrefix + '/execute', "SELECT * FROM public_records WHERE 'FROM secret_records' = 'x';", 'POST', 'alice', 'alice-secret')).status, 200);
   equal((await request(alicePrefix + '/execute', 'INSERT INTO public_records VALUES(1);', 'POST', 'alice', 'alice-secret')).status, 200);
   equal((await request(alicePrefix + '/execute', 'UPDATE public_records SET id = id + 1 WHERE id = 1;', 'POST', 'alice', 'alice-secret')).status, 200);

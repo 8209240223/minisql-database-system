@@ -1,5 +1,7 @@
 #include "minisql/security/access_catalog.hpp"
 #include "minisql/common/error.hpp"
+#include "minisql/sql/lexer.hpp"
+#include "minisql/sql/parser.hpp"
 
 #include <algorithm>
 #include <array>
@@ -263,6 +265,82 @@ std::vector<std::string> tableReferences(std::string_view source, const std::str
     return result;
 }
 
+bool sqlIdentifier(std::string_view value) {
+    if (value.empty() || !(std::isalpha(static_cast<unsigned char>(value.front())) || value.front() == '_')) return false;
+    return std::all_of(value.begin() + 1, value.end(), [](char character) {
+        return std::isalnum(static_cast<unsigned char>(character)) || character == '_';
+    });
+}
+
+void addAstObject(const std::string& value, std::vector<std::string>& result,
+                 std::unordered_set<std::string>& seen) {
+    const auto object = normalized(value);
+    if (sqlIdentifier(object) && seen.insert(object).second) result.push_back(object);
+}
+
+void collectAstStatementObjects(const sql::Statement& statement, std::vector<std::string>& result,
+                                std::unordered_set<std::string>& seen);
+
+void collectAstExpressionObjects(const std::shared_ptr<sql::Expr>& expression,
+                                 std::vector<std::string>& result,
+                                 std::unordered_set<std::string>& seen) {
+    if (!expression) return;
+    collectAstExpressionObjects(expression->left, result, seen);
+    collectAstExpressionObjects(expression->right, result, seen);
+    if (expression->subquery) collectAstStatementObjects(*expression->subquery, result, seen);
+    else if (!expression->subquerySql.empty()) {
+        try {
+            auto nestedSql = expression->subquerySql;
+            if (nestedSql.find_last_not_of(" \t\r\n") == std::string::npos ||
+                nestedSql[nestedSql.find_last_not_of(" \t\r\n")] != ';') nestedSql += ';';
+            for (const auto& nested : sql::parse(sql::tokenize(nestedSql)))
+                collectAstStatementObjects(nested, result, seen);
+        } catch (const MiniSqlError&) {
+            // The caller will use the lexical fallback when the complete source cannot be parsed.
+        }
+    }
+}
+
+void collectAstStatementObjects(const sql::Statement& statement, std::vector<std::string>& result,
+                                std::unordered_set<std::string>& seen) {
+    // A derived-table alias is a scope name, not a database object. Its nested statement is collected below.
+    if (!statement.table.empty() && !(statement.kind == "Select" && statement.fromSubquery))
+        addAstObject(statement.table, result, seen);
+    for (const auto& join : statement.joins) addAstObject(join.table, result, seen);
+    for (const auto& foreignKey : statement.foreignKeys) addAstObject(foreignKey.table, result, seen);
+    for (const auto& column : statement.columns)
+        if (column.references) addAstObject(column.references->first, result, seen);
+    if (statement.fromSubquery) collectAstStatementObjects(*statement.fromSubquery, result, seen);
+    collectAstExpressionObjects(statement.where, result, seen);
+    collectAstExpressionObjects(statement.having, result, seen);
+    for (const auto& item : statement.selectItems) collectAstExpressionObjects(item.expression, result, seen);
+    for (const auto& item : statement.orderBy) collectAstExpressionObjects(item.expression, result, seen);
+    for (const auto& item : statement.assignments) collectAstExpressionObjects(item.expression, result, seen);
+    for (const auto& item : statement.groupBy) collectAstExpressionObjects(item, result, seen);
+    for (const auto& item : statement.checks) collectAstExpressionObjects(item, result, seen);
+    for (const auto& item : statement.valueExpressions) collectAstExpressionObjects(item, result, seen);
+    for (const auto& row : statement.valueRows)
+        for (const auto& item : row) collectAstExpressionObjects(item, result, seen);
+}
+
+std::vector<std::string> astTableReferences(std::string_view source, const std::string& keyword) {
+    try {
+        auto tokens = sql::tokenize(std::string(source));
+        if (keyword == "explain" && !tokens.empty()) {
+            const auto lowerLexeme = [](const sql::Token& token) { return normalized(token.lexeme); };
+            if (lowerLexeme(tokens.front()) == "explain") tokens.erase(tokens.begin());
+            if (!tokens.empty() && lowerLexeme(tokens.front()) == "analyze") tokens.erase(tokens.begin());
+        }
+        std::vector<std::string> result;
+        std::unordered_set<std::string> seen;
+        for (const auto& statement : sql::parse(tokens)) collectAstStatementObjects(statement, result, seen);
+        return result.empty() ? tableReferences(source, keyword) : result;
+    } catch (const MiniSqlError&) {
+        // Unsupported or malformed syntax is still checked by the conservative scanner before execution.
+        return tableReferences(source, keyword);
+    }
+}
+
 bool permissionIn(const nlohmann::json& grants, const std::string& permission, const std::string& object) {
     if (!grants.is_array()) return false;
     for (const auto& grant : grants) {
@@ -386,7 +464,7 @@ void AccessCatalog::authorize(const std::string& user, const std::string& operat
     else if (keyword == "insert" || keyword == "update" || keyword == "delete") permission = keyword;
     std::vector<std::string> objects;
     if (mode == "indexinspect" && !table.empty()) objects.push_back(normalized(table));
-    else objects = tableReferences(sql, keyword);
+    else objects = astTableReferences(sql, keyword);
     if (objects.empty()) objects.push_back("*");
     (void)index;
     for (const auto& object : objects)
