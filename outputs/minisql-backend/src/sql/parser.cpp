@@ -338,10 +338,11 @@ private:
             expect("(");
             if(keyword("SELECT")){
                 const auto start=i;
-                (void)select(false);
+                auto query=select(false);
                 const auto text=tokenText(start,i);
                 expect(")");--depth;
                 auto subquery=std::make_shared<Expr>(Expr{"InSubquery","",left,{},op.location,text});
+                subquery->subquery=std::make_shared<Statement>(std::move(query));
                 return negate?std::make_shared<Expr>(Expr{"Unary","NOT",subquery,{},op.location}):subquery;
             }
             if(at(")")) fail(ErrorCode::Syntax, "IN requires a non-empty value list", t[i].location);
@@ -370,8 +371,10 @@ private:
         if(keyword("EXISTS")){
             const auto token=take();expect("(");
             if(!keyword("SELECT")) fail(ErrorCode::Syntax, "EXISTS requires a SELECT subquery", t[i].location);
-            const auto start=i;(void)select(false);const auto text=tokenText(start,i);expect(")");
-            return std::make_shared<Expr>(Expr{"Exists","",nullptr,{},token.location,text});
+            const auto start=i;auto query=select(false);const auto text=tokenText(start,i);expect(")");
+            auto node=std::make_shared<Expr>(Expr{"Exists","",nullptr,{},token.location,text});
+            node->subquery=std::make_shared<Statement>(std::move(query));
+            return node;
         }
         if(i+1<t.size()&&t[i+1].lexeme=="("&&
            (keyword("COUNT")||keyword("SUM")||keyword("AVG")||keyword("MIN")||keyword("MAX"))){
@@ -409,8 +412,10 @@ private:
         if(at("(") && i+1<t.size()){
             auto next=t[i+1].lexeme;for(char& c:next)if(c>='a'&&c<='z')c-=32;
             if(next=="SELECT"){
-                const auto token=take();const auto start=i;(void)select(false);const auto text=tokenText(start,i);expect(")");
-                return std::make_shared<Expr>(Expr{"ScalarSubquery","",nullptr,{},token.location,text});
+                const auto token=take();const auto start=i;auto query=select(false);const auto text=tokenText(start,i);expect(")");
+                auto node=std::make_shared<Expr>(Expr{"ScalarSubquery","",nullptr,{},token.location,text});
+                node->subquery=std::make_shared<Statement>(std::move(query));
+                return node;
             }
         }
         if(at("(")){if(++depth>256) fail(ErrorCode::Syntax, "Expression depth exceeded", t[i].location);++i;auto e=expression();expect(")");--depth;return e;}auto loc=t[i].location;if(at("-")||at("+"))return std::make_shared<Expr>(Expr{"Literal",literal(),{},{},loc});const auto& x=take();if(x.type=="IDENTIFIER"){auto name=x.lexeme;if(at(".")){++i;name+="."+identifier();}return std::make_shared<Expr>(Expr{"Identifier",name,{},{},x.location});}if(x.type=="INTEGER"||x.type=="DECIMAL"||x.type=="FLOAT"||x.type=="STRING")return std::make_shared<Expr>(Expr{"Literal",x.lexeme,{},{},x.location}); fail(ErrorCode::Syntax, "Expected identifier, literal or '('", x.location, x.endLocation);

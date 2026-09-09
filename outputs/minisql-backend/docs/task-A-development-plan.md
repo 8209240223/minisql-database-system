@@ -202,3 +202,15 @@ node tests\subquery-smoke.mjs tests\statistics-smoke.mjs tests\explain-smoke.mjs
 **说明（X13 迁移语义）**：本系统表/列描述符自 v1–v5 均由 lenient reader 兼容读取，故“迁移”不重写描述符行，仅在成功重读后推进 catalog schemaVersion（可逆版本戳记）。这是对“迁移不得静默改列类型/NULL/约束/索引”最直接的安全实现——不会在迁移过程中改写任何用户schema。
 
 > 后续可接 **X09（派生表/作用域/Apply/SemiJoin）** 或 **X18（统计/成本模型）**。
+
+### 6.4 X09 实施记录（builder-A 第四次提交）
+
+> 本轮推进 **X09 结构化子查询对象身份**。分支 `builder-A`。
+
+- [x] **3.1a** `sql/parser.hpp`：`Expr` 新增 `subquery` 结构化节点（`std::shared_ptr<Statement>`），与过渡字段 `subquerySql` 并存；迁移到结构化对象身份后 3.3–3.5 消费该节点并移除 `subquerySql`。
+- [x] **3.1b** `sql/parser.cpp`：InSubquery / Exists / ScalarSubquery 三个解析点由 `(void)select(false)` 丢弃改为保留返回的 `Statement`，赋值到 `Expr::subquery`（`select()` 本已返回结构化子查询节点）。
+- [x] **3.1c** 新增 `tests/parser_subquery_contract.cpp`（`minisql_parser_subquery_contract`，链接 `minisql_sql`）：遍历 AST 校验 EXISTS/IN/标量子查询节点均携带非空 `Select` 子查询节点（含 FROM 表）且过渡 `subquerySql` 仍在。
+- [x] **3.1d** 构建修复：`CMakeLists.txt` 中 `minisql_arithmetic64_probe` 在 `set(CMAKE_CXX_STANDARD 20)` 之前创建，MSVC 退化为 C++14，`<variant>`（`std::variant`）不可用；将该 probe 目标下移到标准设置之后，确保 test 目标统一 `stdcpp20`。
+- [x] **3.1e** 回归全绿：C++ contract（… / parser_subquery 3 / 其余不回归）+ 全量 59 用例通过。
+
+> 下一步 **3.2**：`sql/parser.cpp` FROM 支持派生表（显式别名、重复输出列名报歧义）、嵌套查询块；随后 **3.3** planner 以 `Scope` 链绑定替换字符串替换，生成 Apply/SemiJoin。

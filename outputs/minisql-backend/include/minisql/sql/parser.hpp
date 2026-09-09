@@ -6,7 +6,12 @@
 #include <cstdint>
 
 namespace minisql::sql {
-struct Expr { std::string kind; std::string value; std::shared_ptr<Expr> left; std::shared_ptr<Expr> right; SourceLocation location{}; std::string subquerySql{}; };
+struct Statement;
+// X09: Expr carries either the raw SQL text (subquerySql, interim) or a
+// structured query node (subquery). Migration to structured object identity is
+// underway; subquerySql stays until planner/execution (3.3-3.5) consume the
+// structured node, then it is removed.
+struct Expr { std::string kind; std::string value; std::shared_ptr<Expr> left; std::shared_ptr<Expr> right; SourceLocation location{}; std::string subquerySql{}; std::shared_ptr<Statement> subquery{}; };
 struct ColumnDef { std::string name; std::string type; bool nullable = true; std::optional<std::string> defaultValue{}; bool primaryKey = false; bool unique = false; std::optional<std::pair<std::string,std::string>> references{}; };
 struct SelectItem { std::shared_ptr<Expr> expression; std::string alias; };
 struct OrderItem { std::shared_ptr<Expr> expression; bool descending = false; std::optional<bool> nullsFirst{}; };
