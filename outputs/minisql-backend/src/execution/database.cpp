@@ -420,7 +420,7 @@ void Database::evaluateAutoCheckpoint(std::size_t committedWriteStatements, std:
     if (autoCheckpointIntervalMs_ > 0 && elapsedMs >= autoCheckpointIntervalMs_) reasons.push_back("interval");
     if (reasons.empty()) return;
     buffer_.flushAll();
-    file_->checkpoint();
+    file_->checkpoint({catalogVersion_, indexVersion_});
     ++checkpointCount_;
     pendingAutoCheckpointWrites_ = 0;
     pendingAutoCheckpointWalBytes_ = 0;
