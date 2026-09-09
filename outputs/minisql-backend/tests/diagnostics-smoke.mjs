@@ -41,4 +41,11 @@ equal(multiLex.diagnostics.every(d => Number.isInteger(d.endLine) && Number.isIn
 // the valid statements after the lexical errors still succeed
 equal(multiLex.diagnostics.filter(d => d.success === true).length, 3);
 
+// X12 (clause-level): one SELECT with two broken clauses reports BOTH syntax
+// errors within the same statement, not just the first.
+const clause = run('SELECT * FROM t WHERE = GROUP BY x ORDER BY ;');
+equal(clause.count, 2);
+equal(clause.diagnostics.every(d => d.stage === 'parser' && d.statementIndex === 0), true);
+equal(clause.diagnostics.length, 2);
+
 console.log(`${checks} batch diagnostics checks passed`);

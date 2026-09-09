@@ -46,6 +46,7 @@ struct Statement {
     bool uniqueIndex = false;
     std::vector<std::string> indexColumns{};
     std::vector<IndexDef> indexes{};
+    bool invalid = false;
 };
 inline std::string constraintSuffix(const std::vector<ConstraintName>& names, const std::string& kind, std::size_t index) {
     for (const auto& binding : names)
@@ -69,4 +70,10 @@ inline std::vector<ForeignKey> allForeignKeys(const Statement& statement) {
     return result;
 }
 std::vector<Statement> parse(const std::vector<Token>& tokens);
+// Recovery-mode parser: instead of throwing on the first syntax error it
+// collects every recoverable syntax error into `errors` (with
+// endLine/endColumn spans), synchronizes to the next statement boundary, and
+// marks the offending Statement invalid so callers can reject it without
+// aborting the whole batch. Valid statements still come back.
+std::vector<Statement> parseRecoverable(const std::vector<Token>& tokens, std::vector<MiniSqlError>& errors);
 }

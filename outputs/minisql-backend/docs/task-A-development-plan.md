@@ -176,10 +176,10 @@ node tests\subquery-smoke.mjs tests\statistics-smoke.mjs tests\explain-smoke.mjs
 - [x] **1.1** `SourceLocation` 增 `endLine/endColumn`（默认回退起点）。
 - [x] **1.2** `Token` 增 `endLocation`。
 - [x] **1.3** lexer 恢复：新增 `tokenizeRecoverable()`，把词法错误记录为 `code=2001` 诊断并跳稳定点继续扫描；原 `tokenize/scanTokens` 抛异常行为不变（兼容既有调用点）。字符串内 `;` 不切语句。
-- [ ] **1.4** parser 多诊断 + sync set：`take/expect/identifier/literal` 收集诊断 + 同步恢复；错误节点置 `invalid=true`。（本轮 X12 完成词法层，语法层留待本轮后增量推进）
-- [ ] **1.5** planner 拒收：AST 含 invalid 即返回错误，不产可执行计划。
+- [x] **1.4** parser 多诊断 + 子句级同步恢复：`expect/take/identifier/literal/primary` 统一走 `fail()`（strict 模式 throw 保兼容；recover 模式记录 `code=2002` 诊断 + 子句同步）。`select()` 各子句（WHERE/GROUP/HAVING/LIMIT/OFFSET）独立 try/catch，同一条语句多错误逐一报告。新增 `parseRecoverable` 返回恢复后的语句，出错语句置 `invalid=true`。
+- [x] **1.5** planner 拒收：diagnostics 入口对 `invalid=true` 语句跳过编译上报，不产可执行计划、不留污染 snapshot。
 - [x] **1.6** `database.cpp diagnostics()` 复用恢复式 tokenize，输出 `endLine/endColumn/statementIndex`。
 - [x] **1.7** 测试扩展：`tests/diagnostics-smoke.mjs` 覆盖多词法错误逐一报告、错误后合法语句继续解析、位置/索引精确。
-- [x] **1.8** 回归：parser 18 / planner 26 / subquery 24 / explain 21 / statistics 11 / diagnostics 19 / contract 全部通过。
+- [x] **1.8** 回归：parser 18 / planner 26 / subquery 24 / explain 21 / statistics 11 / diagnostics 22 / contract 全部通过。
 
-> 本轮目标收敛为 **X12 词法层 + 契约字段冻结**：恢复式 tokenizer + 多词法诊断 + 完整定位字段。语法层恢复（1.4）与 planner 拒收（1.5）在下一子阶段推进（同分支继续提交）。
+> 本轮（builder-A 第二次提交）完成 **X12 语法层恢复（1.4）+ planner 拒收（1.5）**：Parser 引入 `fail()` 出口与 `Recovered` 信号，strict 模式行为不变、recover 模式子句级同步多诊断；`parseRecoverable` 返回恢复后语句，`invalid=true` 语句被 diagnostics 跳过编译。实现 + Parser 集成完成，后续可继续 X09/X18 等任务。

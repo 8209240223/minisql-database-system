@@ -1362,20 +1362,22 @@ nlohmann::json Database::diagnostics(const std::string& source) const {
     std::vector<sql::Token> statement;
     const auto process = [&]() {
         if (statement.empty()) return;
-        try {
-            const auto ast = sql::parse(statement);
-            if (ast.empty()) return;
-            for (const auto& item : ast) {
+        std::vector<MiniSqlError> syntaxErrors;
+        const auto ast = sql::parseRecoverable(statement, syntaxErrors);
+        for (const auto& error : syntaxErrors) append(error);
+        for (const auto& item : ast) {
+            if (item.invalid) continue; // offending statement; already reported above
+            try {
                 const auto nextSnapshot = catalog::compileSnapshot({item}, snapshot);
                 (void)sql::compilePlans({item}, snapshot);
                 snapshot = nextSnapshot;
-                items.push_back({{"success", true}, {"stage", "passed"}, {"kind", item.kind},
-                    {"line", item.location.line}, {"column", item.location.column},
-                    {"endLine", item.location.endLine ? item.location.endLine : item.location.line},
-                    {"endColumn", item.location.endColumn ? item.location.endColumn : item.location.column},
-                    {"statementIndex", statementIndex}});
-            }
-        } catch (const MiniSqlError& error) { append(error); }
+            } catch (const MiniSqlError& error) { append(error); continue; }
+            items.push_back({{"success", true}, {"stage", "passed"}, {"kind", item.kind},
+                {"line", item.location.line}, {"column", item.location.column},
+                {"endLine", item.location.endLine ? item.location.endLine : item.location.line},
+                {"endColumn", item.location.endColumn ? item.location.endColumn : item.location.column},
+                {"statementIndex", statementIndex}});
+        }
         ++statementIndex;
         statement.clear();
     };
