@@ -22,6 +22,9 @@ public:
     nlohmann::json executeScript(const std::string& sql, bool optimize = true);
     const char* transactionState() const;
     nlohmann::json compile(const std::string& sql) const;
+    // 解析并通过当前 Catalog 规范化 SQL 实际访问的基础表对象。
+    // 该结果供入口层权限校验使用，别名和派生表作用域不会被当成持久化对象。
+    std::vector<std::string> resolveAccessObjects(const std::string& sql) const;
     nlohmann::json diagnostics(const std::string& sql) const;
     nlohmann::json catalog();
     nlohmann::json statistics();
