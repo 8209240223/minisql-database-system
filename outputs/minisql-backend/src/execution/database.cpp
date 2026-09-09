@@ -120,6 +120,30 @@ sql::Statement bindOuterStatement(const sql::Statement& statement, const OuterBi
         out.fromSubquery = std::make_shared<sql::Statement>(bindOuterStatement(*statement.fromSubquery, outer, row));
     return out;
 }
+// X09 3.4: 收集相关子查询 AST 中实际引用到的外层列 columnId（去重、升序），
+// 用于按绑定参数分组建缓存键。遍历字段与 bindOuterStatement 对齐。
+void collectOuterReferences(const std::shared_ptr<sql::Expr>& expression, const OuterBinding& outer, std::set<std::size_t>& ids) {
+    if (!expression) return;
+    if (expression->kind == "Identifier") {
+        const auto found = outer.find(key(expression->value));
+        if (found != outer.end()) ids.insert(found->second.first);
+    }
+    if (expression->left) collectOuterReferences(expression->left, outer, ids);
+    if (expression->right) collectOuterReferences(expression->right, outer, ids);
+}
+void collectStatementOuterReferences(const sql::Statement& statement, const OuterBinding& outer, std::set<std::size_t>& ids) {
+    collectOuterReferences(statement.where, outer, ids);
+    for (const auto& item : statement.selectItems) collectOuterReferences(item.expression, outer, ids);
+    for (const auto& item : statement.orderBy) collectOuterReferences(item.expression, outer, ids);
+    for (const auto& assignment : statement.assignments) collectOuterReferences(assignment.expression, outer, ids);
+    for (const auto& check : statement.checks) collectOuterReferences(check, outer, ids);
+    for (const auto& value : statement.valueExpressions) collectOuterReferences(value, outer, ids);
+    for (const auto& valueRow : statement.valueRows) for (const auto& value : valueRow) collectOuterReferences(value, outer, ids);
+    for (const auto& column : statement.groupBy) collectOuterReferences(column, outer, ids);
+    collectOuterReferences(statement.having, outer, ids);
+    for (const auto& join : statement.joins) collectOuterReferences(join.on, outer, ids);
+    if (statement.fromSubquery) collectStatementOuterReferences(*statement.fromSubquery, outer, ids);
+}
 std::string storedDecimal(const json& value, const storage::ColumnSchema& column, SourceLocation location) {
     try {
         const auto text = value.is_number_integer() ? std::to_string(value.get<std::int64_t>()) : value.get<std::string>();
@@ -1354,6 +1378,7 @@ nlohmann::json Database::run(const sql::LogicalPlan& plan) {
     return result;
 }
 nlohmann::json Database::runStatement(const sql::LogicalPlan& plan) {
+    correlatedRowsCache_.clear();
     if (plan.kind == "Checkpoint") {
         if (transaction_ != TransactionState::Idle) throw MiniSqlError(ErrorCode::Transaction, "CHECKPOINT requires an idle transaction");
         buffer_.flushAll();
@@ -1481,10 +1506,32 @@ nlohmann::json Database::runCorrelatedSubquery(const json& expression, const jso
     if (ast.empty()) ast = sql::parse(sql::tokenize(sql + ";"));
     if (ast.size() != 1 || ast.front().kind != "Select")
         throw MiniSqlError(ErrorCode::Semantic, "Correlated subquery must be SELECT");
+
+    // 相关子查询「保守执行优化」：结果仅取决于被引用的外层列绑定值。以
+    // (subquerySql|scope) 标识相关形状、以绑定值分组，对每个不同参数物化子查询一次
+    // （集合语义半连接），结果在单条语句生命周期内复用，避免对重复参数逐行重执行。
+    const std::string prepKey = sql + "\x1f" + scope.dump();
+    auto& referenced = correlatedColumnsCache_[prepKey];
+    if (referenced.empty()) {
+        std::set<std::size_t> ids;
+        collectStatementOuterReferences(ast.front(), outer, ids);
+        referenced.assign(ids.begin(), ids.end());
+    }
+    json tuple = json::array();
+    for (const auto id : referenced) {
+        if (id >= row.size()) fail("Correlated subquery outer column outside row");
+        tuple.push_back(row.at(id));
+    }
+    const std::string fullKey = prepKey + "\x1f" + tuple.dump();
+    const auto cached = correlatedRowsCache_.find(fullKey);
+    if (cached != correlatedRowsCache_.end()) return cached->second;
+
     sql::Statement bound = bindOuterStatement(ast.front(), outer, row);
     const auto subplans = sql::compilePlans({std::move(bound)}, catalog_.view());
     const auto result = run(subplans.front());
-    return result.at("rows");
+    auto rows = result.at("rows");
+    correlatedRowsCache_.emplace(std::move(fullKey), rows);
+    return rows;
 }
 void Database::materializeSubqueries(std::vector<sql::LogicalPlan>& plans) {
     const auto isCorrelated = [&](const json& expression) {
@@ -1713,6 +1760,7 @@ nlohmann::json Database::execute(const std::string& source, bool optimize) {
                     const auto ioBefore = file_->ioStats();
                     auto actualPlans = optimize ? optimized.plans : rawPlans;
                     materializeSubqueries(actualPlans);
+                    correlatedRowsCache_.clear();
                     std::vector<json> nodeStatistics;
                     nodeStats_ = &nodeStatistics;
                     const auto started = std::chrono::steady_clock::now();
