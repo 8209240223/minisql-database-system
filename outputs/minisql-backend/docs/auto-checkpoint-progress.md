@@ -21,10 +21,12 @@
 - `Database::checkpoint()`（显式与计划路径）透传 `catalogVersion_`/`indexVersion_`；`statistics()` 暴露 `committedSequence`、`dirtyWatermark` 与完整 `checkpointRecord`（截止位置/水位/版本/序号/时间戳）。
 - 新增隔离契约测试 `page_file_checkpoint_contract.cpp`（`.tools/harness`）：覆盖全新无记录、提交后序号自增、检查点落盘版本/水位/截止位置、重开后恢复、损坏 `.ckpt` 拒绝。隔离编译 + 运行 21 项全绿；页级 B+ 树契约 496 项无回归。
 
-### 后续增量（本轮未含）
-- 真正的**后台调度线程**（当前为提交事件驱动；后台线程需与单写执行器协调，避免在活动事务提交点前截断未提交日志）。
+### 后续增量（本轮已实现部分）
+- **后台检查点调度线程**：`Database` 新增 `std::recursive_mutex mu_` 串行化全部公共入口（execute/compile/statistics/checkpoint/catalog/diagnostics/indexInspect/configureBuffer/executeScript/runCorrelatedSubquery）与后台线程，杜绝与语句执行竞争。`MINISQL_BACKGROUND_CHECKPOINT_MS` 环境变量设为正值时启动调度线程；线程按该周期评估五类阈值（writes/wal-bytes/dirty-pages/dirty-ratio/interval），**仅当事务空闲（Idle）且无写批时执行 `file_->checkpoint()`**，绝不在活动事务提交点前截断未提交日志；命中阈值但事务忙碌时计入 `deferredReasons` 延后执行。析构时置停止标志、通知并 join 线程。`statistics()` 的 `backgroundScheduler` 暴露 enabled/intervalMs/lastEvaluateMs/lastRunMs/deferredReasons。默认（未设变量）不启动线程，行为与原先完全一致。
 - **WAL 记录内嵌提交序号/事务 id/起始-结束 LSN/恢复起点** 的二进制格式，以及**累积多提交日志 + 非零截止位置重做**（当前整批镜像提交后立即截断 `.wal`，故截止位置为 0；需改缓冲刷新模型使其累积安全）。
-- 新路径的跨进程故障注入与 node 全量回归（`auto-checkpoint-smoke`/`x22-fault-injection`/`journal-process`）需在有 vcpkg + node 环境验证。
+
+### 待验证/接入
+- 新路径的跨进程故障注入与 node 全量回归（`auto-checkpoint-smoke`/`x22-fault-injection`/`journal-process`，以及后台调度线程启用路径）需在有 vcpkg + node 环境验证；`database.cpp` 改动在本隔离环境无法编译断言，需在完整构建中确认。
 
 ## 验证
 

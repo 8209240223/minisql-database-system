@@ -3,6 +3,10 @@
 #include <chrono>
 #include <memory>
 #include <string>
+#include <mutex>
+#include <thread>
+#include <atomic>
+#include <condition_variable>
 #include "minisql/catalog/persistent_catalog.hpp"
 #include "minisql/sql/planner.hpp"
 #include "minisql/storage/bplus_tree.hpp"
@@ -27,6 +31,9 @@ public:
     nlohmann::json runCorrelatedSubquery(const nlohmann::json& expression, const nlohmann::json& row);
 private:
     nlohmann::json bufferStatus() const;
+    void evaluateAutoCheckpoint(std::size_t committedWriteStatements, std::size_t committedDirtyPages);
+    void evaluateBackgroundCheckpoint();
+    void backgroundSchedulerLoop();
     std::shared_ptr<storage::PageFile> file_;
     storage::BufferPool buffer_;
     storage::HeapStore heap_;
@@ -41,7 +48,6 @@ private:
     nlohmann::json runStatement(const sql::LogicalPlan& plan);
     nlohmann::json run(const sql::LogicalPlan& plan);
     nlohmann::json runNode(const sql::LogicalPlan& plan);
-    void evaluateAutoCheckpoint(std::size_t committedWriteStatements, std::size_t committedDirtyPages);
     std::vector<nlohmann::json>* nodeStats_ = nullptr;
     std::size_t sortMemoryRows_ = 10000;
     std::size_t aggregateMemoryRows_ = 10000;
@@ -61,6 +67,15 @@ private:
     std::vector<std::string> lastAutoCheckpointReasons_;
     std::uint64_t catalogVersion_ = 1;   // 目录版本（写入持久化检查点记录）
     std::uint64_t indexVersion_ = 1;     // 索引版本（写入持久化检查点记录）
+    mutable std::recursive_mutex mu_;    // 串行化公共入口与后台检查点，避免与语句执行竞争
+    std::thread scheduler_;
+    std::size_t backgroundCheckpointMs_ = 0;
+    std::atomic<bool> schedulerStop_{false};
+    std::mutex schedulerMutex_;
+    std::condition_variable schedulerCv_;
+    std::uint64_t schedulerLastEvaluateMs_ = 0;
+    std::uint64_t schedulerLastRunMs_ = 0;
+    std::vector<std::string> schedulerDeferredReasons_;
     std::filesystem::path sortTempDirectory_;
     std::filesystem::path cancelFile_;
     std::string sessionId_ = "local";

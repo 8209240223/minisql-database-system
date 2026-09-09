@@ -277,9 +277,25 @@ Database::Database(const std::filesystem::path& path, std::size_t frames, storag
     sortTempDirectory_ = std::getenv("MINISQL_TEMP_DIR") ? std::filesystem::path(std::getenv("MINISQL_TEMP_DIR")) : path.parent_path() / ".minisql-sort";
     if (const char* configured = std::getenv("MINISQL_SESSION_ID"); configured && *configured) sessionId_ = configured;
     if (const char* configured = std::getenv("MINISQL_CANCEL_FILE"); configured && *configured) cancelFile_ = configured;
+    if (const char* configured = std::getenv("MINISQL_BACKGROUND_CHECKPOINT_MS")) {
+        char* end = nullptr;const auto parsed = std::strtoull(configured, &end, 10);
+        if (end && *end == '\0' && parsed > 0 && parsed <= 3600000) backgroundCheckpointMs_ = static_cast<std::size_t>(parsed);
+    }
     for (const auto& table : catalog_.tables()) rebuildIndexes(table.id);
+    if (backgroundCheckpointMs_ > 0) {
+        scheduler_ = std::thread([this] { backgroundSchedulerLoop(); });
+    }
 }
-Database::~Database() = default;
+Database::~Database() {
+    if (backgroundCheckpointMs_ > 0) {
+        {
+            std::lock_guard<std::mutex> lock(schedulerMutex_);
+            schedulerStop_.store(true);
+        }
+        schedulerCv_.notify_all();
+        if (scheduler_.joinable()) scheduler_.join();
+    }
+}
 
 void Database::setSessionContext(const std::string& sessionId, const std::filesystem::path& cancelFile) {
     sessionId_ = sessionId;
@@ -297,6 +313,7 @@ void Database::checkCancelled() const {
     if (cancelled) throw MiniSqlError(ErrorCode::Cancelled, "Query cancelled");
 }
 nlohmann::json Database::compile(const std::string& source) const {
+    std::lock_guard<std::recursive_mutex> guard(mu_);
     requireAvailable();
     if (transaction_ == TransactionState::Aborted) throw MiniSqlError(ErrorCode::Transaction, "Transaction aborted; ROLLBACK required");
     const auto tokens = sql::tokenize(source);
@@ -313,6 +330,7 @@ nlohmann::json Database::compile(const std::string& source) const {
                         {"planner", "passed"}, {"optimizer", "passed"}, {"executor", "notRun"}}}};
 }
 nlohmann::json Database::catalog() {
+    std::lock_guard<std::recursive_mutex> guard(mu_);
     requireAvailable();
     json tables = json::array();
     for (const auto& table : catalog_.tables()) {
@@ -343,6 +361,7 @@ nlohmann::json Database::catalog() {
     return {{"tables", tables}, {"buffer", bufferStatus()}};
 }
 nlohmann::json Database::checkpoint() {
+    std::lock_guard<std::recursive_mutex> guard(mu_);
     requireAvailable();
     if (transaction_ != TransactionState::Idle) throw MiniSqlError(ErrorCode::Transaction, "CHECKPOINT requires an idle transaction");
     buffer_.flushAll();
@@ -355,6 +374,7 @@ nlohmann::json Database::checkpoint() {
     return {{"success", true}, {"kind", "Checkpoint"}, {"wal", "truncated"}};
 }
 nlohmann::json Database::indexInspect(const std::string& table, const std::string& index) {
+    std::lock_guard<std::recursive_mutex> guard(mu_);
     requireAvailable();
     const RuntimeIndex* found = nullptr;
     for (const auto& candidate : indexes_)
@@ -409,6 +429,46 @@ void Database::evaluateAutoCheckpoint(std::size_t committedWriteStatements, std:
     lastCheckpointAtMs_ = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count());
     lastAutoCheckpointAtMs_ = lastCheckpointAtMs_;
+}
+void Database::evaluateBackgroundCheckpoint() {
+    if (unavailable_) return;
+    std::vector<std::string> reasons;
+    const auto dirtyPages = buffer_.dirtyPages();
+    const auto dirtyRatio = buffer_.capacity() == 0 ? 0.0 : std::min(1.0, static_cast<double>(dirtyPages) / static_cast<double>(buffer_.capacity()));
+    const auto now = std::chrono::steady_clock::now();
+    const auto elapsedMs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(now - lastCheckpointAt_).count());
+    if (autoCheckpointWrites_ > 0 && pendingAutoCheckpointWrites_ >= autoCheckpointWrites_) reasons.push_back("writes");
+    if (autoCheckpointWalBytes_ > 0 && pendingAutoCheckpointWalBytes_ >= autoCheckpointWalBytes_) reasons.push_back("wal-bytes");
+    if (autoCheckpointDirtyPages_ > 0 && dirtyPages >= autoCheckpointDirtyPages_) reasons.push_back("dirty-pages");
+    if (autoCheckpointDirtyRatio_ > 0.0 && dirtyRatio >= autoCheckpointDirtyRatio_) reasons.push_back("dirty-ratio");
+    if (autoCheckpointIntervalMs_ > 0 && elapsedMs >= autoCheckpointIntervalMs_) reasons.push_back("interval");
+    schedulerLastEvaluateMs_ = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count());
+    if (reasons.empty()) return;
+    // 后台线程仅在空闲且事务空闲时执行检查点，绝不在活动事务提交点之前截断未提交日志。
+    if (transaction_ != TransactionState::Idle) { schedulerDeferredReasons_ = std::move(reasons); return; }
+    buffer_.flushAll();
+    file_->checkpoint({catalogVersion_, indexVersion_});
+    ++checkpointCount_;
+    pendingAutoCheckpointWrites_ = 0;
+    pendingAutoCheckpointWalBytes_ = 0;
+    lastAutoCheckpointReasons_ = std::move(reasons);
+    lastCheckpointAt_ = now;
+    lastCheckpointAtMs_ = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count());
+    lastAutoCheckpointAtMs_ = lastCheckpointAtMs_;
+    schedulerLastRunMs_ = lastCheckpointAtMs_;
+    schedulerDeferredReasons_.clear();
+}
+void Database::backgroundSchedulerLoop() {
+    std::unique_lock<std::mutex> lock(schedulerMutex_);
+    while (true) {
+        schedulerCv_.wait_for(lock, std::chrono::milliseconds(backgroundCheckpointMs_),
+            [&] { return schedulerStop_.load(); });
+        if (schedulerStop_.load()) break;
+        std::lock_guard<std::recursive_mutex> dbLock(mu_);
+        evaluateBackgroundCheckpoint();
+    }
 }
 std::string Database::tableFingerprint(std::uint64_t tableId) {
     const catalog::StoredTable* stored = nullptr;
@@ -546,6 +606,7 @@ void Database::validateUniqueIndexes(std::uint64_t tableId, const storage::Row& 
     }
 }
 nlohmann::json Database::statistics() {
+    std::lock_guard<std::recursive_mutex> guard(mu_);
     requireAvailable();
     json tables = json::array();
     for (const auto& table : catalog_.tables()) {
@@ -586,7 +647,10 @@ nlohmann::json Database::statistics() {
             {"indexVersion", record.indexVersion}, {"committedSequence", record.committedSequence},
             {"timestampMs", record.timestampMs}}},
         {"lastCheckpointAtMs", lastCheckpointAtMs_}, {"lastAutoCheckpointAtMs", lastAutoCheckpointAtMs_},
-        {"lastAutoCheckpointReasons", lastAutoCheckpointReasons_}};
+        {"lastAutoCheckpointReasons", lastAutoCheckpointReasons_},
+        {"backgroundScheduler", {{"enabled", backgroundCheckpointMs_ > 0 && scheduler_.joinable()},
+            {"intervalMs", backgroundCheckpointMs_}, {"lastEvaluateMs", schedulerLastEvaluateMs_},
+            {"lastRunMs", schedulerLastRunMs_}, {"deferredReasons", schedulerDeferredReasons_}}}};
 }
 nlohmann::json Database::bufferStatus() const {
     const auto& stats = buffer_.stats();
@@ -609,6 +673,7 @@ nlohmann::json Database::bufferStatus() const {
         {"stagedPageWrites", stats.stagedPageWrites}, {"evictions", evictions}};
 }
  nlohmann::json Database::configureBuffer(const std::string& action) {
+    std::lock_guard<std::recursive_mutex> guard(mu_);
     requireAvailable();
     if (transaction_ != TransactionState::Idle)
         throw MiniSqlError(ErrorCode::Transaction, "Buffer configuration requires an idle transaction");
@@ -1391,6 +1456,7 @@ nlohmann::json Database::runStatement(const sql::LogicalPlan& plan) {
     }
 }
 nlohmann::json Database::diagnostics(const std::string& source) const {
+    std::lock_guard<std::recursive_mutex> guard(mu_);
     requireAvailable();
     json items = json::array();
     const auto stageFor = [](ErrorCode code) {
@@ -1436,6 +1502,7 @@ nlohmann::json Database::diagnostics(const std::string& source) const {
     return {{"success", success}, {"diagnostics", items}, {"count", items.size()}};
 }
 nlohmann::json Database::runCorrelatedSubquery(const json& expression, const json& row) {
+    std::lock_guard<std::recursive_mutex> guard(mu_);
     const auto sql = expression.at("subquerySql").get<std::string>();
     const auto& scope = expression.at("outerColumns");
     const auto literal = [](const json& value, const std::string& type) -> std::string {
@@ -1558,6 +1625,7 @@ void Database::materializeSubqueries(std::vector<sql::LogicalPlan>& plans) {
     for (auto& plan : plans) visit(plan);
 }
 nlohmann::json Database::execute(const std::string& source, bool optimize) {
+    std::lock_guard<std::recursive_mutex> guard(mu_);
     json results = json::array();
     currentQueryId_ = ++querySequence_;
     try {
@@ -1775,6 +1843,7 @@ nlohmann::json Database::executionFailure(const MiniSqlError& error, json result
     return response;
 }
 nlohmann::json Database::executeScript(const std::string& source, bool optimize) {
+    std::lock_guard<std::recursive_mutex> guard(mu_);
     auto response = execute(source, optimize);
     if (transaction_ != TransactionState::Idle && !unavailable_) {
         rollbackBatch();transaction_ = TransactionState::Idle;
