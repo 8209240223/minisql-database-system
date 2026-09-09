@@ -4,7 +4,7 @@ import { EditorView } from '@codemirror/view';
 import { lintGutter, setDiagnostics } from '@codemirror/lint';
 import { sql } from '@codemirror/lang-sql';
 import { Activity, Braces, ChevronDown, ChevronRight, CircleHelp, Database, FileCode2, FolderTree, History, MoreHorizontal, Play, Plus, RefreshCw, Search, Settings2, Shield, Table2, Terminal, Trash2, X } from 'lucide-react';
-import { getCatalog, getHealth, getStorage, runSql, openApiSession, closeApiSession, releaseApiSession,
+import { getCatalog, getHealth, getStorage, runSql, openApiSession, closeApiSession, releaseApiSession, cancelSession,
   getCapabilities, getBackups, createBackup, restoreBackup, inspectIndex } from './client';
 import type { IndexInspect } from './client';
 import { AccessControl } from './AccessControl';
@@ -35,6 +35,8 @@ const connectionDefaults = {
   url: import.meta.env.VITE_MINISQL_API ?? 'http://127.0.0.1:8081/api',
 };
 const CONNECTIONS_KEY = 'minisql-studio-connections-v1';
+const CLIENT_TIMEOUT_KEY = 'minisql-client-timeout-ms';
+const DEFAULT_CLIENT_TIMEOUT_MS = 120000;
 const editorExtensions = [sql(), lintGutter()];
 
 function restoreConnectionProfiles(): ConnectionProfile[] {
@@ -96,6 +98,10 @@ function App() {
 const [accessOpen, setAccessOpen] = useState(false);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [resultLimit, setResultLimit] = useState(() => Number(localStorage.getItem('minisql-result-limit') ?? 1000));
+  const [clientTimeoutMs, setClientTimeoutMs] = useState(() => {
+    const configured = Number(localStorage.getItem(CLIENT_TIMEOUT_KEY));
+    return Math.max(1000, Math.min(300000, configured || DEFAULT_CLIENT_TIMEOUT_MS));
+  });
   const [darkMode, setDarkMode] = useState(() => localStorage.getItem('minisql-theme') === 'dark');
   const [storageInfo, setStorageInfo] = useState<Awaited<ReturnType<typeof getStorage>>>();
   const [capabilities, setCapabilities] = useState<Capabilities>();
@@ -365,10 +371,18 @@ const [accessOpen, setAccessOpen] = useState(false);
     if (warning && !window.confirm(warning)) return;
     busy.current = true;
     setRunningTab(active);
-    controller.current?.abort(); controller.current = new AbortController(); setRunning(true); setNotice('');
+    controller.current?.abort(); const requestController = new AbortController(); controller.current = requestController; setRunning(true); setNotice('');
     const started = Date.now();
+    let clientTimedOut = false;
+    let hardTimeoutTimer: number | undefined;
+    const timeoutTimer = window.setTimeout(() => {
+      clientTimedOut = true;
+      void cancelSession(effectiveConnection, sessionId).catch(() => {});
+      hardTimeoutTimer = window.setTimeout(() => requestController.abort(), 5000);
+    }, clientTimeoutMs);
     try {
-      const data = await runSql(effectiveConnection, source, compile, controller.current.signal);
+      const data = await runSql(effectiveConnection, source, compile, requestController.signal);
+      if (clientTimedOut) throw Object.assign(new Error(`客户端请求超时，已发送取消请求。`), { transactionState: data.transactionState });
       if (data.transactionState) setTransactionState(data.transactionState);
       for (const item of data.results ?? []) {
         if (item.kind === 'Commit') settlePending('committed');
@@ -378,14 +392,15 @@ const [accessOpen, setAccessOpen] = useState(false);
       recordHistory(source, compile, data.durationMs, data.rows.length);
       if (!compile) { await refresh(); await refreshStorage(); }
     } catch (e) {
-      const message = e instanceof Error ? e.message : String(e); handleFailure(e);
+      const failure = clientTimedOut ? Object.assign(new Error(`客户端请求超时，已发送取消请求。`), e && typeof e === 'object' ? e : {}) : e;
+      const message = failure instanceof Error ? failure.message : String(failure); handleFailure(failure);
       if ((e as { transactionState?: string }).transactionState === 'ABORTED') await refresh();
       if (command === undefined) {
         const position = e as { line?: number; column?: number };
         updateView({ diagnostic: mapDiagnostic(documentSource, submittedFrom, submittedTo, position.line ?? 0, position.column ?? 0) });
       }
       recordHistory(source, compile, Date.now() - started, 0, message);
-    } finally { busy.current = false; setRunning(false); setRunningTab(undefined); }
+    } finally { window.clearTimeout(timeoutTimer); if (hardTimeoutTimer !== undefined) window.clearTimeout(hardTimeoutTimer); busy.current = false; setRunning(false); setRunningTab(undefined); }
   }
   function addTab() { if (tabs.length >= 50) { setNotice('最多保留 50 个查询标签。'); return; } const id = crypto.randomUUID(); setTabs(v => [...v, { id, name: `query_${v.length + 1}.sql`, sql: '-- New query\n' }]); setActive(id); }
   function insertTable(table: Table) { updateSql(`${current.sql}\nSELECT * FROM ${table.name};`); }
@@ -488,9 +503,10 @@ const [accessOpen, setAccessOpen] = useState(false);
         <label>密码<input disabled={!!sessionId} type="password" value={connection.password} placeholder="无密码用户可留空" onChange={event => setConnection(current => ({ ...current, password: event.target.value }))}/></label>
         {sessionId && <small>断开当前会话后可切换身份。</small>}
       </div>
-      <label>结果显示上限<input type="number" min="100" max="10000" step="100" value={resultLimit} onChange={event => { const value=Math.max(100,Math.min(10000,Number(event.target.value)||100));setResultLimit(value);localStorage.setItem('minisql-result-limit',String(value)); }}/></label>
+       <label>结果显示上限<input type="number" min="100" max="10000" step="100" value={resultLimit} onChange={event => { const value=Math.max(100,Math.min(10000,Number(event.target.value)||100));setResultLimit(value);localStorage.setItem('minisql-result-limit',String(value)); }}/></label>
+       <label>客户端请求超时（毫秒）<input type="number" min="1000" max="300000" step="1000" value={clientTimeoutMs} onChange={event => { const value=Math.max(1000,Math.min(300000,Number(event.target.value)||DEFAULT_CLIENT_TIMEOUT_MS));setClientTimeoutMs(value);localStorage.setItem(CLIENT_TIMEOUT_KEY,String(value)); }}/></label>
       <label className="settings-check"><input type="checkbox" checked={darkMode} onChange={event => {setDarkMode(event.target.checked);localStorage.setItem('minisql-theme',String(event.target.checked?'dark':'light'));}}/>深色主题</label>
-      <button className="settings-reset" onClick={() => { localStorage.removeItem('minisql-result-limit');localStorage.removeItem('minisql-theme');setResultLimit(1000);setDarkMode(false); }}>恢复默认设置</button>
+       <button className="settings-reset" onClick={() => { localStorage.removeItem('minisql-result-limit');localStorage.removeItem(CLIENT_TIMEOUT_KEY);localStorage.removeItem('minisql-theme');setResultLimit(1000);setClientTimeoutMs(DEFAULT_CLIENT_TIMEOUT_MS);setDarkMode(false); }}>恢复默认设置</button>
       <button className="settings-refresh" onClick={() => void refreshStorage()}>刷新存储统计</button>
       {storageInfo ? <StorageStatisticsView value={storageInfo} disabled={running || transactionState !== 'IDLE'} onConfigure={async action => { const buffer = await configureBuffer(effectiveConnection, action); setStorageInfo(previous => previous ? { ...previous, buffer } : previous); }}/> : <div className="storage-info">连接真实 C++ 数据库后可查看存储统计。</div>}
       <SystemSettings connection={effectiveConnection} capabilities={capabilities} backups={backups} error={systemError} busy={systemBusy} connected={!!sessionId} onRefresh={refreshSystem}/>

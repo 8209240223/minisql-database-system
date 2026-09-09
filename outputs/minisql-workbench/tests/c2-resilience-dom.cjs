@@ -1,6 +1,6 @@
 const path = require('node:path');
 const { spawn } = require('node:child_process');
-const { mkdtempSync } = require('node:fs');
+const { mkdtempSync, readdirSync, readFileSync, writeFileSync } = require('node:fs');
 const { tmpdir } = require('node:os');
 const { join } = require('node:path');
 const { once } = require('node:events');
@@ -73,7 +73,19 @@ async function seed(api) {
   await seed(api);
   const browser = await chromium.launch({ channel: 'msedge', headless: true });
   const context = await browser.newContext({ viewport: { width: 1440, height: 900 } });
-  await context.addInitScript(() => localStorage.clear());
+  await context.addInitScript(() => {
+    localStorage.clear();
+    let streamCount = 0;
+    const nativeFetch = window.fetch.bind(window);
+    window.fetch = async (input, init) => {
+      const url = input && typeof input === 'object' && 'url' in input ? input.url : String(input);
+      if (url.includes('/execute/stream')) {
+        streamCount += 1;
+        if (streamCount === 3) await new Promise(resolve => setTimeout(resolve, 5000));
+      }
+      return nativeFetch(input, init);
+    };
+  });
   const page = await context.newPage();
   const errors = [];
   page.on('pageerror', error => errors.push(error.message));
@@ -114,6 +126,19 @@ async function seed(api) {
     await page.locator('.error-state').waitFor({ timeout: 30000 });
     await page.locator('.error-state button').click();
 
+    await page.getByRole('button', { name: '打开设置' }).click();
+    const timeoutSettings = page.getByRole('dialog', { name: '设置' });
+    const timeoutInput = timeoutSettings.locator('label').filter({ hasText: '客户端请求超时' }).locator('input');
+    await timeoutInput.fill('1000');
+    await timeoutSettings.getByRole('button', { name: '关闭设置', exact: true }).click();
+    await page.locator('.cm-content').fill('SELECT id FROM c2_big ORDER BY id DESC;');
+    await page.getByRole('button', { name: 'Run', exact: true }).click();
+    await page.locator('.error-state').filter({ hasText: '客户端请求超时' }).waitFor({ timeout: 30000 });
+    await page.locator('.error-state button').click();
+    await page.getByRole('button', { name: '打开设置' }).click();
+    await page.getByRole('dialog', { name: '设置' }).locator('label').filter({ hasText: '客户端请求超时' }).locator('input').fill('120000');
+    await page.getByRole('dialog', { name: '设置' }).getByRole('button', { name: '关闭设置', exact: true }).click();
+
     await page.locator('.cm-content').fill('SELECT id FROM c2_big ORDER BY id DESC;');
     await page.getByRole('button', { name: 'Run', exact: true }).click();
     await page.getByRole('button', { name: '打开权限与审计' }).click();
@@ -143,6 +168,21 @@ async function seed(api) {
     await backupRow.getByRole('button', { name: '恢复', exact: true }).click();
     await restorePrompt;
     await settings.getByText('备份已恢复', { exact: true }).waitFor({ timeout: 30000 });
+
+    const corruptName = 'c2-corrupt-ui';
+    const corruptBackup = await request(api, '/backup', { name: corruptName });
+    assert.equal(corruptBackup.status, 200, JSON.stringify(corruptBackup.data));
+    const corruptFile = join(root, 'backups', `${corruptName}.pages`);
+    const corruptBytes = readFileSync(corruptFile);
+    corruptBytes[4096 + 16] ^= 0xff;
+    writeFileSync(corruptFile, corruptBytes);
+    await settings.getByRole('button', { name: '刷新', exact: true }).click();
+    const corruptRow = settings.locator('.backup-row').filter({ hasText: `${corruptName}.pages` });
+    await corruptRow.waitFor();
+    const corruptRestorePrompt = page.waitForEvent('dialog').then(dialog => dialog.accept());
+    await corruptRow.getByRole('button', { name: '恢复', exact: true }).click();
+    await corruptRestorePrompt;
+    await settings.getByText(/checksum|校验/i).waitFor({ timeout: 30000 });
     await page.getByRole('button', { name: '关闭设置' }).click();
 
     await page.getByRole('button', { name: '连接会话' }).click();
@@ -155,7 +195,7 @@ async function seed(api) {
     await page.getByRole('grid', { name: '查询结果' }).waitFor({ timeout: 30000 });
     assert.equal(await page.getByRole('grid', { name: '查询结果' }).getByText('29999', { exact: true }).count(), 1);
     assert.deepEqual(errors, []);
-    console.log('C2 browser resilience passed: success, semantic failure, active-request cancellation, backup/restore and post-recovery query; no images');
+    console.log('C2 browser resilience passed: success, semantic failure, client timeout, active-request cancellation, backup/restore, restore failure isolation and post-recovery query; no images');
   } finally {
     await page.getByRole('button', { name: '断开会话' }).click({ timeout: 1000 }).catch(() => {});
     await browser.close();
