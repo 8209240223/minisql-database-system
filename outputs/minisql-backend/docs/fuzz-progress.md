@@ -94,7 +94,7 @@ node tests/fuzz-state-machine-long-run.mjs
 
 ## 九、重复长跑入口
 
-新增 `tests/fuzz-state-machine-soak.mjs`，使用相同的固定种子、状态机步数和资源限制重复启动 `fuzz-state-machine-differential.mjs`，每轮仍然使用独立数据库和 C++ session。默认执行 `20260908,42` 两个种子、每种子 512 步、两轮；每轮都检查 Wrong Result、Wrong Accept、Wrong Reject、错误定位、Crash、Timeout、Resource Limit 和 harness error，最终保存 `report.json`。
+新增 `tests/fuzz-state-machine-soak.mjs`，使用相同的固定种子、状态机步数和资源限制重复启动 `fuzz-state-machine-differential.mjs`，每轮仍然使用独立数据库和 C++ session。默认执行 `20260908,42` 两个种子、每种子 512 步、两轮；也可以用 `FUZZ_SOAK_DURATION_MS` 按固定持续时间循环。每轮都检查 Wrong Result、Wrong Accept、Wrong Reject、错误定位、Crash、Timeout、Resource Limit 和 harness error，最终保存 `report.json`。
 
 短验收可以使用：
 
@@ -106,7 +106,7 @@ Remove-Item Env:FUZZ_SOAK_ROUNDS
 Remove-Item Env:FUZZ_SOAK_STEPS
 ```
 
-长期或夜间回归可设置 `FUZZ_SOAK_ROUNDS`、`FUZZ_SOAK_STEPS`、`FUZZ_SOAK_SEEDS` 和 `FUZZ_SOAK_TIMEOUT_MS`。该入口提供可重复的多轮证据，但本机当前只执行了短 smoke；它不替代无限输入或多小时资源趋势验收。
+长期或夜间回归可设置 `FUZZ_SOAK_ROUNDS`、`FUZZ_SOAK_DURATION_MS`、`FUZZ_SOAK_STEPS`、`FUZZ_SOAK_SEEDS` 和 `FUZZ_SOAK_TIMEOUT_MS`。本机已验证固定持续时间 5 秒、30 步、8 轮且失败分类为零；该入口提供可重复的多轮/定时证据，但仍不替代多小时资源趋势验收。
 
 ### 失败样本重放
 
