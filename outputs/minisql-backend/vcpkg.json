@@ -1,0 +1,16 @@
+{
+  "name": "minisql",
+  "version-semver": "0.1.0",
+  "builtin-baseline": "6f1ddd6b6878e7e66fcc35c65ba1d8feec2e01f8",
+  "dependencies": [
+    "cli11", "fmt", "nlohmann-json", "boost-multiprecision",
+    { "name": "spdlog", "platform": "!windows" },
+    { "name": "spdlog", "platform": "windows", "features": ["wchar"] }
+  ],
+  "features": {
+    "tests": {
+      "description": "Build GoogleTest tests",
+      "dependencies": ["gtest"]
+    }
+  }
+}

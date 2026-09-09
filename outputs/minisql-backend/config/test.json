@@ -1,0 +1,7 @@
+{
+  "data_directory": "./build/runtime-test/data",
+  "wal_directory": "./build/runtime-test/wal",
+  "catalog_directory": "./build/runtime-test/catalog",
+  "buffer_pool_size": 8,
+  "logging": { "level": "DEBUG", "directory": "./build/runtime-test/logs", "console": false }
+}

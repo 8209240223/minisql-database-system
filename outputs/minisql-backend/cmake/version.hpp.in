@@ -1,0 +1,5 @@
+#pragma once
+#include <string_view>
+namespace minisql {
+inline constexpr std::string_view kVersion = "@PROJECT_VERSION@";
+}

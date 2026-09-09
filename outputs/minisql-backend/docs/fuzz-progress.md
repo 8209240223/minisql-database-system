@@ -1,0 +1,66 @@
+# 固定种子与差分测试
+
+日期：2026-09-08。对应 EXT-QA-001、X27，目前为部分完成。
+
+## 一、测试链路
+
+1. `tests/fuzz-model.mjs` 生成受当前表结构约束的 SELECT 模型，覆盖 INT 算术、比较、NOT/AND/OR、Unicode 字符串、DISTINCT、多键排序、LIMIT/OFFSET。整数和除数有界，不制造参考数据库与 MiniSQL 的溢出或除零语义差异。
+2. `tests/fuzz-differential.mjs` 使用真实 `minisql_database.exe` 和已安装的 sql.js/SQLite 分别执行同一数据集和查询。SQLite 只作测试参考，不替代产品的 C++ 执行器或存储。
+3. 数据集包括重复行、负数、中文和含单引号的字符串；排序键覆盖全部输出，避免相同排序键下的合法排列差异被误判。
+4. 每个模型附加四种受控变异：非法字符、缺分号、不存在的列，以及仍然合法的注释/关键字大小写变化。合法变异不要求报错。
+5. 每条 SQL 由新子进程重开隔离数据库。单次限制 5 秒和 8 MiB 输出；统计结果差异、错误接受、错误拒绝、错误位置、崩溃、超时、资源限制及测试框架错误。
+6. 遇到查询结果差异或错误拒绝时，仅在既有合法语法模型中删除条件、简化表达式及移除修饰项，最多探测 64 次。缩减后再次确认相同故障分类，保存原用例和缩减结果，不宣称得到全局最小 SQL。
+7. 每次运行创建独立 `tests/artifacts/fuzz-*` 目录，保存 fixture.sql、corpus.sql、report.json，以及适用时的 failure-N.json。报告记录种子、参数、语料摘要、生成器摘要、C++ 可执行文件摘要和参考引擎版本。
+
+## 二、运行方式
+
+在后端目录执行 `node tests/fuzz-model-contract.mjs`、`node tests/fuzz-process-contract.mjs` 和 `node tests/fuzz-differential.mjs`。
+
+默认种子 20260908、100 个模型，每模型 1 次差分和 4 次变异，共 500 次检查。环境变量 FUZZ_SEED 接受 UINT32，FUZZ_CASES 接受 1 至 1000。测试依赖已构建的后端可执行文件，以及相邻前端目录已安装的 sql.js 和 WASM 文件。
+
+重放需保留报告中的版本和生成器，使用同一 FUZZ_SEED、FUZZ_CASES，并比对 corpusSha256。仅种子相同但生成器版本不同，不保证语料相同。
+
+## 三、验证结果
+
+生成器及缩减器 10 项检查通过，包括同种子确定性、不同种子、条件缩减、预算停止、保留故障、输入不变，以及默认语料覆盖 1 至 4 个条件。
+
+子进程隔离 7 项检查通过，实际启动测试子进程验证超时、输出超限、异常退出、非法 JSON、退出码与 JSON 状态不一致、正常结果及正常 SQL 错误。
+
+最终生成器的种子 20260908、100 模型运行已通过 500 次检查，所有故障计数为零。语料 SHA-256 为 `1487bf24d633a37336f0ed789e5b58b604287c2a736f51ac339623d3f1f1cc52`。这表示本次样本通过，不表示无缺陷或覆盖完整 SQL。
+
+## 四、剩余范围
+
+当前随机语料主要是 SELECT；未随机生成 UPDATE、DELETE、多行 INSERT、JOIN、NULL、事务、索引或崩溃恢复序列。没有覆盖尚未实现的语法，也没有做无限输入或生产压力测试。
+
+缩减器的逻辑已用可控故障谓词测试；本批实际数据库没有出现结果差异，因此没有真实引擎缺陷的自动缩减案例。错误变异仅保存输入与分类，尚未自动缩减。错行错列的精确断言目前集中在注入的非法字符，其余诊断只检查阶段类型和有效位置。
+
+参考引擎仅用于共同支持子集。测试生成器不能替代完整 Catalog 驱动的随机 DDL/DML 状态机。EXT-QA-001 保持部分完成。
+
+## 五、X27 DDL/DML 状态机语料（2026-09-09 补）
+
+### 新增内容
+
+1. `tests/fuzz-state-machine.mjs` 提供构造即合法的 DDL/DML 状态机（CREATE/INSERT/UPDATE/DELETE/SELECT/事务/索引 + 受控负向探针），并暴露 `generateProgram`、`renderProgram`、`validateProgram`、`chunkProgram`、`minimizeProgram` 等可复用接口。
+2. 新增 `tests/fuzz/generate-corpus.mjs`：按固定种子生成并持久化长期回归语料：
+   - `fixture.sql` —— 表结构与初始数据；
+   - `corpus-select-<seed>.sql` —— 由 `fuzz-model.mjs` 生成的 SELECT 语料；
+   - `corpus-state-<seed>.sql` —— 由状态机生成的 DDL/DML 语料；
+   - `manifest.json` —— 记录种子、样本数、各语料 SHA-256、生成器 SHA-256、fixture SHA-256 与生成时间，满足"固定种子长跑、CI 回归和失败样本重放"的可审计要求。
+3. 状态机程序在持久化前用 `validateProgram` 重放校验，杜绝悬空表引用、缺列、重复键或不平衡事务，确保"构造即合法"。
+
+### 运行方式
+
+```powershell
+cd outputs\minisql-backend
+node tests/fuzz/generate-corpus.mjs                      # 默认种子 20260908,42,7
+$env:FUZZ_SEEDS = '20260908,123' ; node tests/fuzz/generate-corpus.mjs
+```
+
+### 验证结果
+
+固定种子 `20260908 / 42 / 7` 各生成 100 条 SELECT 语料与 96 步状态机程序；`validateProgram` 全部通过，`manifest.json` 已生成。同一种子、同一生成器版本可逐字节复现，满足重放一致性。
+
+### 边界与后续
+
+- 状态机语料已覆盖 UPDATE/DELETE/多行 INSERT/JOIN/NULL/事务/索引与受控负向 DDL 探针；崩溃恢复与跨进程组合仍属于 X22/X26 的回归范畴，由成员 B 主责。
+- CI（`.github/workflows/ci.yml`）已接入 `generate-corpus` 与工作台单元回归，作为可重复的夜间回归入口。

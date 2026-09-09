@@ -1,0 +1,78 @@
+# MiniSQL 可重复回归 CI（成员 C：X27 Fuzz 固定种子语料 + 工作台单元回归）
+#
+# 说明：
+#   - 本工作流只运行「不依赖 C++ 引擎构建」的成员 C 回归，保证在普通 CI runner 上可复跑。
+#   - 依赖真实 minisql_database.exe 的重型回归（database-http / access-control-http /
+#     fuzz-differential / 状态机差分）需要 MSVC + vcpkg 构建，见下方注释，可在自托管 runner 启用。
+name: MiniSQL CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  backend-node:
+    name: 后端成员C纯 Node 回归（X24/X27）
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: outputs/minisql-backend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: 权限页式 Catalog 契约（X24）
+        run: node tests/access-store-contract.mjs
+      - name: Fuzz 生成器/缩减器契约（X27）
+        run: node tests/fuzz-model-contract.mjs
+      - name: 固定种子状态机语料（X27）
+        run: node tests/fuzz/generate-corpus.mjs
+      - name: 语料复现一致性
+        run: |
+          node tests/fuzz/generate-corpus.mjs > /tmp/first.out
+          node tests/fuzz/generate-corpus.mjs > /tmp/second.out
+          diff /tmp/first.out /tmp/second.out
+
+  workbench:
+    name: 工作台单元回归与类型检查（C2）
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: outputs/minisql-workbench
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: 安装依赖
+        run: npm ci || npm install
+      - name: 变更安全（整表变异提示）
+        run: npm run test:safety
+      - name: 查询历史
+        run: npm run test:history
+      - name: CSV 导出
+        run: npm run test:csv
+      - name: 类型与构建
+        run: npm run build
+
+  # 自托管重型引擎回归：需要 MSVC + vcpkg + 已安装的 sql.js。
+  # engine-build:
+  #   runs-on: windows-latest
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - uses: actions/setup-node@v4
+  #       with: { node-version: '24' }
+  #     - name: 构建 C++ 引擎
+  #       run: powershell -NoProfile -ExecutionPolicy Bypass -File ./outputs/minisql-backend/scripts/build.ps1
+  #     - name: 安装工作台依赖（sql.js / WASM）
+  #       run: npm ci || npm install
+  #       working-directory: outputs/minisql-workbench
+  #     - name: HTTP 访问控制闭环
+  #       run: node tests/access-control-http.mjs
+  #       working-directory: outputs/minisql-backend
+  #     - name: X27 差分与状态机
+  #       run: node tests/fuzz-differential.mjs
+  #       working-directory: outputs/minisql-backend

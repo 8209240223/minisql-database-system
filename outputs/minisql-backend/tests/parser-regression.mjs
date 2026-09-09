@@ -1,0 +1,20 @@
+import {spawnSync} from 'node:child_process';
+import assert from 'node:assert/strict';
+const exe=new URL('../bin/minisql_compile.exe',import.meta.url);
+import {fileURLToPath} from 'node:url';
+function run(sql){const p=spawnSync(fileURLToPath(exe),['--parse-only'],{input:sql,encoding:'utf8',timeout:5000});assert(!p.error,String(p.error));return JSON.parse(p.stdout);}
+assert.equal(run('').success,true);
+assert.equal(run('SELECT a FROM t;').ast.kind,'Select');
+assert.equal(run('SELECT a FROM t WHERE a=1 OR b=2 AND c=3;').ast.where.right.value,'AND');
+assert.equal(run('DELETE FROM t WHERE NOT a=1 AND b=2;').ast.where.left.value,'NOT');
+assert.equal(run('CREATE TABLE t(a INT); INSERT INTO t(a) VALUES(1); SELECT * FROM t; DELETE FROM t;').statements,4);
+for(const sql of ['SELECT a FROM t','CREATE TABLE t(a nonsense);','SELECT a FROM t WHERE a+;','SELECT a FROM t WHERE a=1=2;','SELECT @;'])assert.equal(run(sql).success,false,sql);
+assert.equal(run("SELECT 'unclosed").error.column,8);
+assert.equal(run('SELECT a FROM t WHERE '+ 'NOT '.repeat(300)+'a=1;').success,false);
+assert.equal(run('INSERT INTO t(a) VALUES(1),(2+3),(DEFAULT);').ast.valueRows.length,3);
+assert.equal(run('INSERT INTO t(a) VALUES(1),();').success,false);
+assert.equal(run('INSERT INTO t(a) VALUES(1),;').success,false);
+assert.deepEqual(run('BEGIN TRANSACTION; COMMIT; ROLLBACK;').ast.map(node=>node.kind),['Begin','Commit','Rollback']);
+assert.equal(run('BEGIN bad;').success,false);
+assert.equal(run('COMMIT').success,false);
+console.log('18 parser/lexer regression checks passed');

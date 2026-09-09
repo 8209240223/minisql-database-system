@@ -1,0 +1,4 @@
+{
+  "mode": "cli",
+  "logging": { "level": "DEBUG", "directory": "./logs", "console": true }
+}

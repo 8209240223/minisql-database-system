@@ -1,0 +1,630 @@
+#include "minisql/sql/planner.hpp"
+#include "minisql/sql/serialization.hpp"
+#include "minisql/common/arithmetic.hpp"
+#include "minisql/common/decimal_type.hpp"
+#include "minisql/common/date.hpp"
+#include "minisql/common/float.hpp"
+#include <algorithm>
+#include <charconv>
+#include <cctype>
+#include <cstdint>
+#include <functional>
+#include <unordered_map>
+
+namespace minisql::sql {
+namespace {
+std::string canonical(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    return value;
+}
+
+[[noreturn]] void invalid(const std::string& message) {
+    throw MiniSqlError(ErrorCode::Internal, "Plan invariant: " + message);
+}
+
+std::size_t columnIndex(const catalog::Table& table, const std::string& name) {
+    return catalog::resolveColumnIndex(table, name);
+}
+
+nlohmann::json literalValue(const std::string& raw) {
+    if (const auto date = dateLiteralText(raw)) return formatIsoDate(parseIsoDate(*date));
+    if (canonical(raw) == "null") return nullptr;
+    if (canonical(raw) == "true" || canonical(raw) == "false") return canonical(raw) == "true";
+    if (!raw.empty() && raw.front() == '\'') {
+        return stringLiteralValue(raw);
+    }
+    if (raw.find_first_of("eE") != std::string::npos) return parseFiniteFloat(raw, ErrorCode::Internal);
+    if (raw.find('.') != std::string::npos) return decimalLiteral(raw).value;
+    const auto* start = raw.data();
+    const auto* end = start + raw.size();
+    if (start != end && *start == '+') ++start;
+    std::int64_t value{};
+    const auto result = std::from_chars(start, end, value);
+    if (result.ec != std::errc{} || result.ptr != end) invalid("unchecked integer literal");
+    return value;
+}
+
+nlohmann::json correlatedScope(const catalog::Table& table) {
+    nlohmann::json scope = nlohmann::json::object();
+    for (std::size_t index = 0; index < table.columns.size(); ++index) {
+        const auto& column = table.columns[index];
+        if (column.qualifier.empty()) continue;
+        scope[canonical(column.qualifier + "." + column.name)] = {{"columnId", index}, {"type", column.type}};
+    }
+    return scope;
+}
+nlohmann::json bindExpression(const Expr& expression, const catalog::Table& table, std::size_t depth = 0) {
+    if (depth > 256) invalid("expression depth exceeded");
+    nlohmann::json result = {{"kind", expression.kind}, {"line", expression.location.line},
+                             {"column", expression.location.column}};
+    if (expression.kind == "Identifier") {
+        const auto index = columnIndex(table, expression.value);
+        result["columnId"] = index;
+        result["name"] = table.columns[index].name;
+        result["type"] = table.columns[index].type;
+        result["nullable"] = table.columns[index].nullable;
+    } else if (expression.kind == "Literal") {
+        result["value"] = literalValue(expression.value);
+        result["type"] = result["value"].is_null() ? "null" : result["value"].is_boolean() ? "bool" : result["value"].is_string() ? "varchar" : result["value"].is_number_float() ? "float" : "int";
+        if (result["value"].is_number_integer() && (result["value"].get<std::int64_t>() < INT32_MIN || result["value"].get<std::int64_t>() > INT32_MAX)) result["type"] = "bigint";
+        result["nullable"] = result["value"].is_null();
+        if (dateLiteralText(expression.value)) result["type"] = "date";
+        if (expression.value.find_first_of("eE") != std::string::npos && expression.value.front() != '\'') result["type"] = "float";
+        if (expression.value.find_first_of("eE") == std::string::npos && expression.value.find('.') != std::string::npos && expression.value.front() != '\'') result["type"] = decimalLiteral(expression.value, expression.location).type.name();
+    } else if (expression.kind == "Exists") {
+        if (expression.subquerySql.empty()) invalid("missing EXISTS subquery");
+        result["subquerySql"] = expression.subquerySql;
+        result["outerColumns"] = correlatedScope(table);
+        result["type"] = "bool";
+        result["nullable"] = false;
+    } else if (expression.kind == "ScalarSubquery") {
+        if (expression.subquerySql.empty()) invalid("missing scalar subquery");
+        result["subquerySql"] = expression.subquerySql;
+        result["outerColumns"] = correlatedScope(table);
+        result["type"] = "null";
+        result["nullable"] = true;
+    } else if (expression.kind == "InSubquery") {
+        if (!expression.left || expression.subquerySql.empty()) invalid("missing IN subquery operand");
+        result["left"] = bindExpression(*expression.left, table, depth + 1);
+        result["subquerySql"] = expression.subquerySql;
+        result["outerColumns"] = correlatedScope(table);
+        result["type"] = "bool";
+        result["nullable"] = true;
+    } else if (expression.kind == "AggregateExpr") {
+        if (!expression.left) invalid("missing aggregate argument");
+        result["function"] = expression.value;
+        result["left"] = expression.left->kind == "Wildcard" ? nlohmann::json(nullptr) : bindExpression(*expression.left, table, depth + 1);
+        result["type"] = expression.value == "COUNT" || expression.value == "SUM" ? "bigint" :
+            expression.value == "AVG" ? "decimal(38,6)" : result["left"].at("type").get<std::string>();
+        result["nullable"] = expression.value != "COUNT";
+        if (expression.value == "SUM" || expression.value == "AVG") {
+            if (result["left"].at("type") == "float") result["type"] = "float";
+            else if (const auto decimal = decimalType(result["left"].at("type").get<std::string>()))
+                result["type"] = DecimalType{38, expression.value == "SUM" ? decimal->scale : std::max(6u, decimal->scale)}.name();
+        }
+    } else if (expression.kind == "Cast") {
+        if (!expression.left) invalid("missing CAST operand");
+        result["type"] = canonical(expression.value);
+        result["left"] = bindExpression(*expression.left, table, depth + 1);
+        result["nullable"] = result["left"].value("nullable", true);
+    } else if (expression.kind == "Unary" || expression.kind == "Binary") {
+        result["operator"] = expression.value;
+        result["type"] = isArithmetic(expression.value) ? "int" : "bool";
+        if (!expression.left) invalid("missing left operand");
+        result["left"] = bindExpression(*expression.left, table, depth + 1);
+        if (expression.kind == "Binary") {
+            if (!expression.right) invalid("missing right operand");
+            result["right"] = bindExpression(*expression.right, table, depth + 1);
+        }
+        result["nullable"] = expression.value != "IS NULL" && expression.value != "IS NOT NULL" &&
+            (result["left"].value("nullable", true) || (expression.kind == "Binary" && result["right"].value("nullable", true)));
+        if (isArithmetic(expression.value) && (result["left"].at("type") == "bigint" || (expression.kind == "Binary" && result["right"].at("type") == "bigint"))) result["type"] = "bigint";
+        if (isArithmetic(expression.value)) {
+            if (result["left"].at("type") == "float" || (expression.kind == "Binary" && result["right"].at("type") == "float")) {
+                result["type"] = "float";
+            } else {
+            const auto a = decimalType(result["left"].at("type").get<std::string>());
+            const auto b = expression.kind == "Binary" ? decimalType(result["right"].at("type").get<std::string>()) : std::nullopt;
+            if (expression.kind == "Unary" && a) result["type"] = a->name();
+            else if (a || b) result["type"] = decimalArithmeticType(expression.value, a ? a->scale : 0, b ? b->scale : 0, expression.location).name();
+            }
+        }
+    } else {
+        invalid("unsupported expression " + expression.kind);
+    }
+    return result;
+}
+
+std::vector<PlanColumn> schema(const catalog::Table& table) {
+    std::vector<PlanColumn> output;
+    for (std::size_t i = 0; i < table.columns.size(); ++i) {
+        output.push_back({table.columns[i].name, table.columns[i].type, i, table.columns[i].nullable, table.columns[i].defaultValue, table.columns[i].primaryKey, table.columns[i].unique, table.columns[i].references});
+    }
+    return output;
+}
+
+nlohmann::json expressionIdentity(nlohmann::json value) {
+    if (!value.is_object()) return value;
+    value.erase("line"); value.erase("column");
+    if (value.contains("left")) value["left"] = expressionIdentity(value["left"]);
+    if (value.contains("right")) value["right"] = expressionIdentity(value["right"]);
+    return value;
+}
+void lowerAggregate(LogicalPlan& project, const Statement& statement, const catalog::Table& scope) {
+    if (project.kind != "Project" || project.children.size() != 1) invalid("aggregate requires a projection input");
+    LogicalPlan aggregate;
+    aggregate.kind = "Aggregate";aggregate.table = project.table;
+    std::unordered_map<std::string, std::size_t> groups, functions;
+    for (const auto& key : statement.groupBy) {
+        auto expression = bindExpression(*key, scope);
+        const auto identity = expressionIdentity(expression).dump();
+        if (groups.contains(identity)) continue;
+        const auto index = aggregate.output.size();
+        groups.emplace(identity, index);
+        aggregate.output.push_back({"_group_" + std::to_string(index), expression.at("type").get<std::string>(), index, expression.value("nullable", true)});
+        aggregate.groupKeys.push_back(std::move(expression));
+    }
+    const auto reference = [&](std::size_t index, const nlohmann::json& expression) {
+        const auto& column = aggregate.output.at(index);
+        return nlohmann::json{{"kind", "Identifier"}, {"columnId", index}, {"name", column.name},
+            {"type", column.type}, {"nullable", column.nullable},
+            {"line", expression.value("line", std::size_t{0})}, {"column", expression.value("column", std::size_t{0})}};
+    };
+    // 聚合以上的表达式只引用分组键或聚合槽位，不保留原始行列引用。
+    std::function<nlohmann::json(nlohmann::json, std::size_t)> rewrite;
+    rewrite = [&](nlohmann::json expression, std::size_t depth) -> nlohmann::json {
+        if (depth > 256) invalid("aggregate expression depth exceeded");
+        const auto identity = expressionIdentity(expression).dump();
+        if (const auto group = groups.find(identity); group != groups.end()) return reference(group->second, expression);
+        const auto kind = expression.at("kind").get<std::string>();
+        if (kind == "AggregateExpr") {
+            auto found = functions.find(identity);
+            if (found == functions.end()) {
+                const auto index = aggregate.output.size();
+                found = functions.emplace(identity, index).first;
+                aggregate.output.push_back({"_aggregate_" + std::to_string(index), expression.at("type").get<std::string>(), index, expression.value("nullable", true)});
+                aggregate.aggregates.push_back({{"function", expression.at("function")}, {"argument", expression.at("left")},
+                    {"columnId", index}, {"type", expression.at("type")}, {"nullable", expression.at("nullable")}});
+            }
+            return reference(found->second, expression);
+        }
+        if (kind == "Identifier") throw MiniSqlError(ErrorCode::Semantic, "Column must be grouped or aggregated: " + expression.at("name").get<std::string>(),
+            {expression.value("line", std::size_t{0}), expression.value("column", std::size_t{0})});
+        if (expression.contains("left")) expression["left"] = rewrite(expression.at("left"), depth + 1);
+        if (expression.contains("right")) expression["right"] = rewrite(expression.at("right"), depth + 1);
+        return expression;
+    };
+    if (project.projections.empty()) for (const auto& column : project.output)
+        project.projections.push_back(bindExpression(Expr{"Identifier", column.name, {}, {}, statement.location}, scope));
+    for (std::size_t i = 0; i < project.projections.size(); ++i) {
+        auto& expression = project.projections[i];
+        expression = rewrite(expression, 0);
+        project.output.at(i).columnId = expression.at("kind") == "Identifier" ? expression.at("columnId").get<std::size_t>() : static_cast<std::size_t>(-1);
+    }
+    auto having = statement.having ? rewrite(bindExpression(*statement.having, scope), 0) : nlohmann::json(nullptr);
+    aggregate.children.push_back(std::move(project.children.front()));
+    project.children.clear();
+    if (statement.having) {
+        LogicalPlan filter;
+        filter.kind = "Filter";filter.table = aggregate.table;filter.output = aggregate.output;
+        filter.predicate = std::move(having);filter.children.push_back(std::move(aggregate));
+        project.children.push_back(std::move(filter));
+    } else project.children.push_back(std::move(aggregate));
+}
+LogicalPlan build(const Statement& statement, const catalog::Catalog& catalog) {
+    if (statement.kind == "Begin" || statement.kind == "Commit" || statement.kind == "Rollback") {
+        LogicalPlan plan;plan.kind = statement.kind;return plan;
+    }
+    if (statement.kind == "Checkpoint") { LogicalPlan plan; plan.kind = "Checkpoint"; return plan; }
+    if (statement.kind == "DropIndex") { LogicalPlan plan; plan.kind = "DropIndex"; plan.table = statement.table; plan.indexName = statement.indexName; return plan; }
+    if (statement.kind == "CreateIndex") { LogicalPlan plan; plan.kind = "CreateIndex"; plan.table = statement.table; plan.indexName = statement.indexName; plan.uniqueIndex = statement.uniqueIndex; plan.indexColumns = statement.indexColumns; return plan; }
+    const auto* table = catalog.find(statement.table);
+    if (!table) invalid("missing table " + statement.table);
+    const auto scope = catalog::queryScope(statement, catalog);
+    const bool aggregated = statement.kind == "Select" && catalog::analyzeSelect(statement, scope).aggregated;
+    LogicalPlan plan;
+    plan.table = table->name;
+    for (const auto& check : table->checks)
+        plan.checks.push_back(bindExpression(*deserializeExpression(nlohmann::json::parse(check)), *table));
+    if (statement.kind == "CreateTable") {
+        plan.kind = "CreateTable";
+        plan.checkDefinitions = serializeChecks(statement.checks);
+        plan.keys = table->keys;
+        plan.foreignKeys = table->foreignKeys;
+        plan.constraintNames = table->constraintNames;
+        plan.output = schema(*table);
+    } else if (statement.kind == "Insert") {
+        plan.kind = "Insert";
+        if (!statement.valueRows.empty()) {
+            auto single = statement;
+            single.valueRows.clear();
+            single.values.clear();
+            for (const auto& row : statement.valueRows) {
+                single.valueExpressions = row;
+                const auto item = build(single, catalog);
+                plan.insertRows.push_back({{"values", item.values}, {"expressions", item.insertExpressions}});
+                plan.columnMapping = item.columnMapping;
+            }
+            return plan;
+        }
+        plan.values = nlohmann::json::array();
+        if (!statement.valueExpressions.empty())
+            for (std::size_t i = 0; i < table->columns.size(); ++i)
+                plan.insertExpressions.push_back(bindExpression(Expr{"Literal", table->columns[i].defaultValue.value_or("NULL"), {}, {}, statement.location}, catalog::Table{"", {}}));
+        for (const auto& column : table->columns) plan.values.push_back(literalValue(column.defaultValue.value_or("NULL")));
+        const auto names = catalog::insertColumns(statement, *table);
+        for (std::size_t i = 0; i < names.size(); ++i) {
+            const auto index = columnIndex(*table, names[i]);
+            plan.columnMapping.push_back(index);
+            if (statement.valueExpressions.empty()) plan.values[index] = literalValue(statement.values[i]);
+            else {
+                const auto& expression = *statement.valueExpressions[i];
+                if (expression.kind == "Default") {
+                    const auto raw = table->columns[index].defaultValue.value_or("NULL");
+                    plan.insertExpressions[index] = bindExpression(Expr{"Literal", raw, {}, {}, expression.location}, catalog::Table{"", {}});
+                    plan.values[index] = literalValue(raw);
+                } else plan.insertExpressions[index] = bindExpression(expression, catalog::Table{"", {}});
+                if (expression.kind == "Literal") plan.values[index] = literalValue(expression.value);
+            }
+        }
+    } else if (statement.kind == "Select" || statement.kind == "Delete" || statement.kind == "Update") {
+        LogicalPlan scan;
+        scan.kind = "SeqScan";
+        scan.table = table->name;
+        scan.output = schema(*table);
+        scan.preservesRowId = true;
+        if (statement.kind == "Select" && !aggregated && statement.joins.empty() && statement.where) {
+            std::unordered_map<std::string, std::shared_ptr<Expr>> equalityLiterals;
+            std::unordered_map<std::string, std::pair<std::string, std::shared_ptr<Expr>>> rangeLiterals;
+            std::function<void(const Expr&)> collect = [&](const Expr& expression) {
+                if (expression.kind == "Binary" && expression.value == "AND" && expression.left && expression.right) {
+                    collect(*expression.left);
+                    collect(*expression.right);
+                    return;
+                }
+                if (expression.kind != "Binary" || !expression.left || !expression.right ||
+                    expression.left->kind != "Identifier" || expression.right->kind != "Literal") return;
+                const auto name = canonical(expression.left->value);
+                if (expression.value == "=") equalityLiterals[name] = expression.right;
+                else if (expression.value == "<" || expression.value == "<=" || expression.value == ">" || expression.value == ">=")
+                    rangeLiterals[name] = {expression.value, expression.right};
+            };
+            collect(*statement.where);
+            for (const auto& index : table->indexes) {
+                if (index.columns.empty()) continue;
+                std::vector<std::shared_ptr<Expr>> values;
+                std::size_t prefix = 0;
+                for (; prefix < index.columns.size(); ++prefix) {
+                    const auto found = equalityLiterals.find(canonical(index.columns[prefix]));
+                    if (found == equalityLiterals.end()) break;
+                    values.push_back(found->second);
+                }
+                bool selected = prefix == index.columns.size();
+                std::pair<std::string, std::shared_ptr<Expr>> range;
+                if (!selected && prefix < index.columns.size()) {
+                    const auto found = rangeLiterals.find(canonical(index.columns[prefix]));
+                    if (found != rangeLiterals.end()) { range = found->second; selected = true; }
+                }
+                if (!selected) continue;
+                scan.kind = "IndexScan";
+                scan.indexName = index.name;
+                scan.indexColumns = index.columns;
+                scan.indexValues = nlohmann::json::array();
+                for (const auto& value : values) scan.indexValues.push_back(bindExpression(*value, scope));
+                if (prefix < index.columns.size()) {
+                    scan.indexRangeOperator = range.first;
+                    scan.indexRangeValue = bindExpression(*range.second, scope);
+                }
+                break;
+            }
+        }
+        LogicalPlan input = std::move(scan);
+        for (std::size_t i = 0; i < statement.joins.size(); ++i) {
+            const auto& source = statement.joins[i];
+            const auto* right = catalog.find(source.table);
+            if (!right) invalid("missing join table");
+            LogicalPlan rightScan;
+            rightScan.kind = "SeqScan";rightScan.table = right->name;
+            rightScan.output = schema(*right);rightScan.preservesRowId = true;
+            const auto prefix = catalog::queryScope(statement, catalog, i + 1);
+            LogicalPlan join;
+            join.kind = source.left && source.right ? "FullJoin" : source.left ? "LeftJoin" : source.right ? "RightJoin" : "NestedLoopJoin";join.table = table->name;
+            join.output = schema(prefix);join.predicate = bindExpression(*source.on, prefix);
+            join.children.push_back(std::move(input));join.children.push_back(std::move(rightScan));
+            input = std::move(join);
+        }
+        if (statement.where) {
+            LogicalPlan filter;
+            filter.kind = "Filter";
+            filter.table = table->name;
+            filter.output = input.output;
+            filter.preservesRowId = input.preservesRowId;
+            filter.predicate = bindExpression(*statement.where, scope);
+            filter.children.push_back(std::move(input));
+            input = std::move(filter);
+        }
+        plan.kind = statement.kind == "Select" ? "Project" : statement.kind;
+        if (statement.kind == "Update") {
+            for (const auto& item : statement.assignments) {
+                const auto index = columnIndex(*table, item.column);
+                plan.columnMapping.push_back(index);
+                if (item.expression->kind == "Default")
+                    plan.projections.push_back(bindExpression(Expr{"Literal", table->columns[index].defaultValue.value_or("NULL"), {}, {}, item.expression->location}, scope));
+                else plan.projections.push_back(bindExpression(*item.expression, scope));
+            }
+        }
+        if (statement.kind == "Select") {
+            if (!statement.selectItems.empty()) {
+                for (std::size_t i = 0; i < statement.selectItems.size(); ++i) {
+                    const auto& item = statement.selectItems[i];
+                    if (item.expression->kind == "Wildcard") {
+                        const auto dot = item.expression->value.find('.');
+                        for (const auto& column : schema(scope)) {
+                            const auto& source = scope.columns[column.columnId];
+                            if (dot != std::string::npos && canonical(source.qualifier) != canonical(item.expression->value.substr(0, dot))) continue;
+                            plan.output.push_back(column);
+                            Expr reference{"Identifier", source.qualifier + "." + column.name, {}, {}, item.expression->location};
+                            plan.projections.push_back(bindExpression(reference, scope));
+                        }
+                        continue;
+                    }
+                    auto bound = bindExpression(*item.expression, scope);
+                    auto name = item.alias;
+                    if (name.empty()) name = item.expression->kind == "Identifier" ? bound.at("name").get<std::string>() : "expr_" + std::to_string(i + 1);
+                    const auto columnId = item.expression->kind == "Identifier" ? bound.at("columnId").get<std::size_t>() : static_cast<std::size_t>(-1);
+                    plan.output.push_back({name, bound.at("type").get<std::string>(), columnId, bound.value("nullable", true)});
+                    plan.projections.push_back(std::move(bound));
+                }
+            } else for (const auto& name : statement.selectList) {
+                if (name == "*") plan.output = schema(*table);
+                else {
+                    auto index = columnIndex(*table, name);
+                    plan.output.push_back({table->columns[index].name, table->columns[index].type, index});
+                }
+            }
+        }
+        plan.children.push_back(std::move(input));
+    } else {
+        invalid("unsupported statement " + statement.kind);
+    }
+    nlohmann::json sortKeys = nlohmann::json::array();
+    auto visibleOutput = plan.output;
+    if (statement.kind == "Select" && !statement.orderBy.empty()) {
+        if (plan.projections.empty()) {
+            for (const auto& column : plan.output) {
+                Expr reference{"Identifier", column.name, {}, {}};
+                plan.projections.push_back(bindExpression(reference, *table));
+            }
+        }
+        for (const auto& item : statement.orderBy) {
+            const auto resolved = catalog::resolveOrder(statement, item, scope);
+            const auto bound = bindExpression(*resolved, scope);
+            const auto identity = expressionIdentity(bound);
+            std::size_t index = 0;
+            while (index < plan.projections.size() && expressionIdentity(plan.projections[index]) != identity) ++index;
+            if (index == plan.projections.size()) {
+                if (statement.distinct) throw MiniSqlError(ErrorCode::Semantic, "DISTINCT ORDER BY must match a projected expression", item.expression->location);
+                plan.projections.push_back(bound);
+                plan.output.push_back({"_sort_" + std::to_string(sortKeys.size()), bound.at("type").get<std::string>(), static_cast<std::size_t>(-1), bound.value("nullable", true)});
+            }
+            sortKeys.push_back({{"index", index}, {"descending", item.descending}, {"nullsFirst", item.nullsFirst.value_or(item.descending)}});
+        }
+    }
+    if (aggregated) {
+        lowerAggregate(plan, statement, scope);
+        std::copy_n(plan.output.begin(), visibleOutput.size(), visibleOutput.begin());
+    }
+    if (statement.kind == "Select" && statement.distinct) {
+        LogicalPlan distinct;
+        distinct.kind = "Distinct";
+        distinct.table = plan.table;
+        distinct.output = plan.output;
+        distinct.children.push_back(std::move(plan));
+        plan = std::move(distinct);
+    }
+    if (!sortKeys.empty()) {
+        LogicalPlan sorted;
+        sorted.kind = "Sort";
+        sorted.table = plan.table;
+        sorted.output = visibleOutput;
+        sorted.sortKeys = std::move(sortKeys);
+        sorted.children.push_back(std::move(plan));
+        plan = std::move(sorted);
+    }
+    if (statement.kind == "Select" && (statement.limit || statement.offset)) {
+        LogicalPlan limit;
+        limit.kind = "Limit";
+        limit.table = plan.table;
+        limit.output = plan.output;
+        limit.limit = statement.limit;
+        limit.offset = statement.offset;
+        limit.children.push_back(std::move(plan));
+        plan = std::move(limit);
+    }
+    return plan;
+}
+}
+
+std::vector<LogicalPlan> compilePlans(const std::vector<Statement>& statements,
+                                      const catalog::Catalog& catalog) {
+    auto snapshot = catalog;
+    std::optional<catalog::Catalog> transactionCatalog;
+    std::vector<LogicalPlan> plans;
+    for (const auto& statement : statements) {
+        if (statement.kind == "Begin") transactionCatalog = snapshot;
+        else if (statement.kind == "Rollback" && transactionCatalog) { snapshot = *transactionCatalog;transactionCatalog.reset(); }
+        else if (statement.kind == "Commit") transactionCatalog.reset();
+        snapshot = catalog::compileSnapshot({statement}, snapshot);
+        plans.push_back(build(statement, snapshot));
+    }
+    return plans;
+}
+
+nlohmann::json serializePlans(const std::vector<LogicalPlan>& plans) {
+    nlohmann::json rows = nlohmann::json::array();
+    std::size_t nextId = 0;
+    std::function<std::size_t(const LogicalPlan&, int, std::size_t, std::size_t)> visit;
+    visit = [&](const LogicalPlan& plan, int parent, std::size_t depth, std::size_t statementIndex) {
+        const auto id = nextId++;
+        const auto rowIndex = rows.size();
+        nlohmann::json output = nlohmann::json::array();
+        for (const auto& column : plan.output) {
+            output.push_back({{"name", column.name}, {"type", column.type}, {"columnId", column.columnId}, {"nullable", column.nullable},
+                {"defaultValue", column.defaultValue ? nlohmann::json(*column.defaultValue) : nlohmann::json(nullptr)}, {"primaryKey", column.primaryKey}, {"unique", column.unique}, {"references", serializeReference(column.references)}});
+        }
+        rows.push_back({{"id", id}, {"parent", parent}, {"depth", depth}, {"statementIndex", statementIndex},
+                        {"kind", plan.kind}, {"detail", plan.kind + " " + plan.table}, {"table", plan.table},
+                        {"indexName", plan.indexName}, {"uniqueIndex", plan.uniqueIndex}, {"indexColumns", plan.indexColumns}, {"indexValues", plan.indexValues}, {"indexRangeOperator", plan.indexRangeOperator}, {"indexRangeValue", plan.indexRangeValue},
+                        {"output", output}, {"preservesRowId", plan.preservesRowId},
+                        {"predicate", plan.predicate}, {"values", plan.values}, {"insertExpressions", plan.insertExpressions}, {"insertRows", plan.insertRows},
+                        {"columnMapping", plan.columnMapping}, {"projections", plan.projections}, {"children", nlohmann::json::array()}});
+        rows[rowIndex]["limit"] = plan.limit ? nlohmann::json(std::to_string(*plan.limit)) : nlohmann::json(nullptr);
+        rows[rowIndex]["offset"] = std::to_string(plan.offset);
+        rows[rowIndex]["sortKeys"] = plan.sortKeys;
+        rows[rowIndex]["groupKeys"] = plan.groupKeys;
+        rows[rowIndex]["aggregates"] = plan.aggregates;
+        rows[rowIndex]["keys"] = serializeKeys(plan.keys);
+        rows[rowIndex]["checks"] = plan.checks;
+        rows[rowIndex]["checkDefinitions"] = plan.checkDefinitions;
+        rows[rowIndex]["foreignKeys"] = serializeForeignKeys(plan.foreignKeys);
+        rows[rowIndex]["constraintNames"] = serializeConstraintNames(plan.constraintNames);
+        for (const auto& child : plan.children) {
+            const auto childId = visit(child, static_cast<int>(id), depth + 1, statementIndex);
+            rows[rowIndex]["children"].push_back(childId);
+        }
+        return id;
+    };
+    for (std::size_t i = 0; i < plans.size(); ++i) visit(plans[i], -1, 0, i);
+    return rows;
+}
+
+std::vector<LogicalPlan> deserializePlans(const nlohmann::json& document) {
+    const auto invalid = []() -> void { throw MiniSqlError(ErrorCode::Storage, "Invalid serialized logical plan"); };
+    nlohmann::json rows;
+    if (document.is_array()) rows = document;
+    else if (document.is_object() && document.value("schemaVersion", 0u) == 1u && document.value("planKind", "") == "logical" && document.contains("plans"))
+        rows = document.at("plans");
+    else invalid();
+    if (!rows.is_array() || rows.size() > 65536) invalid();
+
+    struct Pending {
+        LogicalPlan plan;
+        std::int64_t parent = -1;
+        std::size_t statementIndex = 0;
+        std::vector<std::size_t> children;
+    };
+    std::vector<Pending> pending;
+    pending.reserve(rows.size());
+    std::function<void(const nlohmann::json&, std::size_t)> validateExpression;
+    validateExpression = [&](const nlohmann::json& expression, std::size_t depth) {
+        if (depth > 256 || !expression.is_object()) invalid();
+        const auto kind = expression.value("kind", "");
+        if (kind != "Literal" && kind != "Identifier" && kind != "Cast" &&
+            kind != "Unary" && kind != "Binary" && kind != "AggregateExpr") invalid();
+        if (expression.contains("left") && !expression.at("left").is_null()) validateExpression(expression.at("left"), depth + 1);
+        if (expression.contains("right") && !expression.at("right").is_null()) validateExpression(expression.at("right"), depth + 1);
+    };
+
+    for (std::size_t index = 0; index < rows.size(); ++index) {
+        const auto& row = rows.at(index);
+        if (!row.is_object() || !row.contains("id") || !row.at("id").is_number_unsigned() || row.at("id").get<std::size_t>() != index ||
+            !row.contains("parent") || !row.at("parent").is_number_integer() || !row.contains("depth") || !row.at("depth").is_number_unsigned() ||
+            !row.contains("statementIndex") || !row.at("statementIndex").is_number_unsigned() || !row.contains("kind") || !row.at("kind").is_string() ||
+            !row.contains("table") || !row.at("table").is_string() || !row.contains("output") || !row.at("output").is_array() ||
+            !row.contains("children") || !row.at("children").is_array() || !row.contains("columnMapping") || !row.at("columnMapping").is_array() ||
+            !row.contains("preservesRowId") || !row.at("preservesRowId").is_boolean()) invalid();
+        Pending item;
+        item.parent = row.at("parent").get<std::int64_t>();
+        if (item.parent < -1 || item.parent >= static_cast<std::int64_t>(rows.size())) invalid();
+        item.statementIndex = row.at("statementIndex").get<std::size_t>();
+        item.plan.kind = row.at("kind").get<std::string>();
+        item.plan.table = row.at("table").get<std::string>();
+        item.plan.preservesRowId = row.at("preservesRowId").get<bool>();
+        item.plan.indexName = row.value("indexName", std::string{});
+        item.plan.uniqueIndex = row.value("uniqueIndex", false);
+        item.plan.indexColumns = row.value("indexColumns", std::vector<std::string>{});
+        item.plan.indexValues = row.value("indexValues", nlohmann::json::array());
+        item.plan.indexRangeOperator = row.value("indexRangeOperator", std::string{});
+        item.plan.indexRangeValue = row.value("indexRangeValue", nlohmann::json(nullptr));
+        for (const auto& column : row.at("output")) {
+            if (!column.is_object() || !column.contains("name") || !column.at("name").is_string() || !column.contains("type") || !column.at("type").is_string() ||
+                !column.contains("columnId") || !column.at("columnId").is_number_unsigned() || !column.contains("nullable") || !column.at("nullable").is_boolean()) invalid();
+            PlanColumn value{column.at("name").get<std::string>(), column.at("type").get<std::string>(), column.at("columnId").get<std::size_t>(), column.at("nullable").get<bool>()};
+            if (column.contains("defaultValue") && !column.at("defaultValue").is_null()) value.defaultValue = column.at("defaultValue").get<std::string>();
+            value.primaryKey = column.value("primaryKey", false);
+            value.unique = column.value("unique", false);
+            if (column.contains("references") && !column.at("references").is_null()) {
+                if (!column.at("references").is_object()) invalid();
+                value.references = std::make_pair(column.at("references").at("table").get<std::string>(), column.at("references").at("column").get<std::string>());
+            }
+            item.plan.output.push_back(std::move(value));
+        }
+        for (const auto& child : row.at("children")) {
+            if (!child.is_number_unsigned() || child.get<std::size_t>() >= rows.size()) invalid();
+            item.children.push_back(child.get<std::size_t>());
+        }
+        for (const auto& value : row.at("columnMapping")) {
+            if (!value.is_number_unsigned()) invalid();
+            item.plan.columnMapping.push_back(value.get<std::size_t>());
+        }
+        if (row.contains("limit") && !row.at("limit").is_null()) {
+            if (!row.at("limit").is_string()) invalid();
+            std::uint64_t limit{};
+            const auto text = row.at("limit").get<std::string>();
+            const auto parsed = std::from_chars(text.data(), text.data() + text.size(), limit);
+            if (parsed.ec != std::errc{} || parsed.ptr != text.data() + text.size()) invalid();
+            item.plan.limit = limit;
+        }
+        if (row.contains("offset")) {
+            if (!row.at("offset").is_string()) invalid();
+            const auto text = row.at("offset").get<std::string>();
+            const auto parsed = std::from_chars(text.data(), text.data() + text.size(), item.plan.offset);
+            if (parsed.ec != std::errc{} || parsed.ptr != text.data() + text.size()) invalid();
+        }
+        item.plan.predicate = row.value("predicate", nlohmann::json(nullptr));
+        item.plan.values = row.value("values", nlohmann::json::array());
+        item.plan.insertExpressions = row.value("insertExpressions", nlohmann::json::array());
+        item.plan.insertRows = row.value("insertRows", nlohmann::json::array());
+        item.plan.projections = row.value("projections", nlohmann::json::array());
+        item.plan.sortKeys = row.value("sortKeys", nlohmann::json::array());
+        item.plan.groupKeys = row.value("groupKeys", nlohmann::json::array());
+        item.plan.aggregates = row.value("aggregates", nlohmann::json::array());
+        item.plan.checks = row.value("checks", nlohmann::json::array());
+        item.plan.checkDefinitions = row.value("checkDefinitions", nlohmann::json::array());
+        if (!item.plan.predicate.is_null()) validateExpression(item.plan.predicate, 0);
+        for (const auto& expression : item.plan.projections) validateExpression(expression, 0);
+        for (const auto& expression : item.plan.groupKeys) validateExpression(expression, 0);
+        for (const auto& aggregate : item.plan.aggregates) {
+            if (!aggregate.is_object() || !aggregate.contains("argument")) invalid();
+            if (!aggregate.at("argument").is_null()) validateExpression(aggregate.at("argument"), 0);
+        }
+        for (const auto& expression : item.plan.insertExpressions) if (!expression.is_null()) validateExpression(expression, 0);
+        for (const auto& inserted : item.plan.insertRows) {
+            if (!inserted.is_object() || !inserted.contains("expressions")) invalid();
+            for (const auto& expression : inserted.at("expressions")) if (!expression.is_null()) validateExpression(expression, 0);
+        }
+        if (row.contains("keys")) for (const auto& key : row.at("keys")) item.plan.keys.push_back({key.at("primary").get<bool>(), key.at("columns").get<std::vector<std::string>>()});
+        if (row.contains("foreignKeys")) for (const auto& key : row.at("foreignKeys")) item.plan.foreignKeys.push_back({key.at("columns").get<std::vector<std::string>>(), key.at("table").get<std::string>(), key.at("referencedColumns").get<std::vector<std::string>>()});
+        if (row.contains("constraintNames")) for (const auto& binding : row.at("constraintNames")) item.plan.constraintNames.push_back({binding.at("name").get<std::string>(), binding.at("kind").get<std::string>(), binding.at("index").get<std::size_t>()});
+        pending.push_back(std::move(item));
+    }
+    std::vector<bool> attached(rows.size(), false);
+    std::function<LogicalPlan(std::size_t, std::size_t)> buildTree;
+    buildTree = [&](std::size_t index, std::size_t depth) -> LogicalPlan {
+        if (depth > 256 || index >= pending.size() || attached[index]) invalid();
+        attached[index] = true;
+        auto plan = pending[index].plan;
+        for (const auto child : pending[index].children) {
+            if (pending[child].parent != static_cast<std::int64_t>(index)) invalid();
+            plan.children.push_back(buildTree(child, depth + 1));
+        }
+        return plan;
+    };
+    std::vector<LogicalPlan> result;
+    for (std::size_t index = 0; index < pending.size(); ++index) if (pending[index].parent == -1) result.push_back(buildTree(index, 0));
+    if (std::any_of(attached.begin(), attached.end(), [](bool value) { return !value; })) invalid();
+    return result;
+}
+}
