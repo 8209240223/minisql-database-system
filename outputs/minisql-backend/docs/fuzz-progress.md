@@ -106,7 +106,7 @@ Remove-Item Env:FUZZ_SOAK_ROUNDS
 Remove-Item Env:FUZZ_SOAK_STEPS
 ```
 
-长期或夜间回归可设置 `FUZZ_SOAK_ROUNDS`、`FUZZ_SOAK_DURATION_MS`、`FUZZ_SOAK_STEPS`、`FUZZ_SOAK_SEEDS` 和 `FUZZ_SOAK_TIMEOUT_MS`。本机已验证固定持续时间 5 秒、30 步、8 轮且失败分类为零；该入口提供可重复的多轮/定时证据，但仍不替代多小时资源趋势验收。
+长期或夜间回归可设置 `FUZZ_SOAK_ROUNDS`、`FUZZ_SOAK_DURATION_MS`、`FUZZ_SOAK_STEPS`、`FUZZ_SOAK_SEEDS` 和 `FUZZ_SOAK_TIMEOUT_MS`。本机已验证固定持续时间 5 秒、30 步、8 轮，以及固定持续时间 60 秒、96 步、39 轮，失败分类均为零；该入口提供可重复的多轮/定时证据，但仍不替代多小时资源趋势验收。
 
 ### 失败样本重放
 

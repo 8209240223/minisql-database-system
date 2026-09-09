@@ -434,6 +434,17 @@ AccessCatalog AccessCatalog::load(const std::filesystem::path& databasePath) {
     return result;
 }
 
+AccessCatalog AccessCatalog::fromDocument(nlohmann::json document, std::uint32_t permissionVersion) {
+    if (permissionVersion == 0 || !document.is_object() || !document.contains("users") || !document.contains("roles") ||
+        !document.at("users").is_object() || !document.at("roles").is_object())
+        throw MiniSqlError(ErrorCode::Storage, "Access catalog document is invalid");
+    AccessCatalog result;
+    result.enabled_ = true;
+    result.permissionVersion_ = permissionVersion;
+    result.catalog_ = std::move(document);
+    return result;
+}
+
 bool AccessCatalog::verify(const std::string& user, const std::string& password) const {
     if (!enabled_) return true;
     const auto name = normalized(user);

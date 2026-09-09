@@ -692,7 +692,7 @@ const server = http.createServer(async (req, res) => {
       castTargets: ['int', 'bigint', 'float', 'varchar', 'varchar(n)', 'decimal(p,s)', 'bool', 'date'],
       audit: true, permissions: true, backupRestore: true, backupManifestVersion: 2, backupManifestVersions: [2, 3],
       backupIncremental: true, backupChain: true, backupMigration: 'v1-to-v2',
-      permissionsModel: 'catalog-access', accessCatalogVersion: 1, accessCatalogStore: 'paged-access-catalog', accessCatalogPermissionVersion: permissionVersion,
+      permissionsModel: 'catalog-access', accessCatalogVersion: 1, accessCatalogStore: 'paged-access-catalog', engineAccessCatalogStore: 'persistent-catalog-system-table', accessCatalogPermissionVersion: permissionVersion,
       engineAuthorization: true, directBinaryAuth: true, accessCatalogHotReload: true,
       objectPermissions: true, roleInheritance: true,
       atomicPermissionEndpoints: true, permissionEndpoints: ['POST /users', 'DELETE /users/:name', 'POST /users/:name/password', 'POST /users/:name/roles', 'DELETE /users/:name/roles/:role', 'POST /roles', 'DELETE /roles/:name', 'POST /grants', 'POST /revokes'],
