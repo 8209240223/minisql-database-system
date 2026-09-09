@@ -64,6 +64,62 @@ ExactDecimal decimalValue(const json& value, const std::string& type) {
     const auto decimal = decimalType(type);
     return decimal ? ExactDecimal::parse(value.get<std::string>(), decimal->precision, decimal->scale) : ExactDecimal::fromInteger(value.get<std::int64_t>());
 }
+// X09 3.5: 相关子查询 by-value 参数绑定执行。序列化外层列绑定值为 SQL 字面量
+// 文本（与解析器产出的 Literal 一致），随后绑定进已缓存的结构化 AST，取代原
+// 先“文本重解析 + 字面量改写”的路径。
+using OuterBinding = std::unordered_map<std::string, std::pair<std::size_t, std::string>>;
+std::string parameterLiteral(const json& value, const std::string& type) {
+    if (value.is_null()) return "NULL";
+    if (type == "bool") return value.get<bool>() ? "TRUE" : "FALSE";
+    if (type == "float") return formatFiniteFloat(value.get<double>());
+    if (type == "int" || type == "bigint") return std::to_string(value.get<std::int64_t>());
+    if (decimalType(type)) return value.is_string() ? value.get<std::string>() : std::to_string(value.get<std::int64_t>());
+    const auto text = value.get<std::string>();
+    std::string quoted;
+    for (const char ch : text) { quoted += ch; if (ch == '\'') quoted += '\''; }
+    if (type == "date") return "DATE'" + quoted + "'";
+    return "'" + quoted + "'";
+}
+std::shared_ptr<sql::Expr> bindOuter(const std::shared_ptr<sql::Expr>& expression, const OuterBinding& outer, const json& row, std::size_t depth = 0) {
+    if (!expression) return nullptr;
+    if (depth > 256) fail("correlated subquery expression depth exceeded");
+    if (expression->kind == "Identifier") {
+        const auto found = outer.find(key(expression->value));
+        if (found != outer.end()) {
+            const auto columnId = found->second.first;
+            if (columnId >= row.size()) fail("Correlated subquery outer column outside row");
+            auto literal = std::make_shared<sql::Expr>();
+            literal->kind = "Literal";
+            literal->value = parameterLiteral(row.at(columnId), found->second.second);
+            literal->location = expression->location;
+            return literal;
+        }
+    }
+    auto cloned = std::make_shared<sql::Expr>();
+    cloned->kind = expression->kind;
+    cloned->value = expression->value;
+    cloned->location = expression->location;
+    cloned->subquerySql = expression->subquerySql;
+    if (expression->left) cloned->left = bindOuter(expression->left, outer, row, depth + 1);
+    if (expression->right) cloned->right = bindOuter(expression->right, outer, row, depth + 1);
+    return cloned;
+}
+sql::Statement bindOuterStatement(const sql::Statement& statement, const OuterBinding& outer, const json& row) {
+    sql::Statement out = statement;
+    out.where = bindOuter(statement.where, outer, row);
+    for (auto& item : out.selectItems) item.expression = bindOuter(item.expression, outer, row);
+    for (auto& item : out.orderBy) item.expression = bindOuter(item.expression, outer, row);
+    for (auto& assignment : out.assignments) assignment.expression = bindOuter(assignment.expression, outer, row);
+    for (auto& check : out.checks) check = bindOuter(check, outer, row);
+    for (auto& value : out.valueExpressions) value = bindOuter(value, outer, row);
+    for (auto& valueRow : out.valueRows) for (auto& value : valueRow) value = bindOuter(value, outer, row);
+    for (auto& column : out.groupBy) column = bindOuter(column, outer, row);
+    out.having = bindOuter(statement.having, outer, row);
+    for (auto& join : out.joins) join.on = bindOuter(join.on, outer, row);
+    if (statement.fromSubquery)
+        out.fromSubquery = std::make_shared<sql::Statement>(bindOuterStatement(*statement.fromSubquery, outer, row));
+    return out;
+}
 std::string storedDecimal(const json& value, const storage::ColumnSchema& column, SourceLocation location) {
     try {
         const auto text = value.is_number_integer() ? std::to_string(value.get<std::int64_t>()) : value.get<std::string>();
@@ -1413,43 +1469,20 @@ nlohmann::json Database::diagnostics(const std::string& source) const {
 nlohmann::json Database::runCorrelatedSubquery(const json& expression, const json& row) {
     const auto sql = expression.at("subquerySql").get<std::string>();
     const auto& scope = expression.at("outerColumns");
-    const auto literal = [](const json& value, const std::string& type) -> std::string {
-        if (value.is_null()) return "NULL";
-        if (type == "bool") return value.get<bool>() ? "TRUE" : "FALSE";
-        if (type == "float") return formatFiniteFloat(value.get<double>());
-        if (type == "int" || type == "bigint") return std::to_string(value.get<std::int64_t>());
-        if (decimalType(type)) return value.is_string() ? value.get<std::string>() : std::to_string(value.get<std::int64_t>());
-        const auto text = value.get<std::string>();
-        std::string quoted;
-        for (const char ch : text) { quoted += ch; if (ch == '\'') quoted += '\''; }
-        if (type == "date") return "DATE '" + quoted + "'";
-        return "'" + quoted + "'";
-    };
-    const auto tokens = sql::tokenize(sql);
-    std::string rewritten;
-    for (std::size_t index = 0; index < tokens.size(); ++index) {
-        const auto& token = tokens[index];
-        std::size_t consumed = 0;
-        std::string name = key(token.lexeme);
-        if (token.type == "IDENTIFIER" && index + 2 < tokens.size() && tokens[index + 1].lexeme == "." && tokens[index + 2].type == "IDENTIFIER") {
-            name = key(token.lexeme + "." + tokens[index + 2].lexeme);
-            consumed = 2;
-        }
-        if (token.type == "IDENTIFIER" && scope.contains(name)) {
-            const auto& binding = scope.at(name);
-            const auto columnId = binding.at("columnId").get<std::size_t>();
-            if (columnId >= row.size()) fail("Correlated subquery outer column outside row");
-            if (!rewritten.empty()) rewritten += ' ';
-            rewritten += literal(row.at(columnId), binding.at("type").get<std::string>());
-            index += consumed;
-            continue;
-        }
-        if (!rewritten.empty()) rewritten += ' ';
-        rewritten += token.lexeme;
-    }
-    const auto ast = sql::parse(sql::tokenize(rewritten + ";"));
-    if (ast.size() != 1 || ast.front().kind != "Select") throw MiniSqlError(ErrorCode::Semantic, "Correlated subquery must be SELECT");
-    const auto subplans = sql::compilePlans(ast, catalog_.view());
+    OuterBinding outer;
+    outer.reserve(scope.size());
+    for (auto it = scope.begin(); it != scope.end(); ++it)
+        outer.emplace(it.key(),
+                      std::make_pair(it.value().at("columnId").get<std::size_t>(),
+                                     it.value().at("type").get<std::string>()));
+    // 缓存按 subquerySql 解析的结构化 AST，执行时以 by-value 参数绑定替换外层列，
+    // 避免逐行文本重解析与字面量改写；仍以当前 catalog 编译，保证 schema 变更生效。
+    auto& ast = correlatedAstCache_[sql];
+    if (ast.empty()) ast = sql::parse(sql::tokenize(sql + ";"));
+    if (ast.size() != 1 || ast.front().kind != "Select")
+        throw MiniSqlError(ErrorCode::Semantic, "Correlated subquery must be SELECT");
+    sql::Statement bound = bindOuterStatement(ast.front(), outer, row);
+    const auto subplans = sql::compilePlans({std::move(bound)}, catalog_.view());
     const auto result = run(subplans.front());
     return result.at("rows");
 }

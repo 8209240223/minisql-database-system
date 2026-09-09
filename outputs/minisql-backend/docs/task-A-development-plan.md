@@ -240,3 +240,13 @@ node tests\subquery-smoke.mjs tests\statistics-smoke.mjs tests\explain-smoke.mjs
 - [x] **3.3g** 回归全绿：C++ contract 全 59 用例通过；node derived 12 / subquery 24 / parser 18 / planner 26 / explain 21 / outer-join 9 / aggregate-plan 75 / update 30 / insert 45 / database 7 通过（join-process、aggregate-process 因 workbench 未装 `sql.js` 差分依赖而无法运行，属环境缺失、与本次改动无关）。
 
 > 下一步 **3.3/3.4**：把相关子查询（EXISTS/IN/标量）从“文本重解析 + 外层列字面量替换”迁移到 by-value 参数绑定的 Apply/SemiJoin 计划节点与优化器去相关改写。
+
+### 6.7 X09 Phase 3.5 记录（builder-A 第七次提交）
+
+> 本轮推进 **相关子查询 by-value 参数绑定执行（非文本重解析）**。分支 `builder-A`。
+
+- [x] **3.5a** `execution/database.cpp`：新增 `parameterLiteral()`——把外层列绑定值序列化为 SQL 字面量文本（与解析器产出的 Literal 一致，含 BOOL/浮点/整数/十进制/字符串转义/`DATE`）；新增 `bindOuter()`——递归克隆表达式树并仅把「匹配外层作用域限定名」的 `Identifier` 节点替换为携带绑定值的 `Literal` 节点；新增 `bindOuterStatement()`——克隆整条子查询 Statement 并对其 where/selectItems/orderBy/assignments/checks/valueExpressions/valueRows/groupBy/having/joins.on/fromSubquery 逐表达式绑定。
+- [x] **3.5b** `database.hpp`：新增 `correlatedAstCache_`（`unordered_map<subquerySql, vector<Statement>>`）——按 subquerySql 缓存已解析的结构化 AST。
+- [x] **3.5c** `runCorrelatedSubquery()`：弃用「tokenize 整段子查询文本 → 外层列字面量改写 → 重解析」路径，改为「缓存 AST → 每行对缓存做一次结构化 by-value 绑定 → 以当前 catalog 编译 → 执行」。仍保留原有外层列越界、非 SELECT、类型化字面量校验语义；缓存经当前 catalog 重新编译，schema 变更仍即时生效。
+- [x] **3.5d** 回归全绿：ctest C++ contract 全 59 用例通过；node subquery 24 / derived 12 / statistics 11 / explain 21 / parser 18 / planner 26 / diagnostics 22 通过；optimizer_contract 518 项通过。
+- [ ] 遗留：真正的 **Apply/SemiJoin 计划节点 + 优化器去相关**（`compiled-once` 参数化执行，进一步消除每行重编译）留待 3.4/后续阶段；本阶段已消除逐行**文本重解析** 路径。

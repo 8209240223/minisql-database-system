@@ -3,6 +3,8 @@
 #include <chrono>
 #include <memory>
 #include <string>
+#include <unordered_map>
+#include <vector>
 #include "minisql/catalog/persistent_catalog.hpp"
 #include "minisql/sql/planner.hpp"
 #include "minisql/storage/bplus_tree.hpp"
@@ -40,6 +42,9 @@ private:
     nlohmann::json runStatement(const sql::LogicalPlan& plan);
     nlohmann::json run(const sql::LogicalPlan& plan);
     nlohmann::json runNode(const sql::LogicalPlan& plan);
+    // X09 3.5: 相关子查询按 subquerySql 缓存已解析 AST，执行时以 by-value 参数
+    // 绑定替换外层列（不再逐行文本重解析）。值会在 run 时以当前 catalog 重新编译。
+    std::unordered_map<std::string, std::vector<sql::Statement>> correlatedAstCache_;
     void evaluateAutoCheckpoint(std::size_t committedWriteStatements, std::size_t committedDirtyPages);
     std::vector<nlohmann::json>* nodeStats_ = nullptr;
     std::size_t sortMemoryRows_ = 10000;
