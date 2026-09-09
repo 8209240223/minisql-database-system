@@ -7,6 +7,8 @@
 #include <thread>
 #include <atomic>
 #include <condition_variable>
+#include <unordered_map>
+#include <vector>
 #include "minisql/catalog/persistent_catalog.hpp"
 #include "minisql/sql/planner.hpp"
 #include "minisql/storage/bplus_tree.hpp"
@@ -48,6 +50,15 @@ private:
     nlohmann::json runStatement(const sql::LogicalPlan& plan);
     nlohmann::json run(const sql::LogicalPlan& plan);
     nlohmann::json runNode(const sql::LogicalPlan& plan);
+    // X09 3.5: 相关子查询按 subquerySql 缓存已解析 AST，执行时以 by-value 参数
+    // 绑定替换外层列（不再逐行文本重解析）。值会在 run 时以当前 catalog 重新编译。
+    std::unordered_map<std::string, std::vector<sql::Statement>> correlatedAstCache_;
+    // X09 3.4: 相关子查询「保守执行优化」——等值/确定性相关的 EXISTS/IN/标量按绑定
+    // 参数分组，对每个不同参数物化子查询一次（collection 语义半连接），避免重复执行。
+    // 以 (subquerySql|scope) 为形缓存外层列引用，以 (shape|绑定值) 缓存结果行；
+    // 缓存生命周期仅在单条语句内（runStatement/EXPLAIN ANALYZE 入口清空）。
+    std::unordered_map<std::string, std::vector<std::size_t>> correlatedColumnsCache_;
+    std::unordered_map<std::string, nlohmann::json> correlatedRowsCache_;
     std::vector<nlohmann::json>* nodeStats_ = nullptr;
     std::size_t sortMemoryRows_ = 10000;
     std::size_t aggregateMemoryRows_ = 10000;

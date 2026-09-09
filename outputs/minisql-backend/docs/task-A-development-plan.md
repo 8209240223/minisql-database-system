@@ -240,3 +240,25 @@ node tests\subquery-smoke.mjs tests\statistics-smoke.mjs tests\explain-smoke.mjs
 - [x] **3.3g** 回归全绿：C++ contract 全 59 用例通过；node derived 12 / subquery 24 / parser 18 / planner 26 / explain 21 / outer-join 9 / aggregate-plan 75 / update 30 / insert 45 / database 7 通过（join-process、aggregate-process 因 workbench 未装 `sql.js` 差分依赖而无法运行，属环境缺失、与本次改动无关）。
 
 > 下一步 **3.3/3.4**：把相关子查询（EXISTS/IN/标量）从“文本重解析 + 外层列字面量替换”迁移到 by-value 参数绑定的 Apply/SemiJoin 计划节点与优化器去相关改写。
+
+### 6.7 X09 Phase 3.5 记录（builder-A 第七次提交）
+
+> 本轮推进 **相关子查询 by-value 参数绑定执行（非文本重解析）**。分支 `builder-A`。
+
+- [x] **3.5a** `execution/database.cpp`：新增 `parameterLiteral()`——把外层列绑定值序列化为 SQL 字面量文本（与解析器产出的 Literal 一致，含 BOOL/浮点/整数/十进制/字符串转义/`DATE`）；新增 `bindOuter()`——递归克隆表达式树并仅把「匹配外层作用域限定名」的 `Identifier` 节点替换为携带绑定值的 `Literal` 节点；新增 `bindOuterStatement()`——克隆整条子查询 Statement 并对其 where/selectItems/orderBy/assignments/checks/valueExpressions/valueRows/groupBy/having/joins.on/fromSubquery 逐表达式绑定。
+- [x] **3.5b** `database.hpp`：新增 `correlatedAstCache_`（`unordered_map<subquerySql, vector<Statement>>`）——按 subquerySql 缓存已解析的结构化 AST。
+- [x] **3.5c** `runCorrelatedSubquery()`：弃用「tokenize 整段子查询文本 → 外层列字面量改写 → 重解析」路径，改为「缓存 AST → 每行对缓存做一次结构化 by-value 绑定 → 以当前 catalog 编译 → 执行」。仍保留原有外层列越界、非 SELECT、类型化字面量校验语义；缓存经当前 catalog 重新编译，schema 变更仍即时生效。
+- [x] **3.5d** 回归全绿：ctest C++ contract 全 59 用例通过；node subquery 24 / derived 12 / statistics 11 / explain 21 / parser 18 / planner 26 / diagnostics 22 通过；optimizer_contract 518 项通过。
+- [ ] 遗留：真正的 **Apply/SemiJoin 计划节点 + 优化器去相关**（`compiled-once` 参数化执行，进一步消除每行重编译）留待 3.4/后续阶段；本阶段已消除逐行**文本重解析** 路径。
+
+### 6.8 X09 Phase 3.4 记录 —— 保守执行优化（builder-A 第八次提交）
+
+> 经与用户对齐：本轮 **Phase 3.4 采用「保守执行优化」**（仅改 executor，不触 planner/optimizer/序列化），把相关子查询从「逐行重执行」优化为「按绑定参数分组、对每个不同参数物化一次（集合语义半连接）」。分支 `builder-A`。
+
+- [x] **3.4a** `execution/database.cpp`：新增 `collectOuterReferences()`/`collectStatementOuterReferences()`——扫描子查询 AST 中实际引用到的外层列 `columnId`（去重、升序，遍历字段与 `bindOuterStatement` 对齐）。
+- [x] **3.4b** `runCorrelatedSubquery()`：以 `(subquerySql|scope)` 为“相关形状”，缓存引用列；再以 `(形状|绑定值)` 分组建缓存键；命中则直接返回已物化的结果行，未命中才绑定+编译+执行并写入缓存。**结果仅取决于被引用的外层列绑定值**，故对重复参数（如多个外层行共享同一 `grp`）只执行一次，正确性等同逐行。
+- [x] **3.4c** 语句级生命周期：`correlatedRowsCache_` 在 `runStatement()` 入口及 EXPLAIN ANALYZE 实际执行前清空，杜绝跨语句在数据变更后的陈旧复用。
+- [x] **3.4d** `database.hpp`：新增 `correlatedColumnsCache_`（形状→引用列）与 `correlatedRowsCache_`（形状|绑定值→结果行）。
+- [x] **3.4e** 新增端到端 `tests/correlated-exec-smoke.mjs`：8 项覆盖 EXISTS/IN/NOT EXISTS/标量相关的分组半连接结果正确，以及「同一库先后两条语句、后一条须反映新写入（验证语句级清缓存）」，全部通过。
+- [x] **3.4f** 回归全绿：ctest C++ contract 全 59 用例通过；node correlated-exec 8 / subquery 24 / derived 12 / statistics 11 / explain 21 / parser 18 / planner 26 / diagnostics 22 通过；optimizer_contract 518 项通过。
+- [ ] 遗留：真正 **Apply/SemiJoin/AntiJoin 计划节点 + 优化器去相关**（消除每行重编译的 `compiled-once` 参数化执行）是更大工程，涉及 planner 生成结构化子计划与 serialization/executor 同步改造，留待后续项目阶段（非本轮范围，经用户确认）。
