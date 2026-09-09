@@ -1,6 +1,6 @@
 // X24 C++ 引擎入口权限回归：验证页式权限目录被真实 session 与直连命令共同执行。
 import assert from 'node:assert/strict';
-import { mkdtempSync } from 'node:fs';
+import { mkdtempSync, unlinkSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -76,6 +76,10 @@ try {
   await session.terminate();
 }
 
+// The C++ engine must be able to restart from the PersistentCatalog system copy
+// even when the external page source is temporarily unavailable.
+unlinkSync(accessPages);
+
 function direct(sql, user, password) {
   const result = spawnSync(executable, [database, 'execute'], {
     input: sql,
@@ -88,6 +92,10 @@ function direct(sql, user, password) {
   assert.ifError(result.error);
   return { code: result.status, data: JSON.parse(result.stdout.trim()) };
 }
+
+const systemCatalogSelect = direct('SELECT * FROM public_records;', 'alice', 'alice-secret');
+equal(systemCatalogSelect.code, 0, 'restart can authenticate from the PersistentCatalog access system table');
+equal(systemCatalogSelect.data.success, true, 'system-table access snapshot authorizes the restarted engine');
 
 const directSelect = direct('SELECT * FROM public_records;', 'alice', 'alice-secret');
 equal(directSelect.code, 0, 'direct authenticated select exits successfully');

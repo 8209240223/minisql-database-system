@@ -377,6 +377,30 @@ Database::~Database() {
     }
 }
 
+void Database::synchronizeAccessCatalog(const nlohmann::json& document, std::uint32_t permissionVersion) {
+    std::lock_guard<std::recursive_mutex> guard(mu_);
+    requireAvailable();
+    if (transaction_ != TransactionState::Idle)
+        throw MiniSqlError(ErrorCode::Transaction, "Cannot synchronize access catalog during an active transaction");
+    const auto payload = document.dump();
+    const auto existing = catalog_.accessCatalogRecord();
+    if (existing && existing->permissionVersion >= permissionVersion) {
+        if (existing->permissionVersion == permissionVersion && existing->payload != payload)
+            throw MiniSqlError(ErrorCode::Catalog, "Access catalog version conflict");
+        return;
+    }
+    buffer_.beginWriteBatch();
+    try {
+        catalog_.storeAccessCatalog(permissionVersion, payload);
+        buffer_.commitWriteBatch();
+        catalog_.reload();
+    } catch (...) {
+        if (file_->writeBatchActive()) buffer_.rollbackWriteBatch();
+        throw;
+    }
+    ++catalogVersion_;
+}
+
 void Database::setSessionContext(const std::string& sessionId, const std::filesystem::path& cancelFile) {
     sessionId_ = sessionId;
     cancelFile_ = cancelFile;
