@@ -38,6 +38,8 @@
   - 全部要求 `GRANT` 权限，失败返回 4xx 且不落盘部分状态；CORS 允许 DELETE。
 - **启动预热弹性**：引擎 Catalog 预热若因二进制缺失/损坏失败，服务器仍进入降级模式（健康检查报 degraded、引擎路由返回 503），使不依赖引擎的 access/audit/capabilities 管理端点保持可用。
 - **新增集成测试**（`outputs/minisql-backend/tests/access-atomic-http.mjs`）：39 项检查通过（不依赖 C++ 引擎）。
+- **C++ 引擎鉴权闭环（2026-09-10 补）**：新增页式权限目录读取器并接入 `minisql_database.exe`；真实 session 和直连命令在执行前校验身份、操作与对象权限，session 按 `permissionVersion` 热重载；bridge 关闭共享 worker 时复用最后一次已验证身份，避免权限收口后关闭请求悬挂。
+- **索引检查调用链修复（2026-09-10 补）**：bridge 将 `table`/`index` 转发到 C++ session，权限 HTTP 回归新增页级索引检查断言。
 - 更新 `outputs/minisql-backend/docs/access-control-progress.md`（本轮实现、验证、限制）。
 
 ### C3 · X27 Fuzz 与长期回归
@@ -80,6 +82,8 @@
 | `node tests/access-store-contract.mjs` | X24 页式权限目录：页布局、多页负载、损坏拒绝、原子写、JSON 迁移 | 48 项通过 |
 | `node tests/access-catalog-atomic-contract.mjs` | X24 原子权限接口（本次新增） | 27 项通过 |
 | `node tests/access-atomic-http.mjs` | X24 原子 HTTP 资源端点（本次新增，不依赖引擎） | 39 项通过 |
+| `node tests/access-control-process.mjs` | X24 C++ session/直连入口身份、密码和对象授权 | 14 项通过 |
+| `node tests/access-control-http.mjs`（索引检查扩展） | X24 bridge 到 C++ session 的索引检查调用链 | 40 项通过 |
 | `node tests/fuzz-model-contract.mjs` | X27 生成器/缩减器确定性、覆盖 | 10 项通过 |
 | `node tests/fuzz-process-contract.mjs` | X27 子进程隔离、超时、输出超限、异常退出 | 7 项通过 |
 | `node tests/fuzz/generate-corpus.mjs` | X27 固定种子语料生成 + 状态机校验 | 通过（3 种子 × 100 SELECT + 96 步） |
@@ -104,7 +108,7 @@
 
 | X 编号 | 状态 | 说明 |
 | --- | --- | --- |
-| X24 | 部分实现 | 访问目录、角色继承、对象授权、加盐密码、跨会话身份、元数据过滤、审计过滤、原子 HTTP 端点和权限感知 CLI 均已验证；工作台已携带当前身份。仍缺：访问目录进入 C++ 页式 Catalog、直接二进制入口鉴权。 |
+| X24 | 部分实现 | 访问目录、角色继承、对象授权、加盐密码、跨会话身份、元数据过滤、审计过滤、原子 HTTP 端点、权限感知 CLI，以及 C++ session/直连入口身份校验和权限版本热重载均已验证；工作台已携带当前身份。仍缺：访问目录统一进入现有 `PersistentCatalog` 系统表，复杂 SQL 对象从轻量扫描升级为完整 AST 绑定。 |
 | X27 | 部分实现 | SELECT 固定种子差分 500 项、DDL/DML 状态机生成与持久化、真实 C++ session 差分、3 种固定种子各 96 步回归、2 种固定种子各 512 步长跑、DATE/BOOL 字面量回归、模型缩减、故障分类、五阶段跨进程崩溃恢复组合，以及 4 种子 × 512 步 × 4096 条压力数据的溢写/资源回归均已验证。仍缺：无限输入和多小时长期资源趋势。 |
 | C2 工作台 | 部分实现 | 已接入真实 C++ 编译、Token/AST/计划展示、诊断、事务、历史、CSV、存储统计、身份、权限/审计/会话、锁等待取消、资源预算、客户端超时和备份入口；真实 Edge 浏览器已覆盖成功/失败查询、客户端超时、活动请求取消、全量备份、替换恢复、损坏备份失败隔离和恢复后查询。仍缺：迁移失败专用 UI 流程建模与验收。 |
 | C4 全量验收 | 部分完成 | 已定稿 `outputs/V3_feature_matrix.md` 与 `outputs/V3最终验收报告.md`，但 X01-X27 中仍有部分实现项，不能关闭整体 V3 验收。 |
@@ -147,15 +151,15 @@
 2. 工作台浏览器 DOM 回归已经通过；新增的 `c2-resilience-dom.cjs` 需要在 CI 环境确认 Edge、C++ 引擎、bridge 和隔离数据库目录的启动条件一致。
 
 **成员 C 待完成**
-- 在 C++ 内部 Catalog 中落地访问目录页式系统表，并为直接二进制入口补齐身份校验。
+- 将当前 C++ 可读取的访问页与现有 `PersistentCatalog` 系统表统一，并将复杂 SQL 权限对象识别接入完整绑定结果。
 - 补齐迁移失败专用 UI 流程建模与浏览器验收。
-- 访问目录进入 C++ 页式 Catalog（需与成员 B 接口协作）。
+- 与成员 B 协作完成访问目录系统表统一和迁移兼容验证。
 - 在无限输入和多小时运行条件下补充 X27 资源趋势证据。
 
 ## 八、2026-09-10 合并后结论
 
 - C1、C2、C3 的主路径、接口和专项回归已完成本轮收口；A/B 的最新提交（含结构化相关子查询执行、页级索引、WAL/检查点）也已合并并通过回归；C4 的矩阵和报告已更新为合并后的真实证据。
-- C 任务不能标记为“全部完成”：X24 仍未把访问目录接入 C++ 内部 Catalog，C2 仍缺迁移失败专用 UI 流程，X27 仍缺无限输入和多小时长期资源趋势。
+- C 任务仍不能标记为“全部完成”：X24 尚未与现有 `PersistentCatalog` 系统表统一，C2 仍缺迁移失败专用 UI 流程，X27 仍缺无限输入和多小时长期资源趋势；同时 X01-X27 仍有其他部分实现项。
 - X01-X27 中仍有多个“部分实现”项，因此整体 V3 最终验收继续保持未通过，不把 A/B/C 的专项测试通过等同于全部需求完成。
 
 ---

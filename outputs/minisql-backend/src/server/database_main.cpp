@@ -1,5 +1,7 @@
 #include "minisql/execution/database.hpp"
 #include "minisql/common/wire_json.hpp"
+#include "minisql/security/access_catalog.hpp"
+#include <cstdlib>
 #include <iostream>
 #include <iterator>
 #ifdef _WIN32
@@ -9,7 +11,35 @@
 
 namespace {
 using json = nlohmann::json;
-int session(minisql::execution::Database& database) {
+void authorizeRequest(const minisql::security::AccessCatalog& access, const json& request,
+                      const std::string& operation, const std::string& sql = {},
+                      const std::string& table = {}, const std::string& index = {}) {
+    if (!access.enabled()) return;
+    if (!request.contains("user") || !request["user"].is_string() ||
+        !request.contains("password") || !request["password"].is_string() ||
+        request["user"].get_ref<const std::string&>().empty() || request["user"].get_ref<const std::string&>().size() > 64 ||
+        request["password"].get_ref<const std::string&>().size() > 4096)
+        throw minisql::MiniSqlError(minisql::ErrorCode::Permission, "Permission denied");
+    const auto& user = request["user"].get_ref<const std::string&>();
+    const auto& password = request["password"].get_ref<const std::string&>();
+    if (!access.verify(user, password)) throw minisql::MiniSqlError(minisql::ErrorCode::Permission, "Permission denied");
+    access.authorize(user, operation, sql, table, index);
+}
+
+void authorizeDirect(const minisql::security::AccessCatalog& access, const std::string& operation,
+                     const std::string& sql = {}) {
+    const auto* bypass = std::getenv("MINISQL_AUTH_BYPASS");
+    if (!access.enabled() || (bypass && std::string(bypass) == "1")) return;
+    const auto* configuredUser = std::getenv("MINISQL_USER");
+    const auto* configuredPassword = std::getenv("MINISQL_PASSWORD");
+    const std::string user = configuredUser ? configuredUser : "";
+    const std::string password = configuredPassword ? configuredPassword : "";
+    if (!access.verify(user, password)) throw minisql::MiniSqlError(minisql::ErrorCode::Permission, "Permission denied");
+    access.authorize(user, operation, sql);
+}
+
+int session(minisql::execution::Database& database, minisql::security::AccessCatalog access,
+            const std::filesystem::path& databasePath) {
     const auto emit = [](json value) {
         value["integerEncoding"] = "safe-number-or-decimal-string";
         std::cout << minisql::wireJson(std::move(value)).dump() << '\n' << std::flush;
@@ -42,10 +72,14 @@ int session(minisql::execution::Database& database) {
             id = request["id"];
             for (const auto& [name, value] : request.items()) {
                 (void)value;
-                if (name != "id" && name != "operation" && name != "sql" && name != "sessionId" && name != "cancelFile")
+                if (name != "id" && name != "operation" && name != "sql" && name != "sessionId" && name != "cancelFile" && name != "table" && name != "index" && name != "user" && name != "password")
                     throw minisql::MiniSqlError(minisql::ErrorCode::InvalidArgument, "Unknown session request field");
             }
             const auto operation = request["operation"].get<std::string>();
+            const auto refreshedAccess = minisql::security::AccessCatalog::load(databasePath);
+            if (refreshedAccess.enabled() != access.enabled() ||
+                refreshedAccess.permissionVersion() != access.permissionVersion())
+                access = refreshedAccess;
             if (request.contains("sessionId")) {
                 if (!request["sessionId"].is_string() || request["sessionId"].get_ref<const std::string&>().empty() ||
                     request["sessionId"].get_ref<const std::string&>().size() > 128)
@@ -59,23 +93,28 @@ int session(minisql::execution::Database& database) {
                 if (!request.contains("sql") || !request["sql"].is_string())
                     throw minisql::MiniSqlError(minisql::ErrorCode::InvalidArgument, "Expected SQL string");
                 const auto source = request["sql"].get<std::string>();
+                authorizeRequest(access, request, operation, source);
                 result = operation == "execute" ? database.execute(source) : database.compile(source);
             } else if (operation == "buffer") {
                 if (!request.contains("sql") || !request["sql"].is_string())
                     throw minisql::MiniSqlError(minisql::ErrorCode::InvalidArgument, "Expected buffer action string");
+                authorizeRequest(access, request, operation, request["sql"].get<std::string>());
                 result = database.configureBuffer(request["sql"].get<std::string>());
             } else if (operation == "diagnostics") {
                 if (!request.contains("sql") || !request["sql"].is_string())
                     throw minisql::MiniSqlError(minisql::ErrorCode::InvalidArgument, "Expected SQL string");
+                authorizeRequest(access, request, operation, request["sql"].get<std::string>());
                 result = database.diagnostics(request["sql"].get<std::string>());
-            } else if (operation == "statistics") result = database.statistics();
-            else if (operation == "catalog") result = database.catalog();
+            } else if (operation == "statistics") { authorizeRequest(access, request, operation); result = database.statistics(); }
+            else if (operation == "catalog") { authorizeRequest(access, request, operation); result = database.catalog(); }
             else if (operation == "indexInspect") {
                 if (!request.contains("table") || !request["table"].is_string() ||
                     !request.contains("index") || !request["index"].is_string())
                     throw minisql::MiniSqlError(minisql::ErrorCode::InvalidArgument, "Expected table and index strings");
+                authorizeRequest(access, request, operation, {}, request["table"].get<std::string>(), request["index"].get<std::string>());
                 result = database.indexInspect(request["table"].get<std::string>(), request["index"].get<std::string>());
             } else if (operation == "close") {
+                authorizeRequest(access, request, operation);
                 close = true;
                 if (std::string(database.transactionState()) == "ACTIVE" || std::string(database.transactionState()) == "ABORTED")
                     result = database.execute("ROLLBACK;");
@@ -116,12 +155,14 @@ int main(int argc, char** argv) {
 #else
         path = argv[1];
 #endif
+        auto access = minisql::security::AccessCatalog::load(path);
         minisql::execution::Database database(path);
-        if (mode == "session") return session(database);
+        if (mode == "session") return session(database, std::move(access), path);
         nlohmann::json result;
-        if (mode == "catalog") result = database.catalog();
+        if (mode == "catalog") { authorizeDirect(access, mode); result = database.catalog(); }
         else {
             const std::string source{std::istreambuf_iterator<char>(std::cin), {}};
+            authorizeDirect(access, mode, source);
             result = mode == "execute" ? database.executeScript(source) : mode == "diagnostics" ? database.diagnostics(source) : mode == "statistics" ? database.statistics() : database.compile(source);
         }
         result["integerEncoding"] = "safe-number-or-decimal-string";
