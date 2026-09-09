@@ -38,6 +38,30 @@ void authorizeDirect(const minisql::security::AccessCatalog& access, const std::
     access.authorize(user, operation, sql);
 }
 
+minisql::security::AccessCatalog reconcileAccessCatalog(minisql::execution::Database& database,
+                                                        const std::filesystem::path& databasePath) {
+    const auto external = minisql::security::AccessCatalog::load(databasePath);
+    const auto stored = database.accessCatalogRecord();
+    const bool sameVersionConflict = external.enabled() && stored &&
+        external.permissionVersion() == stored->permissionVersion && external.document().dump() != stored->payload;
+    const bool externalIsNewer = external.enabled() && (!stored || external.permissionVersion() > stored->permissionVersion);
+    if (sameVersionConflict)
+        throw minisql::MiniSqlError(minisql::ErrorCode::Catalog, "Access catalog version conflict");
+    if (externalIsNewer) {
+        if (std::string(database.transactionState()) == "IDLE") {
+            database.synchronizeAccessCatalog(external.document(), external.permissionVersion());
+        } else {
+            // 活动事务不被目录同步写入打断；本次请求仍使用已校验的新页，事务结束后再固化到系统表。
+            return external;
+        }
+    }
+    const auto persisted = database.accessCatalogRecord();
+    if (persisted && (!external.enabled() || persisted->permissionVersion >= external.permissionVersion()))
+        return minisql::security::AccessCatalog::fromDocument(
+            nlohmann::json::parse(persisted->payload), persisted->permissionVersion);
+    return external;
+}
+
 int session(minisql::execution::Database& database, minisql::security::AccessCatalog access,
             const std::filesystem::path& databasePath) {
     const auto emit = [](json value) {
@@ -76,7 +100,7 @@ int session(minisql::execution::Database& database, minisql::security::AccessCat
                     throw minisql::MiniSqlError(minisql::ErrorCode::InvalidArgument, "Unknown session request field");
             }
             const auto operation = request["operation"].get<std::string>();
-            const auto refreshedAccess = minisql::security::AccessCatalog::load(databasePath);
+            const auto refreshedAccess = reconcileAccessCatalog(database, databasePath);
             if (refreshedAccess.enabled() != access.enabled() ||
                 refreshedAccess.permissionVersion() != access.permissionVersion())
                 access = refreshedAccess;
@@ -155,8 +179,8 @@ int main(int argc, char** argv) {
 #else
         path = argv[1];
 #endif
-        auto access = minisql::security::AccessCatalog::load(path);
         minisql::execution::Database database(path);
+        auto access = reconcileAccessCatalog(database, path);
         if (mode == "session") return session(database, std::move(access), path);
         nlohmann::json result;
         if (mode == "catalog") { authorizeDirect(access, mode); result = database.catalog(); }

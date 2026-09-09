@@ -27,6 +27,9 @@ public:
     nlohmann::json statistics();
     nlohmann::json checkpoint();
     nlohmann::json indexInspect(const std::string& table, const std::string& index);   // 页级索引结构校验（页类型/height/keyCount/兄弟指针/叶链/根可达）
+    // 将已由入口层校验的权限快照同步到 PersistentCatalog 的保留系统表。
+    void synchronizeAccessCatalog(const nlohmann::json& document, std::uint32_t permissionVersion);
+    const std::optional<catalog::AccessCatalogRecord>& accessCatalogRecord() const { return catalog_.accessCatalogRecord(); }
     ~Database();
     void setSessionContext(const std::string& sessionId, const std::filesystem::path& cancelFile);
     nlohmann::json configureBuffer(const std::string& action);
