@@ -477,7 +477,7 @@ nlohmann::json Database::indexInspect(const std::string& table, const std::strin
             {"nodeCount", state.nodeCount}, {"leafCount", state.leafCount}, {"rowCount", state.rowCount},
             {"leafChainLength", state.leafChainLength}, {"rootReachable", state.rootReachable},
             {"leafChainLinked", state.leafChainLinked}, {"parentLinksValid", state.parentLinksValid},
-            {"problems", std::move(problems)}, {"pages", std::move(pages)}};
+            {"storage", "page-file"}, {"problems", std::move(problems)}, {"pages", std::move(pages)}};
 }
 void Database::evaluateAutoCheckpoint(std::size_t committedWriteStatements, std::size_t committedDirtyPages) {
     if (committedWriteStatements == 0) return;

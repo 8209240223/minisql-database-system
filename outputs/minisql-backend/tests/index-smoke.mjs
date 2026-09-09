@@ -12,6 +12,10 @@ try {
   equal((await session.request('execute', 'CREATE INDEX idx_v ON t(v);')).success, true);
   const catalog = await session.request('catalog');
   equal(catalog.tables[0].indexes[0].name, 'idx_v');
+  const inspected = await session.request('indexInspect', undefined, { table: 't', index: 'idx_v' });
+  equal(inspected.present, true);
+  equal(inspected.storage, 'page-file');
+  assert.equal(inspected.rootReachable, true); ++checks;
   const compiled = await session.request('compile', 'SELECT id FROM t WHERE v=20 ORDER BY id;');
   assert.ok(compiled.plan.some(node => node.kind === 'IndexScan')); ++checks;
   equal((await session.request('execute', 'SELECT id FROM t WHERE v=20 ORDER BY id;')).results.at(-1).rows, [[2],[3]]);
