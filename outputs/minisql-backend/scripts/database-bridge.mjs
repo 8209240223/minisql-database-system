@@ -5,7 +5,8 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createHash, randomUUID } from 'node:crypto';
 import { openSession } from './session-process.mjs';
-import { can, canConnect, hashPassword, loadAccess, normalizeAccess, publicAccess, saveAccess } from './access-catalog.mjs';
+import { can, canConnect, hashPassword, loadAccess, normalizeAccess, publicAccess, saveAccess,
+  createUser, dropUser, createRole, dropRole, setPassword, addRole, removeRole, grant, revoke } from './access-catalog.mjs';
 
 const releaseExecutable = fileURLToPath(new URL('../build/windows/Release/minisql_database.exe', import.meta.url));
 const executable = process.env.MINISQL_DATABASE_EXE ?? (existsSync(releaseExecutable) ? releaseExecutable : fileURLToPath(new URL('../bin/minisql_database.exe', import.meta.url)));
@@ -516,7 +517,7 @@ const server = http.createServer(async (req, res) => {
     const headers = { 'Content-Type': 'application/json; charset=utf-8', 'Vary': 'Origin' };
     if (origin && allowedOrigins.has(origin)) headers['Access-Control-Allow-Origin'] = origin;
     headers['Access-Control-Allow-Headers'] = 'Content-Type, X-MiniSQL-User, X-MiniSQL-Password';
-    headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS';
+    headers['Access-Control-Allow-Methods'] = 'GET, POST, DELETE, OPTIONS';
     res.writeHead(status, headers);
     res.end(JSON.stringify(data));
   };
@@ -525,7 +526,7 @@ const server = http.createServer(async (req, res) => {
     const headers = { 'Content-Type': 'application/x-ndjson; charset=utf-8', 'Cache-Control': 'no-store', 'Vary': 'Origin' };
     if (origin && allowedOrigins.has(origin)) headers['Access-Control-Allow-Origin'] = origin;
     headers['Access-Control-Allow-Headers'] = 'Content-Type, X-MiniSQL-User, X-MiniSQL-Password';
-    headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS';
+    headers['Access-Control-Allow-Methods'] = 'GET, POST, DELETE, OPTIONS';
     res.writeHead(status, headers);
     const write = value => new Promise((resolve, reject) => {
       if (res.destroyed || res.writableEnded) { reject(httpError(499, 'Stream client disconnected')); return; }
@@ -579,6 +580,68 @@ const server = http.createServer(async (req, res) => {
     } catch (error) { send(400, { success: false, error: { message: error instanceof Error ? error.message : String(error) } }); }
     return;
   }
+
+  // X24 原子权限资源接口：每个端点对应一次原子变更，失败不产生部分状态。
+  const readJson = async () => {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    return JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks)));
+  };
+  const requireGrant = () => { if (!can(access, requestUser, 'GRANT')) throw httpError(403, 'Permission denied'); };
+  const commitAccess = () => { saveAccess(accessPath, access); send(200, { success: true, access: publicAccess(access) }); };
+  const badRequest = error => send(error?.status ?? 400, { success: false, error: { message: error instanceof Error ? error.message : String(error) } });
+
+  if (req.method === 'POST' && req.url === '/api/users') {
+    try { requireGrant(); access = createUser(access, await readJson()); commitAccess(); }
+    catch (error) { badRequest(error); }
+    return;
+  }
+  const userDelete = req.url?.match(/^\/api\/users\/([^/]+)$/);
+  if (req.method === 'DELETE' && userDelete) {
+    try { requireGrant(); access = dropUser(access, decodeURIComponent(userDelete[1])); commitAccess(); }
+    catch (error) { badRequest(error); }
+    return;
+  }
+  const passwordRoute = req.url?.match(/^\/api\/users\/([^/]+)\/password$/);
+  if (req.method === 'POST' && passwordRoute) {
+    try { requireGrant(); const body = await readJson(); access = setPassword(access, decodeURIComponent(passwordRoute[1]), body.password); commitAccess(); }
+    catch (error) { badRequest(error); }
+    return;
+  }
+  const addRoleRoute = req.url?.match(/^\/api\/users\/([^/]+)\/roles$/);
+  if (req.method === 'POST' && addRoleRoute) {
+    try { requireGrant(); const body = await readJson(); access = addRole(access, decodeURIComponent(addRoleRoute[1]), body.role); commitAccess(); }
+    catch (error) { badRequest(error); }
+    return;
+  }
+  const removeRoleRoute = req.url?.match(/^\/api\/users\/([^/]+)\/roles\/([^/]+)$/);
+  if (req.method === 'DELETE' && removeRoleRoute) {
+    try { requireGrant(); access = removeRole(access, decodeURIComponent(removeRoleRoute[1]), decodeURIComponent(removeRoleRoute[2])); commitAccess(); }
+    catch (error) { badRequest(error); }
+    return;
+  }
+  if (req.method === 'POST' && req.url === '/api/roles') {
+    try { requireGrant(); access = createRole(access, await readJson()); commitAccess(); }
+    catch (error) { badRequest(error); }
+    return;
+  }
+  const roleDelete = req.url?.match(/^\/api\/roles\/([^/]+)$/);
+  if (req.method === 'DELETE' && roleDelete) {
+    try { requireGrant(); access = dropRole(access, decodeURIComponent(roleDelete[1])); commitAccess(); }
+    catch (error) { badRequest(error); }
+    return;
+  }
+  if (req.method === 'POST' && req.url === '/api/grants') {
+    try { requireGrant(); access = grant(access, await readJson()); commitAccess(); }
+    catch (error) { badRequest(error); }
+    return;
+  }
+  if (req.method === 'POST' && req.url === '/api/revokes') {
+    try { requireGrant(); access = revoke(access, await readJson()); commitAccess(); }
+    catch (error) { badRequest(error); }
+    return;
+  }
+
   if (req.method === 'GET' && req.url?.startsWith('/api/audit')) {
     if (!can(access, requestUser, 'AUDIT')) { send(403, { success: false, error: { code: 7001, message: 'Permission denied' } }); return; }
     const query = new URL(req.url, 'http://127.0.0.1');
@@ -620,6 +683,7 @@ const server = http.createServer(async (req, res) => {
       audit: true, permissions: true, backupRestore: true, backupManifestVersion: 2, backupManifestVersions: [2, 3],
       backupIncremental: true, backupChain: true, backupMigration: 'v1-to-v2',
       permissionsModel: 'catalog-access', accessCatalogVersion: 1, objectPermissions: true, roleInheritance: true,
+      atomicPermissionEndpoints: true, permissionEndpoints: ['POST /users', 'DELETE /users/:name', 'POST /users/:name/password', 'POST /users/:name/roles', 'DELETE /users/:name/roles/:role', 'POST /roles', 'DELETE /roles/:name', 'POST /grants', 'POST /revokes'],
       passwordHashing: 'sha256-salted', auditFiltering: true, sessionIdentity: true,
       indexPageStorage: true,
       capabilities: ['backupRestore', 'backupIncremental', 'backupChain', 'backupMigration', 'permissions', 'audit', 'create', 'insert', 'multiRowInsert', 'select', 'delete', 'update', 'arithmetic', 'projection', 'tableAlias', 'innerJoin', 'leftJoin', 'null', 'notNull', 'bigint', 'float', 'default', 'primaryKey', 'unique', 'compositeKey', 'distinct', 'orderBy', 'limit', 'groupBy', 'having', 'count', 'sum', 'min', 'max', 'avg', 'compile', 'diagnostics', 'inSubquery', 'existsSubquery', 'scalarSubquery', 'correlatedSubquery', 'astRoundTrip', 'planRoundTrip', 'hashJoin', 'predicatePushdown', 'pruneColumns', 'statistics', 'createIndex', 'indexScan', 'uniqueIndex', 'indexPersistence', 'indexSnapshots', 'indexPageStorage', 'checkpoint', 'nodeStatistics', 'optimizer', 'storageStats', 'externalSort', 'sortSpill', 'externalAggregate', 'aggregateSpill', 'cancellation', 'streamingResults', 'autoCheckpoint', 'multiSession', 'sessionRegistry', 'health'] });
@@ -845,7 +909,11 @@ const server = http.createServer(async (req, res) => {
       error: { message: error.message, suggestion: 'Do not automatically retry writes; inspect database state.' } });
   }
 });
-await callDatabase('catalog');
+// 启动预热：尝试加载一次引擎 Catalog。若引擎二进制缺失或损坏，服务器仍进入降级
+// 模式（健康检查报 degraded、引擎路由返回 503），使 access/audit/capabilities 等
+// 不依赖引擎的管理端点保持可用（供管理员恢复）。
+try { await callDatabase('catalog'); }
+catch { quarantined = true; }
 server.listen(Number(process.env.PORT ?? 8081), '127.0.0.1', () => {
   console.log(`MiniSQL database API http://127.0.0.1:${server.address().port}/api`);
 });

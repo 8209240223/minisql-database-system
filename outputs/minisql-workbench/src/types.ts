@@ -30,3 +30,18 @@ export interface Connection { mode: 'api'; name: string; url: string; sessionId?
 export interface QueryTab { id: string; name: string; sql: string; dirty?: boolean }
 export interface HistoryItem { id: string; sql: string; at: number; durationMs: number; rows: number; error?: string; mode: Connection['mode']; connection: string; action: 'compile' | 'execute' }
 export interface SqlToken { type: string; text: string; line: number; column: number }
+
+// X24 / C2 权限与审计
+export interface AccessGrant { object: string; permissions: string[] }
+export interface AccessUser { name: string; roles: string[]; grants: AccessGrant[]; passwordProtected: boolean }
+export interface AccessRole { name: string; inherits: string[]; grants: AccessGrant[] }
+export interface AccessState { version: number; users: AccessUser[]; roles: AccessRole[] }
+export interface AuditEntry {
+  id: string; at: string; method: string; path: string; user: string; sessionId?: string;
+  sql?: string; object?: string; status: number; success: boolean; durationMs: number;
+  affectedRows?: number; errorCode?: number; transactionState?: string; quarantined?: boolean;
+}
+export interface SessionEntry {
+  sessionId: string; user: string; transactionState: string; activeRequest: boolean;
+  waitingForLock: boolean; ownsTransactionLock: boolean; lastActiveAt: string;
+}

@@ -1,5 +1,6 @@
 # Local dependency and build workspaces
 work/
+.venv/
 
 # Backend build and dependency outputs
 outputs/minisql-backend/build/
