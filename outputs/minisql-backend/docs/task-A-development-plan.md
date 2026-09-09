@@ -214,3 +214,15 @@ node tests\subquery-smoke.mjs tests\statistics-smoke.mjs tests\explain-smoke.mjs
 - [x] **3.1e** 回归全绿：C++ contract（… / parser_subquery 3 / 其余不回归）+ 全量 59 用例通过。
 
 > 下一步 **3.2**：`sql/parser.cpp` FROM 支持派生表（显式别名、重复输出列名报歧义）、嵌套查询块；随后 **3.3** planner 以 `Scope` 链绑定替换字符串替换，生成 Apply/SemiJoin。
+
+### 6.5 X09 Phase 3.2 记录（builder-A 第五次提交）
+
+> 本轮推进 **FROM 派生表解析**。分支 `builder-A`。
+
+- [x] **3.2a** `sql/parser.hpp`：`Statement` 新增 `fromSubquery`（`std::shared_ptr<Statement>`）承载 FROM 派生表子查询。
+- [x] **3.2b** `sql/parser.cpp` `select()`：FROM 支持 `( SELECT ... ) [AS] alias` 派生表；必须有显式别名（缺省 → `Semantic` 错误）；输出列名重复 → `Semantic` 歧义错误（wildcard/表达式列静态无法判重则跳过）；透传 `selectList`。正常表路径不变。
+- [x] **3.2c** `serialization.hpp`：`serializeStatement` 输出 `fromSubquery`（null 或嵌套 statement），`readStatement` 回读，保证 AST 往返稳定。
+- [x] **3.2d** 契约测试扩展：`tests/parser_subquery_contract.cpp` 增 4 项派生表校验（子查询节点非空 / `Select` / 显式别名 / select 项保留；无别名拒绝；重复列名拒绝）。
+- [x] **3.2e** 回归：C++ contract 全 59 用例通过；node parser 18 / subquery 24 / planner 26 / explain 21 通过。
+
+> 下一步 **3.3**：planner `bindExpression()`/`build()` 建立逐查询块 `Scope` 链（当前列→当前别名→外层相关），未限定名按固定顺序解析（禁字符串替换），生成 Apply/SemiJoin。

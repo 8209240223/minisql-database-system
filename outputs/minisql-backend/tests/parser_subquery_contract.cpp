@@ -55,5 +55,20 @@ int main() {
     }
     require(count == 3, "expected EXISTS/IN/scalar subquery nodes");
     std::cout << "3 X09 structured-subquery parser checks passed\n";
+
+    // --- X09 Phase 3.2: FROM derived tables ---
+    auto single = [](const std::string& sql) { return parse(tokenize(sql)).front(); };
+    const auto derived = single("SELECT d.x FROM (SELECT a AS x FROM t) AS d;");
+    require(derived.fromSubquery != nullptr, "derived table must carry a structured subquery");
+    require(derived.fromSubquery->kind == "Select", "derived table subquery is not a Select");
+    require(derived.tableAlias == "d", "derived table explicit alias not captured");
+    require(derived.fromSubquery->selectItems.size() == 1, "derived subquery must keep its select items");
+
+    auto rejected = [&](const std::string& sql) {
+        try { (void)single(sql); return false; } catch (const minisql::MiniSqlError&) { return true; }
+    };
+    require(rejected("SELECT * FROM (SELECT a FROM t);"), "derived table without explicit alias must be rejected");
+    require(rejected("SELECT * FROM (SELECT a AS x, b AS x FROM t) AS d;"), "duplicate derived output column names must be rejected");
+    std::cout << "4 X09 derived-table parser checks passed\n";
     return 0;
 }

@@ -276,9 +276,42 @@ private:
             if(value->kind=="Identifier"||value->kind=="Wildcard")s.selectList.push_back(value->value);
             s.selectItems.push_back({std::move(value),std::move(alias)});
         } while(at(",")&&(++i,true));
-        expect("FROM");s.table=identifier();
-        if(keyword("AS")){++i;s.tableAlias=identifier();}
-        else if(i<t.size()&&t[i].type=="IDENTIFIER")s.tableAlias=identifier();
+        expect("FROM");
+        if(at("(")) {
+            // X09: 派生表 `FROM ( SELECT ... ) [AS] alias`，必须有显式别名。
+            ++i;
+            auto derived = select(false);
+            expect(")");
+            std::string alias;
+            if(keyword("AS")){++i;alias=identifier();}
+            else if(i<t.size()&&t[i].type=="IDENTIFIER")alias=identifier();
+            if(alias.empty()) fail(ErrorCode::Semantic, "A derived table must have an explicit alias", t[i].location);
+            // 派生表输出列名不得歧义（重复 → 语义歧义错误）。
+            if(derived.selectList.size()==derived.selectItems.size()) {
+                std::vector<std::string> names;
+                bool opaque=false;
+                for(const auto& item: derived.selectItems){
+                    std::string name;
+                    if(!item.alias.empty()){name=item.alias;}
+                    else if(item.expression&&item.expression->kind=="Identifier"){name=item.expression->value;}
+                    else { opaque=true; break; } // wildcard / 表达式：静态无法判重，跳过。
+                    names.push_back(name);
+                }
+                if(!opaque){
+                    auto sorted=names;std::sort(sorted.begin(),sorted.end());
+                    if(std::adjacent_find(sorted.begin(),sorted.end())!=sorted.end())
+                        fail(ErrorCode::Semantic, "Derived table output column name is ambiguous", t[i].location);
+                }
+            }
+            if(!derived.selectList.empty())s.selectList=derived.selectList;
+            s.fromSubquery=std::make_shared<Statement>(std::move(derived));
+            s.tableAlias=alias;
+            s.table=alias; // 3.3 planner 以 Scope 链消费 fromSubquery；此处占位保持既有表路径兼容。
+        } else {
+            s.table=identifier();
+            if(keyword("AS")){++i;s.tableAlias=identifier();}
+            else if(i<t.size()&&t[i].type=="IDENTIFIER")s.tableAlias=identifier();
+        }
         while(keyword("JOIN")||keyword("INNER")||keyword("LEFT")||keyword("RIGHT")||keyword("FULL")) {
             if(s.joins.size()>=32) fail(ErrorCode::Syntax, "Join count exceeds 32", t[i].location);
             Join join;

@@ -38,6 +38,8 @@ struct Statement {
     std::vector<Assignment> assignments{};
     std::string tableAlias{};
     std::vector<Join> joins{};
+    // X09: FROM 派生表 `( SELECT ... ) AS alias` —— 结构化子查询节点 + 显式别名。
+    std::shared_ptr<Statement> fromSubquery{};
     std::vector<std::shared_ptr<Expr>> valueExpressions{};
     bool defaultValues = false;
     std::vector<std::vector<std::shared_ptr<Expr>>> valueRows{};

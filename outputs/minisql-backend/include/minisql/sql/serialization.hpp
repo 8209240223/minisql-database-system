@@ -156,6 +156,7 @@ inline nlohmann::json serializeStatement(const Statement& statement) {
     node["joins"] = json::array();
     for (const auto& join : statement.joins)
         node["joins"].push_back({{"kind", join.left && join.right ? "FullJoin" : join.left ? "LeftJoin" : join.right ? "RightJoin" : "InnerJoin"}, {"table", join.table}, {"alias", join.alias}, {"on", serializeExpression(join.on)}});
+    node["fromSubquery"] = statement.fromSubquery ? serializeStatement(*statement.fromSubquery) : nullptr;
     return node;
 }
 namespace detail {
@@ -241,6 +242,8 @@ inline Statement readStatement(const nlohmann::json& node, std::size_t depth = 0
         join.on = deserializeExpression(item.at("on"), depth + 1);
         statement.joins.push_back(std::move(join));
     }
+    if (node.contains("fromSubquery") && !node.at("fromSubquery").is_null()) 
+        statement.fromSubquery = std::make_shared<Statement>(readStatement(node.at("fromSubquery"), depth + 1));
     if (node.contains("valueExpressions")) for (const auto& item : node.at("valueExpressions")) statement.valueExpressions.push_back(deserializeExpression(item, depth + 1));
     statement.defaultValues = node.value("defaultValues", false);
     if (node.contains("valueRows")) for (const auto& row : node.at("valueRows")) {
