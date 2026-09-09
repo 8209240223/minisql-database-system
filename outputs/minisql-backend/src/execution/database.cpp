@@ -13,6 +13,7 @@
 #include <set>
 #include <map>
 #include <unordered_map>
+#include <unordered_set>
 #include <type_traits>
 #include <chrono>
 #include <cmath>
@@ -432,6 +433,68 @@ nlohmann::json Database::compile(const std::string& source) const {
             {"schemaVersion", 1}, {"planKind", "logical"},
             {"stages", {{"lexer", "passed"}, {"parser", "passed"}, {"semantic", "passed"},
                         {"planner", "passed"}, {"optimizer", "passed"}, {"executor", "notRun"}}}};
+}
+
+std::vector<std::string> Database::resolveAccessObjects(const std::string& source) const {
+    std::lock_guard<std::recursive_mutex> guard(mu_);
+    requireAvailable();
+    try {
+        auto tokens = sql::tokenize(source);
+        if (!tokens.empty() && key(tokens.front().lexeme) == "explain") {
+            tokens.erase(tokens.begin());
+            if (!tokens.empty() && key(tokens.front().lexeme) == "analyze") tokens.erase(tokens.begin());
+        }
+        const auto statements = sql::parse(tokens);
+        std::vector<std::string> result;
+        std::unordered_set<std::string> seen;
+        const auto add = [&](const std::string& name) {
+            if (name.empty()) return;
+            const auto* bound = catalog_.view().find(name);
+            const auto resolved = key(bound ? bound->name : name);
+            if (seen.insert(resolved).second) result.push_back(resolved);
+        };
+        std::function<void(const sql::Statement&)> visitStatement;
+        std::function<void(const std::shared_ptr<sql::Expr>&)> visitExpression;
+        visitExpression = [&](const std::shared_ptr<sql::Expr>& expression) {
+            if (!expression) return;
+            visitExpression(expression->left);
+            visitExpression(expression->right);
+            if (expression->subquery) visitStatement(*expression->subquery);
+            else if (!expression->subquerySql.empty()) {
+                try {
+                    auto nestedSql = expression->subquerySql;
+                    const auto last = nestedSql.find_last_not_of(" \t\r\n");
+                    if (last == std::string::npos || nestedSql[last] != ';') nestedSql += ';';
+                    for (const auto& nested : sql::parse(sql::tokenize(nestedSql))) visitStatement(nested);
+                } catch (const MiniSqlError&) {
+                    // 不完整子查询由入口层保留现有保守对象扫描结果。
+                }
+            }
+        };
+        visitStatement = [&](const sql::Statement& statement) {
+            if (!statement.fromSubquery && !statement.table.empty()) add(statement.table);
+            for (const auto& join : statement.joins) add(join.table);
+            for (const auto& foreignKey : statement.foreignKeys) add(foreignKey.table);
+            for (const auto& column : statement.columns)
+                if (column.references) add(column.references->first);
+            if (statement.fromSubquery) visitStatement(*statement.fromSubquery);
+            visitExpression(statement.where);
+            visitExpression(statement.having);
+            for (const auto& item : statement.selectItems) visitExpression(item.expression);
+            for (const auto& item : statement.orderBy) visitExpression(item.expression);
+            for (const auto& item : statement.assignments) visitExpression(item.expression);
+            for (const auto& item : statement.groupBy) visitExpression(item);
+            for (const auto& item : statement.checks) visitExpression(item);
+            for (const auto& item : statement.valueExpressions) visitExpression(item);
+            for (const auto& row : statement.valueRows)
+                for (const auto& item : row) visitExpression(item);
+            for (const auto& join : statement.joins) visitExpression(join.on);
+        };
+        for (const auto& statement : statements) visitStatement(statement);
+        return result;
+    } catch (const MiniSqlError&) {
+        return {};
+    }
 }
 nlohmann::json Database::catalog() {
     std::lock_guard<std::recursive_mutex> guard(mu_);
