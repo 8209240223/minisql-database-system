@@ -42,7 +42,7 @@ int session(minisql::execution::Database& database) {
             id = request["id"];
             for (const auto& [name, value] : request.items()) {
                 (void)value;
-                if (name != "id" && name != "operation" && name != "sql" && name != "sessionId" && name != "cancelFile")
+                if (name != "id" && name != "operation" && name != "sql" && name != "sessionId" && name != "cancelFile" && name != "table" && name != "index")
                     throw minisql::MiniSqlError(minisql::ErrorCode::InvalidArgument, "Unknown session request field");
             }
             const auto operation = request["operation"].get<std::string>();
