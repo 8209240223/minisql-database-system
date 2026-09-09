@@ -32,6 +32,8 @@ jobs:
         run: node tests/access-atomic-http.mjs
       - name: 权限感知 CLI 契约（X24）
         run: node tests/cli-contract.mjs
+      - name: SQL 对象引用扫描契约（X24）
+        run: node tests/sql-object-references-contract.mjs
       - name: Fuzz 生成器/缩减器契约（X27）
         run: node tests/fuzz-model-contract.mjs
       - name: 固定种子状态机语料（X27）
@@ -88,6 +90,9 @@ jobs:
       - name: HTTP 访问控制闭环
         run: node tests/access-control-http.mjs
         working-directory: outputs/minisql-backend
+      - name: C++ 入口访问控制闭环
+        run: node tests/access-control-process.mjs
+        working-directory: outputs/minisql-backend
       - name: 权限感知 CLI 与原子 HTTP 回归
         run: |
           node tests/access-atomic-http.mjs
@@ -129,6 +134,9 @@ jobs:
         working-directory: outputs/minisql-backend
       - name: DDL/DML 状态机长跑回归
         run: node tests/fuzz-state-machine-long-run.mjs
+        working-directory: outputs/minisql-backend
+      - name: DDL/DML 状态机重复长跑 smoke
+        run: node tests/fuzz-state-machine-soak.mjs
         working-directory: outputs/minisql-backend
       - name: 状态机崩溃恢复组合回归
         run: node tests/fuzz-state-machine-crash-recovery.mjs
