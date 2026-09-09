@@ -28,6 +28,9 @@ try {
     server.once('exit', () => reject(new Error(errors || 'Server exited before readiness')));
   });
   equal((await request('/execute', { sql: 'CREATE TABLE t(id INT); INSERT INTO t VALUES(1),(2);' })).status, 200);
+  const generated = await request('/backup', {});
+  equal(generated.status, 200);
+  assert.match(generated.data.backup, /^backup-\d+\.pages$/); ++checks;
   const backup = await request('/backup', { name: 'snap1' });
   equal(backup.status, 200);
   assert.equal(backup.data.backup, 'snap1.pages'); ++checks;

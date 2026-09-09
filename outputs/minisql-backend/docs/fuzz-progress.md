@@ -1,6 +1,6 @@
 # 固定种子与差分测试
 
-日期：2026-09-09。对应 EXT-QA-001、X27，目前为部分完成。
+日期：2026-09-10。对应 EXT-QA-001、X27，目前为部分完成。
 
 ## 一、测试链路
 
@@ -30,7 +30,7 @@ SELECT 语料重放需保留报告中的版本和生成器，使用同一 `FUZZ_
 
 ## 四、剩余范围
 
-当前随机语料主要是 SELECT；未随机生成 UPDATE、DELETE、多行 INSERT、JOIN、NULL、事务、索引或崩溃恢复序列。没有覆盖尚未实现的语法，也没有做无限输入或生产压力测试。
+通用差分语料仍主要是 SELECT；独立状态机语料已经覆盖 UPDATE、DELETE、多行 INSERT、JOIN、NULL、事务、索引和受控负向 DDL 探针，崩溃恢复组合另由固定种子故障注入脚本覆盖。没有覆盖尚未实现的语法，也没有做无限输入或生产压力测试。
 
 缩减器的逻辑已用可控故障谓词测试；本批实际数据库没有出现结果差异，因此没有真实引擎缺陷的自动缩减案例。错误变异仅保存输入与分类，尚未自动缩减。错行错列的精确断言目前集中在注入的非法字符，其余诊断只检查阶段类型和有效位置。
 
@@ -80,6 +80,12 @@ node tests/fuzz-state-machine-long-run.mjs
 
 长跑结果 artifact 保留在 `tests/artifacts/fuzz-state-*`，报告包含可执行文件 SHA-256、生成器 SHA-256、固定种子、步数和分类计数；若后续出现故障，仍可通过 `FUZZ_STATE_REPLAY` 重放完整程序。
 
+## 七、状态机与崩溃恢复组合
+
+`tests/fuzz-state-machine-crash-recovery.mjs` 使用固定种子 `20260908`、40 步 DDL/DML/事务/索引状态机作为基线，然后在独立数据库上对 `prepared`、`published`、`applied-page`、`data-synced`、`checkpointed` 五个提交阶段分别注入故障。每个案例都重启 C++ 引擎，检查 setup 行未丢失、事务恢复结果是目标事务的稳定前缀、重复读取一致，并在恢复后继续提交一行数据。
+
+本机 5 个阶段全部通过。该测试输出 `report.json`，记录固定种子、状态机步数、可执行文件 SHA-256、生成器 SHA-256、基线 SQL SHA-256、每个故障阶段恢复的事务行数和恢复后的最终行数。
+
 ### 失败样本重放
 
 `fuzz-state-machine-differential.mjs` 在 Wrong Result、Wrong Reject、错误定位、崩溃、超时或资源限制等故障发生时，向报告目录写入 `failure-<n>.json`。文件包含种子、故障分类、完整状态机 `program` 和（适用时）缩减程序。重放命令如下：
@@ -94,5 +100,5 @@ Remove-Item Env:FUZZ_STATE_REPLAY
 
 ### 边界与后续
 
-- 状态机语料已覆盖 UPDATE/DELETE/多行 INSERT/JOIN/NULL/事务/索引与受控负向 DDL 探针；崩溃恢复与跨进程组合仍属于 X22/X26 的回归范畴，由成员 B 主责。
+- 状态机语料已覆盖 UPDATE/DELETE/多行 INSERT/JOIN/NULL/事务/索引与受控负向 DDL 探针；提交阶段崩溃恢复组合已经由 `fuzz-state-machine-crash-recovery.mjs` 关闭一组固定种子证据，但更高压力、长期资源趋势和在线备份边界仍未完成。
 - CI（`.github/workflows/ci.yml`）已接入权限契约、CLI 契约、固定种子逐文件复现和工作台单元回归；Windows job 还会构建真实 C++ 引擎并运行 HTTP、SELECT 差分、DDL/DML 状态机差分、状态机重放契约和工作台真实浏览器回归。

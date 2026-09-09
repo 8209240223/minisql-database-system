@@ -795,10 +795,11 @@ const server = http.createServer(async (req, res) => {
       const body = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks)));
       if (sessions.size) throw httpError(409, 'Database reserved by active sessions');
       if (req.url === '/api/backup') {
+        const requestedName = typeof body?.name === 'string' && body.name.trim() ? body.name : `backup-${Date.now()}`;
         const incremental = body.kind === 'incremental' || Boolean(body.base);
         if (incremental) {
           if (!backupArtifactFile(body.base)) throw httpError(404, 'Base backup not found');
-          const target = deltaBackupFile(body.name);
+          const target = deltaBackupFile(requestedName);
           await enqueue(async () => {
             await callDatabase('execute', 'CHECKPOINT;');
             const current = readFileSync(database);
@@ -829,7 +830,7 @@ const server = http.createServer(async (req, res) => {
           });
           send(200, { success: true, backup: target.name, kind: 'incremental', base: backupArtifactFile(body.base).name, bytes: statSync(target.file).size, sha256: sha256(target.file) });
         } else {
-          const { name, file } = backupFile(body.name);
+          const { name, file } = backupFile(requestedName);
           await enqueue(async () => {
             await callDatabase('execute', 'CHECKPOINT;');
             copyFileSync(database, file);
