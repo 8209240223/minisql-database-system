@@ -9,6 +9,13 @@
 #include <limits>
 
 namespace minisql::sql {
+// X13 version contract. These are the authoritative constants for on-wire and
+// on-disk serialized artifacts. Unknown major versions are rejected on read;
+// same major, higher minor must be read leniently where fields are present.
+inline constexpr std::uint32_t AST_SCHEMA_VERSION = 1;      // AST document schemaVersion
+inline constexpr std::uint32_t PLAN_SCHEMA_VERSION = 1;     // logical plan schemaVersion
+inline constexpr std::uint32_t PRODUCER_VERSION = 1;        // this binary's producer version
+inline constexpr std::uint32_t CATALOG_SCHEMA_VERSION = 5;  // newest table/column descriptor
 inline nlohmann::json serializeReference(const std::optional<std::pair<std::string,std::string>>& reference) {
     return reference ? nlohmann::json{{"table", reference->first}, {"column", reference->second}} : nlohmann::json(nullptr);
 }
@@ -263,7 +270,7 @@ inline Statement readStatement(const nlohmann::json& node, std::size_t depth = 0
 inline std::vector<Statement> deserializeAst(const nlohmann::json& document) {
     nlohmann::json nodes = document;
     if (document.is_object() && document.contains("schemaVersion")) {
-        if (document.at("schemaVersion") != 1 || !document.contains("statements") || !document.at("statements").is_array())
+        if (document.at("schemaVersion") != AST_SCHEMA_VERSION || !document.contains("statements") || !document.at("statements").is_array())
             throw MiniSqlError(ErrorCode::Storage, "Unsupported AST schema version");
         nodes = document.at("statements");
     }
@@ -272,6 +279,13 @@ inline std::vector<Statement> deserializeAst(const nlohmann::json& document) {
     std::vector<Statement> statements;
     for (const auto& node : nodes) statements.push_back(detail::readStatement(node));
     return statements;
+}
+// Serialize an AST batch as a versioned document (schemaVersion + producerVersion)
+// so reads can reject unknown schema versions while keeping the statements payload.
+inline nlohmann::json serializeAstDocument(const std::vector<Statement>& statements) {
+    auto nodes = nlohmann::json::array();
+    for (const auto& statement : statements) nodes.push_back(serializeStatement(statement));
+    return {{"schemaVersion", AST_SCHEMA_VERSION}, {"producerVersion", PRODUCER_VERSION}, {"statements", std::move(nodes)}};
 }
 inline nlohmann::json serializeAst(const std::vector<Statement>& statements) {
     auto nodes = nlohmann::json::array();

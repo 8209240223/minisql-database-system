@@ -324,7 +324,7 @@ nlohmann::json Database::catalog() {
             {"constraintNames", sql::serializeConstraintNames(table.definition.constraintNames)},
             {"rowCount", rowCount}, {"allocatedPages", file_->pagesFor(table.id).size()}});
     }
-    return {{"tables", tables}, {"buffer", bufferStatus()}};
+    return {{"tables", tables}, {"buffer", bufferStatus()}, {"schemaVersion", catalog_.catalogSchemaVersion()}};
 }
 nlohmann::json Database::checkpoint() {
     requireAvailable();

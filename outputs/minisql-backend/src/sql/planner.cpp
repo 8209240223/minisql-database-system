@@ -504,7 +504,7 @@ std::vector<LogicalPlan> deserializePlans(const nlohmann::json& document) {
     const auto invalid = []() -> void { throw MiniSqlError(ErrorCode::Storage, "Invalid serialized logical plan"); };
     nlohmann::json rows;
     if (document.is_array()) rows = document;
-    else if (document.is_object() && document.value("schemaVersion", 0u) == 1u && document.value("planKind", "") == "logical" && document.contains("plans"))
+    else if (document.is_object() && document.value("schemaVersion", 0u) == PLAN_SCHEMA_VERSION && document.value("planKind", "") == "logical" && document.contains("plans"))
         rows = document.at("plans");
     else invalid();
     if (!rows.is_array() || rows.size() > 65536) invalid();

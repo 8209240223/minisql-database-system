@@ -183,3 +183,22 @@ node tests\subquery-smoke.mjs tests\statistics-smoke.mjs tests\explain-smoke.mjs
 - [x] **1.8** 回归：parser 18 / planner 26 / subquery 24 / explain 21 / statistics 11 / diagnostics 22 / contract 全部通过。
 
 > 本轮（builder-A 第二次提交）完成 **X12 语法层恢复（1.4）+ planner 拒收（1.5）**：Parser 引入 `fail()` 出口与 `Recovered` 信号，strict 模式行为不变、recover 模式子句级同步多诊断；`parseRecoverable` 返回恢复后语句，`invalid=true` 语句被 diagnostics 跳过编译。实现 + Parser 集成完成，后续可继续 X09/X18 等任务。
+
+### 6.3 X13 Schema/Plan/AST 版本化实施记录（builder-A 第三次提交）
+
+> 范围：**Phase 2（X13 Schema 迁移契约）**。分支 `builder-A`。
+
+- [x] **2.1a** `serialization.hpp` 定义版本常量：`AST_SCHEMA_VERSION=1 / PLAN_SCHEMA_VERSION=1 / PRODUCER_VERSION=1 / CATALOG_SCHEMA_VERSION=5`（映射现状表/列描述符最新版）。
+- [x] **2.1b** AST：新增 `serializeAstDocument()`（`schemaVersion+producerVersion+statements` 对称文档）与 `deserializeAst()` 未知主版本拒绝（`schemaVersion != AST_SCHEMA_VERSION` → `Storage` 错误）。`serializeAst()` 保持裸数组兼容既有调用点。
+- [x] **2.1c** Plan：`deserializePlans()` 版检由硬编码 `1u` 改为 `PLAN_SCHEMA_VERSION` 常量，wrapper 文档（`schemaVersion+planKind+plans`）未知版本拒绝。
+- [x] **2.2** catalog schemaVersion 落盘：新增保留关系 `CatalogMetaStore`（占用 `uint64::max`，与从 2 起、单调递增的 `int32` 用户表 id 永不相交），单行 `{schemaVersion:int, detailJson}`。迁移入口 `PersistentCatalog::migrationPlan(from)` 返回 `[from, current]` 每步 `{from,to,reversible,preflight,action,recoveryPoint}`。
+- [x] **2.3a** `PersistentCatalog` 构造建档（重启校验）：absent→stamp 当前版本；`<current`→按迁移链升至 `CATALOG_SCHEMA_VERSION` 并记 `migratedFrom`；`==current`→no-op；`>current`→拒绝（`Unsupported catalog schema version N`）；非正版本/畸形 detail→`STORAGE_CORRUPTION`。
+- [x] **2.3b** 迁移为**版本戳记**式：表/列/索引/约束描述符在 lenient 重读后保持字节不变，仅推进 header schemaVersion（满足“迁移不得静默改列类型/NULL/约束/索引”）；恢复点=既有单行 header，`replace` 原子提交，中断后重启沿用恢复点重跑并使库可打开。
+- [x] **2.3c** 中断恢复：header detail 带 `pendingMigration>=current` 标记 → 视为崩溃中断，重启完成戳记并标 `recovered=true`。
+- [x] **2.3d** `Database::catalog()` 输出新增顶层 `schemaVersion`；`PersistentCatalog::catalogMetadata()`/`catalogSchemaVersion()` 暴露版本与迁移元信息。
+- [x] **2.4** 新增 `tests/catalog_migration_contract.cpp`（`minisql_catalog_migration_contract`，链接 `minisql_execution`）：迁移链 `1→current` 全部可逆/带前置/动作/恢复点；新建即戳 current；旧版 header 升级保留表；中断恢复 `recovered=true`；未知新版 `99` 拒绝且不改文件；非正版本畸形拒绝；迁移后 `execution::Database` 端到端可打开并查询。
+- [x] **2.5** 回归全绿：C++ contract（heap 2698 / database 81 / optimizer 518 / planner / catalog-migration 20）+ mjs（parser 18 / planner 26 / diagnostics 22 / subquery 24 / statistics 11 / explain 21）+ database-http 联调。
+
+**说明（X13 迁移语义）**：本系统表/列描述符自 v1–v5 均由 lenient reader 兼容读取，故“迁移”不重写描述符行，仅在成功重读后推进 catalog schemaVersion（可逆版本戳记）。这是对“迁移不得静默改列类型/NULL/约束/索引”最直接的安全实现——不会在迁移过程中改写任何用户schema。
+
+> 后续可接 **X09（派生表/作用域/Apply/SemiJoin）** 或 **X18（统计/成本模型）**。
