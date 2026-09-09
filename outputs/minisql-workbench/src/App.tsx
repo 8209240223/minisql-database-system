@@ -74,6 +74,55 @@ function App() {
     wide.addEventListener('change', closeOnWide);
     return () => wide.removeEventListener('change', closeOnWide);
   }, []);
+  useEffect(() => {
+    const sidebar = document.querySelector<HTMLElement>('.sidebar');
+    if (!sidebar) return;
+    const minimum = 220;
+    const maximum = 520;
+    const stored = Number(localStorage.getItem('minisql-sidebar-width'));
+    const clamp = (value: number) => Math.max(minimum, Math.min(maximum, value));
+    sidebar.style.width = `${clamp(Number.isFinite(stored) ? stored : 245)}px`;
+    const resizer = document.createElement('div');
+    resizer.className = 'sidebar-resizer';
+    resizer.setAttribute('role', 'separator');
+    resizer.setAttribute('aria-orientation', 'vertical');
+    resizer.setAttribute('aria-label', '拖动调整侧栏宽度');
+    sidebar.appendChild(resizer);
+    let drag: { pointerId: number; startX: number; startWidth: number } | undefined;
+    const finish = (event: PointerEvent) => {
+      if (!drag || drag.pointerId !== event.pointerId) return;
+      try { resizer.releasePointerCapture(event.pointerId); } catch { /* Pointer capture may already be released. */ }
+      drag = undefined;
+      resizer.classList.remove('dragging');
+      document.body.classList.remove('sidebar-resizing');
+      localStorage.setItem('minisql-sidebar-width', String(clamp(sidebar.getBoundingClientRect().width)));
+    };
+    const start = (event: PointerEvent) => {
+      if (event.button !== 0) return;
+      drag = { pointerId: event.pointerId, startX: event.clientX, startWidth: sidebar.getBoundingClientRect().width };
+      resizer.setPointerCapture(event.pointerId);
+      resizer.classList.add('dragging');
+      document.body.classList.add('sidebar-resizing');
+      event.preventDefault();
+    };
+    const move = (event: PointerEvent) => {
+      if (!drag || drag.pointerId !== event.pointerId) return;
+      sidebar.style.width = `${clamp(drag.startWidth + event.clientX - drag.startX)}px`;
+      event.preventDefault();
+    };
+    resizer.addEventListener('pointerdown', start);
+    resizer.addEventListener('pointermove', move);
+    resizer.addEventListener('pointerup', finish);
+    resizer.addEventListener('pointercancel', finish);
+    return () => {
+      resizer.removeEventListener('pointerdown', start);
+      resizer.removeEventListener('pointermove', move);
+      resizer.removeEventListener('pointerup', finish);
+      resizer.removeEventListener('pointercancel', finish);
+      resizer.remove();
+      document.body.classList.remove('sidebar-resizing');
+    };
+  }, []);
   function recordHistory(source: string, compile: boolean, durationMs: number, rows: number, error?: string) {
     setHistoryOmitted(source.length > MAX_HISTORY_SQL);
     if (source.length > MAX_HISTORY_SQL) return;

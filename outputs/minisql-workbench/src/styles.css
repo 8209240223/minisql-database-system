@@ -26,5 +26,10 @@ button:disabled{opacity:.45;cursor:not-allowed}
 /* 展开列时改为文档流布局，避免绝对定位覆盖后续表节点。 */
 .table-node{flex-wrap:wrap;align-items:center}
 .table-node:has(.columns){margin-bottom:0}
-.columns{position:static;flex:0 0 100%;width:auto;margin-left:12px;padding-bottom:4px}
-.column-node{width:100%;padding-left:0}
+.columns{position:static;flex:0 0 100%;width:max-content;min-width:240px;margin-left:12px;padding-right:14px;padding-bottom:4px}
+.column-node{width:100%;min-width:240px;padding-left:0;padding-right:14px}
+.sidebar{position:relative}
+.sidebar-resizer{position:absolute;top:0;right:-4px;width:8px;height:100%;cursor:col-resize;touch-action:none;z-index:30}
+.sidebar-resizer::after{content:"";position:absolute;top:0;bottom:0;left:3px;width:2px;background:transparent;transition:background .15s}
+.sidebar-resizer:hover::after,.sidebar-resizer.dragging::after{background:#1c6d63}
+.sidebar-resizing{cursor:col-resize;user-select:none}
