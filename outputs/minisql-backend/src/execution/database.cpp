@@ -1339,15 +1339,24 @@ nlohmann::json Database::diagnostics(const std::string& source) const {
         if (code == ErrorCode::NotImplemented) return "planner";
         return "internal";
     };
+    std::size_t statementIndex = 0;
     const auto append = [&](const MiniSqlError& error) {
+        const auto& loc = error.location();
         items.push_back({{"success", false}, {"stage", stageFor(error.code())},
             {"code", static_cast<int>(error.code())}, {"message", error.what()},
-            {"line", error.location().line}, {"column", error.location().column},
-            {"recoverable", true}});
+            {"line", loc.line}, {"column", loc.column},
+            {"endLine", loc.endLine ? loc.endLine : loc.line},
+            {"endColumn", loc.endColumn ? loc.endColumn : loc.column},
+            {"recoverable", true}, {"statementIndex", statementIndex}});
     };
-    std::vector<sql::Token> tokens;
-    try { tokens = sql::tokenize(source); }
-    catch (const MiniSqlError& error) { append(error); return {{"success", false}, {"diagnostics", items}, {"count", items.size()}}; }
+    // Tokenize in recovery mode so every lexical error is reported, not only
+    // the first one. Valid tokens still come back for later statements.
+    std::vector<MiniSqlError> lexicalErrors;
+    const auto tokens = sql::tokenizeRecoverable(source, lexicalErrors);
+    for (const auto& error : lexicalErrors) append(error);
+    if (!lexicalErrors.empty() && tokens.size() <= 1) {
+        return {{"success", false}, {"diagnostics", items}, {"count", items.size()}};
+    }
 
     catalog::Catalog snapshot = catalog_.view();
     std::vector<sql::Token> statement;
@@ -1361,9 +1370,13 @@ nlohmann::json Database::diagnostics(const std::string& source) const {
                 (void)sql::compilePlans({item}, snapshot);
                 snapshot = nextSnapshot;
                 items.push_back({{"success", true}, {"stage", "passed"}, {"kind", item.kind},
-                    {"line", item.location.line}, {"column", item.location.column}});
+                    {"line", item.location.line}, {"column", item.location.column},
+                    {"endLine", item.location.endLine ? item.location.endLine : item.location.line},
+                    {"endColumn", item.location.endColumn ? item.location.endColumn : item.location.column},
+                    {"statementIndex", statementIndex}});
             }
         } catch (const MiniSqlError& error) { append(error); }
+        ++statementIndex;
         statement.clear();
     };
     for (const auto& token : tokens) {

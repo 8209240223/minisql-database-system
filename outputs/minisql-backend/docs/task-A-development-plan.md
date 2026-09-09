@@ -1,0 +1,185 @@
+# 成员 A 开发计划（函数级）：编译前端与优化器
+
+对应：《MiniSQL_V3_未完成功能三人分工详细设计任务书.md》第五/九/十节
+主责：**X12、X13、X09 剩余、X18 剩余** + **A5 编译器/优化集成门禁**
+作者身份：anyu999（本地提交，推送由用户另行操作）
+代码根：`outputs/minisql-backend`
+
+---
+
+## 0. 基线锁定（第一个动作）
+
+跑 A5 固定回归，记录每项当前通过数/失败点作基线：
+
+```powershell
+cd outputs\minisql-backend
+node tests\parser-regression.mjs
+node tests\planner-regression.mjs
+node tests\diagnostics-smoke.mjs
+node tests\subquery-smoke.mjs
+node tests\statistics-smoke.mjs
+node tests\explain-smoke.mjs
+.\bin\planner_contract.exe
+.\bin\optimizer_contract.exe
+```
+
+同时把 `diagnostics()` 当前 JSON（见 `execution/database.cpp:1332-1375`）作契约基线快照。
+
+---
+
+## 1. 现状基线（函数级，已核实）
+
+### X12 编译器错误恢复 —— 差距
+| 位置 | 现状 | 缺口 |
+| --- | --- | --- |
+| `sql/lexer.cpp` `fail()` L18-20、L23-27、L35-67 | 遇词法错误**立即 throw Lexical**，链断 | 无「恢复跳过到稳定 Token」；无词法错误类别字段 |
+| `sql/lexer.hpp` `Token` L6 | `type/lexeme/location` | 无结束位置、无原始文本/错误类别 |
+| `sql/parser.cpp` `take()/expect()/identifier()/literal()` L10-18 | 每题**抛即止** | 无多诊断收集；无同步集合（sync set） |
+| `sql/parser.hpp` `Statement` | 语句级 `location` | 无 `invalid` 标记 → 错误 AST 无拒收标识 |
+| `execution/database.cpp` `diagnostics()` L1332-1375 | 语句级多诊断，字段 `success/stage/code/message/line/column/recoverable` | 无 `endLine/endColumn/statementIndex` |
+| `sql/planner.cpp` `build()` L216-227 | `invalid()` 抛 Internal | 无「AST 含 invalid 即拒、不产可执行计划」的显式闸门 |
+
+### X13 AST/Plan/Schema 版本化 —— 差距
+| 位置 | 现状 | 缺口 |
+| --- | --- | --- |
+| `include/minisql/sql/serialization.hpp` | 有 version 包装 + 往返 | 无 `nodeVersion/planVersion/schemaVersion/producerVersion`；未知主版本不拒绝 |
+| `sql/planner.cpp` L450-480（`compilePlans`） | 顺序编译 | 输出计划无稳定版本字段 |
+| `catalog/persistent_catalog.cpp` | 目录持久化 | 无 `schemaVersion` 迁移入口 |
+| `execution/database.cpp` | 打开库 | 无迁移执行/失败回滚/重启校验 |
+
+### X09 子查询/作用域 —— 差距
+| 位置 | 现状 | 缺口 |
+| --- | --- | --- |
+| `sql/parser.hpp` `Expr` L9 → `subquerySql` | **子查询以字符串存**（违背任务书「禁字符串替换」） | 需改为结构化对象身份（DerivedTable/Subquery 节点） |
+| `sql/parser.cpp` `select(false)` L235 | IN (SELECT…) 解析后存 `subquerySql` | 无 `Scope`；FROM 无派生表 |
+| `sql/planner.cpp` `bindExpression()` L58-67 | 直接把 Identifier 绑到 catalog 列 | 无当前块/外层作用域链；未限定名无固定解析规则 |
+| `sql/planner.hpp` `Join` L14 | `table/alias/on/{left,right}` | 无 Apply/SemiJoin 计划 |
+| `optimizer/optimizer.cpp` L22-35 | 支持 Exists/Scalar/InSubquery 重写 | 无去相关/Apply 改写；无跨边界保守规则 |
+
+### X18 统计/成本 —— 差距
+| 位置 | 现状 | 缺口 |
+| --- | --- | --- |
+| `execution/database.cpp` `statistics()` | 已有表/列行数/页数/distinct/NULL | 无直方图、无 `ANALYZE` 刷新、无统计版本/刷新时间 |
+| `optimizer/optimizer.cpp` 主循环 L368-404 | 单一 rewrite 固定点 | 无候选计划比较、无成本公式、无确定性决胜 |
+| `sql/planner.cpp` | 出 IndexScan/Join/Sort 计划 | 计划缺 `statsSource`/估计行数/页数/成本字段 |
+| `explain` | 已有 stats-v1 估计 + EXPLAIN ANALYZE 实际 | 估计来源/实际来源未区分，无完整成本模型 |
+
+---
+
+## 2. 分阶段规划（函数级）
+
+> 顺序遵循接口冻结规则（任务书 8.1）：Phase0/1 先冻结 A 对外契约，再进实现；IndexScan 计划字段与 B 协商后再做。
+
+### Phase 0 —— 基线 + 契约冻结
+- [ ] 跑 §0 基线回归，记录通过数。
+- [ ] R1 扩展 `SourceLocation` → 增 `endLine/endColumn`（默认回退起止）。影响文件：`common/error.hpp`；同步 `ast`/`Expr` 序列化字段读取。
+- [ ] R2 定义统一 `Diagnostic` 结构（code/message/line/column/endLine/endColumn/statementIndex/stage/source）与 JSON 契约，写 `docs/diagnostics-progress.md`。
+- [ ] R3 `serialization.hpp` 定义版本常量：`AST_NODE_VERSION/PLAN_VERSION/PRODUCER_VERSION/CATALOG_SCHEMA_VERSION`，主版本未知→拒绝，小版本→兼容读。
+- **跨组交付**：诊断 JSON 快照、AST/Plan 版本字段 → 告知 B/C（types.ts 同步）。
+
+### Phase 1 —— X12 Token 级错误恢复 + 单语句多诊断
+- **1.1 lexer 恢复**（`lexer.hpp/.cpp`）
+  - `Token` 增 `endLocation`；扫描器取消首个错误的 `fail()` throw，改为**记录诊断并跳到稳定的下一个 Token** 继续（`tokenize`/`scanTokens` 增诊断输出参数）。
+  - 非法字符、未闭合字符串、非法数字、未闭合注释 → 各输出一条 `code=2001,stage=lexer` 诊断 + 恢复点；字符串内 `;` 不切语句。
+- **1.2 parser 多诊断 + 同步**（`parser.hpp/.cpp`）
+  - 定义 sync set：`;`、`)`、语句关键字（SELECT/INSERT/UPDATE/DELETE/CREATE/DROP/…）、查询块边界。
+  - `take/expect/identifier/literal` 不再抛即止，改为收集诊断 + 按 sync set 跳到同步点继续本语句内解析，从而**单语句多诊断**。
+  - 错误处生成带 `invalid=true` 的节点/Statement；多语句循环边界不被打乱。
+- **1.3 planner 拒收**（`planner.cpp` `build()/compilePlans()`）：AST 含任何 `invalid` → 直接返回错误，**不产可执行计划、不产空计划/默认节点**。
+- **1.4 服务端+工作台**：`database.cpp diagnostics()` 输出全字段（含 `statementIndex/endLine/endColumn`）；`database_main.cpp` 透传；workbench `diagnostic-location.ts` 多诊断映射 + `App.tsx` 列表定位。
+- **1.5 测试**（`tests/diagnostics-smoke.mjs` 扩展）：
+  - ① 2 错 + 1 对混合 → `count=2`、两条独立诊断、合法语句仍 `success:true`；
+  - ② `'a;b'` 字符串含分号不误切；③ invalid AST 不进 Planner（执行拒绝测试）；
+  - ④ 恢复后后续语句仍正确解析；⑤ 位置与源码逐字符一致（含 endLine/endColumn、statementIndex）。
+- **退出**：X12 专项通过 + 错误 AST 执行拒绝测试通过 + 工作台多诊断定位可用。
+
+### Phase 2 —— X13 Schema 迁移契约
+- 2.1 `serialization.hpp`：未知主版本拒绝；同主版小版本兼容读（新旧节点往返测试）。
+- 2.1 `serialization.hpp`：未知主版本拒绝；同主版小版本兼容读（新旧节点往返测试）。
+- 2.2 `catalog/persistent_catalog.cpp`：`schemaVersion` 落盘 + 迁移入口（源/目标版本、可逆、前置校验、动作、失败恢复点）。
+- 2.3 `execution/database.cpp`：迁移执行、失败回滚点、重启校验；迁移不得静默改列类型/NULL/约束/索引。
+- 2.4 测试 `tests/planner-regression.mjs`（新旧节点、未知版本拒绝、往返）+ `tests/backup-smoke.mjs`（迁移链、失败回滚后库可打开）。
+- **退出**：X13 版本拒绝 / 往返 / 迁移成功 / 迁移失败回滚全部通过。
+
+### Phase 3 —— X09 派生表、作用域与 Apply/SemiJoin
+- 3.1 `sql/ast.hpp`：`DerivedTable`/`Scope`/`Subquery` 结构化节点；`Expr` 移除 `subquerySql`，改为子查询对象身份；列/表/索引/约束用稳定对象身份（非数组下标）。
+- 3.2 `sql/parser.cpp`：FROM 支持派生表（显式别名，重复输出列名报歧义）、嵌套查询块；`select()` 返回结构化子查询节点。
+- 3.3 `sql/planner.cpp` `bindExpression()`/`build()`：建立逐查询块 `Scope` 链（当前列→当前别名→外层相关），未限定名按固定顺序解析（禁字符串替换）；生成 Apply/SemiJoin 计划。
+- 3.4 `optimizer/optimizer.cpp`：先正确性优先 Apply，后 SemiJoin/AntiJoin + 保守去相关；子查询含聚合/DISTINCT/LIMIT/相关引用默认不跨边界改写；UPDATE/DELETE 用同一 Scope 与 NULL 三值逻辑。
+- 3.5 `execution/database.cpp`：Apply/SemiJoin 执行（非相关可缓存，相关按外层行绑定）。
+- 3.6 测试 `tests/subquery-smoke.mjs` 扩展：派生表别名/重复列/嵌套；三层作用域未限定名；IN/NOT IN/EXISTS/标量 NULL 与空集；标量多行/多列报错；UPDATE/DELETE 相关子查询；Apply 改写前后行数/重复/NULL 一致。
+- **退出**：X09 专项通过与 B 的 IndexScan、HashJoin、事务测试组合回归（与 B 一起联调）。
+
+### Phase 4 —— X18 统计、成本模型、确定性计划
+- 4.1 `execution/database.cpp` `statistics()`：增列 distinct/NULL 比例/min/max/可选直方图；显式 `ANALYZE` 或受控后台刷新，记录刷新时间与统计版本；缺失统计用有界默认值并标 `statsSource`。
+- 4.2 `optimizer/optimizer.cpp`：成本公式覆盖 SeqScan/IndexScan/NestedLoopJoin/HashJoin/Sort；候选计划比较 + 固定决胜规则（不依赖容器迭代顺序/随机值）；重复编译同统计→同计划。
+- 4.3 `sql/planner.cpp`：IndexScan/Join/Sort 计划输出 `statsSource`、估计行数/页数/成本、访问路径、过滤条件。
+- 4.4 explain：EXPLAIN 返回估计；EXPLAIN ANALYZE 只读返回实际行数/实际页读写/耗时；估计来源/实际来源区分。
+- 4.5 测试 `tests/statistics-smoke.mjs`、`tests/explain-smoke.mjs`：高低选择率、空表/缺失统计/过期/索引不存在、同成本多次编译一致、EXPLAIN 不执行写语句、实际行数与执行一致、读页差有记录（不伪造加速倍数）。
+- **依赖**：IndexScan 计划字段与 B(X20) 协商冻结（第二阶段开始），先接口后实现、复用现有点查。
+- **退出**：X18 专项通过 + EXPLAIN 字段进入 HTTP 契约并可由工作台展示。
+
+### Phase 5 —— A5 编译与优化集成门禁
+- 全量跑 §0 固定回归全部通过；`planner_contract/optimizer_contract.exe` 无回归。
+- 交付物：X12/X13/X09/X18 的 progress 文档；AST/Plan/Schema 版本迁移说明；编译错误码表 + 多诊断协议；成本模型公式/默认值/决胜规则。
+- 分支合入前：每个任务一次提交序列（author=anyu999）+ 至少一名成员评审 + 全量回归。
+
+---
+
+## 3. 回归命令（每 Phase 结束必跑）
+
+```powershell
+cd outputs\minisql-backend
+node tests\parser-regression.mjs tests\planner-regression.mjs tests\diagnostics-smoke.mjs
+node tests\subquery-smoke.mjs tests\statistics-smoke.mjs tests\explain-smoke.mjs
+.\bin\planner_contract.exe .\bin\optimizer_contract.exe
+# 联调：node tests\database-http.mjs
+```
+
+## 4. 跨组接口与风险
+
+| 依赖/风险 | 类型 | 对策 |
+| --- | --- | --- |
+| AST/Plan 结构改动影响 B/C | 雪崩 | Phase0 冻结版本契约 + 评审；下沉 B/C 前先同步 types.ts |
+| IndexScan 计划字段（X18） | 依赖 B(X20) | 第二阶段冻结契约，先接口后实现，复用现有点查 |
+| X09 去相关改写正确性 | 高 | 先正确性优先 Apply，再 SemiJoin/AntiJoin；严格 NULL/空集/标量报错测试 |
+| Schema 迁移破坏可打开性 | 高 | 强制失败回滚点 + 失败后库可打开测试 |
+| 统计/成本确定性 | 需求 | 固定决胜规则 + 同输入多次编译一致测试 |
+| 单语句多诊断跨阶段消化 | 高 | synset 与 invalid 标记先行，Planner 拒收闸门配套 |
+
+## 5. 提交与评审
+
+- 分支：`feature/x12-parser-recovery` / `feature/x13-schema-migration` / `feature/x09-subquery-scope` / `feature/x18-cost-model`。
+- 每个任务一个提交序列，author=anyu999；每任务至少一名成员评审；合入 `main` 前跑 §3 回归。
+
+---
+
+## 6. 本次提交（builder-A）执行记录
+
+> 基于最新 main `97f50bd`，分支 `builder-A`（fast-forward 推送）。范围：**Phase 0 + Phase 1（X12）**。
+
+### 6.0 基线核实（逐行确认，非推断）
+- [x] `common/error.hpp` `SourceLocation` 仅 `line/column`，无 `endLine/endColumn`。
+- [x] `sql/lexer.hpp` `Token` 仅 `type/lexeme/location`，无 `endLocation`；`tokenize` 纯 value 返回、无诊断输出参数。
+- [x] `sql/lexer.cpp` 共 9 处 `fail()`（L26/40/47/51/55/59/61/64/66），全部立即 throw Lexical。
+- [x] `sql/parser.cpp` `take/expect/identifier/literal` 抛 Syntax 即止。
+- [x] `sql/parser.hpp` `Statement` 无 `invalid` 标记；`Expr` 子查询仍以 `subquerySql` 字符串存储。
+- [x] `sql/planner.cpp` `build()` 无 invalid 拒收闸门；`bindExpression()` 无作用域链。
+- [x] `include/minisql/sql/serialization.hpp` 无细分版本常量、无未知主版本拒绝。
+- [x] `execution/database.cpp` `diagnostics()`（L1332-1376）语句级多诊断，缺 `endLine/endColumn/statementIndex`。
+
+### 6.1 构建环境修复
+- 根因：VS BuildTools 自带 vcpkg 在 Windows 上 install 引导阶段需要 `powershell-core`(pwsh)，但 `environment.ps1` 的 `VCPKG_FORCE_SYSTEM_BINARIES=1` 禁止 vcpkg 下载工具，而本机无系统 pwsh → `Could not fetch powershell-core`。
+- 修复：[scripts/environment.ps1](../scripts/environment.ps1) 移除 FORCE 标志（仅移除强制，CMake/git 仍走系统 PATH）。vcpkg 经代理 7890 下载 pin 版 pwsh 后继续。
+
+### 6.2 X12 实施记录（对照 §1）—— 已提交，验证全绿
+- [x] **1.1** `SourceLocation` 增 `endLine/endColumn`（默认回退起点）。
+- [x] **1.2** `Token` 增 `endLocation`。
+- [x] **1.3** lexer 恢复：新增 `tokenizeRecoverable()`，把词法错误记录为 `code=2001` 诊断并跳稳定点继续扫描；原 `tokenize/scanTokens` 抛异常行为不变（兼容既有调用点）。字符串内 `;` 不切语句。
+- [ ] **1.4** parser 多诊断 + sync set：`take/expect/identifier/literal` 收集诊断 + 同步恢复；错误节点置 `invalid=true`。（本轮 X12 完成词法层，语法层留待本轮后增量推进）
+- [ ] **1.5** planner 拒收：AST 含 invalid 即返回错误，不产可执行计划。
+- [x] **1.6** `database.cpp diagnostics()` 复用恢复式 tokenize，输出 `endLine/endColumn/statementIndex`。
+- [x] **1.7** 测试扩展：`tests/diagnostics-smoke.mjs` 覆盖多词法错误逐一报告、错误后合法语句继续解析、位置/索引精确。
+- [x] **1.8** 回归：parser 18 / planner 26 / subquery 24 / explain 21 / statistics 11 / diagnostics 19 / contract 全部通过。
+
+> 本轮目标收敛为 **X12 词法层 + 契约字段冻结**：恢复式 tokenizer + 多词法诊断 + 完整定位字段。语法层恢复（1.4）与 planner 拒收（1.5）在下一子阶段推进（同分支继续提交）。

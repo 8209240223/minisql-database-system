@@ -20,6 +20,8 @@ enum class ErrorCode {
 struct SourceLocation {
     std::size_t line{0};   // 1-based; 0 means location unavailable.
     std::size_t column{0};
+    std::size_t endLine{0};    // Exclusive end of the source span; 0 = fall back to line.
+    std::size_t endColumn{0};  // One past the last column of the source span; 0 = fall back to column.
 };
 
 std::string errorType(ErrorCode code);

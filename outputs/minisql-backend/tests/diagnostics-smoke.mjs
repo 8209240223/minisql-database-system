@@ -29,4 +29,16 @@ equal(valid.count, 3);
 const lexical = run("SELECT 'unterminated");
 equal(lexical.success, false);
 equal(lexical.diagnostics[0].stage, 'lexer');
+
+// X12: recovery-mode tokenizer reports EVERY lexical error in the batch (not
+// just the first) and still parses the remaining valid statements.
+const multiLex = run('SELECT @@ @; CREATE TABLE a(id INT); INSERT INTO a VALUES(1); SELECT * FROM a;');
+equal(multiLex.count, 6);
+const lexerStages = multiLex.diagnostics.filter(d => d.stage === 'lexer');
+equal(lexerStages.length, 2); // two '@' errors are both reported
+equal(lexerStages.every(d => d.recoverable === true && d.statementIndex === 0), true);
+equal(multiLex.diagnostics.every(d => Number.isInteger(d.endLine) && Number.isInteger(d.endColumn)), true);
+// the valid statements after the lexical errors still succeed
+equal(multiLex.diagnostics.filter(d => d.success === true).length, 3);
+
 console.log(`${checks} batch diagnostics checks passed`);
