@@ -96,7 +96,7 @@
 | `node tests/fuzz-state-machine-long-run.mjs` | X27 真实 C++ 长跑 | 2 种子 × 512 步通过 |
 | `node tests/fuzz-state-machine-crash-recovery.mjs` | X27 状态机崩溃恢复组合 | 5 个提交故障点全部通过 |
 | `node tests/fuzz-state-machine-pressure.mjs` | X27 高压状态机与资源采样 | 4 种子 × 512 步、4096 条压力数据、临时文件清理通过 |
-| `node tests/fuzz-state-machine-soak.mjs` | X27 重复长跑入口 | 固定种子/步数/轮次可配置；本轮短 smoke 通过，长期轮次需在 CI/夜间环境执行 |
+| `node tests/fuzz-state-machine-soak.mjs` | X27 重复长跑入口 | 固定种子/步数/轮次或持续时间可配置；5 秒/30 步固定持续时间 smoke 完成 8 轮且失败分类为零，长期轮次需在 CI/夜间环境执行 |
 | `npm run test:safety`（工作台） | 整表变异提示 | 22 项通过 |
 | `npm run test:history`（工作台） | 查询历史 | 24 项通过 |
 | `npm run test:csv`（工作台） | CSV 导出 | 21 项通过 |
