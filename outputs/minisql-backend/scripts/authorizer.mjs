@@ -12,6 +12,9 @@ import {
   normalizeAccess, publicAccess, roleNames, verifyUser,
 } from './access-catalog.mjs';
 import { openStore, pagesPathFor, readHeader, writeStore } from './access-store.mjs';
+import { firstKeyword, tableReferences } from './sql-object-references.mjs';
+
+export { firstKeyword, tableReferences };
 
 export const PERMISSION_DENIED_CODE = 7001;
 
@@ -66,36 +69,6 @@ function requirePermissions(raw) {
 // ---------------------------------------------------------------------------
 // SQL → 权限检查项映射（CLI 与 HTTP 共用，保证两条路径判定完全一致）
 // ---------------------------------------------------------------------------
-
-export function firstKeyword(sql) {
-  return String(sql ?? '').replace(/^\s+|\s+$/g, '')
-    .match(/^(?:\/\*[\s\S]*?\*\/\s*|--[^\r\n]*\r?\n\s*)*([a-zA-Z]+)/)?.[1]?.toUpperCase() ?? '';
-}
-
-export function tableReferences(sql, keyword) {
-  const stripped = String(sql ?? '').replace(/^EXPLAIN(?:\s+ANALYZE)?/i, '');
-  const tables = [];
-  const add = pattern => {
-    const expression = new RegExp(pattern, 'gi');
-    let match;
-    while ((match = expression.exec(stripped))) {
-      const name = match[1]?.toLowerCase();
-      if (name && !tables.includes(name)) tables.push(name);
-    }
-  };
-  if (keyword === 'SELECT') {
-    add('\\b(?:FROM|JOIN)\\s+([A-Za-z_][A-Za-z0-9_]*)');
-    add('\\bUPDATE\\s+([A-Za-z_][A-Za-z0-9_]*)');
-  } else if (keyword === 'INSERT') add('\\bINTO\\s+([A-Za-z_][A-Za-z0-9_]*)');
-  else if (keyword === 'UPDATE') add('\\bUPDATE\\s+([A-Za-z_][A-Za-z0-9_]*)');
-  else if (keyword === 'DELETE') add('\\bFROM\\s+([A-Za-z_][A-Za-z0-9_]*)');
-  else if (keyword === 'DROP') add('\\bTABLE\\s+([A-Za-z_][A-Za-z0-9_]*)');
-  else if (keyword === 'CREATE') {
-    add('\\bTABLE\\s+([A-Za-z_][A-Za-z0-9_]*)');
-    add('\\bON\\s+([A-Za-z_][A-Za-z0-9_]*)');
-  }
-  return tables;
-}
 
 export function sqlPermissionChecks(mode, sql) {
   if (mode === 'catalog' || mode === 'statistics' || mode === 'buffer') return [{ permission: 'read', object: '*' }];

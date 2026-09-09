@@ -55,6 +55,9 @@ try {
   const deniedNestedRead = await session.request('execute', 'SELECT * FROM public_records WHERE id IN (SELECT id FROM secret_records);', alice);
   equal(deniedNestedRead.success, false, 'nested subquery object without SELECT permission is denied');
   equal(deniedNestedRead.error.code, 7001, 'nested subquery denial is a PermissionError');
+  const deniedDerivedRead = await session.request('execute', 'SELECT * FROM (SELECT id FROM secret_records) AS hidden;', alice);
+  equal(deniedDerivedRead.success, false, 'derived-table object without SELECT permission is denied');
+  equal(deniedDerivedRead.error.code, 7001, 'derived-table denial is a PermissionError');
   equal((await session.request('execute', "SELECT * FROM public_records WHERE 'FROM secret_records' = 'x';", alice)).success, true,
     'object names inside string literals do not trigger authorization');
 

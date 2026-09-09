@@ -83,8 +83,9 @@
 | `node tests/access-store-contract.mjs` | X24 页式权限目录：页布局、多页负载、损坏拒绝、原子写、JSON 迁移 | 48 项通过 |
 | `node tests/access-catalog-atomic-contract.mjs` | X24 原子权限接口（本次新增） | 27 项通过 |
 | `node tests/access-atomic-http.mjs` | X24 原子 HTTP 资源端点（本次新增，不依赖引擎） | 39 项通过 |
-| `node tests/access-control-process.mjs` | X24 C++ session/直连入口身份、密码和嵌套对象授权 | 18 项通过 |
-| `node tests/access-control-http.mjs`（索引检查扩展） | X24 bridge 到 C++ session 的索引检查、嵌套对象和字符串扫描调用链 | 42 项通过 |
+| `node tests/access-control-process.mjs` | X24 C++ session/直连入口身份、密码和嵌套/派生对象授权 | 20 项通过 |
+| `node tests/access-control-http.mjs`（索引检查扩展） | X24 bridge 到 C++ session 的索引检查、嵌套/派生对象和字符串扫描调用链 | 43 项通过 |
+| `node tests/sql-object-references-contract.mjs` | X24 HTTP/CLI 对象引用扫描契约 | 8 项通过 |
 | `node tests/backup-smoke.mjs` | C2 备份清单迁移校验、失败分类与恢复隔离 | 50 项通过 |
 | `node tests/fuzz-model-contract.mjs` | X27 生成器/缩减器确定性、覆盖 | 10 项通过 |
 | `node tests/fuzz-process-contract.mjs` | X27 子进程隔离、超时、输出超限、异常退出 | 7 项通过 |
@@ -111,7 +112,7 @@
 
 | X 编号 | 状态 | 说明 |
 | --- | --- | --- |
-| X24 | 部分实现 | 访问目录、角色继承、对象授权、加盐密码、跨会话身份、元数据过滤、审计过滤、原子 HTTP 端点、权限感知 CLI，以及 C++ session/直连入口身份校验和权限版本热重载均已验证；工作台已携带当前身份。仍缺：访问目录统一进入现有 `PersistentCatalog` 系统表，复杂 SQL 对象从轻量扫描升级为完整 AST 绑定。 |
+| X24 | 部分实现 | 访问目录、角色继承、对象授权、加盐密码、跨会话身份、元数据过滤、审计过滤、原子 HTTP 端点、权限感知 CLI，以及 C++ session/直连入口身份校验和权限版本热重载均已验证；支持语句的 C++ 对象收集已改为结构化 AST，工作台已携带当前身份。仍缺：访问目录统一进入现有 `PersistentCatalog` 系统表、完整 Catalog 名称绑定和更广 SQL 的统一 AST 绑定。 |
 | X27 | 部分实现 | SELECT 固定种子差分 500 项、DDL/DML 状态机生成与持久化、真实 C++ session 差分、3 种固定种子各 96 步回归、2 种固定种子各 512 步长跑、DATE/BOOL 字面量回归、模型缩减、故障分类、五阶段跨进程崩溃恢复组合，以及 4 种子 × 512 步 × 4096 条压力数据的溢写/资源回归均已验证。仍缺：无限输入和多小时长期资源趋势。 |
 | C2 工作台 | 已完成本轮范围 | 已接入真实 C++ 编译、Token/AST/计划展示、诊断、事务、历史、CSV、存储统计、身份、权限/审计/会话、锁等待取消、资源预算、客户端超时、备份迁移校验和恢复入口；真实 Edge 浏览器已覆盖成功/失败查询、客户端超时、活动请求取消、迁移校验通过、替换恢复、迁移校验失败、损坏恢复失败隔离和恢复后查询。 |
 | C4 全量验收 | 部分完成 | 已定稿 `outputs/V3_feature_matrix.md` 与 `outputs/V3最终验收报告.md`，但 X01-X27 中仍有部分实现项，不能关闭整体 V3 验收。 |
@@ -131,6 +132,7 @@
 - `outputs/minisql-backend/tests/fuzz/fixture.sql`、`corpus-select-*.sql`、`corpus-state-*.sql` —— 生成语料
 - `outputs/minisql-backend/tests/access-catalog-atomic-contract.mjs` —— X24 原子接口契约测试
 - `outputs/minisql-backend/tests/access-atomic-http.mjs` —— X24 原子 HTTP 资源端点集成测试（不依赖引擎）
+- `outputs/minisql-backend/tests/sql-object-references-contract.mjs` —— X24 统一对象引用扫描契约测试
 - `outputs/minisql-workbench/src/AccessControl.tsx` —— C2 权限/审计/会话面板组件
 - `outputs/minisql-workbench/tests/c2-resilience-dom.cjs` —— C2 真实 Edge 取消、备份替换恢复和恢复后查询回归
 - `.github/workflows/ci.yml` —— 可重复回归 CI（成员 C 入口）
@@ -144,6 +146,7 @@
 - `outputs/minisql-workbench/src/styles.css` —— 权限面板样式（含深色适配）
 - `outputs/minisql-backend/docs/access-control-progress.md` —— 记录原子接口/HTTP 端点/面板与验证
 - `outputs/minisql-backend/docs/fuzz-progress.md` —— 记录 X27 状态机语料与 CI
+- `outputs/minisql-backend/scripts/sql-object-references.mjs` —— HTTP/CLI/审计共用 SQL 对象引用扫描器
 - `outputs/MiniSQL扩展功能实施清单_V1.0.md` —— 更新 X24 / X27 状态行
 
 ---
@@ -162,7 +165,7 @@
 ## 八、2026-09-10 合并后结论
 
 - C1、C2、C3 的主路径、接口和专项回归已完成本轮收口；A/B 的最新提交（含结构化相关子查询执行、页级索引、WAL/检查点）也已合并并通过回归；C4 的矩阵和报告已更新为合并后的真实证据。
-- C 任务仍不能标记为“全部完成”：X24 的完整 AST 对象绑定和与现有 `PersistentCatalog` 的统一仍需跨组接口，X27 的无限输入和多小时长期资源趋势仍需长期环境证据；同时 X01-X27 仍有其他部分实现项。
+- C 任务仍不能标记为“全部完成”：X24 的完整 Catalog 名称绑定和与现有 `PersistentCatalog` 的统一仍需跨组接口，X27 的无限输入和多小时长期资源趋势仍需长期环境证据；同时 X01-X27 仍有其他部分实现项。
 - X01-X27 中仍有多个“部分实现”项，因此整体 V3 最终验收继续保持未通过，不把 A/B/C 的专项测试通过等同于全部需求完成。
 
 ---
