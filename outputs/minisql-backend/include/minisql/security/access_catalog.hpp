@@ -4,6 +4,7 @@
 #include <filesystem>
 #include <string>
 #include <nlohmann/json.hpp>
+#include <vector>
 
 namespace minisql::security {
 
@@ -19,7 +20,8 @@ public:
     const nlohmann::json& document() const noexcept { return catalog_; }
     bool verify(const std::string& user, const std::string& password) const;
     void authorize(const std::string& user, const std::string& operation, const std::string& sql,
-                   const std::string& table = {}, const std::string& index = {}) const;
+                   const std::string& table = {}, const std::string& index = {},
+                   const std::vector<std::string>& resolvedObjects = {}) const;
 
 private:
     bool enabled_ = false;

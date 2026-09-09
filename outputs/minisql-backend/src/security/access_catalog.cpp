@@ -460,7 +460,8 @@ bool AccessCatalog::verify(const std::string& user, const std::string& password)
 }
 
 void AccessCatalog::authorize(const std::string& user, const std::string& operation, const std::string& sql,
-                              const std::string& table, const std::string& index) const {
+                              const std::string& table, const std::string& index,
+                              const std::vector<std::string>& resolvedObjects) const {
     if (!enabled_) return;
     const auto mode = normalized(operation);
     const auto keyword = firstKeyword(sql);
@@ -475,6 +476,7 @@ void AccessCatalog::authorize(const std::string& user, const std::string& operat
     else if (keyword == "insert" || keyword == "update" || keyword == "delete") permission = keyword;
     std::vector<std::string> objects;
     if (mode == "indexinspect" && !table.empty()) objects.push_back(normalized(table));
+    else if (!resolvedObjects.empty()) objects = resolvedObjects;
     else objects = astTableReferences(sql, keyword);
     if (objects.empty()) objects.push_back("*");
     (void)index;
