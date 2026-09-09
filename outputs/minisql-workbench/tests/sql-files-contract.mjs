@@ -1,0 +1,10 @@
+import assert from 'node:assert/strict';
+import { decodeSqlFile, sqlFilename, MAX_SQL_FILE_BYTES } from '../src/sql-files.ts';
+assert.equal(decodeSqlFile(new TextEncoder().encode('中文\r\nSELECT 1;')), '中文\r\nSELECT 1;');
+assert.equal(decodeSqlFile(new Uint8Array()), '');
+assert.throws(() => decodeSqlFile(new Uint8Array([255])), /UTF-8/);
+assert.throws(() => decodeSqlFile(new Uint8Array(MAX_SQL_FILE_BYTES + 1)), /8 MiB/);
+assert.equal(sqlFilename('../query'), '.._query.sql');
+assert.equal(sqlFilename('a.SQL'), 'a.SQL');
+assert.equal(sqlFilename('  '), 'query.sql');
+console.log('7 SQL file contract checks passed');

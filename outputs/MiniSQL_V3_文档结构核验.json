@@ -1,0 +1,15 @@
+{
+  "tables": 40,
+  "headings": 147,
+  "requirements": 74,
+  "extension_requirements": 27,
+  "characters": 50450,
+  "numbered_chapters": 20,
+  "ui_requirements": 10,
+  "mapped_original_requirements": 62,
+  "source_files_rehashed": 4,
+  "images": 0,
+  "visual_review": "未进行；遵照用户要求，不生成或读取图片",
+  "scope": "仅文档检查，不是软件功能测试报告",
+  "docx_sha256": "a72f37bf06f42448b8ca89a4ae5af0afeafab1c6e40e93561fc43fe35fc1d64d"
+}

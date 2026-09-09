@@ -1,0 +1,25 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "MiniSQL: CLI (MSVC)",
+      "type": "cppvsdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/build/windows/Debug/minisql.exe",
+      "args": ["--config", "config/development.json"],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "preLaunchTask": "MiniSQL: build Debug"
+    },
+    {
+      "name": "MiniSQL: GoogleTest (MSVC)",
+      "type": "cppvsdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/build/windows/tests/Debug/minisql_tests.exe",
+      "args": [],
+      "cwd": "${workspaceFolder}/build/windows/tests",
+      "console": "integratedTerminal",
+      "preLaunchTask": "MiniSQL: build Debug"
+    }
+  ]
+}

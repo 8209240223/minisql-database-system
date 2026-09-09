@@ -1,0 +1,15 @@
+/build/
+/build-*/
+/bin/
+/out/
+/.tools/
+/vcpkg_installed/
+/data/
+/logs/
+/tests/artifacts/
+/.ninja_log
+/CMakeUserPresets.json
+/.vs/
+/ui/node_modules/
+/ui/dist/
+*.user

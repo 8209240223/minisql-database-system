@@ -1,0 +1,11 @@
+import assert from 'node:assert/strict';
+import { invoke } from './fuzz-process.mjs';
+const run = (code, options) => invoke(process.execPath, ['-e', code], '', options);
+assert.equal(run('setTimeout(()=>{},5000)', { timeoutMs: 100 }).category, 'timeout');
+assert.equal(run('process.stdout.write("x".repeat(1000000))', { outputBytes: 128 }).category, 'resourceLimit');
+assert.equal(run('process.exit(17)').category, 'crash');
+assert.equal(run('console.log("not json")').category, 'crash');
+assert.equal(run('console.log(JSON.stringify({success:false}))').category, 'crash');
+assert.deepEqual(run('console.log(JSON.stringify({success:true,results:[]}))').data, { success: true, results: [] });
+assert.deepEqual(run('console.log(JSON.stringify({success:false}));process.exitCode=1').data, { success: false });
+console.log('7 real child-process isolation checks passed');

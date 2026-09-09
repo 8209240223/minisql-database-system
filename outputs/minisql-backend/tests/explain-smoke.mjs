@@ -1,0 +1,36 @@
+import { spawnSync } from 'node:child_process';
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import assert from 'node:assert/strict';
+const db = join(mkdtempSync(join(tmpdir(), 'minisql-explain-')), 'db.pages');
+function run(sql) {
+  const process = spawnSync('./build/windows/Release/minisql_database.exe', [db, 'execute'], { input: sql, encoding: 'utf8', windowsHide: true, timeout: 15000 });
+  assert.ifError(process.error);
+  return JSON.parse(process.stdout);
+}
+assert.equal(run('CREATE TABLE t(id INT); INSERT INTO t VALUES(1);').success, true);
+const result = run('/* plan */ EXPLAIN INSERT INTO t VALUES(2); EXPLAIN SELECT * FROM t WHERE 1=1; SELECT * FROM t;');
+assert.equal(result.success, true, JSON.stringify(result));
+assert.equal(result.results[0].executed, false);
+assert.equal(result.results[0].affectedRows, 0);
+assert.deepEqual(result.results[2].rows, [[1]]);
+assert.ok(result.results[1].plan.length > 0);
+assert.ok(result.results[1].rows.every(row => row.length === 5 && Number.isFinite(row[2]) && Number.isFinite(row[3]) && row[4] === 'stats-v1'));
+assert.equal(run('EXPLAIN CREATE TABLE absent(id INT);').success, true);
+assert.equal(run('SELECT * FROM absent;').success, false);
+assert.equal(run('EXPLAIN ANALYZE INSERT INTO t VALUES(3);').success, false);
+assert.deepEqual(run('SELECT * FROM t;').results[0].rows, [[1]]);
+const analyzed = run('EXPLAIN ANALYZE SELECT * FROM t;');
+assert.equal(analyzed.success, true, JSON.stringify(analyzed));
+const stats = analyzed.results[0].executionStats;
+assert.equal(stats.actualRows, 1);
+assert.equal(stats.scope, 'query');
+assert.ok(stats.durationMs >= 0);
+assert.equal(stats.loops, 1);
+assert.equal(stats.nodeStatisticsAvailable, true);
+assert.ok(stats.nodeStatistics.length > 0);
+assert.ok(stats.nodeStatistics.every(node => Number.isFinite(node.actualRows) && Number.isFinite(node.durationMs)));
+assert.equal(run('EXPLAIN ANALYZE SELECT * FROM t WHERE FALSE;').results[0].executionStats.actualRows, 0);
+assert.equal(run('EXPLAIN ANALYZE SELECT 1/0 FROM t;').completedStatements, 0);
+console.log('21 EXPLAIN smoke checks passed');

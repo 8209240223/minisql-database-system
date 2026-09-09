@@ -1,0 +1,44 @@
+import assert from 'node:assert/strict';
+import { mkdtempSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { invoke } from './fuzz-process.mjs';
+const directory=mkdtempSync(fileURLToPath(new URL('./artifacts/decimal-cast-',import.meta.url)));
+const file=join(directory,'database.pages');
+const executable=fileURLToPath(new URL('../bin/minisql_database.exe',import.meta.url));
+let checks=0;
+function equal(a,b){assert.deepEqual(a,b);++checks;}
+function run(sql,mode='execute'){const result=invoke(executable,[file,mode],sql);assert.ok(!result.category,JSON.stringify(result));return result.data;}
+function query(sql){const result=run(sql);assert.equal(result.success,true,JSON.stringify(result));++checks;return result.results.at(-1).rows;}
+equal(run('CREATE TABLE t(v INT); INSERT INTO t VALUES(2),(10),(-2);').success,true);
+equal(query("SELECT CAST(12 AS DECIMAL(6,2)),CAST('0012.3400' AS DECIMAL(6,3)),CAST(1.235 AS DECIMAL(4,2)),CAST(-1.235 AS DECIMAL(4,2)) FROM t LIMIT 1;"),[['12.00','12.340','1.24','-1.24']]);
+equal(query('SELECT CAST(2.5 AS DECIMAL(2,0)),CAST(-2.5 AS DECIMAL(2,0)),CAST(-0.004 AS DECIMAL(2,2)),CAST(9.995 AS DECIMAL(4,2)) FROM t LIMIT 1;'),[['3','-3','0.00','10.00']]);
+equal(query('SELECT CAST(NULL AS DECIMAL(38,38)),CAST(0 AS DECIMAL(1,1)),CAST(0.00000001 AS DECIMAL(38,38)) FROM t LIMIT 1;'),[[null,'0.0','0.00000001000000000000000000000000000000']]);
+equal(query('SELECT CAST(CAST(1.2345 AS DECIMAL(6,3)) AS DECIMAL(4,2)),CAST(CAST(-2.5 AS DECIMAL(2,1)) AS INT) FROM t LIMIT 1;'),[['1.24',-3]]);
+equal(query('SELECT CAST(v AS DECIMAL(4,1)) AS d FROM t ORDER BY d;'),[['-2.0'],['2.0'],['10.0']]);
+equal(query('SELECT COUNT(CAST(v AS DECIMAL(4,1))),SUM(CAST(v AS DECIMAL(4,1))),AVG(CAST(v AS DECIMAL(4,1))),MIN(CAST(v AS DECIMAL(4,1))),MAX(CAST(v AS DECIMAL(4,1))) FROM t;'),[[3,'10.0','3.333333','-2.0','10.0']]);
+equal(query('SELECT CAST(v AS DECIMAL(4,1)),COUNT(*) FROM t GROUP BY CAST(v AS DECIMAL(04,01)) ORDER BY CAST(v AS DECIMAL(4,1));'),[['-2.0',1],['2.0',1],['10.0',1]]);
+equal(query("SELECT CAST('99999999999999999999999999999999999999' AS DECIMAL(38,0)) FROM t LIMIT 1;"),[['99999999999999999999999999999999999999']]);
+equal(query('SELECT CAST(-9223372036854775808 AS DECIMAL(19,0)),CAST(9223372036854775807 AS DECIMAL(19,0)) FROM t LIMIT 1;'),[['-9223372036854775808','9223372036854775807']]);
+equal(query("SELECT CAST(CAST('9223372036854775807.4' AS DECIMAL(20,1)) AS BIGINT) FROM t LIMIT 1;"),[['9223372036854775807']]);
+equal(query("SELECT FALSE AND CAST('bad' AS DECIMAL(2,1))>0,TRUE OR CAST('bad' AS DECIMAL(2,1))>0 FROM t LIMIT 1;"),[[false,true]]);
+for(const target of ['DECIMAL(0,0)','DECIMAL(39,0)','DECIMAL(1,2)']) equal(run(`SELECT CAST(NULL AS ${target}) FROM t;`).error.code,2003);
+for(const target of ['DECIMAL','DECIMAL(2)','DECIMAL(2,)','DECIMAL(-1,0)','DECIMAL(2,1.0)','DECIMAL(2,1,0)','DECIMAL(4294967296,0)']) equal(run(`SELECT CAST(1 AS ${target}) FROM t;`).error.code,2002);
+for(const raw of ["'1.2x'","' 1.2'","'1.2 '","'1e2'","'NaN'","''","'+'","'+-1'","'.5'","'1.'",'9.995']) equal(run(`SELECT CAST(${raw} AS DECIMAL(3,2)) FROM t;`).error.code,5001);
+equal(run('SELECT CAST(TRUE AS DECIMAL(3,2)) FROM t;').error.code,2003);
+equal(run("SELECT CAST(CAST('9223372036854775807.5' AS DECIMAL(20,1)) AS BIGINT) FROM t;").error.code,5001);
+const error=run("SELECT\nCAST('bad' AS DECIMAL(2,1)) FROM t;").error;
+equal(error.line,2);equal(error.column,1);
+const compiled=run('SELECT CAST(1.234 AS DeCiMaL(04,02)) FROM t;','compile');
+equal(compiled.success,true);equal(compiled.ast.selectItems[0].expression.value,'decimal(4,2)');
+equal(compiled.plan[0].output[0].type,'decimal(4,2)');
+equal(run('CREATE TABLE c(v INT CHECK(CAST(v AS DECIMAL(3,1))<5.0)); INSERT INTO c VALUES(1);').success,true);
+equal(query('SELECT * FROM c;'),[[1]]);
+equal(run('INSERT INTO c VALUES(5);').error.code,5001);
+equal(run('INSERT INTO t VALUES(CAST(CAST(2.5 AS DECIMAL(2,0)) AS INT));').success,true);
+equal(query('SELECT v FROM t WHERE v=3;'),[[3]]);
+const before=readFileSync(file);
+equal(run('INSERT INTO t VALUES(CAST(2 AS DECIMAL(2,0)));').error.code,2003);equal(readFileSync(file),before);
+equal(run("BEGIN; INSERT INTO t VALUES(99); SELECT CAST('bad' AS DECIMAL(2,0)) FROM t; COMMIT;").success,false);
+equal(readFileSync(file),before);
+console.log(`${checks} DECIMAL target CAST checks passed`);

@@ -1,0 +1,15 @@
+import assert from 'node:assert/strict';
+import { generate, minimize, render } from './fuzz-model.mjs';
+assert.deepEqual(generate(123, 80), generate(123, 80));
+assert.notDeepEqual(generate(123, 80), generate(124, 80));
+const source = { ...generate(123, 1)[0], predicates: ['a>1', 'b=2', 'a<4'] };
+const reduced = minimize(source, model => model.predicates.includes('b=2'));
+assert.deepEqual(reduced.model.predicates, ['b=2']);
+assert.equal(reduced.model.expression, 'a');
+assert.equal(reduced.model.limit, null);
+assert.ok(render(reduced.model).length < render(source).length);
+assert.deepEqual(source.predicates, ['a>1', 'b=2', 'a<4']);
+assert.equal(minimize(source, () => false, 1).attempts, 1);
+assert.deepEqual(minimize(source, () => false).model, source);
+assert.deepEqual([...new Set(generate(20260908, 100).map(model => model.predicates.length))].sort(), [1, 2, 3, 4]);
+console.log('10 fuzz generator/minimizer checks passed');

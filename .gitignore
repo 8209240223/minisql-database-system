@@ -1,0 +1,22 @@
+# Local dependency and build workspaces
+work/
+
+# Backend build and dependency outputs
+outputs/minisql-backend/build/
+outputs/minisql-backend/build-*/
+outputs/minisql-backend/.tools/
+outputs/minisql-backend/vcpkg_installed/
+outputs/minisql-backend/data/
+outputs/minisql-backend/logs/
+outputs/minisql-backend/tests/artifacts/
+
+# Frontend dependencies and generated output
+outputs/minisql-workbench/node_modules/
+outputs/minisql-workbench/dist/
+outputs/minisql-workbench/*.tsbuildinfo
+
+# Editors and local runtime files
+.vs/
+.vscode/*.user
+*.user
+*.log

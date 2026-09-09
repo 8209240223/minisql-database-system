@@ -1,0 +1,11 @@
+{
+  "data_directory": "./data",
+  "wal_directory": "./data/wal",
+  "catalog_directory": "./data/system",
+  "page_size": 4096,
+  "buffer_pool_size": 128,
+  "replacement_policy": "LRU",
+  "mode": "cli",
+  "server": { "host": "127.0.0.1", "port": 8080, "websocket_enabled": true },
+  "logging": { "level": "INFO", "directory": "./logs", "console": true, "max_file_size": 5242880, "max_files": 3 }
+}
