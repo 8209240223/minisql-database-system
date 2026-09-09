@@ -4,6 +4,7 @@
 // is in place before the planner/optimizer switch over in 3.3-3.5.
 #include "minisql/sql/lexer.hpp"
 #include "minisql/sql/parser.hpp"
+#include "minisql/sql/planner.hpp"
 #include <iostream>
 #include <stdexcept>
 
@@ -70,5 +71,29 @@ int main() {
     require(rejected("SELECT * FROM (SELECT a FROM t);"), "derived table without explicit alias must be rejected");
     require(rejected("SELECT * FROM (SELECT a AS x, b AS x FROM t) AS d;"), "duplicate derived output column names must be rejected");
     std::cout << "4 X09 derived-table parser checks passed\n";
+
+    // --- X09 Phase 3.3: derived-table scope-chain planning (compilePlans) ---
+    minisql::catalog::Catalog catalog;
+    for (const auto& s : parse(tokenize("CREATE TABLE t(id INT, a INT, b INT); CREATE TABLE s(id INT, v INT);")))
+        minisql::catalog::validate({s}, catalog);
+    auto parseOne = [](const std::string& sql) { return parse(tokenize(sql)).front(); };
+
+    const auto derivedPlan = compilePlans({parseOne("SELECT d.x, d.y FROM (SELECT a AS x, b AS y FROM t WHERE a>=20) AS d;")}, catalog).front();
+    require(derivedPlan.kind == "Project", "derived outer plan root is a Project");
+    require(derivedPlan.table == "d", "derived plan is named by alias");
+    require(derivedPlan.output.size() == 2, "derived outer projection exposes two output columns");
+    require(derivedPlan.output[0].name == "x" && derivedPlan.output[1].name == "y", "derived outer output uses alias names");
+    // 外层 Project 的孩子应为满足派生关系的子计划（Filter→Project 或 Project）。
+    require(!derivedPlan.children.empty(), "derived outer plan has a base subplan");
+    // 外层投影通过列引用读取派生输出列。
+    for (const auto& projection : derivedPlan.projections)
+        require(projection.value("kind", "") == "Identifier", "derived outer projection is bound to a derived column");
+
+    bool derivedMissingColumn = false;
+    try {
+        (void)compilePlans({parseOne("SELECT nope FROM (SELECT a AS x FROM t) AS d;")}, catalog);
+    } catch (const minisql::MiniSqlError&) { derivedMissingColumn = true; }
+    require(derivedMissingColumn, "unknown derived outer column must be rejected");
+    std::cout << "3 X09 derived-table planner checks passed\n";
     return 0;
 }

@@ -890,6 +890,27 @@ nlohmann::json Database::runNode(const sql::LogicalPlan& plan) {
         for (const auto& column : plan.output) result["columns"].push_back(column.name);
         return result;
     }
+    // X09 3.3: 外层 Select 投影于一个“成形的”子计划（派生表）之上 —— 先物化内层
+    // 关系，再对外层投影求值。普通 Select（Filter 下接裸 Scan）不受影响。
+    if (plan.kind == "Project" && plan.children.size() == 1) {
+        std::function<bool(const sql::LogicalPlan&)> subplanRoot;
+        subplanRoot = [&subplanRoot](const sql::LogicalPlan& node) -> bool {
+            if (node.kind == "Project" || node.kind == "Aggregate" || node.kind == "Distinct" ||
+                node.kind == "Sort" || node.kind == "Limit") return true;
+            if (node.kind == "Filter") return !node.children.empty() && subplanRoot(node.children.front());
+            return false;
+        };
+        if (subplanRoot(plan.children.front())) {
+            for (const auto& column : plan.output) result["columns"].push_back(column.name);
+            const auto sub = run(plan.children.front());
+            for (const auto& row : sub.at("rows")) {
+                json projected = json::array();
+                for (const auto& expression : plan.projections) projected.push_back(evaluate(expression, row));
+                result["rows"].push_back(std::move(projected));
+            }
+            return result;
+        }
+    }
     if (plan.kind == "CreateIndex") {
         const catalog::StoredTable* stored = nullptr;
         for (const auto& candidate : catalog_.tables()) if (key(candidate.definition.table) == key(plan.table)) stored = &candidate;
