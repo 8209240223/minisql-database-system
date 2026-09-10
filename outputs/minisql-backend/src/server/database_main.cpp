@@ -98,7 +98,7 @@ int session(minisql::execution::Database& database, minisql::security::AccessCat
             id = request["id"];
             for (const auto& [name, value] : request.items()) {
                 (void)value;
-                if (name != "id" && name != "operation" && name != "sql" && name != "sessionId" && name != "cancelFile" && name != "table" && name != "index" && name != "user" && name != "password")
+                    if (name != "id" && name != "operation" && name != "sql" && name != "sessionId" && name != "cancelFile" && name != "table" && name != "index" && name != "target" && name != "user" && name != "password")
                     throw minisql::MiniSqlError(minisql::ErrorCode::InvalidArgument, "Unknown session request field");
             }
             const auto operation = request["operation"].get<std::string>();
@@ -139,6 +139,11 @@ int session(minisql::execution::Database& database, minisql::security::AccessCat
                     throw minisql::MiniSqlError(minisql::ErrorCode::InvalidArgument, "Expected table and index strings");
                 authorizeRequest(database, access, request, operation, {}, request["table"].get<std::string>(), request["index"].get<std::string>());
                 result = database.indexInspect(request["table"].get<std::string>(), request["index"].get<std::string>());
+            } else if (operation == "snapshot") {
+                if (!request.contains("target") || !request["target"].is_string())
+                    throw minisql::MiniSqlError(minisql::ErrorCode::InvalidArgument, "Expected snapshot target string");
+                authorizeRequest(database, access, request, operation);
+                result = database.createSnapshot(request["target"].get<std::string>());
             } else if (operation == "close") {
                 authorizeRequest(database, access, request, operation);
                 close = true;

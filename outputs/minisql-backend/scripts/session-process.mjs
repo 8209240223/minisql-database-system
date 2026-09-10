@@ -56,6 +56,7 @@ export async function openSession(executable, database, { timeoutMs = 30000, max
       ...(context.cancelFile === undefined ? {} : { cancelFile: context.cancelFile }),
       ...(context.table === undefined ? {} : { table: context.table }),
       ...(context.index === undefined ? {} : { index: context.index }),
+      ...(context.target === undefined ? {} : { target: context.target }),
       ...(context.user === undefined ? {} : { user: context.user }),
       ...(context.password === undefined ? {} : { password: context.password }),
     });

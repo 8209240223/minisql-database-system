@@ -466,6 +466,7 @@ void AccessCatalog::authorize(const std::string& user, const std::string& operat
     const auto mode = normalized(operation);
     const auto keyword = firstKeyword(sql);
     std::string permission = "compile";
+    if (mode == "snapshot" || mode == "restore") permission = "checkpoint";
     if (mode == "catalog" || mode == "statistics" || mode == "buffer") permission = "read";
     else if (mode == "close") permission = "connect";
     else if (mode == "indexinspect") permission = "read";

@@ -8,6 +8,7 @@
 #include "minisql/storage/page_bplus_tree.hpp"
 #include "minisql/execution/external_sort.hpp"
 #include "minisql/sql/serialization.hpp"
+#include <filesystem>
 #include <algorithm>
 #include <cctype>
 #include <set>
@@ -619,6 +620,17 @@ nlohmann::json Database::checkpoint() {
     lastCheckpointAtMs_ = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count());
     return {{"success", true}, {"kind", "Checkpoint"}, {"wal", "truncated"}};
+}
+
+nlohmann::json Database::createSnapshot(const std::filesystem::path& target) {
+    std::lock_guard<std::recursive_mutex> guard(mu_);
+    requireAvailable();
+    file_->copyTo(target);
+    const auto& record = file_->checkpointRecord();
+    return {{"success", true}, {"kind", "Snapshot"}, {"target", target.string()},
+        {"walBytes", file_->walBytes()}, {"walCutoffBytes", record.walCutoffBytes},
+        {"committedSequence", record.committedSequence}, {"catalogVersion", record.catalogVersion},
+        {"indexVersion", record.indexVersion}};
 }
 nlohmann::json Database::indexInspect(const std::string& table, const std::string& index) {
     std::lock_guard<std::recursive_mutex> guard(mu_);

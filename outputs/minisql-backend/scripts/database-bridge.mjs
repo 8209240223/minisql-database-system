@@ -139,8 +139,12 @@ function normalizeFullManifest(metadata, file, manifest) {
     writeFileSync(manifest, JSON.stringify(migrated), 'utf8');
     return migrated;
   }
-  if (metadata.version !== 2 || metadata.pageFormatVersion !== detectedPageVersion || metadata.walBytes !== 0)
+  if (metadata.version !== 2 && metadata.version !== 4)
     throw httpError(422, 'Backup manifest version or page format mismatch');
+  if (metadata.pageFormatVersion !== detectedPageVersion) throw httpError(422, 'Backup page format mismatch');
+  if (metadata.version === 2 && metadata.walBytes !== 0) throw httpError(422, 'Backup WAL prefix is not supported');
+  if (metadata.version === 4 && (metadata.walCutoffBytes === undefined || metadata.committedSequence === undefined))
+    throw httpError(422, 'Snapshot manifest is incomplete');
   return metadata;
 }
 function deltaHeader(basePages, finalPages, records) {
@@ -179,7 +183,10 @@ async function reconstructBackup(name, depth = 0) {
   if (!artifact) throw httpError(404, 'Backup not found');
   if (artifact.kind === 'full') {
     const metadata = normalizeFullManifest(JSON.parse(readFileSync(artifact.manifest, 'utf8')), artifact.file, artifact.manifest);
-    return { buffer: readFileSync(artifact.file), pages: Math.floor(statSync(artifact.file).size / backupPageSize), manifest: metadata };
+    const walBuffer = metadata.version === 4 && existsSync(artifact.file + '.wal') ? readFileSync(artifact.file + '.wal') : Buffer.alloc(0);
+    const ckptBuffer = metadata.version === 4 && existsSync(artifact.file + '.ckpt') ? readFileSync(artifact.file + '.ckpt') : Buffer.alloc(0);
+    return { buffer: readFileSync(artifact.file), pages: Math.floor(statSync(artifact.file).size / backupPageSize),
+      manifest: metadata, walBuffer, ckptBuffer };
   }
   if (depth > 8) throw httpError(422, 'Backup chain too deep');
   const delta = readFileSync(artifact.file);
@@ -203,12 +210,23 @@ async function reconstructBackup(name, depth = 0) {
   }
   if (offset !== delta.length) throw httpError(422, 'Incremental backup trailing data');
   if (header.basePages !== base.pages) throw httpError(422, 'Incremental base page count mismatch');
-  return { buffer, pages: header.finalPages, manifest: metadata };
+  return { buffer, pages: header.finalPages, manifest: metadata,
+    walBuffer: base.walBuffer ?? Buffer.alloc(0), ckptBuffer: base.ckptBuffer ?? Buffer.alloc(0) };
 }
-function writeDatabaseAtomically(buffer) {
+function writeDatabaseAtomically(buffer, walBuffer, ckptBuffer) {
   const temporary = database + '.restore.tmp';
   writeFileSync(temporary, buffer);
   renameSync(temporary, database);
+  if (walBuffer && walBuffer.length) {
+    const walTemporary = database + '.wal.restore.tmp';
+    writeFileSync(walTemporary, walBuffer);
+    renameSync(walTemporary, database + '.wal');
+  } else if (existsSync(database + '.wal')) unlinkSync(database + '.wal');
+  if (ckptBuffer && ckptBuffer.length) {
+    const ckptTemporary = database + '.ckpt.restore.tmp';
+    writeFileSync(ckptTemporary, ckptBuffer);
+    renameSync(ckptTemporary, database + '.ckpt');
+  } else if (existsSync(database + '.ckpt')) unlinkSync(database + '.ckpt');
 }
 const auditPath = process.env.MINISQL_AUDIT_LOG ?? resolve(dirname(database), 'audit.log');
 const auditLimitBytes = 16 * 1024 * 1024;
@@ -759,7 +777,7 @@ const server = http.createServer(async (req, res) => {
           manifestVersion: metadata.version,
           pageFormatVersion: metadata.pageFormatVersion,
           walBytes: metadata.walBytes,
-          migrationState: metadata.version === 1 ? 'pending' : metadata.version === 2 || metadata.version === 3 ? 'ready' : 'unknown',
+          migrationState: metadata.version === 1 ? 'pending' : metadata.version >= 2 && metadata.version <= 4 ? 'ready' : 'unknown',
         };
       });
       send(200, { success: true, entries });
@@ -798,9 +816,40 @@ const server = http.createServer(async (req, res) => {
       const chunks = [];
       for await (const chunk of req) chunks.push(chunk);
       const body = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks)));
-      if (sessions.size) throw httpError(409, 'Database reserved by active sessions');
+      const online = req.url === '/api/backup' && (body.mode === 'online' || body.kind === 'online');
+      if (sessions.size && !online) throw httpError(409, 'Database reserved by active sessions');
       if (req.url === '/api/backup') {
         const requestedName = typeof body?.name === 'string' && body.name.trim() ? body.name : `backup-${Date.now()}`;
+        if (online) {
+          if (!can(access, requestUser, 'CHECKPOINT')) throw httpError(403, 'Permission denied');
+          const { name, file } = backupFile(requestedName);
+          const cancelFile = sessionCancelFile(`backup-${auditId}`);
+          clearCancelFile(cancelFile);
+          const ephemeral = {
+            id: `backup-${auditId}`, cancelFile, closing: false, timer: undefined, epoch: undefined,
+            transactionState: 'IDLE', activeRequest: false, waiting: false, cancelRequested: false,
+            user: requestUser, password: requestPassword ?? '',
+          };
+          auditSql = `SNAPSHOT ${name}`;
+          const result = await runSessionOperation(ephemeral, 'snapshot', '', res, { target: file });
+          clearCancelFile(cancelFile);
+          await closeEngineIfIdle({ user: requestUser, password: requestPassword ?? '' });
+          if (result.success === false) {
+            send(quarantined ? 503 : 422, result);
+            return;
+          }
+          const metadata = {
+            version: 4, kind: 'snapshot', name, createdAt: new Date().toISOString(),
+            bytes: statSync(file).size, sha256: sha256(file), pageFormatVersion: pageFormatVersion(file),
+            walBytes: Number(result.walBytes ?? 0), walCutoffBytes: Number(result.walCutoffBytes ?? 0),
+            committedSequence: Number(result.committedSequence ?? 0), catalogVersion: Number(result.catalogVersion ?? 0),
+            indexVersion: Number(result.indexVersion ?? 0),
+          };
+          writeFileSync(file + '.json', JSON.stringify(metadata), 'utf8');
+          send(200, { success: true, backup: name, kind: 'snapshot', bytes: metadata.bytes,
+            sha256: metadata.sha256, walBytes: metadata.walBytes, committedSequence: metadata.committedSequence });
+          return;
+        }
         const incremental = body.kind === 'incremental' || Boolean(body.base);
         if (incremental) {
           if (!backupArtifactFile(body.base)) throw httpError(404, 'Base backup not found');
@@ -846,9 +895,7 @@ const server = http.createServer(async (req, res) => {
       } else {
         await enqueue(async () => {
           const reconstructed = await reconstructBackup(body.name);
-          writeDatabaseAtomically(reconstructed.buffer);
-          const wal = database + '.wal';
-          if (existsSync(wal)) unlinkSync(wal);
+          writeDatabaseAtomically(reconstructed.buffer, reconstructed.walBuffer, reconstructed.ckptBuffer);
           await callDatabase('catalog');
         });
         send(200, { success: true, restored: body.name, bytes: statSync(database).size });

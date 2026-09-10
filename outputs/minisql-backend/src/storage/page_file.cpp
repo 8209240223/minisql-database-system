@@ -290,6 +290,20 @@ void PageFile::checkpointJournal() {
     if (!output) fail("Cannot close redo journal");
     syncFile(journal);
 }
+
+void PageFile::copyTo(const std::filesystem::path& destination) {
+    requireHealthy();
+    if (destination.empty()) fail("Snapshot destination is empty");
+    std::filesystem::create_directories(destination.parent_path());
+    if (std::filesystem::exists(destination)) fail("Snapshot destination already exists");
+    std::filesystem::copy_file(path_, destination);
+    if (const auto journal = sidecar(path_, ".wal"); std::filesystem::exists(journal)) {
+        std::filesystem::copy_file(journal, sidecar(destination, ".wal"));
+    }
+    if (const auto ckpt = sidecar(path_, ".ckpt"); std::filesystem::exists(ckpt)) {
+        std::filesystem::copy_file(ckpt, sidecar(destination, ".ckpt"));
+    }
+}
 void PageFile::notify(std::string_view stage, bool allowCrash) {
     if (observer_) observer_(stage);
     if (!allowCrash) return;

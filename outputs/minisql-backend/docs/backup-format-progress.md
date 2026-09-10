@@ -28,6 +28,18 @@
 - 覆盖全量 base1、增量 inc1、二次链 inc2、恢复、列表 kind/base、链上 manifest 损坏拒绝。
 - Release 构建和 HTTP 回归通过。
 
+## 在线快照增量
+
+- 新增在线一致性快照入口 `POST /api/backup`（`mode=online`）：
+  - 复用 C++ `Database::createSnapshot` 在数据库级锁内复制页文件、WAL 和 `.ckpt`。
+  - 备份 manifest 升级为 version 4，记录 `walBytes`、`walCutoffBytes`、`committedSequence`、`catalogVersion` 和 `indexVersion`。
+  - 会话在线时也允许快照；快照完成后 bridge 会关闭无会话共享引擎，避免旧锁阻塞后续请求。
+  - 恢复链支持 version 4 manifest 和非零 WAL 截止位置，并在重建整条链后原子替换页文件和 sidecar。
+
+## 在线快照验证
+
+- `node tests/backup-online-smoke.mjs`：19 项通过，覆盖在线快照、manifest 版本 4、WAL 侧车校验、快照后插入并恢复、活动会话下快照和恢复后数据一致。
+
 ## 未完成
 
 - 尚未实现备份期间在线并发读写一致性快照和 WAL 非零位置重做。

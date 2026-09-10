@@ -51,6 +51,7 @@ public:
     std::uint64_t committedSequence() const { return committedSequence_; }
     std::uint64_t dirtyWatermark() const { return dirtyWatermark_; }
     const CheckpointRecord& checkpointRecord() const { return checkpointRecord_; }
+    void copyTo(const std::filesystem::path& destination);
     const std::filesystem::path& path() const { return path_; }
     const PageIoStats& ioStats() const { return ioStats_; }
     void resetIoStats() { ioStats_ = {}; }
