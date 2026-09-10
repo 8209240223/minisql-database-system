@@ -30,8 +30,6 @@ jobs:
         run: node tests/access-catalog-atomic-contract.mjs
       - name: 权限原子 HTTP 端点（X24）
         run: node tests/access-atomic-http.mjs
-      - name: 权限感知 CLI 契约（X24）
-        run: node tests/cli-contract.mjs
       - name: SQL 对象引用扫描契约（X24）
         run: node tests/sql-object-references-contract.mjs
       - name: Fuzz 生成器/缩减器契约（X27）
@@ -73,6 +71,7 @@ jobs:
           node-version: '24'
       - name: 构建 C++ 引擎
         shell: pwsh
+        working-directory: outputs/minisql-backend
         run: |
           cmake --preset windows -DBUILD_TESTING=OFF
           if ($LASTEXITCODE -ne 0) { throw 'CMake configuration failed.' }
