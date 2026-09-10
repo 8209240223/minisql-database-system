@@ -27,3 +27,4 @@
 - 新增 `FilterRowStream`、`ProjectRowStream`、`LimitRowStream`，并提供 `Database::openRowStream` 打开简单 `SeqScan -> Filter -> Project -> Limit` 链。
 - HTTP 层 `queryResult` 现在回传最后一个执行节点的 `resourceUsage`，`x25-row-stream-contract.mjs` 15 项通过。
 - `Limit` 在子计划支持 `RowStream` 时直接按 offset/limit 读取并提前停止；普通单表 `Project` 也会优先通过 `openRowStream` 执行。
+- 新增 `MaterializedRowStream`，`Sort`、`Aggregate`、`Distinct` 结果可以通过统一 `RowStream` 接口逐行消费；它们仍先物化结果，但后续 HTTP 逐行输出可以直接复用该接口。
