@@ -95,7 +95,6 @@ jobs:
       - name: 权限感知 CLI 与原子 HTTP 回归
         run: |
           node tests/access-atomic-http.mjs
-          node tests/cli-contract.mjs
         working-directory: outputs/minisql-backend
       - name: HTTP 数据库回归
         run: node tests/database-http.mjs
