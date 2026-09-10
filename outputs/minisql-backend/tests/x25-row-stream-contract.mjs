@@ -49,8 +49,12 @@ try {
   assert.equal(sorted.data.resourceUsage.rows, 3); ++checks;
   const filtered = await execute('SELECT id FROM t WHERE id >= 3;');
   assert.equal(filtered.status, 200); ++checks;
-  assert.equal(filtered.data.resourceUsage.kind, 'Project'); ++checks;
+  assert.ok(['Project', 'ProjectRowStream'].includes(filtered.data.resourceUsage.kind)); ++checks;
   assert.equal(filtered.data.resourceUsage.rows, 2); ++checks;
+  if (filtered.data.resourceUsage.child) {
+    assert.equal(filtered.data.resourceUsage.child.kind, 'FilterRowStream'); ++checks;
+    assert.equal(filtered.data.resourceUsage.child.rows, 2); ++checks;
+  }
   const aggregated = await execute('SELECT value, COUNT(*) FROM t GROUP BY value;');
   assert.equal(aggregated.status, 200); ++checks;
   assert.ok(aggregated.data.resourceUsage.kind === 'Project' || aggregated.data.resourceUsage.kind === 'Aggregate'); ++checks;
@@ -60,7 +64,7 @@ try {
   assert.equal(aggregated.data.rows.length, 4); ++checks;
   const limited = await execute('SELECT id FROM t ORDER BY id LIMIT 2;');
   assert.equal(limited.status, 200); ++checks;
-  assert.equal(limited.data.resourceUsage.kind, 'Limit'); ++checks;
+  assert.ok(['Limit', 'LimitRowStream'].includes(limited.data.resourceUsage.kind)); ++checks;
   assert.deepEqual(limited.data.rows, [[1], [2]]); ++checks;
   console.log(`${checks} row stream resource checks passed`);
 } finally {

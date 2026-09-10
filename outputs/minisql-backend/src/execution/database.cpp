@@ -1743,6 +1743,21 @@ nlohmann::json Database::runNode(const sql::LogicalPlan& plan) {
     }
     if (plan.kind != "Project" && plan.kind != "Delete" && plan.kind != "Update") fail("Unsupported root plan");
     if (plan.children.size() != 1) fail("Root plan requires one child");
+    if (plan.kind == "Project") {
+        try {
+            auto stream = openRowStream(plan);
+            json rows = json::array();
+            json row;
+            while (stream->next(row)) rows.push_back(std::move(row));
+            stream->close();
+            json columns = json::array();
+            for (const auto& column : plan.output) columns.push_back(column.name);
+            return {{"kind", "Project"}, {"columns", std::move(columns)}, {"rows", std::move(rows)},
+                {"affectedRows", 0}, {"resourceUsage", stream->resourceUsage()}};
+        } catch (const MiniSqlError& error) {
+            if (error.code() != ErrorCode::InvalidArgument) throw;
+        }
+    }
     const auto* input = &plan.children.front();
     const json* predicate = nullptr;
     if (input->kind == "Filter") {
