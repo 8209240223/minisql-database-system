@@ -1726,9 +1726,48 @@ nlohmann::json Database::execute(const std::string& source, bool optimize) {
                         const json* literal = left.value("kind", "") == "Literal" ? &left : right.value("kind", "") == "Literal" ? &right : nullptr;
                         if (id && literal && id->contains("columnId")) {
                             const auto* stat = columnStat(table, id->at("columnId").get<std::size_t>());
-                            if (stat && op == "=") {
-                                const auto distinct = stat->value("distinctCount", std::size_t{0});
-                                if (distinct > 0) return 1.0 / static_cast<double>(distinct);
+                            if (stat) {
+                                // X18 4.2: 数值列（存在直方图）用等宽直方图桶累计估算范围谓词选择率，
+                                // 替代粗粒度默认值 0.33；确定性、与 4.1 直方图同源。
+                                if (stat->contains("histogram") && op[0] != '=' && literal->at("value").is_number()) {
+                                    const auto& h = stat->at("histogram");
+                                    const auto buckets = h.at("buckets");
+                                    double total = 0;
+                                    for (const auto& bucket : buckets) total += bucket.get<std::size_t>();
+                                    if (total > 0) {
+                                        const auto bucketCount = h.at("bucketCount").get<std::size_t>();
+                                        const auto span = h.at("max").get<double>() - h.at("min").get<double>();
+                                        const auto value = literal->at("value").get<double>();
+                                        double position = span == 0.0 ? 0.0 : (value - h.at("min").get<double>()) / span;
+                                        if (position < 0.0) position = 0.0;
+                                        else if (position > 1.0) position = 1.0;
+                                        const auto slot = position == 1.0 ? bucketCount - 1 : static_cast<std::size_t>(position * bucketCount);
+                                        double le = 0, lt = 0;
+                                        for (std::size_t i = 0; i < buckets.size(); ++i) {
+                                            if (i <= slot) le += buckets[i].get<std::size_t>();
+                                            if (i < slot) lt += buckets[i].get<std::size_t>();
+                                        }
+                                        const double fracLe = le / total, fracLt = lt / total;
+                                        if (op == "<") return fracLt;
+                                        if (op == "<=") return fracLe;
+                                        if (op == ">") return 1.0 - fracLe;
+                                        if (op == ">=") return 1.0 - fracLt;
+                                    }
+                                }
+                                // 等值谓词仍在统计范围内才用 1/distinct；越界与范围谓词回退默认值。
+                                if (op == "=") {
+                                    const auto distinct = stat->value("distinctCount", std::size_t{0});
+                                    if (distinct > 0 && stat->contains("min")) {
+                                        const auto value = literal->at("value");
+                                        if (value.is_number()) {
+                                            const auto lo = stat->at("min").get<double>();
+                                            const auto hi = stat->at("max").get<double>();
+                                            const auto v = value.get<double>();
+                                            if (v < lo || v > hi) return 0.0;
+                                        }
+                                    }
+                                    if (distinct > 0) return 1.0 / static_cast<double>(distinct);
+                                }
                             }
                         }
                     }

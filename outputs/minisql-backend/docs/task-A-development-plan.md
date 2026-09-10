@@ -273,3 +273,14 @@ node tests\subquery-smoke.mjs tests\statistics-smoke.mjs tests\explain-smoke.mjs
 - [x] **4.1d** 新增端到端 `tests/statistics-histogram-smoke.mjs`：20 项覆盖行数/基数/null 计数/min/max、数值列直方图存在且 `1..bucketCount<=16`、直方图桶求和等于 distinct 计数、以及非数值/单值列的稳健性，全部通过。
 - [x] **4.1e** 回归全绿：node statistics-histogram 20 / correlated-exec 8 / statistics 11 / subquery 24 / derived 12 / explain 21 通过；optimizer_contract 518 项、planner_contract 契约通过。
 - [ ] 后续：基于本切片的 stat 元数据在 optimizer 实现**成本估算模型**（4.2：SeqScan/IndexScan/NestedLoop/HashJoin/Sort 成本公式 + 固定决胜规则 + 「同统计→同计划」确定性测试），并将 EXPLAIN 估值/成本字段并入 HTTP 契约。
+
+### 6.10 X18 成本模型增量切片 —— 直方图驱动的范围/等值选择性（builder-A 第十次提交）
+
+> X18 Phase 4.2 的首个增量：让 EXPLAIN 的选择率估算真正消费 4.1 的直方图，替换范围谓词一档默认 `0.33`。仍只改 executor 的选择率函数，不触 optimizer 主循环 / 既有成本公式 / HTTP 契约。分支 `builder-A`。
+
+- [x] **4.2a** `execution/database.cpp` `selectivity()`：对**存在直方图**的数值列，按等宽直方图桶累计估算范围谓词选择率——`<`用 `fracLt`（不含界）、`<=`用 `fracLe`（含界）、`>`用 `1-fracLe`、`>=`用 `1-fracLt`；值压缩到 `[min,max]` 再定位桶，`span==0`（单值）落到 0 号桶，确定性（仅依赖直方图同源数据）。
+- [x] **4.2b** 等值谓词 `=`：值超出 `[min,max]` 时返回 `0`（不再误用 `1/distinct` 高估越界选择率）；范围内的等值仍保留 `1/distinct`。
+- [x] **4.2c** 缺直方图（varchar 等非数值列、缺失统计）回退原默认选择率，不崩溃；`IS NULL/IS NOT NULL` 仍用 `nullRatio`，`AND/OR/NOT` 组合仍用既有布尔折叠。
+- [x] **4.2d** 新增端到端 `tests/statistics-cost-smoke.mjs`：9 项覆盖范围谓词估计行数收缩且随阈值单调、越界范围/等值归零、确定性（同 SQL 同统计重复 EXPLAIN 一致）、非数值列安全回退，全部通过。
+- [x] **4.2e** 回归全绿：node statistics-cost 9 / statistics-histogram 20 / statistics 11 / explain 21 / subquery 24 / derived 12 / correlated-exec 8 通过；optimizer_contract 518、planner_contract 契约通过。
+- [ ] 后续：将估计进一步落到 plan 节点的 `statsSource/estimatedRows/estimatedCost` 字段并接入 optimizer 候选比较与**固定决胜**（4.2 主体、4.3），以及成本/估值字段并入 HTTP 契约（退出条件）。
