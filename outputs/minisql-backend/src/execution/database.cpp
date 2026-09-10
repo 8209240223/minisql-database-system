@@ -1673,8 +1673,8 @@ nlohmann::json Database::execute(const std::string& source, bool optimize) {
                 if (analyze && target.front().kind != "Select")
                     throw MiniSqlError(ErrorCode::Semantic, "EXPLAIN ANALYZE permits only SELECT", location);
                 const auto optimized = optimizer::optimize(rawPlans);
-                const auto raw = sql::serializePlans(rawPlans);
-                const auto optimizedJson = sql::serializePlans(optimized.plans);
+                json raw = sql::serializePlans(rawPlans);
+                json optimizedJson = sql::serializePlans(optimized.plans);
                 const auto tableEstimate = [&](const std::string& name) -> std::pair<double, double> {
                     for (const auto& table : catalog_.tables()) if (key(table.definition.table) == key(name)) {
                         double rows = 0;
@@ -1803,20 +1803,37 @@ nlohmann::json Database::execute(const std::string& source, bool optimize) {
                     }
                     return {child.first, child.second + child.first};
                 };
-                std::vector<const sql::LogicalPlan*> planNodes;
-                std::function<void(const sql::LogicalPlan&)> collect;
-                collect = [&](const sql::LogicalPlan& plan) {
-                    planNodes.push_back(&plan);
-                    for (const auto& child : plan.children) collect(child);
+                std::vector<const sql::LogicalPlan*> rawNodes, optNodes;
+                std::function<void(const std::vector<sql::LogicalPlan>&, std::vector<const sql::LogicalPlan*>&)> collectPlans;
+                collectPlans = [&](const std::vector<sql::LogicalPlan>& plans, std::vector<const sql::LogicalPlan*>& nodes) {
+                    std::function<void(const sql::LogicalPlan&)> visitNode;
+                    visitNode = [&](const sql::LogicalPlan& plan) {
+                        nodes.push_back(&plan);
+                        for (const auto& child : plan.children) visitNode(child);
+                    };
+                    for (const auto& plan : plans) visitNode(plan);
                 };
-                for (const auto& plan : (optimize ? optimized.plans : rawPlans)) collect(plan);
+                collectPlans(rawPlans, rawNodes);
+                collectPlans(optimized.plans, optNodes);
+                // X18 4.3: 把估计元数据落到 EXPLAIN 的 plan JSON 节点上（仅 EXPLAIN 展示路径，
+                // 不改 serializePlans / compile() 冻结契约）；比 estimateSource 列更细粒度、可被工作台消费。
+                const auto annotate = [&](json& array, const std::vector<const sql::LogicalPlan*>& nodes) {
+                    for (auto& node : array) {
+                        if (!node.is_object() || !node.contains("id") || !node.at("id").is_number_unsigned()) continue;
+                        const auto planIndex = node.at("id").get<std::size_t>();
+                        if (planIndex >= nodes.size()) fail("EXPLAIN plan node index is invalid");
+                        const auto estimated = estimate(*nodes[planIndex]);
+                        node["estimatedRows"] = estimated.first;
+                        node["estimatedCost"] = estimated.second;
+                        node["statsSource"] = "stats-v1";
+                    }
+                };
+                annotate(raw, rawNodes);
+                annotate(optimizedJson, optNodes);
+                // 展示行与 plan JSON 同源，保证 estimatedRows/estimatedCost 一致。
                 json rows = json::array();
-                for (const auto& node : (optimize ? optimizedJson : raw)) {
-                    const auto planIndex = node.at("id").get<std::size_t>();
-                    if (planIndex >= planNodes.size()) fail("EXPLAIN plan node index is invalid");
-                    const auto estimated = estimate(*planNodes[planIndex]);
-                    rows.push_back({node.at("kind"), node.at("detail"), estimated.first, estimated.second, "stats-v1"});
-                }
+                for (const auto& node : (optimize ? optimizedJson : raw))
+                    rows.push_back({node.at("kind"), node.at("detail"), node.at("estimatedRows"), node.at("estimatedCost"), "stats-v1"});
                 json explanation = {{"kind", "Explain"}, {"columns", {"node", "detail", "estimatedRows", "estimatedCost", "estimateSource"}},
                     {"columnTypes", {"varchar", "varchar", "bigint", "float", "varchar"}}, {"rows", rows}, {"affectedRows", 0},
                     {"plan", raw}, {"optimizedPlan", optimizedJson}, {"optimizationRules", optimized.changes},

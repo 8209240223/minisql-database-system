@@ -284,3 +284,13 @@ node tests\subquery-smoke.mjs tests\statistics-smoke.mjs tests\explain-smoke.mjs
 - [x] **4.2d** 新增端到端 `tests/statistics-cost-smoke.mjs`：9 项覆盖范围谓词估计行数收缩且随阈值单调、越界范围/等值归零、确定性（同 SQL 同统计重复 EXPLAIN 一致）、非数值列安全回退，全部通过。
 - [x] **4.2e** 回归全绿：node statistics-cost 9 / statistics-histogram 20 / statistics 11 / explain 21 / subquery 24 / derived 12 / correlated-exec 8 通过；optimizer_contract 518、planner_contract 契约通过。
 - [ ] 后续：将估计进一步落到 plan 节点的 `statsSource/estimatedRows/estimatedCost` 字段并接入 optimizer 候选比较与**固定决胜**（4.2 主体、4.3），以及成本/估值字段并入 HTTP 契约（退出条件）。
+
+### 6.11 X18 4.3 增量——估计元数据落到 EXPLAIN plan JSON（builder-A 第十一次提交）
+
+> 4.3 的一个**保守、冻结契约友好**切片：把 `statsSource/estimatedRows/estimatedCost` 注入 EXPLAIN 的 `plan`/`optimizedPlan` 节点 JSON，并把展示行与 plan JSON 改为**同源**（避免重复计算、保证一致）。只改 executor 的 EXPLAIN 展示路径，`serializePlans` / `compile()` 冻结契约不动。分支 `builder-A`。
+
+- [x] **4.3a** `execution/database.cpp` EXPLAIN：`raw`/`optimizedJson` 改为可变，新增 `annotate()` 对每个 plan 节点按 id 求 `estimate()` 并写入 `estimatedRows/estimatedCost/statsSource`；`rawPlans` 与 `optimized.plans` 各自收集节点指针序（`rawNodes`/`optNodes`）分别标注，保证 id 对齐。
+- [x] **4.3b** EXPLAIN 展示 `rows` 直接读已标注字段，与 plan JSON 完全同源（`estimatedRows`/`estimatedCost`/`estimateSource="stats-v1"`）。
+- [x] **4.3c** 增补 `tests/statistics-cost-smoke.mjs`：断言 `optimizedPlan/Filter` 节点携带三个估计字段、与展示行估计行数相等、多次编译成本确定性；成本测试升至 12 项通过。
+- [x] **4.3d** 回归全绿：node statistics-cost 12 / statistics-histogram 20 / statistics 11 / explain 21 / subquery 24 / derived 12 / correlated-exec 8 / planner-regression 26 通过；database-http（含序列化写）、database-process、bridge-regression 通过；optimizer_contract 518 通过。
+- [ ] 后续/退出：把预估成本接入 optimizer**候选比较 + 固定决胜**（`hash-join` 等改为成本驱动而非无条件布尔），并将 EXPLAIN 估计字段并入 HTTP 契约/工作台展示；IndexScan 估计字段依赖与 B(X20) 第二段协商。

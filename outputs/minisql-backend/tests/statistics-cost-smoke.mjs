@@ -48,4 +48,17 @@ equal(run('execute', 'CREATE TABLE u(v VARCHAR(20)); INSERT INTO u VALUES(\'x\')
 const vs = estimatedRows('EXPLAIN SELECT * FROM u WHERE v < \'y\';');
 ok(Number.isFinite(vs) && vs > 0, `non-numeric column falls back to default selectivity (${vs})`);
 
+// 展示行与 plan JSON 同源：optimizedPlan/Filter 节点带估计字段且与 rows 展示一致。
+function planNodeEstimate(sql, kind = 'Filter') {
+  const result = run('execute', sql);
+  assert.equal(result.success, true, JSON.stringify(result));
+  const explain = result.results.at(-1);
+  const node = explain.optimizedPlan.find((n) => n.kind === kind);
+  return node && { rows: node.estimatedRows, cost: node.estimatedCost, source: node.statsSource };
+}
+const ann = planNodeEstimate('EXPLAIN SELECT * FROM t WHERE a < 5;');
+ok(ann && typeof ann.rows === 'number' && typeof ann.cost === 'number' && ann.source === 'stats-v1', 'plan JSON node carries estimatedRows/estimatedCost/statsSource');
+equal(ann.rows, lt5, 'plan JSON estimatedRows matches EXPLAIN display row');
+equal(ann.cost, planNodeEstimate('EXPLAIN SELECT * FROM t WHERE a < 5;').cost, 'plan JSON estimate is deterministic across compiles');
+
 console.log(`${checks} statistics-cost checks passed`);
