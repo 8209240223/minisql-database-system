@@ -26,3 +26,4 @@
 - 新增 `ScanRowStream`，用于扫描层的资源计量和取消点；当前作为接口层落地，尚未把所有算子整体迁移到逐行流。
 - 新增 `FilterRowStream`、`ProjectRowStream`、`LimitRowStream`，并提供 `Database::openRowStream` 打开简单 `SeqScan -> Filter -> Project -> Limit` 链。
 - HTTP 层 `queryResult` 现在回传最后一个执行节点的 `resourceUsage`，`x25-row-stream-contract.mjs` 15 项通过。
+- `Limit` 在子计划支持 `RowStream` 时直接按 offset/limit 读取并提前停止；普通单表 `Project` 也会优先通过 `openRowStream` 执行。
