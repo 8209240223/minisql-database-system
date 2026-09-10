@@ -61,6 +61,7 @@ $groups = @{
         'tests/float-process.mjs',
         'tests/transaction-process.mjs'
         'tests/transaction-savepoint.mjs'
+        'tests/transaction-overflow.mjs'
     )
     storage = @(
         'tests/checkpoint-smoke.mjs',

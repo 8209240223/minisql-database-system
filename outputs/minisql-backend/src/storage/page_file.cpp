@@ -15,7 +15,16 @@ constexpr std::uint32_t journalMagic = 0x4a44534d;
 constexpr std::uint32_t recordMagic = 0x5244534d;
 constexpr std::uint32_t commitMarkerMagic = 0x434d544d;
 constexpr std::uint32_t checkpointMagic = 0x4d595043;
-constexpr std::size_t maxBatchPages = 16384;
+constexpr std::size_t defaultMaxBatchPages = 16384;
+std::size_t maxBatchPages() {
+    const auto* configured = std::getenv("MINISQL_MAX_BATCH_PAGES");
+    if (!configured || !*configured) return defaultMaxBatchPages;
+    char* end = nullptr;
+    const auto parsed = std::strtoull(configured, &end, 10);
+    if (end && *end == '\0' && parsed > 0 && parsed <= defaultMaxBatchPages)
+        return static_cast<std::size_t>(parsed);
+    return defaultMaxBatchPages;
+}
 [[noreturn]] void fail(const char* message) { throw MiniSqlError(ErrorCode::Storage, message); }
 void seal(PageBytes& bytes) { writeUnsigned(bytes, 4, 4, checksum(bytes)); }
 std::filesystem::path sidecar(std::filesystem::path path, const char* suffix) { path += suffix;return path; }
@@ -97,7 +106,7 @@ void PageFile::writeRaw(PageId id, const PageBytes& bytes) {
     if (failed_) fail("Page file disabled after I/O failure; reopen required");
     if (id > static_cast<PageId>(std::numeric_limits<std::streamoff>::max()) / kPageSize) fail("Page offset overflow");
     if (batch_) {
-        if (!batch_->pages.contains(id) && batch_->pages.size() >= maxBatchPages)
+        if (!batch_->pages.contains(id) && batch_->pages.size() >= maxBatchPages())
             throw MiniSqlError(ErrorCode::Transaction, "Write batch page limit exceeded; rollback required");
         batch_->pages.insert_or_assign(id, bytes);return;
     }
@@ -373,7 +382,7 @@ void PageFile::recoverJournal(bool recovering) {
         if (readUnsigned(header, 8, 4) != 1 || readUnsigned(header, 12, 4) != kPageSize ||
             readUnsigned(header, 4, 4) != checksum(header)) fail("STORAGE_CORRUPTION: redo header");
         const auto records = readUnsigned(header, 16, 8), finalCount = readUnsigned(header, 24, 8), baseCount = readUnsigned(header, 48, 8);
-        if (records == 0 || records > maxBatchPages || baseCount == 0 || finalCount < baseCount || finalCount - baseCount > records ||
+        if (records == 0 || records > maxBatchPages() || baseCount == 0 || finalCount < baseCount || finalCount - baseCount > records ||
             finalCount > static_cast<PageId>(std::numeric_limits<std::streamoff>::max()) / kPageSize) fail("STORAGE_CORRUPTION: redo header fields");
         const std::array<std::uint64_t, 2> identity{readUnsigned(header, 32, 8), readUnsigned(header, 40, 8)};
         const auto original = readRaw(0);
