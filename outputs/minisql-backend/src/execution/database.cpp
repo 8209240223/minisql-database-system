@@ -1885,6 +1885,7 @@ void Database::rollbackBatch() {
     try {
         if (file_->writeBatchActive()) buffer_.rollbackWriteBatch();
         catalog_.reload();
+        savepoints_.clear();
         for (const auto& table : catalog_.tables()) rebuildIndexes(table.id);
     } catch (...) {
         unavailable_ = true;
@@ -1923,16 +1924,36 @@ nlohmann::json Database::runStatement(const sql::LogicalPlan& plan) {
         return {{"kind", plan.kind}, {"columns", json::array()}, {"rows", json::array()}, {"affectedRows", 0}, {"commitState", "rolledBack"}};
     }
     if (transaction_ == TransactionState::Aborted) throw MiniSqlError(ErrorCode::Transaction, "Transaction aborted; ROLLBACK required");
+    if (plan.kind == "Savepoint") {
+        if (transaction_ != TransactionState::Active) throw MiniSqlError(ErrorCode::Transaction, "SAVEPOINT requires an active transaction");
+        if (plan.savepointName.empty()) throw MiniSqlError(ErrorCode::Transaction, "Savepoint name is required");
+        savepoints_[key(plan.savepointName)] = SavepointState{file_->savepoint(), catalog_.snapshot()};
+        return {{"kind", plan.kind}, {"columns", json::array()}, {"rows", json::array()}, {"affectedRows", 0}, {"commitState", "pending"}};
+    }
+    if (plan.kind == "ReleaseSavepoint") {
+        if (transaction_ != TransactionState::Active || !savepoints_.erase(key(plan.savepointName)))
+            throw MiniSqlError(ErrorCode::Transaction, "Savepoint does not exist: " + plan.savepointName);
+        return {{"kind", plan.kind}, {"columns", json::array()}, {"rows", json::array()}, {"affectedRows", 0}, {"commitState", "pending"}};
+    }
+    if (plan.kind == "RollbackTo") {
+        if (transaction_ != TransactionState::Active) throw MiniSqlError(ErrorCode::Transaction, "ROLLBACK TO requires an active transaction");
+        const auto found = savepoints_.find(key(plan.savepointName));
+        if (found == savepoints_.end()) throw MiniSqlError(ErrorCode::Transaction, "Savepoint does not exist: " + plan.savepointName);
+        file_->restoreSavepoint(found->second.file);
+        catalog_.restore(found->second.catalog);
+        for (const auto& table : catalog_.tables()) rebuildIndexes(table.id);
+        return {{"kind", plan.kind}, {"columns", json::array()}, {"rows", json::array()}, {"affectedRows", 0}, {"commitState", "pending"}};
+    }
     if (plan.kind == "Begin") {
         if (transaction_ != TransactionState::Idle) throw MiniSqlError(ErrorCode::Transaction, "Nested transactions are not supported");
-        buffer_.beginWriteBatch();transaction_ = TransactionState::Active;transactionWriteStatements_ = 0;
+        buffer_.beginWriteBatch();transaction_ = TransactionState::Active;transactionWriteStatements_ = 0;savepoints_.clear();
         return {{"kind", plan.kind}, {"columns", json::array()}, {"rows", json::array()}, {"affectedRows", 0}, {"commitState", "pending"}};
     }
     if (plan.kind == "Commit") {
         if (transaction_ != TransactionState::Active) throw MiniSqlError(ErrorCode::Transaction, "No active transaction");
         const auto committedWriteStatements = transactionWriteStatements_;
         const auto committedDirtyPages = file_->stagedPageCount();
-        buffer_.commitWriteBatch();transaction_ = TransactionState::Idle;transactionWriteStatements_ = 0;
+        buffer_.commitWriteBatch();transaction_ = TransactionState::Idle;transactionWriteStatements_ = 0;savepoints_.clear();
         evaluateAutoCheckpoint(committedWriteStatements, committedDirtyPages);
         return {{"kind", plan.kind}, {"columns", json::array()}, {"rows", json::array()}, {"affectedRows", 0}, {"commitState", "committed"}};
     }

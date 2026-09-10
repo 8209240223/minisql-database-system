@@ -37,6 +37,7 @@ struct LogicalPlan {
     nlohmann::json groupKeys = nlohmann::json::array();
     nlohmann::json aggregates = nlohmann::json::array();
     std::string indexName{};
+    std::string savepointName{};
     bool uniqueIndex = false;
     std::vector<std::string> indexColumns{};
     nlohmann::json indexValues = nlohmann::json::array();

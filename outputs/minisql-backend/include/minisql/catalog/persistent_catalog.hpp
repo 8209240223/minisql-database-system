@@ -30,6 +30,16 @@ struct CatalogMigrationStep {
 };
 class PersistentCatalog {
 public:
+    struct Snapshot {
+        Catalog view;
+        std::vector<StoredTable> tables;
+        std::int32_t nextId = 2;
+        std::uint32_t schemaVersion = 0;
+        std::uint32_t migratedFrom = 0;
+        bool recovered = false;
+        std::uint32_t producerVersion = 0;
+        std::optional<AccessCatalogRecord> accessCatalog;
+    };
     explicit PersistentCatalog(storage::HeapStore& heap);
     const Catalog& view() const { return view_; }
     const std::vector<StoredTable>& tables() const { return tables_; }
@@ -46,6 +56,8 @@ public:
     void createIndex(const sql::Statement& definition);
     void dropIndex(const sql::Statement& definition);
     void reload();
+    Snapshot snapshot() const;
+    void restore(const Snapshot& snapshot);
 private:
     void stampHeader(std::uint32_t version, const nlohmann::json& detail);
     storage::HeapStore& heap_;

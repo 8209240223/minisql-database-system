@@ -124,6 +124,7 @@ jobs:
           node tests/session-process.mjs
           node tests/session-http.mjs
           node tests/multi-session-http.mjs
+          node tests/transaction-savepoint.mjs
           node tests/cancel-smoke.mjs
           node tests/x25-stream-http.mjs
           node tests/backup-smoke.mjs

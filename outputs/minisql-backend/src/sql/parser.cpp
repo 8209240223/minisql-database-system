@@ -108,11 +108,24 @@ private:
         return "decimal("+std::to_string(precision)+","+std::to_string(scale)+")";
     }
     void semicolon(){if(at(";"))++i;else fail(ErrorCode::Syntax, "Expected ';'", i<t.size()?t[i].location:SourceLocation{});}
-    Statement statement(){auto loc=t[i].location;Statement s;if(keyword("BEGIN")||keyword("COMMIT")||keyword("ROLLBACK"))s=transaction();else if(keyword("CREATE"))s=create();else if(keyword("INSERT"))s=insert();else if(keyword("SELECT"))s=select();else if(keyword("DELETE"))s=remove();else if(keyword("UPDATE"))s=update();else if(keyword("CHECKPOINT"))s=checkpointStatement();else if(keyword("DROP"))s=dropIndex();else fail(ErrorCode::Syntax, "Expected SQL statement or transaction command", loc);s.location=loc;return s;}
+    Statement statement(){auto loc=t[i].location;Statement s;if(keyword("BEGIN")||keyword("COMMIT")||keyword("ROLLBACK")||keyword("SAVEPOINT")||keyword("RELEASE"))s=transaction();else if(keyword("CREATE"))s=create();else if(keyword("INSERT"))s=insert();else if(keyword("SELECT"))s=select();else if(keyword("DELETE"))s=remove();else if(keyword("UPDATE"))s=update();else if(keyword("CHECKPOINT"))s=checkpointStatement();else if(keyword("DROP"))s=dropIndex();else fail(ErrorCode::Syntax, "Expected SQL statement or transaction command", loc);s.location=loc;return s;}
     Statement dropIndex(){Statement s{"DropIndex"};expect("DROP");expect("INDEX");s.indexName=identifier();if(keyword("ON")){++i;s.table=identifier();}semicolon();return s;}
     Statement checkpointStatement(){Statement s{"Checkpoint"};expect("CHECKPOINT");semicolon();return s;}
     Statement transaction() {
-        Statement s{keyword("BEGIN") ? "Begin" : keyword("COMMIT") ? "Commit" : "Rollback"};
+        if (keyword("SAVEPOINT")) {
+            Statement s{"Savepoint"};++i;s.savepointName=identifier();semicolon();return s;
+        }
+        if (keyword("RELEASE")) {
+            Statement s{"ReleaseSavepoint"};++i;
+            if(keyword("SAVEPOINT"))++i;
+            s.savepointName=identifier();semicolon();return s;
+        }
+        if (keyword("ROLLBACK")) {
+            ++i;
+            if (keyword("TO")) { ++i;if(keyword("SAVEPOINT"))++i;Statement s{"RollbackTo"};s.savepointName=identifier();semicolon();return s; }
+            if(keyword("TRANSACTION"))++i;semicolon();return Statement{"Rollback"};
+        }
+        Statement s{keyword("BEGIN") ? "Begin" : "Commit"};
         ++i;if(keyword("TRANSACTION"))++i;
         semicolon();return s;
     }

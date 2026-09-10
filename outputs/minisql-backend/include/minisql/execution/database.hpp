@@ -82,6 +82,11 @@ private:
     std::uint64_t pendingAutoCheckpointWalBytes_ = 0;
     std::size_t checkpointCount_ = 0;
     std::size_t transactionWriteStatements_ = 0;
+    struct SavepointState {
+        storage::PageFileSavepoint file;
+        catalog::PersistentCatalog::Snapshot catalog;
+    };
+    std::unordered_map<std::string, SavepointState> savepoints_;
     std::chrono::steady_clock::time_point lastCheckpointAt_;
     std::uint64_t lastCheckpointAtMs_ = 0;
     std::uint64_t lastAutoCheckpointAtMs_ = 0;

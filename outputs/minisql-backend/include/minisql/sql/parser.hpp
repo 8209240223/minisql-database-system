@@ -50,6 +50,7 @@ struct Statement {
     std::vector<std::shared_ptr<Expr>> groupBy{};
     std::shared_ptr<Expr> having{};
     std::string indexName{};
+    std::string savepointName{};
     bool uniqueIndex = false;
     std::vector<std::string> indexColumns{};
     std::vector<IndexDef> indexes{};

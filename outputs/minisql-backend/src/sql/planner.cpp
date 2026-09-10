@@ -9,6 +9,7 @@
 #include <cctype>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <unordered_map>
 
 namespace minisql::sql {
@@ -220,8 +221,9 @@ void lowerAggregate(LogicalPlan& project, const Statement& statement, const cata
     } else project.children.push_back(std::move(aggregate));
 }
 LogicalPlan build(const Statement& statement, const catalog::Catalog& catalog) {
-    if (statement.kind == "Begin" || statement.kind == "Commit" || statement.kind == "Rollback") {
-        LogicalPlan plan;plan.kind = statement.kind;return plan;
+    if (statement.kind == "Begin" || statement.kind == "Commit" || statement.kind == "Rollback" ||
+        statement.kind == "Savepoint" || statement.kind == "ReleaseSavepoint" || statement.kind == "RollbackTo") {
+        LogicalPlan plan;plan.kind = statement.kind;plan.savepointName = statement.savepointName;return plan;
     }
     if (statement.kind == "Checkpoint") { LogicalPlan plan; plan.kind = "Checkpoint"; return plan; }
     if (statement.kind == "DropIndex") { LogicalPlan plan; plan.kind = "DropIndex"; plan.table = statement.table; plan.indexName = statement.indexName; return plan; }
@@ -482,11 +484,19 @@ std::vector<LogicalPlan> compilePlans(const std::vector<Statement>& statements,
                                       const catalog::Catalog& catalog) {
     auto snapshot = catalog;
     std::optional<catalog::Catalog> transactionCatalog;
+    std::map<std::string, catalog::Catalog> savepointCatalogs;
     std::vector<LogicalPlan> plans;
     for (const auto& statement : statements) {
-        if (statement.kind == "Begin") transactionCatalog = snapshot;
-        else if (statement.kind == "Rollback" && transactionCatalog) { snapshot = *transactionCatalog;transactionCatalog.reset(); }
-        else if (statement.kind == "Commit") transactionCatalog.reset();
+        if (statement.kind == "Begin") { transactionCatalog = snapshot; savepointCatalogs.clear(); }
+        else if (statement.kind == "Savepoint" && transactionCatalog) savepointCatalogs[canonical(statement.savepointName)] = snapshot;
+        else if (statement.kind == "ReleaseSavepoint") savepointCatalogs.erase(canonical(statement.savepointName));
+        else if (statement.kind == "RollbackTo" && transactionCatalog) {
+            const auto found = savepointCatalogs.find(canonical(statement.savepointName));
+            if (found == savepointCatalogs.end()) invalid("savepoint does not exist: " + statement.savepointName);
+            snapshot = found->second;
+        }
+        else if (statement.kind == "Rollback" && transactionCatalog) { snapshot = *transactionCatalog;transactionCatalog.reset();savepointCatalogs.clear(); }
+        else if (statement.kind == "Commit") { transactionCatalog.reset();savepointCatalogs.clear(); }
         snapshot = catalog::compileSnapshot({statement}, snapshot);
         plans.push_back(build(statement, snapshot));
     }
@@ -507,7 +517,7 @@ nlohmann::json serializePlans(const std::vector<LogicalPlan>& plans) {
         }
         rows.push_back({{"id", id}, {"parent", parent}, {"depth", depth}, {"statementIndex", statementIndex},
                         {"kind", plan.kind}, {"detail", plan.kind + " " + plan.table}, {"table", plan.table},
-                        {"indexName", plan.indexName}, {"uniqueIndex", plan.uniqueIndex}, {"indexColumns", plan.indexColumns}, {"indexValues", plan.indexValues}, {"indexRangeOperator", plan.indexRangeOperator}, {"indexRangeValue", plan.indexRangeValue},
+                        {"indexName", plan.indexName}, {"savepointName", plan.savepointName}, {"uniqueIndex", plan.uniqueIndex}, {"indexColumns", plan.indexColumns}, {"indexValues", plan.indexValues}, {"indexRangeOperator", plan.indexRangeOperator}, {"indexRangeValue", plan.indexRangeValue},
                         {"output", output}, {"preservesRowId", plan.preservesRowId},
                         {"predicate", plan.predicate}, {"values", plan.values}, {"insertExpressions", plan.insertExpressions}, {"insertRows", plan.insertRows},
                         {"columnMapping", plan.columnMapping}, {"projections", plan.projections}, {"children", nlohmann::json::array()}});
@@ -573,7 +583,8 @@ std::vector<LogicalPlan> deserializePlans(const nlohmann::json& document) {
         item.plan.kind = row.at("kind").get<std::string>();
         item.plan.table = row.at("table").get<std::string>();
         item.plan.preservesRowId = row.at("preservesRowId").get<bool>();
-        item.plan.indexName = row.value("indexName", std::string{});
+    item.plan.indexName = row.value("indexName", std::string{});
+    item.plan.savepointName = row.value("savepointName", std::string{});
         item.plan.uniqueIndex = row.value("uniqueIndex", false);
         item.plan.indexColumns = row.value("indexColumns", std::vector<std::string>{});
         item.plan.indexValues = row.value("indexValues", nlohmann::json::array());

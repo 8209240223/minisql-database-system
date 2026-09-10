@@ -269,6 +269,20 @@ void PageFile::commitWriteBatch() {
     batch_.reset();
     notify("checkpointed");
 }
+PageFileSavepoint PageFile::savepoint() const {
+    if (!batch_) throw MiniSqlError(ErrorCode::Transaction, "No active write batch");
+    return {count_, active_, owners_, free_, batch_->pages, batch_->published};
+}
+void PageFile::restoreSavepoint(const PageFileSavepoint& snapshot) {
+    if (!batch_) throw MiniSqlError(ErrorCode::Transaction, "No active write batch");
+    if (batch_->published) throw MiniSqlError(ErrorCode::Transaction, "Commit point passed; reopen for recovery");
+    count_ = snapshot.count;
+    active_ = snapshot.active;
+    owners_ = snapshot.owners;
+    free_ = snapshot.free;
+    batch_->pages = snapshot.pages;
+    batch_->published = snapshot.published;
+}
 void PageFile::checkpoint(const CheckpointOptions& options) {
     if (batch_) throw MiniSqlError(ErrorCode::Transaction, "Cannot checkpoint during a write batch");
     // 检查点后整段日志回收（已提交数据均已落盘），恢复起点归零；脏页水位=已落盘页数上限。

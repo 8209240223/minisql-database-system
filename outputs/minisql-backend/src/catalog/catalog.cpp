@@ -453,7 +453,9 @@ std::vector<std::string> insertColumns(const sql::Statement& statement, const Ta
 }
 void validate(const std::vector<sql::Statement>& statements, Catalog& catalog) {
     for (const auto& statement : statements) {
-        if (statement.kind == "Begin" || statement.kind == "Commit" || statement.kind == "Rollback" || statement.kind == "Checkpoint") continue;
+        if (statement.kind == "Begin" || statement.kind == "Commit" || statement.kind == "Rollback" ||
+            statement.kind == "Savepoint" || statement.kind == "ReleaseSavepoint" || statement.kind == "RollbackTo" ||
+            statement.kind == "Checkpoint") continue;
         if (statement.kind == "CreateIndex") { catalog.createIndex(statement); continue; }
         if (statement.kind == "DropIndex") { catalog.dropIndex(statement); continue; }
         if (statement.kind == "Insert" && !statement.valueRows.empty()) {

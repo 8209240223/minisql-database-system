@@ -60,6 +60,7 @@ $groups = @{
         'tests/decimal-arithmetic-process.mjs',
         'tests/float-process.mjs',
         'tests/transaction-process.mjs'
+        'tests/transaction-savepoint.mjs'
     )
     storage = @(
         'tests/checkpoint-smoke.mjs',

@@ -234,6 +234,19 @@ void PersistentCatalog::reload() {
     nextId_ = restored.nextId_;
     accessCatalog_ = std::move(restored.accessCatalog_);
 }
+PersistentCatalog::Snapshot PersistentCatalog::snapshot() const {
+    return {view_, tables_, nextId_, schemaVersion_, migratedFrom_, recovered_, producerVersion_, accessCatalog_};
+}
+void PersistentCatalog::restore(const Snapshot& snapshot) {
+    view_ = snapshot.view;
+    tables_ = snapshot.tables;
+    nextId_ = snapshot.nextId;
+    schemaVersion_ = snapshot.schemaVersion;
+    migratedFrom_ = snapshot.migratedFrom;
+    recovered_ = snapshot.recovered;
+    producerVersion_ = snapshot.producerVersion;
+    accessCatalog_ = snapshot.accessCatalog;
+}
 void PersistentCatalog::storeAccessCatalog(std::uint32_t permissionVersion, const std::string& payload) {
     if (permissionVersion == 0 || payload.empty() || payload.size() > accessChunkBytes * accessMaxChunks)
         throw MiniSqlError(ErrorCode::Catalog, "Invalid access catalog snapshot");
