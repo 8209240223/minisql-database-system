@@ -574,26 +574,67 @@ nlohmann::json decorrelateWhere(LogicalPlan& input, const nlohmann::json& predic
         } catch (...) { return {false, {}}; }
     };
     nlohmann::json remaining = nullptr;
+    const auto isScalarSub = [&](const nlohmann::json& n) -> bool {
+        return n.is_object() && n.value("kind", "") == "ScalarSubquery" && isCorrelated(n);
+    };
     for (const auto& conjunct : conjuncts) {
         const bool ifExists = conjunct.value("kind", "") == "Exists" && isCorrelated(conjunct);
         const bool ifNotExists = conjunct.value("kind", "") == "Unary" && conjunct.value("operator", "") == "NOT" &&
             conjunct.contains("left") && conjunct.at("left").is_object() &&
             conjunct.at("left").value("kind", "") == "Exists" && isCorrelated(conjunct.at("left"));
         const bool ifIn = conjunct.value("kind", "") == "InSubquery" && isCorrelated(conjunct);
-        if (ifExists || ifNotExists || ifIn) {
-            const auto& target = ifNotExists ? conjunct.at("left") : conjunct;
+        // X09 4.x: NOT IN 相关 → AntiSemiJoin(残差)；标量相关 → Apply(scalar)。
+        const bool ifNotIn = conjunct.value("kind", "") == "Unary" && conjunct.value("operator", "") == "NOT" &&
+            conjunct.contains("left") && conjunct.at("left").is_object() &&
+            conjunct.at("left").value("kind", "") == "InSubquery" && isCorrelated(conjunct.at("left"));
+        const bool ifScalarBool = isScalarSub(conjunct);
+        const bool ifScalarComp = conjunct.value("kind", "") == "Binary" &&
+            ((conjunct.contains("left") && isScalarSub(conjunct.at("left"))) ||
+             (conjunct.contains("right") && isScalarSub(conjunct.at("right"))));
+        if (ifExists || ifNotExists || ifIn || ifNotIn || ifScalarBool || ifScalarComp) {
+            nlohmann::json target = conjunct;
+            if (ifNotExists || ifNotIn) target = conjunct.at("left");
+            else if (ifScalarBool) target = conjunct;
+            else if (ifScalarComp) target = isScalarSub(conjunct.at("left")) ? conjunct.at("left") : conjunct.at("right");
             nlohmann::json paramBinding;
-            auto [ok, subplan] = buildRight(target, paramBinding, ifIn);
+            auto [ok, subplan] = buildRight(target, paramBinding, ifIn || ifNotIn || ifScalarBool || ifScalarComp);
             nlohmann::json residual = nullptr;
-            if (ok && ifIn && conjunct.contains("left")) {
-                residual = nlohmann::json{{"kind", "Binary"}, {"operator", "="}, {"type", "bool"}, {"nullable", true},
-                    {"left", conjunct.at("left")},
-                    {"right", nlohmann::json{{"kind", "Identifier"}, {"columnId", input.output.size()},
-                        {"name", subplan.output.front().name}, {"type", subplan.output.front().type}, {"nullable", true}}}};
+            if (ok) {
+                if (ifIn || ifNotIn) {
+                    // IN/NOT IN 残差：左操作数与右子计划首列等值。
+                    const nlohmann::json* inOperand = nullptr;
+                    if (ifIn && conjunct.contains("left")) inOperand = &conjunct.at("left");
+                    else if (ifNotIn && conjunct.at("left").contains("left")) inOperand = &conjunct.at("left").at("left");
+                    if (inOperand) residual = nlohmann::json{{"kind", "Binary"}, {"operator", "="}, {"type", "bool"}, {"nullable", true},
+                        {"left", *inOperand},
+                        {"right", nlohmann::json{{"kind", "Identifier"}, {"columnId", input.output.size()},
+                            {"name", subplan.output.front().name}, {"type", subplan.output.front().type}, {"nullable", true}}}};
+                } else if (ifScalarBool || ifScalarComp) {
+                    // 标量残差：追加列为右子计划首列；比较型则把子查询一侧替换为该列。
+                    const auto appended = nlohmann::json{{"kind", "Identifier"}, {"columnId", input.output.size()},
+                        {"name", subplan.output.front().name}, {"type", subplan.output.front().type}, {"nullable", true}};
+                    if (ifScalarBool) residual = appended;
+                    else {
+                        // 把子查询一侧替换为追加标量列，另一侧保持原位：
+                        //   left 为子查询 → left=appended,  right=conjunct.right
+                        //   right 为子查询 → left=conjunct.left, right=appended
+                        if (isScalarSub(conjunct.at("left")))
+                            residual = nlohmann::json{{"kind", "Binary"}, {"operator", conjunct.value("operator", "=")},
+                                {"type", "bool"}, {"nullable", true},
+                                {"left", appended}, {"right", conjunct.at("right")}};
+                        else
+                            residual = nlohmann::json{{"kind", "Binary"}, {"operator", conjunct.value("operator", "=")},
+                                {"type", "bool"}, {"nullable", true},
+                                {"left", conjunct.at("left")}, {"right", appended}};
+                    }
+                }
             }
             if (ok) {
                 LogicalPlan node;
-                node.kind = ifNotExists ? "AntiSemiJoin" : "SemiJoin";
+                if (ifScalarBool || ifScalarComp) {
+                    node.kind = "Apply";
+                    node.values = nlohmann::json{{"scalar", true}};
+                } else node.kind = (ifNotExists || ifNotIn) ? "AntiSemiJoin" : "SemiJoin";
                 node.table = input.table;
                 node.output = input.output;
                 node.preservesRowId = input.preservesRowId;

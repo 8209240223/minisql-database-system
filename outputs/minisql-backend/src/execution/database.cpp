@@ -899,15 +899,23 @@ std::vector<storage::Row> Database::joinRows(const sql::LogicalPlan& plan) {
         if (plan.children.size() != 2) fail("Apply/SemiJoin requires two children");
         const auto left = joinRows(plan.children[0]);
         if (plan.kind == "SemiJoin" || plan.kind == "AntiSemiJoin") {
+            // X09 4.x: 半连接 —— 按 paramBinding 逐左行绑定后 in-process 运行右子计划。
+            // NOT EXISTS（无残差）以“右非空”判命中；IN/NOT IN（有残差）以右行等值成立判命中，
+            // 且 NOT IN 额外把“右值列 NULL”视为命中（SQL：子查询含 NULL 时 NOT IN 为 NULL→排除）。
             const bool anti = plan.kind == "AntiSemiJoin";
+            const bool hasResidual = plan.predicate.is_object();
+            // 右子计划为单列（IN/NOT IN/buildRight inSubquery 已保证 output.size()==1），
+            // 其 NULL 值位于右行索引 0 处。
             for (const auto& a : left) {
                 checkCancelled();
                 bindCorrelation(a);
                 const auto right = joinRows(plan.children[1]);
-                bool matched = !right.empty();
-                if (plan.kind == "SemiJoin" && plan.predicate.is_object() && !right.empty()) {
-                    matched = false;
+                bool matched = false;
+                if (!hasResidual) {
+                    matched = !right.empty();
+                } else {
                     for (const auto& b : right) {
+                        if (anti && !b.empty() && std::holds_alternative<std::monostate>(b[0])) { matched = true; break; }
                         auto combined = a;
                         combined.insert(combined.end(), b.begin(), b.end());
                         if (accepted(evaluate(plan.predicate, combined))) { matched = true; break; }
@@ -917,7 +925,7 @@ std::vector<storage::Row> Database::joinRows(const sql::LogicalPlan& plan) {
             }
             return rows;
         }
-        // Apply：左行拼接右子计划每行（标量语义：右 >1 行报错、=0 行补 NULL）。
+        // Apply：左行拼接右子计划每行（标量语义：右 >1 行报错、=0 行补 NULL；可选残差过滤）。
         const bool scalar = plan.values.is_object() && plan.values.value("scalar", false);
         for (const auto& a : left) {
             checkCancelled();
@@ -928,6 +936,7 @@ std::vector<storage::Row> Database::joinRows(const sql::LogicalPlan& plan) {
                 auto combined = a;
                 if (right.empty()) combined.resize(a.size() + plan.children[1].output.size(), std::monostate{});
                 else combined.insert(combined.end(), right.front().begin(), right.front().end());
+                if (plan.predicate.is_object() && !accepted(evaluate(plan.predicate, combined))) continue;
                 rows.push_back(std::move(combined));
             } else {
                 for (const auto& b : right) {
