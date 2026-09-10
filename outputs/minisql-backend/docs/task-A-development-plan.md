@@ -351,11 +351,12 @@ node tests\subquery-smoke.mjs tests\statistics-smoke.mjs tests\explain-smoke.mjs
 - [x] **4.x-g** 相关**NOT IN→AntiSemiJoin(+residual)** 去相关：`decorrelateWhere` 识别 `Unary NOT over InSubquery`（`ifNotIn`），`buildRight` 一次性编译右子计划，残差把 IN 左操作数等值判定附加右侧过滤；执行器 `joinRows` 的 `AntiSemiJoin` 在有残差时改为「右行值 NULL 或残差成立 判命中」→ 排除（SQL：子查询含 NULL 时 NOT IN 为 NULL）。EXPLAIN 顶层出现 `AntiSemiJoin` + `paramBinding` + 残差谓词。
 - [x] **4.x-h** 相关**标量子查询→Apply(scalar)** 去相关：`decorrelateWhere` 识别纯布尔标量（`ifScalarBool`）与比较型标量（`ifScalarComp`，子查询在 Binary left 或 right），生成 `Apply` 节点（`values={"scalar":true}`），残差把子查询一侧替换为追加标量列 Identifier 并保持操作数位置；执行器 `Apply` 标量分支求值残差谓词过滤（空集补 NULL→比较 NULL→排除、多行报 `ExecutionError`）。EXPLAIN 顶层出现 `Apply` + `values.scalar` + `paramBinding` + 残差谓词。
 - [x] **4.x-i** 回归：新增 `tests/decorrelate-apply-smoke.mjs`（12 checks：NOT IN / IN / NOT EXISTS / EXISTS / 标量等值 / 标量左比较 / 空集标量 / 派生表基座 IN & NOT IN & 标量）。node parser 18 / planner 26 / diagnostics 22 / subquery 24 / explain 21 / outer-join 9 / statistics 11 / histogram 20 / cost 12 / costjoin 10 / optimizer-selectivity 14 / correlated-exec 8 / derived 12 / decorrelate-apply 12 通过；C++ contracts：optimizer 518 / planner / parser_subquery 3 / database 全绿。
-- [ ] 后续：右子计划以 `Expr::subquery` 结构化 AST 优先替代文本重解析；跨库缓存与 `correlatedRowsCache_` 结合做绑定级 memo；`ScalarSubquery` 在 projection/HAVING/ORDER BY 中的去相关。
+- [x] **4.x-j** 收口 `ScalarSubquery` 在 **HAVING / 聚合投影 / ORDER BY** 位置的相关求值，并修正「子计划含聚合时去相关产出不可执行节点」的缺口（详见 §6.19）。
+- [ ] 后续（非正确性，属重解析/缓存优化）：右子计划以 `Expr::subquery` 结构化 AST 优先替代文本重解析；跨库缓存与 `correlatedRowsCache_` 结合做绑定级 memo。
 
-### 6.18 基线漂移核对与修复（工作区，未提交）
+### 6.18 基线漂移核对与修复（builder-A 第十八次提交）
 
-> 在 `builder-A` HEAD `7d44676` 上继续收敛：先修两处真实缺陷，再核对全量回归的既存失败（对照 progress 文档区分「产品缺陷」与「测试契约滞后」）。
+> 在 `builder-A` HEAD `7d44676` 上继续收敛：先修两处真实缺陷，再核对全量回归的既存失败（对照 progress 文档区分「产品缺陷」与「测试契约滞后」）。提交 `240acee`（author/committer=anyu999），已推送 `7d44676..240acee`。
 
 - [x] **6.18-a 修复解析器栈溢出**：`sql/parser.cpp` 表达式深度上限由 `256` 改 `kMaxExpressionDepth=128`。递归下降表达式链约 8 帧/层，默认 1 MiB 线程栈约在 190 层耗尽，原上限永不触发即 `0xC00000FD` 崩溃；同时 `allRecoverable()` 每条语句重置 `depth`，避免恢复回绕把后续语句误判。深层 `CAST(`/`(`/`SUM(` 嵌套现返回 `2002 Expression depth exceeded`。
 - [x] **6.18-b 修复 DATE 字面量误判**：`sql/planner.cpp` `bindExpression` 中 `DATE '...'` 的 `E` 命中指数启发式被标为 `float`（值仍是字符串），`WHERE d < DATE '2000-01-01'` 报内部类型错误；改为先判 `dateLiteralText`，命中后跳过 float/decimal 启发式。日期比较恢复正常。
@@ -367,3 +368,16 @@ node tests\subquery-smoke.mjs tests\statistics-smoke.mjs tests\explain-smoke.mjs
   - `write-batch-process`：`bin/write_batch_contract.exe` 缺名（MSVC 产物带 `minisql_` 前缀，`bin/` 约定为去前缀名）→ 补齐该产物。
   - `journal-process`：全量连跑时触发本地批量删除护栏（产物累计 1067，>50/回合）；清空 `tests/artifacts` 后单独运行 **88 项通过**，非产品失败。
 - [x] **6.18-d 复核**：ctest 59/59；node **76/76**（`journal-process` 于干净产物目录单独复跑通过）。
+
+### 6.19 X09 4.x 收口——相关子查询在 HAVING / 聚合投影 / ORDER BY 位置
+
+> 收口 §6.17 的遗留项。定位到两处**真实缺口**（非文档口径问题），逐条用对抗性用例验证。分支 `builder-A`。
+
+- [x] **6.19-a 缺口定位**：对 `ScalarSubquery` 五个位置实测——投影与 ORDER BY **本已正确**（执行期按行绑定 `runCorrelatedSubquery`，早前一次误判是测试数据单调所致）；真正的缺口是
+  - `HAVING (SELECT COUNT(*) … WHERE u.k = t.grp) > 0` → `5001 Correlated subquery outer column outside row`；
+  - `WHERE id = (SELECT MAX(u.id) … WHERE u.id = t.id)` → `5001 Unsupported join input`。
+- [x] **6.19-b 根因一（HAVING）**：`lowerAggregate` 的 `rewrite` 只重写分组键 / `AggregateExpr`，而相关子查询的外层列引用存放在独立字段 `outerColumns`（`{限定名: {columnId, type}}`）中，未被重写。聚合之后实际求值的行是**聚合输出行**（分组键 + 聚合槽位），外层列却仍带**基表列下标** → 越界或取自错误列。修复：`lowerAggregate` 新增 `remapGroupRefs`，把 HAVING / 聚合投影中相关子查询的 `outerColumns.columnId` 重映射到 `GROUP BY` 键在 `aggregate.output` 中的槽位；引用**未分组列**时按 SQL 语义报 `2003 Column must be grouped or aggregated`（分组键本身是表达式时同样拒绝，避免基表下标在聚合行上取错列）。
+- [x] **6.19-c 根因二（WHERE + 聚合子计划）**：`decorrelateWhere` 原先无条件把可提升的相关子查询改写为 `SemiJoin/AntiSemiJoin/Apply`，但执行器的 in-process `joinRows` 只支持 `Project/Filter/Scan/Join`；子计划含 `Aggregate`（或 `Sort/Limit/Distinct`）时必然落到 `Unsupported join input`。修复：新增 `inProcessExecutable(subplan)` 判定，子计划含 `joinRows` 不支持的节点时**不去相关**，退回执行期按行绑定（`Correlated*` 表达式）路径——语义一致，且该路径已在投影位置长期验证，避免生成运行期必然失败的 `Apply/SemiJoin`。
+- [x] **6.19-d 行为核对**（逐条实跑，非仅翻转断言）：HAVING 相关标量 / `EXISTS` / `NOT EXISTS` / `IN`、HAVING 两侧同时含聚合的比较、表别名限定名；聚合投影 `SELECT grp, (SELECT COUNT(*) …)`；WHERE 侧 `=` / `IN` / `NOT IN` / `COUNT(*)` 聚合。其中 `NOT IN` 命中 SQL 的经典陷阱——子查询为 `MAX(空集)` 时返回**单行 NULL**，`NOT IN {NULL}` 为 NULL → 整行排除（结果为空集）。
+- [x] **6.19-e 结构化断言**：简单子计划仍生成 `SemiJoin`（去相关生效）；含 `MAX` 的子计划回退为 `Filter`（去相关关闭）；HAVING 计划为 `Filter → Aggregate → SeqScan`。
+- [x] **6.19-f 回归**：新增 `tests/correlated-aggregate-smoke.mjs`（**21 checks**）。ctest **59/59**；node **77/77**（`journal-process` 与 §6.18 同因：全量连跑会触本地批量删除护栏，清空 `tests/artifacts` 后单独运行 **88 项通过**，非产品失败）。

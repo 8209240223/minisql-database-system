@@ -11,7 +11,10 @@
 #include <cctype>
 #include <cstdint>
 #include <functional>
+#include <map>
+#include <string>
 #include <unordered_map>
+#include <vector>
 
 namespace minisql::sql {
 namespace {
@@ -235,6 +238,49 @@ void lowerAggregate(LogicalPlan& project, const Statement& statement, const cata
         project.output.at(i).columnId = expression.at("kind") == "Identifier" ? expression.at("columnId").get<std::size_t>() : static_cast<std::size_t>(-1);
     }
     auto having = statement.having ? rewrite(bindExpression(*statement.having, scope), 0) : nlohmann::json(nullptr);
+    // X09 4.x: 聚合之上（HAVING / 投影 / ORDER BY）的相关子查询 —— 其外层列引用携带的是
+    // 基表列下标，而此处实际求值的行是聚合输出行（分组键 + 聚合槽位）。必须把外层列下标
+    // 重映射到 GROUP BY 键在 aggregate.output 中的槽位，否则执行期会越界或取自错误列。
+    // 引用未参与分组的列按 SQL 语义报错（与 rewrite 对普通标识符的处理一致）。
+    std::unordered_map<std::size_t, std::size_t> groupSlot;
+    for (std::size_t i = 0; i < aggregate.groupKeys.size(); ++i) {
+        const auto& key = aggregate.groupKeys[i];
+        if (key.is_object() && key.value("kind", "") == "Identifier" && key.contains("columnId"))
+            groupSlot.emplace(key.at("columnId").get<std::size_t>(), i);
+    }
+    std::function<void(nlohmann::json&)> remapGroupRefs;
+    remapGroupRefs = [&](nlohmann::json& node) {
+        if (!node.is_object()) return;
+        const auto kind = node.value("kind", "");
+        if ((kind == "ScalarSubquery" || kind == "Exists" || kind == "InSubquery") &&
+            node.contains("subquerySql") && node.at("subquerySql").is_string() &&
+            node.contains("outerColumns") && node.at("outerColumns").is_object()) {
+            std::vector<std::string> referenced;
+            try {
+                const auto toks = tokenize(node.at("subquerySql").get<std::string>());
+                for (std::size_t i = 0; i + 2 < toks.size(); ++i)
+                    if (toks[i].type == "IDENTIFIER" && toks[i + 1].lexeme == "." && toks[i + 2].type == "IDENTIFIER")
+                        referenced.push_back(canonical(toks[i].lexeme + "." + toks[i + 2].lexeme));
+            } catch (...) { referenced.clear(); }
+            std::map<std::string, std::size_t> slots;
+            for (const auto& name : referenced) {
+                const auto found = node.at("outerColumns").find(name);
+                if (found == node.at("outerColumns").end() || !found->is_object() || !found->contains("columnId")) continue;
+                const auto slot = groupSlot.find(found->at("columnId").get<std::size_t>());
+                if (slot == groupSlot.end()) {
+                    const auto dot = name.find('.');
+                    throw MiniSqlError(ErrorCode::Semantic, "Column must be grouped or aggregated: " +
+                        (dot == std::string::npos ? name : name.substr(dot + 1)), statement.location);
+                }
+                slots.emplace(name, slot->second);
+            }
+            for (const auto& entry : slots) node.at("outerColumns").at(entry.first)["columnId"] = entry.second;
+        }
+        if (node.contains("left")) remapGroupRefs(node["left"]);
+        if (node.contains("right")) remapGroupRefs(node["right"]);
+    };
+    for (auto& expression : project.projections) remapGroupRefs(expression);
+    if (!having.is_null()) remapGroupRefs(having);
     aggregate.children.push_back(std::move(project.children.front()));
     project.children.clear();
     if (statement.having) {
@@ -552,6 +598,20 @@ nlohmann::json decorrelateWhere(LogicalPlan& input, const nlohmann::json& predic
         } catch (...) { return false; }
         return false;
     };
+    // X09 4.x: in-process 子计划可执行性。执行器的 joinRows 只支持 Project/Filter/Scan/Join
+    // 与 Apply/SemiJoin 本身；含 Aggregate/Sort/Limit/Distinct 的子计划只能在顶层 `run` 中
+    // 执行。这类相关子查询退回执行期按行绑定（Correlated* 表达式）路径：语义一致，且该路径
+    // 已在投影位置长期验证，避免生成运行期必然失败的 Apply/SemiJoin。
+    std::function<bool(const LogicalPlan&)> inProcessExecutable;
+    inProcessExecutable = [&](const LogicalPlan& node) -> bool {
+        const auto supported = node.kind == "SemiJoin" || node.kind == "AntiSemiJoin" || node.kind == "Apply" ||
+            node.kind == "Project" || node.kind == "Filter" || node.kind == "IndexScan" || node.kind == "SeqScan" ||
+            node.kind == "NestedLoopJoin" || node.kind == "HashJoin" || node.kind == "LeftJoin" ||
+            node.kind == "RightJoin" || node.kind == "FullJoin";
+        if (!supported) return false;
+        for (const auto& child : node.children) if (!inProcessExecutable(child)) return false;
+        return true;
+    };
     const auto buildRight = [&](const nlohmann::json& node, nlohmann::json& paramBindingOut,
                                 bool inSubquery) -> std::pair<bool, LogicalPlan> {
         // 一次性（compiled-once）把子查询编译为结构化右子计划；外层列按 outerColumns
@@ -575,6 +635,7 @@ nlohmann::json decorrelateWhere(LogicalPlan& input, const nlohmann::json& predic
             CorrelatedScopeGuard guard(&corr);
             auto subplan = build(ast.front(), catalog);
             if (inSubquery && subplan.output.size() != 1) return {false, {}};
+            if (!inProcessExecutable(subplan)) return {false, {}};
             return {true, std::move(subplan)};
         } catch (...) { return {false, {}}; }
     };
