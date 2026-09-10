@@ -638,9 +638,9 @@ public:
         return true;
     }
     void cancel() override { cancelled_ = true; }
-    void close() override { refs_.clear(); }
+    void close() override { closed_ = true; }
     nlohmann::json resourceUsage() const override {
-        return {{"kind", "ScanRowStream"}, {"rows", rows_}, {"pending", refs_.size() - cursor_}};
+        return {{"kind", "ScanRowStream"}, {"rows", rows_}, {"pending", refs_.size() > cursor_ ? refs_.size() - cursor_ : 0}, {"closed", closed_}};
     }
 private:
     storage::HeapStore& heap_;
@@ -650,6 +650,7 @@ private:
     std::size_t cursor_ = 0;
     std::size_t rows_ = 0;
     bool cancelled_ = false;
+    bool closed_ = false;
 };
 
 class FilterRowStream : public RowStream {
@@ -721,6 +722,26 @@ private:
     std::optional<std::uint64_t> limit_;
     std::uint64_t skipped_ = 0;
     std::uint64_t emitted_ = 0;
+};
+
+class MaterializedRowStream : public RowStream {
+public:
+    explicit MaterializedRowStream(nlohmann::json rows) : rows_(std::move(rows)) {}
+    bool next(nlohmann::json& row) override {
+        if (cursor_ >= rows_.size()) return false;
+        row = rows_.at(cursor_++);
+        return true;
+    }
+    void cancel() override { cancelled_ = true; }
+    void close() override { closed_ = true; }
+    nlohmann::json resourceUsage() const override {
+        return {{"kind", "MaterializedRowStream"}, {"rows", rows_.size()}, {"emitted", cursor_}, {"closed", closed_}, {"cancelled", cancelled_}};
+    }
+private:
+    nlohmann::json rows_ = nlohmann::json::array();
+    std::size_t cursor_ = 0;
+    bool cancelled_ = false;
+    bool closed_ = false;
 };
 
 nlohmann::json Database::createSnapshot(const std::filesystem::path& target) {
@@ -1325,6 +1346,10 @@ std::unique_ptr<RowStream> Database::openRowStream(const sql::LogicalPlan& plan)
         if (plan.children.size() != 1) fail("Limit requires one child");
         auto child = openRowStream(plan.children.front());
         return std::make_unique<LimitRowStream>(std::move(child), plan.offset, plan.limit);
+    }
+    if (plan.kind == "Sort" || plan.kind == "Aggregate" || plan.kind == "Distinct") {
+        auto result = runNode(plan);
+        return std::make_unique<MaterializedRowStream>(result.at("rows"));
     }
     throw MiniSqlError(ErrorCode::InvalidArgument, "RowStream does not support plan kind " + plan.kind);
 }
