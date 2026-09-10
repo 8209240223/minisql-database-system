@@ -36,7 +36,9 @@ const avgOverflow=run(`SELECT\nAVG(${maximum}) FROM t;`);
 equal(avgOverflow.error.line,2);equal(avgOverflow.error.column,5);
 const averageMaximum='99999999999999999999999999999999.999999';
 equal(query(`SELECT AVG(${averageMaximum}) FROM t;`),[[averageMaximum]]);
-for(const raw of ['1.','1.2.3','1.2e3','1.2abc','.5']) equal(run(`SELECT ${raw} FROM t;`).error.code,2001);
+// Exponent notation lexes as a FLOAT literal (see float-process.mjs), not a malformed DECIMAL.
+for(const raw of ['1.','1.2.3','1.2abc','.5']) equal(run(`SELECT ${raw} FROM t;`).error.code,2001);
+equal(query('SELECT 1.2e3 FROM t LIMIT 1;'),[[1200]]);
 for(const raw of ['1.'+'0'.repeat(38),'0.'+'0'.repeat(38)+'1']) equal(run(`SELECT ${raw} FROM t;`).error.code,2003);
 equal(run('SELECT 1.0+TRUE FROM t;').error.code,2003);
 equal(run("SELECT 1.0='1.0' FROM t;").error.code,2003);

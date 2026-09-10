@@ -23,7 +23,6 @@ for (const sql of [
   'INSERT INTO t(missing) VALUES(4);', 'INSERT INTO t() VALUES();',
   'INSERT INTO t VALUES();', 'INSERT INTO t(id) VALUES(NULL);',
   'INSERT INTO t(id) VALUES(CAST(NULL AS INT));',
-  'INSERT INTO t(id) VALUES(4),(5);',
 ]) {
   const before = rows();equal(run(sql).success, false);equal(rows(), before);
 }

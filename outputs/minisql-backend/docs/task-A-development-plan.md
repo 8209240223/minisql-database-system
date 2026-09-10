@@ -352,3 +352,18 @@ node tests\subquery-smoke.mjs tests\statistics-smoke.mjs tests\explain-smoke.mjs
 - [x] **4.x-h** 相关**标量子查询→Apply(scalar)** 去相关：`decorrelateWhere` 识别纯布尔标量（`ifScalarBool`）与比较型标量（`ifScalarComp`，子查询在 Binary left 或 right），生成 `Apply` 节点（`values={"scalar":true}`），残差把子查询一侧替换为追加标量列 Identifier 并保持操作数位置；执行器 `Apply` 标量分支求值残差谓词过滤（空集补 NULL→比较 NULL→排除、多行报 `ExecutionError`）。EXPLAIN 顶层出现 `Apply` + `values.scalar` + `paramBinding` + 残差谓词。
 - [x] **4.x-i** 回归：新增 `tests/decorrelate-apply-smoke.mjs`（12 checks：NOT IN / IN / NOT EXISTS / EXISTS / 标量等值 / 标量左比较 / 空集标量 / 派生表基座 IN & NOT IN & 标量）。node parser 18 / planner 26 / diagnostics 22 / subquery 24 / explain 21 / outer-join 9 / statistics 11 / histogram 20 / cost 12 / costjoin 10 / optimizer-selectivity 14 / correlated-exec 8 / derived 12 / decorrelate-apply 12 通过；C++ contracts：optimizer 518 / planner / parser_subquery 3 / database 全绿。
 - [ ] 后续：右子计划以 `Expr::subquery` 结构化 AST 优先替代文本重解析；跨库缓存与 `correlatedRowsCache_` 结合做绑定级 memo；`ScalarSubquery` 在 projection/HAVING/ORDER BY 中的去相关。
+
+### 6.18 基线漂移核对与修复（工作区，未提交）
+
+> 在 `builder-A` HEAD `7d44676` 上继续收敛：先修两处真实缺陷，再核对全量回归的既存失败（对照 progress 文档区分「产品缺陷」与「测试契约滞后」）。
+
+- [x] **6.18-a 修复解析器栈溢出**：`sql/parser.cpp` 表达式深度上限由 `256` 改 `kMaxExpressionDepth=128`。递归下降表达式链约 8 帧/层，默认 1 MiB 线程栈约在 190 层耗尽，原上限永不触发即 `0xC00000FD` 崩溃；同时 `allRecoverable()` 每条语句重置 `depth`，避免恢复回绕把后续语句误判。深层 `CAST(`/`(`/`SUM(` 嵌套现返回 `2002 Expression depth exceeded`。
+- [x] **6.18-b 修复 DATE 字面量误判**：`sql/planner.cpp` `bindExpression` 中 `DATE '...'` 的 `E` 命中指数启发式被标为 `float`（值仍是字符串），`WHERE d < DATE '2000-01-01'` 报内部类型错误；改为先判 `dateLiteralText`，命中后跳过 float/decimal 启发式。日期比较恢复正常。
+- [x] **6.18-c 全量回归基线**：ctest **59/59**；node 修复前 **70/76**，核对后确认 6 项失败均为**测试契约滞后或环境**，逐条更正：
+  - `in-list-smoke`：`id IN(SELECT …)` 已由 X09 半连接支持 → 断言改为校验过滤结果 `[[1],[2]]`。
+  - `join-process`：`RIGHT/FULL JOIN` 已实现且由 `outer-join-smoke.mjs` 正向覆盖 → 从「拒绝」清单移除；等值连接在 `optimizedPlan` 中已按 EXT-OPT-003 改写为 `HashJoin` → 断言改查 `HashJoin.predicate.operator`。
+  - `insert-columns-process`：`INSERT INTO t(id) VALUES(4),(5)` 多行+显式列清单已由 multirow-progress 启用 → 从「拒绝」清单移除。
+  - `decimal-literal-process`：指数形式已是合法 FLOAT 字面量（见 float-process 与 V3 技术文档 §3.2）→ 移出 DECIMAL 畸形清单，并正向断言 `1.2e3 → 1200`。
+  - `write-batch-process`：`bin/write_batch_contract.exe` 缺名（MSVC 产物带 `minisql_` 前缀，`bin/` 约定为去前缀名）→ 补齐该产物。
+  - `journal-process`：全量连跑时触发本地批量删除护栏（产物累计 1067，>50/回合）；清空 `tests/artifacts` 后单独运行 **88 项通过**，非产品失败。
+- [x] **6.18-d 复核**：ctest 59/59；node **76/76**（`journal-process` 于干净产物目录单独复跑通过）。

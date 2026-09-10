@@ -11,6 +11,16 @@ namespace {
 // the statement-level handler can synchronize and continue.
 struct Recovered {};
 
+// Maximum expression nesting depth. The recursive-descent expression chain
+// (expression -> conjunction -> negation -> comparison -> addition ->
+// multiplication -> unary -> primary) costs roughly eight stack frames per
+// nesting level, so this guard must fire well before the default 1 MiB thread
+// stack is exhausted -- otherwise the process dies with a stack overflow
+// (0xC00000FD) instead of reporting a syntax error. A limit of 256 overflowed
+// at about 190 levels of `CAST(`/`(`/`SUM(` nesting; 128 keeps a comfortable
+// margin while staying far above any realistic SQL expression.
+constexpr std::size_t kMaxExpressionDepth = 128;
+
 class Parser {
 public:
     explicit Parser(const std::vector<Token>& tokens): t(tokens) {}
@@ -29,6 +39,10 @@ public:
     std::vector<Statement> allRecoverable(){
         std::vector<Statement> out;
         while(i<t.size() && t[i].type!="END"){
+            // A recovered statement unwinds through Recovered{}, which skips the
+            // matching `--depth` of any guard it passed, so reset the counter per
+            // statement to avoid an inflated depth falsely rejecting later ones.
+            depth = 0;
             try {
                 auto st = statement();
                 if (inError_) st.invalid = true;
@@ -361,13 +375,13 @@ private:
     std::shared_ptr<Expr> expression(){auto left=conjunction();while(keyword("OR")){++i;left=std::make_shared<Expr>(Expr{"Binary","OR",left,conjunction()});}return left;}
     std::shared_ptr<Expr> conjunction(){auto left=negation();while(keyword("AND")){++i;left=std::make_shared<Expr>(Expr{"Binary","AND",left,negation()});}return left;}
     std::size_t depth=0;
-    std::shared_ptr<Expr> negation(){if(keyword("NOT")){if(++depth>256) fail(ErrorCode::Syntax, "Expression depth exceeded", t[i].location);++i;auto child=negation();--depth;return std::make_shared<Expr>(Expr{"Unary","NOT",child,{}});}return comparison();}
+    std::shared_ptr<Expr> negation(){if(keyword("NOT")){if(++depth>kMaxExpressionDepth) fail(ErrorCode::Syntax, "Expression depth exceeded", t[i].location);++i;auto child=negation();--depth;return std::make_shared<Expr>(Expr{"Unary","NOT",child,{}});}return comparison();}
     std::shared_ptr<Expr> comparison(){
         auto left=addition();
         if(keyword("IN")||keyword("NOT")){
             const bool negate=keyword("NOT");const auto op=take();
             if(negate)expect("IN");
-            if(++depth>256) fail(ErrorCode::Syntax, "Expression depth exceeded", op.location);
+            if(++depth>kMaxExpressionDepth) fail(ErrorCode::Syntax, "Expression depth exceeded", op.location);
             expect("(");
             if(keyword("SELECT")){
                 const auto start=i;
@@ -413,7 +427,7 @@ private:
            (keyword("COUNT")||keyword("SUM")||keyword("AVG")||keyword("MIN")||keyword("MAX"))){
             const auto token=take();auto name=token.lexeme;
             std::transform(name.begin(),name.end(),name.begin(),[](unsigned char c){return static_cast<char>(std::toupper(c));});
-            if(++depth>256) fail(ErrorCode::Syntax, "Expression depth exceeded", token.location);
+            if(++depth>kMaxExpressionDepth) fail(ErrorCode::Syntax, "Expression depth exceeded", token.location);
             expect("(");std::shared_ptr<Expr> argument;
             if(at("*")){
                 const auto star=take();
@@ -425,7 +439,7 @@ private:
         }
         if(keyword("CAST")){
             const auto token=take();
-            if(++depth>256) fail(ErrorCode::Syntax, "Expression depth exceeded", token.location);
+            if(++depth>kMaxExpressionDepth) fail(ErrorCode::Syntax, "Expression depth exceeded", token.location);
             expect("(");auto child=expression();expect("AS");
             auto target=typeName();expect(")");--depth;
             return std::make_shared<Expr>(Expr{"Cast",target,child,{},token.location});
@@ -435,7 +449,7 @@ private:
         if(at("+")||at("-")){
             if(i+1<t.size()&&(t[i+1].type=="INTEGER"||t[i+1].type=="DECIMAL"||t[i+1].type=="FLOAT")){auto loc=t[i].location;return std::make_shared<Expr>(Expr{"Literal",literal(),{},{},loc});}
             auto op=take();
-            if(++depth>256) fail(ErrorCode::Syntax, "Expression depth exceeded", op.location);
+            if(++depth>kMaxExpressionDepth) fail(ErrorCode::Syntax, "Expression depth exceeded", op.location);
             auto child=unary();--depth;
             return std::make_shared<Expr>(Expr{"Unary",op.lexeme,child,{},op.location});
         }
@@ -451,7 +465,7 @@ private:
                 return node;
             }
         }
-        if(at("(")){if(++depth>256) fail(ErrorCode::Syntax, "Expression depth exceeded", t[i].location);++i;auto e=expression();expect(")");--depth;return e;}auto loc=t[i].location;if(at("-")||at("+"))return std::make_shared<Expr>(Expr{"Literal",literal(),{},{},loc});const auto& x=take();if(x.type=="IDENTIFIER"){auto name=x.lexeme;if(at(".")){++i;name+="."+identifier();}return std::make_shared<Expr>(Expr{"Identifier",name,{},{},x.location});}if(x.type=="INTEGER"||x.type=="DECIMAL"||x.type=="FLOAT"||x.type=="STRING")return std::make_shared<Expr>(Expr{"Literal",x.lexeme,{},{},x.location}); fail(ErrorCode::Syntax, "Expected identifier, literal or '('", x.location, x.endLocation);
+        if(at("(")){if(++depth>kMaxExpressionDepth) fail(ErrorCode::Syntax, "Expression depth exceeded", t[i].location);++i;auto e=expression();expect(")");--depth;return e;}auto loc=t[i].location;if(at("-")||at("+"))return std::make_shared<Expr>(Expr{"Literal",literal(),{},{},loc});const auto& x=take();if(x.type=="IDENTIFIER"){auto name=x.lexeme;if(at(".")){++i;name+="."+identifier();}return std::make_shared<Expr>(Expr{"Identifier",name,{},{},x.location});}if(x.type=="INTEGER"||x.type=="DECIMAL"||x.type=="FLOAT"||x.type=="STRING")return std::make_shared<Expr>(Expr{"Literal",x.lexeme,{},{},x.location}); fail(ErrorCode::Syntax, "Expected identifier, literal or '('", x.location, x.endLocation);
     }
 };
 }

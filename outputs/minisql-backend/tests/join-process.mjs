@@ -58,8 +58,8 @@ try {
     'SELECT x.id FROM t x JOIN missing y ON x.id=y.id;',
     'SELECT t.id FROM t x JOIN u y ON x.id=y.id;',
   ]) equal(run(sql).error.type, 'SemanticError');
-  for (const sql of ['SELECT * FROM t RIGHT JOIN u ON t.id=u.id;',
-    'SELECT * FROM t FULL JOIN u ON t.id=u.id;', 'SELECT * FROM t CROSS JOIN u;', 'SELECT * FROM t NATURAL JOIN u;',
+  // RIGHT/FULL JOIN are implemented and verified by outer-join-smoke.mjs.
+  for (const sql of ['SELECT * FROM t CROSS JOIN u;', 'SELECT * FROM t NATURAL JOIN u;',
     'SELECT * FROM t JOIN u;', 'SELECT * FROM t JOIN u USING(id);']) equal(run(sql).success, false);
   const compiled = run('SELECT x.*,y.score FROM t x JOIN u y ON 1=1 AND x.id=y.id;', 'compile');
   equal(compiled.ast.joins[0].alias, 'y');
@@ -67,7 +67,8 @@ try {
   equal(plan.children.length, 2);
   equal(plan.output.length, 4);
   equal(plan.preservesRowId, false);
-  equal(compiled.optimizedPlan.find(node => node.kind === 'NestedLoopJoin').predicate.operator, '=');
+  // The optimizer rewrites the direct equi-join to a HashJoin (EXT-OPT-003).
+  equal(compiled.optimizedPlan.find(node => node.kind === 'HashJoin').predicate.operator, '=');
   equal(run('SELECT x.id FROM t x JOIN u y ON 1/0=1;').error.type, 'ExecutionError');
   equal(run('SELECT x.id FROM t x JOIN u y ON 1=0 AND 1/0=1;').success, true);
   console.log(`${checks} INNER JOIN assertions passed, including 16 SQLite differential queries`);

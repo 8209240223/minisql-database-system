@@ -96,9 +96,14 @@ nlohmann::json bindExpression(const Expr& expression, const catalog::Table& tabl
         result["type"] = result["value"].is_null() ? "null" : result["value"].is_boolean() ? "bool" : result["value"].is_string() ? "varchar" : result["value"].is_number_float() ? "float" : "int";
         if (result["value"].is_number_integer() && (result["value"].get<std::int64_t>() < INT32_MIN || result["value"].get<std::int64_t>() > INT32_MAX)) result["type"] = "bigint";
         result["nullable"] = result["value"].is_null();
-        if (dateLiteralText(expression.value)) result["type"] = "date";
-        if (expression.value.find_first_of("eE") != std::string::npos && expression.value.front() != '\'') result["type"] = "float";
-        if (expression.value.find_first_of("eE") == std::string::npos && expression.value.find('.') != std::string::npos && expression.value.front() != '\'') result["type"] = decimalLiteral(expression.value, expression.location).type.name();
+        // A DATE literal (`DATE '2000-01-01'`) carries an ISO string value, so the
+        // numeric heuristics below must not run on it. The 'E' in the DATE keyword
+        // would otherwise classify it as a FLOAT literal whose value stays a
+        // string, and comparing it later fails with an internal type error.
+        const bool isDateLiteral = dateLiteralText(expression.value).has_value();
+        if (isDateLiteral) result["type"] = "date";
+        if (!isDateLiteral && expression.value.find_first_of("eE") != std::string::npos && expression.value.front() != '\'') result["type"] = "float";
+        if (!isDateLiteral && expression.value.find_first_of("eE") == std::string::npos && expression.value.find('.') != std::string::npos && expression.value.front() != '\'') result["type"] = decimalLiteral(expression.value, expression.location).type.name();
     } else if (expression.kind == "Exists") {
         if (expression.subquerySql.empty()) invalid("missing EXISTS subquery");
         result["subquerySql"] = expression.subquerySql;
