@@ -23,7 +23,7 @@
 | X15 | EXT-OPT-001 规则框架 | 部分实现 | 4 条规则、固定点、禁用规则、预算、收敛诊断、三值折叠 | 通用注册和其余规则 |
 | X16 | EXT-OPT-002 列裁剪与冗余节点 | 部分实现 | 恒真/恒假/NULL Filter、简单列裁剪、Schema/执行等价检查 | 连接、聚合和复杂表达式列裁剪 |
 | X17 | EXT-OPT-003 谓词下推与连接改写 | 部分实现 | INNER JOIN 单表谓词下推、直接等值 HashJoin 改写 | LEFT JOIN、跨表条件和完整改写 |
-| X18 | EXT-OPT-004 统计信息与代价 | 已实现（基础版） | 表/列统计、distinct、NULL 比例、min/max、轻量直方图、索引 entries/height/pageCount、统计版本/刷新时间、stats-v1 估计、EXPLAIN statsSource；statistics-smoke 20 项通过 | 更复杂直方图和候选计划成本比较为后续增强 |
+| X18 | EXT-OPT-004 统计信息与代价 | 已实现（基础版） | 表/列统计、distinct、NULL 比例、min/max、轻量直方图、索引 entries/height/pageCount、统计版本/刷新时间、stats-v1 估计、EXPLAIN statsSource、SeqScan/IndexScan 候选成本比较和确定性选择；statistics-smoke 20 项通过 | 更复杂直方图和成本公式为后续增强 |
 | X19 | EXT-OPT-005 EXPLAIN/ANALYZE | 部分实现 | 原始/优化计划、实际行数/耗时、逐节点统计、写语句拒绝 | 完整 X19 组合验收 |
 | X20 | EXT-SYS-001 B+ 树与索引 | 已实现（基础版） | 页级 B+ 树主路径、页类型/元页、根到叶遍历、分裂、借位/合并、重启恢复、结构 inspect、索引 HTTP/工作台入口；29+41+44 项索引检查通过；1000/5000/10000 行性能曲线（height 2/3/3，pages 33/162/323）已产出 | MB 级性能压力为后续增强，不纳入基础版 |
 | X21 | EXT-SYS-002 事务与原子性 | 已实现（声明方案） | DDL/DML 事务、提交/回滚、HTTP 常驻会话、失败回滚、锁等待、SAVEPOINT/RELEASE/ROLLBACK TO（7 项）、事务溢写预算与回滚（5 项） | MVCC 和行级隔离等高级模式为后续增强，不纳入基础版 |

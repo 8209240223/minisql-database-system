@@ -22,7 +22,7 @@
 ## X18 统计与成本
 
 - 已完成：表/列统计、distinct、NULL 比例、min/max、轻量直方图、索引 entries/height/pageCount、统计版本/刷新时间。
-- EXPLAIN：增加 `statsSource`、`costModelVersion` 和确定性决胜标记。
+- EXPLAIN：增加 `statsSource`、`costModelVersion`、确定性决胜标记、SeqScan/IndexScan 候选成本列表和 `chosenAccessPath`。
 - 必要回归：`statistics-smoke.mjs` 20 项、`explain-smoke.mjs` 21 项通过。
 
 ## A5 集成门禁
@@ -31,4 +31,4 @@
 
 ## 后续增强
 
-- 更完整的 LR/LALR 生成器、复杂直方图和候选计划成本比较保留为后续增强，不阻塞 A 基础版完成。
+- 更完整的 LR/LALR 生成器和更复杂直方图保留为后续增强，不阻塞 A 基础版完成。

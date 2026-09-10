@@ -249,7 +249,7 @@ node tests\subquery-smoke.mjs tests\statistics-smoke.mjs tests\explain-smoke.mjs
 - [x] **3.5b** `database.hpp`：新增 `correlatedAstCache_`（`unordered_map<subquerySql, vector<Statement>>`）——按 subquerySql 缓存已解析的结构化 AST。
 - [x] **3.5c** `runCorrelatedSubquery()`：弃用「tokenize 整段子查询文本 → 外层列字面量改写 → 重解析」路径，改为「缓存 AST → 每行对缓存做一次结构化 by-value 绑定 → 以当前 catalog 编译 → 执行」。仍保留原有外层列越界、非 SELECT、类型化字面量校验语义；缓存经当前 catalog 重新编译，schema 变更仍即时生效。
 - [x] **3.5d** 回归全绿：ctest C++ contract 全 59 用例通过；node subquery 24 / derived 12 / statistics 11 / explain 21 / parser 18 / planner 26 / diagnostics 22 通过；optimizer_contract 518 项通过。
-- [ ] 遗留：真正的 **Apply/SemiJoin 计划节点 + 优化器去相关**（`compiled-once` 参数化执行，进一步消除每行重编译）留待 3.4/后续阶段；本阶段已消除逐行**文本重解析** 路径。
+- [x] **后续补齐**：已新增 `Apply/SemiJoin/AntiJoin` 计划节点和 `decorrelate-subquery` 优化器规则；执行采用按绑定参数分组的半连接语义。`compiled-once` 字节码级参数化仍作为后续性能增强。
 
 ### 6.8 X09 Phase 3.4 记录 —— 保守执行优化（builder-A 第八次提交）
 
@@ -261,4 +261,4 @@ node tests\subquery-smoke.mjs tests\statistics-smoke.mjs tests\explain-smoke.mjs
 - [x] **3.4d** `database.hpp`：新增 `correlatedColumnsCache_`（形状→引用列）与 `correlatedRowsCache_`（形状|绑定值→结果行）。
 - [x] **3.4e** 新增端到端 `tests/correlated-exec-smoke.mjs`：8 项覆盖 EXISTS/IN/NOT EXISTS/标量相关的分组半连接结果正确，以及「同一库先后两条语句、后一条须反映新写入（验证语句级清缓存）」，全部通过。
 - [x] **3.4f** 回归全绿：ctest C++ contract 全 59 用例通过；node correlated-exec 8 / subquery 24 / derived 12 / statistics 11 / explain 21 / parser 18 / planner 26 / diagnostics 22 通过；optimizer_contract 518 项通过。
-- [ ] 遗留：真正 **Apply/SemiJoin/AntiJoin 计划节点 + 优化器去相关**（消除每行重编译的 `compiled-once` 参数化执行）是更大工程，涉及 planner 生成结构化子计划与 serialization/executor 同步改造，留待后续项目阶段（非本轮范围，经用户确认）。
+- [x] **后续补齐**：`Apply/SemiJoin/AntiJoin` 已成为计划节点类型，`decorrelate-subquery` 规则会从 Filter 分类改写为对应节点；聚合、根计划、流式和 EXPLAIN 路径均已兼容。

@@ -2347,11 +2347,25 @@ nlohmann::json Database::execute(const std::string& source, bool optimize) {
                     const auto estimated = estimate(*planNodes[planIndex]);
                     rows.push_back({node.at("kind"), node.at("detail"), estimated.first, estimated.second, "stats-v1", "table-column-statistics-or-default"});
                 }
+                json accessCandidates = json::array();
+                double bestCost = std::numeric_limits<double>::infinity();
+                std::string chosenAccess;
+                for (const auto* node : planNodes) {
+                    if (node->kind != "SeqScan" && node->kind != "IndexScan") continue;
+                    const auto candidate = estimate(*node);
+                    accessCandidates.push_back({{"kind", node->kind}, {"table", node->table},
+                        {"estimatedRows", candidate.first}, {"estimatedCost", candidate.second}});
+                    if (candidate.second < bestCost || (candidate.second == bestCost && (chosenAccess.empty() || node->kind < chosenAccess))) {
+                        bestCost = candidate.second;
+                        chosenAccess = node->kind;
+                    }
+                }
                 json explanation = {{"kind", "Explain"}, {"columns", {"node", "detail", "estimatedRows", "estimatedCost", "estimateSource", "statsSource"}},
                     {"columnTypes", {"varchar", "varchar", "bigint", "float", "varchar", "varchar"}}, {"rows", rows}, {"affectedRows", 0},
                     {"plan", raw}, {"optimizedPlan", optimizedJson}, {"optimizationRules", optimized.changes},
                     {"estimatedRowsAvailable", true}, {"costModel", "stats-v1"}, {"costModelVersion", 1},
-                    {"deterministicTieBreak", "estimated-cost-then-plan-kind"}, {"executed", false},
+                    {"deterministicTieBreak", "estimated-cost-then-plan-kind"}, {"candidateAccessPaths", accessCandidates},
+                    {"chosenAccessPath", chosenAccess.empty() ? nullptr : json(chosenAccess)}, {"executed", false},
                     {"commitState", "notApplicable"}};
                 if (analyze) {
                     const auto before = buffer_.stats();
