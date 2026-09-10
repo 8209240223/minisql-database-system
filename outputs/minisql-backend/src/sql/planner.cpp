@@ -773,12 +773,24 @@ nlohmann::json serializePlans(const std::vector<LogicalPlan>& plans) {
     return rows;
 }
 
+nlohmann::json serializePlanDocument(const std::vector<LogicalPlan>& plans) {
+    return {{"schemaVersion", PLAN_SCHEMA_VERSION}, {"schemaMinor", PLAN_SCHEMA_MINOR},
+            {"planVersion", PLAN_VERSION}, {"producerVersion", PRODUCER_VERSION},
+            {"planKind", "logical"}, {"plans", serializePlans(plans)}};
+}
+
 std::vector<LogicalPlan> deserializePlans(const nlohmann::json& document) {
     const auto invalid = []() -> void { throw MiniSqlError(ErrorCode::Storage, "Invalid serialized logical plan"); };
     nlohmann::json rows;
     if (document.is_array()) rows = document;
-    else if (document.is_object() && document.value("schemaVersion", 0u) == PLAN_SCHEMA_VERSION && document.value("planKind", "") == "logical" && document.contains("plans"))
+    else if (document.is_object() && document.contains("schemaVersion") && document.value("planKind", "") == "logical" && document.contains("plans")) {
+        std::uint32_t documentMajor = 0, documentMinor = 0;
+        if (!readVersionField(document, "schemaVersion", documentMajor) ||
+            (document.contains("schemaMinor") && !readVersionField(document, "schemaMinor", documentMinor)) ||
+            !versionReadable(documentMajor, documentMinor, PLAN_SCHEMA_VERSION, PLAN_SCHEMA_MINOR) ||
+            !optionalVersionReadable(document, "planVersion", PLAN_VERSION, 0u)) invalid();
         rows = document.at("plans");
+    }
     else invalid();
     if (!rows.is_array() || rows.size() > 65536) invalid();
 

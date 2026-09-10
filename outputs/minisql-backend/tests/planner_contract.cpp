@@ -37,6 +37,24 @@ int main() {
     try { (void)minisql::sql::deserializePlans(nlohmann::json{{"schemaVersion", 2}, {"planKind", "logical"}, {"plans", document}}); }
     catch (const minisql::MiniSqlError&) { badVersion = true; }
     require(badVersion);
+    // X13: versioned plan document carries schemaMinor/planVersion/producerVersion and round-trips.
+    const auto planDocument = minisql::sql::serializePlanDocument(structured);
+    require(planDocument.at("schemaVersion").get<std::uint32_t>() == minisql::sql::PLAN_SCHEMA_VERSION);
+    require(planDocument.at("schemaMinor").get<std::uint32_t>() == minisql::sql::PLAN_SCHEMA_MINOR);
+    require(planDocument.at("planVersion").get<std::uint32_t>() == minisql::sql::PLAN_VERSION);
+    require(planDocument.contains("producerVersion") && planDocument.at("planKind") == "logical");
+    require(minisql::sql::serializePlans(minisql::sql::deserializePlans(planDocument)) == document);
+    // X13: same major, minor at or below current reads leniently; a newer minor is rejected.
+    require(minisql::sql::serializePlans(minisql::sql::deserializePlans(
+        nlohmann::json{{"schemaVersion", 1}, {"schemaMinor", 0}, {"planKind", "logical"}, {"plans", document}})) == document);
+    bool newerPlanMinor = false;
+    try { (void)minisql::sql::deserializePlans(nlohmann::json{{"schemaVersion", 1}, {"schemaMinor", 1}, {"planKind", "logical"}, {"plans", document}}); }
+    catch (const minisql::MiniSqlError&) { newerPlanMinor = true; }
+    require(newerPlanMinor);
+    bool badPlanNode = false;
+    try { (void)minisql::sql::deserializePlans(nlohmann::json{{"schemaVersion", 1}, {"planVersion", 2}, {"planKind", "logical"}, {"plans", document}}); }
+    catch (const minisql::MiniSqlError&) { badPlanNode = true; }
+    require(badPlanNode);
     auto damagedParent = document;
     damagedParent[0]["children"] = nlohmann::json::array({99});
     bool badChild = false;
@@ -65,6 +83,21 @@ int main() {
     try { (void)minisql::sql::deserializeAst(nlohmann::json{{"schemaVersion", 2}, {"statements", astDocument}}); }
     catch (const minisql::MiniSqlError&) { badAstVersion = true; }
     require(badAstVersion);
+    // X13: versioned AST document carries nodeVersion/schemaMinor and reads back.
+    const auto astVersioned = minisql::sql::serializeAstDocument(ast);
+    require(astVersioned.at("nodeVersion").get<std::uint32_t>() == minisql::sql::AST_NODE_VERSION);
+    require(astVersioned.at("schemaMinor").get<std::uint32_t>() == minisql::sql::AST_SCHEMA_MINOR);
+    require(minisql::sql::serializeAst(minisql::sql::deserializeAst(astVersioned)) == astDocument);
+    require(minisql::sql::serializeAst(minisql::sql::deserializeAst(
+        nlohmann::json{{"schemaVersion", 1}, {"schemaMinor", 0}, {"statements", astDocument}})) == astDocument);
+    bool newerAstMinor = false;
+    try { (void)minisql::sql::deserializeAst(nlohmann::json{{"schemaVersion", 1}, {"schemaMinor", 1}, {"statements", astDocument}}); }
+    catch (const minisql::MiniSqlError&) { newerAstMinor = true; }
+    require(newerAstMinor);
+    bool badAstNode = false;
+    try { (void)minisql::sql::deserializeAst(nlohmann::json{{"schemaVersion", 1}, {"nodeVersion", 2}, {"statements", astDocument}}); }
+    catch (const minisql::MiniSqlError&) { badAstNode = true; }
+    require(badAstNode);
     auto damagedAst = astDocument;
     damagedAst[1]["valueRows"][0][0] = nlohmann::json{{"kind", "Unknown"}};
     bool badAstExpression = false;

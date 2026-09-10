@@ -10,12 +10,51 @@
 
 namespace minisql::sql {
 // X13 version contract. These are the authoritative constants for on-wire and
-// on-disk serialized artifacts. Unknown major versions are rejected on read;
-// same major, higher minor must be read leniently where fields are present.
-inline constexpr std::uint32_t AST_SCHEMA_VERSION = 1;      // AST document schemaVersion
-inline constexpr std::uint32_t PLAN_SCHEMA_VERSION = 1;     // logical plan schemaVersion
+// on-disk serialized artifacts. Every reader applies the same gate: an unknown
+// major version is rejected; the same major with a minor at or below what this
+// binary understands is read leniently (absent optional fields fall back to
+// defaults); a newer minor is rejected because we cannot know the shape of
+// fields it may have introduced.
+inline constexpr std::uint32_t AST_SCHEMA_VERSION = 1;      // AST document schemaVersion (major)
+inline constexpr std::uint32_t AST_SCHEMA_MINOR = 0;        // newest AST minor this binary writes
+inline constexpr std::uint32_t AST_NODE_VERSION = 1;        // statement/expression node contract (major)
+inline constexpr std::uint32_t PLAN_SCHEMA_VERSION = 1;     // logical plan schemaVersion (major)
+inline constexpr std::uint32_t PLAN_SCHEMA_MINOR = 0;       // newest plan minor this binary writes
+inline constexpr std::uint32_t PLAN_VERSION = 1;            // logical plan node contract (major)
 inline constexpr std::uint32_t PRODUCER_VERSION = 1;        // this binary's producer version
 inline constexpr std::uint32_t CATALOG_SCHEMA_VERSION = 5;  // newest table/column descriptor
+
+// X13 read-side gate shared by every versioned reader (AST, plan, catalog).
+inline bool versionReadable(std::uint32_t documentMajor, std::uint32_t documentMinor,
+                            std::uint32_t currentMajor, std::uint32_t currentMinor) {
+    return documentMajor == currentMajor && documentMinor <= currentMinor;
+}
+// X13 reader helper: coerce a JSON version field to uint32. Accepts either JSON
+// integer form (signed or unsigned); rejects missing/wrong-typed/negative or
+// out-of-range values. A JSON literal like 1 parses as a *signed* integer, so a
+// strict unsigned check would wrongly reject well-formed documents.
+inline bool readVersionField(const nlohmann::json& node, const char* field, std::uint32_t& out) {
+    if (!node.contains(field) || !node.at(field).is_number_integer()) return false;
+    if (node.at(field).is_number_unsigned()) {
+        const auto value = node.at(field).get<std::uint64_t>();
+        if (value > 0xFFFFFFFFull) return false;
+        out = static_cast<std::uint32_t>(value);
+    } else {
+        const auto value = node.at(field).get<std::int64_t>();
+        if (value < 0 || value > 0x7FFFFFFFll) return false;
+        out = static_cast<std::uint32_t>(value);
+    }
+    return true;
+}
+// Optional-field version gate: absent fields are treated as the oldest readable
+// form; present fields must be a valid version that passes versionReadable.
+inline bool optionalVersionReadable(const nlohmann::json& node, const char* field,
+                                    std::uint32_t currentMajor, std::uint32_t currentMinor) {
+    if (!node.contains(field) || node.at(field).is_null()) return true;
+    std::uint32_t value = 0;
+    if (!readVersionField(node, field, value)) return false;
+    return versionReadable(value, 0u, currentMajor, currentMinor);
+}
 inline nlohmann::json serializeReference(const std::optional<std::pair<std::string,std::string>>& reference) {
     return reference ? nlohmann::json{{"table", reference->first}, {"column", reference->second}} : nlohmann::json(nullptr);
 }
@@ -273,7 +312,12 @@ inline Statement readStatement(const nlohmann::json& node, std::size_t depth = 0
 inline std::vector<Statement> deserializeAst(const nlohmann::json& document) {
     nlohmann::json nodes = document;
     if (document.is_object() && document.contains("schemaVersion")) {
-        if (document.at("schemaVersion") != AST_SCHEMA_VERSION || !document.contains("statements") || !document.at("statements").is_array())
+        std::uint32_t documentMajor = 0, documentMinor = 0;
+        if (!readVersionField(document, "schemaVersion", documentMajor) ||
+            (document.contains("schemaMinor") && !readVersionField(document, "schemaMinor", documentMinor)) ||
+            !versionReadable(documentMajor, documentMinor, AST_SCHEMA_VERSION, AST_SCHEMA_MINOR) ||
+            !optionalVersionReadable(document, "nodeVersion", AST_NODE_VERSION, 0u) ||
+            !document.contains("statements") || !document.at("statements").is_array())
             throw MiniSqlError(ErrorCode::Storage, "Unsupported AST schema version");
         nodes = document.at("statements");
     }
@@ -288,7 +332,9 @@ inline std::vector<Statement> deserializeAst(const nlohmann::json& document) {
 inline nlohmann::json serializeAstDocument(const std::vector<Statement>& statements) {
     auto nodes = nlohmann::json::array();
     for (const auto& statement : statements) nodes.push_back(serializeStatement(statement));
-    return {{"schemaVersion", AST_SCHEMA_VERSION}, {"producerVersion", PRODUCER_VERSION}, {"statements", std::move(nodes)}};
+    return {{"schemaVersion", AST_SCHEMA_VERSION}, {"schemaMinor", AST_SCHEMA_MINOR},
+            {"nodeVersion", AST_NODE_VERSION}, {"producerVersion", PRODUCER_VERSION},
+            {"statements", std::move(nodes)}};
 }
 inline nlohmann::json serializeAst(const std::vector<Statement>& statements) {
     auto nodes = nlohmann::json::array();

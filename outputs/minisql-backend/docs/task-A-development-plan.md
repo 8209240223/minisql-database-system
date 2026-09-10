@@ -381,3 +381,12 @@ node tests\subquery-smoke.mjs tests\statistics-smoke.mjs tests\explain-smoke.mjs
 - [x] **6.19-d 行为核对**（逐条实跑，非仅翻转断言）：HAVING 相关标量 / `EXISTS` / `NOT EXISTS` / `IN`、HAVING 两侧同时含聚合的比较、表别名限定名；聚合投影 `SELECT grp, (SELECT COUNT(*) …)`；WHERE 侧 `=` / `IN` / `NOT IN` / `COUNT(*)` 聚合。其中 `NOT IN` 命中 SQL 的经典陷阱——子查询为 `MAX(空集)` 时返回**单行 NULL**，`NOT IN {NULL}` 为 NULL → 整行排除（结果为空集）。
 - [x] **6.19-e 结构化断言**：简单子计划仍生成 `SemiJoin`（去相关生效）；含 `MAX` 的子计划回退为 `Filter`（去相关关闭）；HAVING 计划为 `Filter → Aggregate → SeqScan`。
 - [x] **6.19-f 回归**：新增 `tests/correlated-aggregate-smoke.mjs`（**21 checks**）。ctest **59/59**；node **77/77**（`journal-process` 与 §6.18 同因：全量连跑会触本地批量删除护栏，清空 `tests/artifacts` 后单独运行 **88 项通过**，非产品失败）。
+
+### 6.20 X13 版本契约补全——nodeVersion/planVersion + 同主版小版本兼容读
+
+> 收口任务书 A2 范围 1/2。定位到两处**真实缺口**：① AST/Plan 文档只有 `schemaVersion` + `producerVersion`，缺任务书要求的 `nodeVersion`/`planVersion`；② 读端版本比对是**裸值精确相等**（`serialization.hpp` 的 `document.at("schemaVersion") != AST_SCHEMA_VERSION`、`planner.cpp` 的 `document.value("schemaVersion", 0u) == PLAN_SCHEMA_VERSION`），既无「未知主版本拒绝」的显式语义，也无「同主版小版本兼容读」。分支 `builder-A`。
+
+- [x] **6.20-a 常量与读端闸门**：`serialization.hpp` 新增 `AST_SCHEMA_MINOR / AST_NODE_VERSION / PLAN_SCHEMA_MINOR / PLAN_VERSION`，并引入统一闸门 `versionReadable(documentMajor, documentMinor, currentMajor, currentMinor)`（主版本必须相等、次版本不得高于本二进制）与 `readVersionField`（接受 JSON 有符号/无符号整数，拒绝缺失/错型/负值/越界）、`optionalVersionReadable`（缺省字段视为最旧可读形态）。
+- [x] **6.20-b AST 文档**：`serializeAstDocument` 写入 `schemaVersion/schemaMinor/nodeVersion/producerVersion`；`deserializeAst` 改用版本闸门——未知主版本（如 `schemaVersion:2`）拒绝，`schemaMinor` 高于当前（1 > 0）拒绝，`nodeVersion` 未知主版本拒绝，缺省次版本按 0 兼容读。
+- [x] **6.20-c Plan 文档**：新增 `serializePlanDocument(plans)`（writer，输出 `schemaVersion/schemaMinor/planVersion/producerVersion/planKind/plans`，与 `serializePlans` 往返一致）；`deserializePlans` 改用同一版本闸门。**不改动 compile 响应既有结构**（`database.cpp`/`compile_main.cpp` 的 `schemaVersion:1`）——按任务书 8.1 接口冻结，响应接入（含前端 `types.ts` 同步）留待跨组同步，本提交只完成编解码契约。
+- [x] **6.20-d 回归**：`tests/planner_contract.cpp` 新增 12 项断言（版本化往返、主版拒绝、更高次版拒绝、`nodeVersion`/`planVersion` 未知主版拒绝、同主版次版兼容读、`serializeAstDocument`/`serializePlanDocument` 字段存在）；`ctest` **59/59**；node `planner-regression` 26 项通过。

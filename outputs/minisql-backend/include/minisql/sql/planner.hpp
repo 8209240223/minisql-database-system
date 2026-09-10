@@ -50,5 +50,9 @@ struct LogicalPlan {
 std::vector<LogicalPlan> compilePlans(const std::vector<Statement>& statements,
                                       const catalog::Catalog& catalog);
 nlohmann::json serializePlans(const std::vector<LogicalPlan>& plans);
+// X13: wrap a plan batch as a versioned plan document (schemaVersion + schemaMinor
+// + planVersion + producerVersion + planKind) so readers can reject an unknown
+// major and read an older minor leniently. Round-trips with deserializePlans.
+nlohmann::json serializePlanDocument(const std::vector<LogicalPlan>& plans);
 std::vector<LogicalPlan> deserializePlans(const nlohmann::json& document);
 }
