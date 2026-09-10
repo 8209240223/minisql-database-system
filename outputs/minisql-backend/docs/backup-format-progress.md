@@ -38,7 +38,7 @@
 
 ## 在线快照验证
 
-- `node tests/backup-online-smoke.mjs`：19 项通过，覆盖在线快照、manifest 版本 4、WAL 侧车校验、快照后插入并恢复、活动会话下快照和恢复后数据一致。
+- `node tests/backup-online-smoke.mjs`：20 项通过，覆盖在线快照、manifest 版本 4、WAL 侧车校验、快照后插入并恢复、活动事务未提交时快照、提交后恢复不包含未提交行。
 
 ## 回滚目录增量
 

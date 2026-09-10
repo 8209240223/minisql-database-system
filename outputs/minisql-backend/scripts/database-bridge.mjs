@@ -508,6 +508,19 @@ async function runSessionOperation(session, mode, sql, res, context = {}) {
   }
 }
 
+async function runSnapshotOperation(session, target) {
+  return enqueue(async () => {
+    const currentEngine = await ensureEngine();
+    clearCancelFile(session.cancelFile);
+    const value = await currentEngine.worker.request('snapshot', '', {
+      sessionId: session.id, cancelFile: session.cancelFile, user: session.user, password: session.password, target,
+    });
+    if (value.error?.code === 5002) value.cancelled = true;
+    if (value.commitState === 'unknown' || value.error?.code === 4001 || value.error?.code === 9999) quarantined = true;
+    return value;
+  });
+}
+
 function queryResult(data, durationMs) {
   const results = data.results ?? [];
   const last = results.at(-1);
@@ -847,7 +860,7 @@ const server = http.createServer(async (req, res) => {
             user: requestUser, password: requestPassword ?? '',
           };
           auditSql = `SNAPSHOT ${name}`;
-          const result = await runSessionOperation(ephemeral, 'snapshot', '', res, { target: file });
+          const result = await runSnapshotOperation(ephemeral, file);
           clearCancelFile(cancelFile);
           await closeEngineIfIdle({ user: requestUser, password: requestPassword ?? '' });
           if (result.success === false) {

@@ -83,10 +83,11 @@ try {
   const sessions = await request('/sessions');
   equal(sessions.status, 201);
   const sessionId = sessions.data.sessionId;
-  equal((await request('/sessions/' + sessionId + '/execute', { sql: 'SELECT * FROM t ORDER BY id;' })).status, 200);
-  const onlineDuringSession = await request('/backup', { name: 'active-snap', mode: 'online' });
-  equal(onlineDuringSession.status, 200);
-  equal(onlineDuringSession.data.kind, 'snapshot');
+  equal((await request('/sessions/' + sessionId + '/execute', { sql: 'BEGIN; INSERT INTO t VALUES(5);' })).status, 200);
+  const onlineDuringTransaction = await request('/backup', { name: 'active-snap', mode: 'online' });
+  equal(onlineDuringTransaction.status, 200);
+  equal(onlineDuringTransaction.data.kind, 'snapshot');
+  equal((await request('/sessions/' + sessionId + '/execute', { sql: 'COMMIT;' })).status, 200);
   await request('/sessions/' + sessionId + '/close');
   equal((await request('/restore', { name: 'active-snap.pages' })).status, 200);
   equal((await request('/execute', { sql: 'SELECT * FROM t ORDER BY id;' })).data.rows, [[1], [2]]);
