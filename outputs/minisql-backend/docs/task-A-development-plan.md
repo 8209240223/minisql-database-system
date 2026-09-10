@@ -294,3 +294,13 @@ node tests\subquery-smoke.mjs tests\statistics-smoke.mjs tests\explain-smoke.mjs
 - [x] **4.3c** 增补 `tests/statistics-cost-smoke.mjs`：断言 `optimizedPlan/Filter` 节点携带三个估计字段、与展示行估计行数相等、多次编译成本确定性；成本测试升至 12 项通过。
 - [x] **4.3d** 回归全绿：node statistics-cost 12 / statistics-histogram 20 / statistics 11 / explain 21 / subquery 24 / derived 12 / correlated-exec 8 / planner-regression 26 通过；database-http（含序列化写）、database-process、bridge-regression 通过；optimizer_contract 518 通过。
 - [ ] 后续/退出：把预估成本接入 optimizer**候选比较 + 固定决胜**（`hash-join` 等改为成本驱动而非无条件布尔），并将 EXPLAIN 估计字段并入 HTTP 契约/工作台展示；IndexScan 估计字段依赖与 B(X20) 第二段协商。
+
+### 6.12 X18 4.2 主体——优化器成本驱动 join 选择（builder-A 第十二次提交）
+
+> 4.2 的核心：优化器内部的**确定性有界成本估算** + **候选比较 + 固定决胜**，把 `hash-join` 从「无条件布尔改写」改为「成本驱动」。无运行统计时用有界默认值，因而在现有 SQL 输入上**默认行为不变（保守、无破坏）**。分支 `builder-A`。
+
+- [x] **4.2a** `optimizer/optimizer.cpp`：新增 `optimizerRows()`（确定性，仅依计划结构）与常量 `kOptimizerDefaultRows=1000` / `kOptimizerDefaultFilterSelectivity=0.25`，覆盖 SeqScan/Filter/Limit/Distinct/Aggregate/Join/Sort/Project 的行数估算，作为「缺失统计的有界默认值」。
+- [x] **4.2b** hash-join 规则改造：`NestedLoopJoin` 满足等值键后，比较 `HashCost=L+R` 与 `NL Cost=L*M`；**只当 `L+R <= L*M` 才改写为 HashJoin**（相等时固定偏好 HashJoin，决胜不依赖容器序/随机值）。多行两端→HashJoin（与既有 518 契约保持一致）；估算行数≤1 的一侧→保留 NestedLoopJoin（新行为）。
+- [x] **4.2c** 新增端到端 `tests/statistics-costjoin-smoke.mjs`：6 项验证多行等值连接选 HashJoin 且替换掉 NestedLoop、同 SQL 多次优化 join 选择序列一致（确定性）、HashJoin 路径返回正确行数；并留注「当前 parser 不支持派生表+JOIN、优化器对表按默认行数估算，SQL 层暂难构造单行端→NL 分支，留待派生表 JOIN/真实统计接入后验证」。
+- [x] **4.2d** 回归全绿：optimizer_contract 518、planner_contract 契约通过；node statistics-cost 12 / statistics-costjoin 6 / explain 21 / statistics 11 / statistics-histogram 20 / subquery 24 / derived 12 / correlated-exec 8 / index 29 通过；database-http、bridge 集成 7 通过。
+- [ ] 后续/退出：接入真实统计后让 `optimizerRows` 消费 `statistics()`/直方图（不再统一默认 1000），使单行/低基数场景真正影响 join 选择；把成本/估计并入 HTTP 契约与工作台展示；IndexScan 估计字段依赖与 B(X20) 第二段协商。
