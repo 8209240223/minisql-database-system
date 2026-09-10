@@ -83,6 +83,7 @@ $groups = @{
         'tests/cancel-smoke.mjs',
         'tests/result-budget-smoke.mjs',
         'tests/x25-stream-http.mjs'
+        'tests/session-stream-process.mjs'
     )
 }
 

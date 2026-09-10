@@ -550,9 +550,14 @@ async function runSessionOperation(session, mode, sql, res, context = {}) {
       };
       res?.once('close', disconnected);
       try {
-        const value = await currentEngine.worker.request(mode, sql, {
-          sessionId: session.id, cancelFile: session.cancelFile, user: session.user, password: session.password, ...context,
-        });
+        const { stream: streamRequested, onFrame, ...sessionContext } = context;
+        const value = streamRequested
+          ? await currentEngine.worker.requestStream('executeStream', sql, {
+              sessionId: session.id, cancelFile: session.cancelFile, user: session.user, password: session.password, ...sessionContext,
+            }, onFrame)
+          : await currentEngine.worker.request(mode, sql, {
+              sessionId: session.id, cancelFile: session.cancelFile, user: session.user, password: session.password, ...sessionContext,
+            });
         if (value.error?.code === 5002) value.cancelled = true;
         if (value.commitState === 'unknown' || value.error?.code === 4001 || value.error?.code === 9999) quarantined = true;
         return value;
@@ -613,6 +618,7 @@ const server = http.createServer(async (req, res) => {
   let auditSessionId = req.url?.match(/^\/api\/sessions\/([a-zA-Z0-9-]+)/)?.[1] ?? '';
   const origin = req.headers.origin;
   let auditObjects = [];
+  let streamOutput = null;
   const send = (status, data) => {
     if (!res.destroyed && !res.writableEnded) {
       appendAudit({
@@ -641,7 +647,7 @@ const server = http.createServer(async (req, res) => {
     res.writeHead(status, headers);
     res.end(JSON.stringify(data));
   };
-  const sendStream = async (status, data) => {
+  const beginStream = (status = 200) => {
     if (res.destroyed || res.writableEnded) return;
     const headers = { 'Content-Type': 'application/x-ndjson; charset=utf-8', 'Cache-Control': 'no-store', 'Vary': 'Origin' };
     if (origin && allowedOrigins.has(origin)) headers['Access-Control-Allow-Origin'] = origin;
@@ -661,6 +667,12 @@ const server = http.createServer(async (req, res) => {
       if (res.write(JSON.stringify(value) + '\n')) finish();
       else res.once('drain', onDrain);
     });
+    return { write, end() { if (!res.destroyed && !res.writableEnded) res.end(); } };
+  };
+  const sendStream = async (status, data) => {
+    const output = beginStream(status);
+    if (!output) return;
+    const { write } = output;
     const rows = Array.isArray(data.rows) ? data.rows : [];
     if (data.success === false) {
       await write({ type: 'error', success: false, error: data.error, commitState: data.commitState, transactionState: data.transactionState });
@@ -672,7 +684,7 @@ const server = http.createServer(async (req, res) => {
       await write({ type: 'complete', success: true, rowCount: rows.length, affectedRows: data.affectedRows,
         statements: data.statements, transactionState: data.transactionState, durationMs: data.durationMs });
     }
-    if (!res.destroyed && !res.writableEnded) res.end();
+    output.end();
   };
   if (origin && !allowedOrigins.has(origin)) { send(403, { error: { message: 'Origin not allowed' } }); return; }
   if (req.method === 'OPTIONS') { send(204, {}); return; }
@@ -1128,7 +1140,19 @@ const server = http.createServer(async (req, res) => {
       session.password = requestPassword ?? '';
       if (res.destroyed && mode !== 'close') throw httpError(499, 'Request disconnected before execution');
       if (mode === 'close') return closeSession(session);
-      return runSessionOperation(session, mode, sql, res);
+      const streamSession = streamed && mode === 'execute';
+      return runSessionOperation(session, mode, sql, res, streamSession ? {
+        stream: true,
+        onFrame: async frame => {
+          streamOutput ??= beginStream(200);
+          if (frame.type === 'meta') await streamOutput.write({ type: 'meta', success: true, ...frame.meta });
+          else if (frame.type === 'row') await streamOutput.write({ type: 'row', success: true, values: frame.row });
+          else if (frame.type === 'complete') await streamOutput.write({ type: 'complete', success: true,
+            rowCount: frame.rows, resourceUsage: frame.resourceUsage, transactionState: session.transactionState });
+          else if (frame.type === 'error') await streamOutput.write({ type: 'error', success: false,
+            error: frame.error, commitState: frame.commitState, transactionState: session.transactionState });
+        },
+      } : {});
     })();
     if ((mode === 'catalog' || mode === 'statistics') && data && Array.isArray(data.tables)) {
       data.tables = data.tables.filter(table => can(access, requestUser, 'SELECT', table.name));
@@ -1142,11 +1166,16 @@ const server = http.createServer(async (req, res) => {
         rolledBack ? `事务内 ${rolledBack} 条已执行语句已回滚。` : ''].filter(Boolean).join('');
       response.error = { ...data.error, message: `${data.error.message}${suffix ? '；' + suffix : ''}` };
     }
-    if (streamed) await sendStream(status, response); else send(status, response);
+    if (streamOutput) streamOutput.end();
+    else if (streamed) await sendStream(status, response); else send(status, response);
   } catch (error) {
-    send(error.status ?? 503, { success: false, commitState: !error.status && mode === 'execute' ? 'unknown' : undefined,
+    const failure = { success: false, commitState: !error.status && mode === 'execute' ? 'unknown' : undefined,
       transactionState: sessionRoute ? sessions.get(sessionRoute[1])?.transactionState : undefined,
-      error: { message: error.message, suggestion: 'Do not automatically retry writes; inspect database state.' } });
+      error: { message: error.message, suggestion: 'Do not automatically retry writes; inspect database state.' } };
+    if (streamOutput) {
+      await streamOutput.write({ type: 'error', ...failure });
+      streamOutput.end();
+    } else send(error.status ?? 503, failure);
   }
 });
 // 启动预热：尝试加载一次引擎 Catalog。若引擎二进制缺失或损坏，服务器仍进入降级

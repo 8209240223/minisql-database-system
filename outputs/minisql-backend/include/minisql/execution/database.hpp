@@ -7,6 +7,7 @@
 #include <thread>
 #include <atomic>
 #include <condition_variable>
+#include <functional>
 #include <unordered_map>
 #include <vector>
 #include "minisql/catalog/persistent_catalog.hpp"
@@ -21,6 +22,9 @@ public:
                       storage::PageFile::CommitObserver observer = {});
     nlohmann::json execute(const std::string& sql, bool optimize = true);
     nlohmann::json executeScript(const std::string& sql, bool optimize = true);
+    nlohmann::json executeStreaming(const std::string& sql,
+                                    const std::function<void(const nlohmann::json&)>& emitMeta,
+                                    const std::function<bool(const nlohmann::json&)>& emitRow);
     const char* transactionState() const;
     nlohmann::json compile(const std::string& sql) const;
     // 解析并通过当前 Catalog 规范化 SQL 实际访问的基础表对象。

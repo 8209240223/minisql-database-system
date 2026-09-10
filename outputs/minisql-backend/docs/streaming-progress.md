@@ -13,7 +13,8 @@
 ## 验证
 
 - `node tests/x25-stream-http.mjs`：12 项检查通过。
-- 覆盖 NDJSON 元数据/行/完成帧、结果顺序、写语句前置拒绝、响应断开后的后续查询和背压写入路径。
+- `node tests/x25-stream-http.mjs`：18 项检查通过，覆盖普通 HTTP 流式帧、会话级 C++ 多帧流式、结果顺序、写语句前置拒绝、响应断开后的后续查询和背压写入路径。
+- `node tests/session-stream-process.mjs`：9 项通过，直接用 session 进程验证 `meta/row/complete/error` 帧和 LIMIT 提前停止。
 
 ## 未完成
 
@@ -28,3 +29,4 @@
 - HTTP 层 `queryResult` 现在回传最后一个执行节点的 `resourceUsage`，`x25-row-stream-contract.mjs` 15 项通过。
 - `Limit` 在子计划支持 `RowStream` 时直接按 offset/limit 读取并提前停止；普通单表 `Project` 也会优先通过 `openRowStream` 执行。
 - 新增 `MaterializedRowStream`，`Sort`、`Aggregate`、`Distinct` 结果可以通过统一 `RowStream` 接口逐行消费；它们仍先物化结果，但后续 HTTP 逐行输出可以直接复用该接口。
+- 新增 C++ `Database::executeStreaming` 和会话操作 `executeStream`：会话进程按行发送 `meta/row/complete` 帧，bridge 的 session `/execute/stream` 现在直接转发这些帧，不再先等待完整 JSON 结果。

@@ -40,7 +40,16 @@ export async function openSession(executable, database, { timeoutMs = 30000, max
           if (message.type !== 'ready' || message.protocolVersion !== 1) throw new Error(message.error?.message ?? 'Invalid session handshake');
           ready = true; clearTimeout(startupTimer); resolveReady(); continue;
         }
-        if (!pending || message.id !== pending.id || typeof message.success !== 'boolean') throw new Error('Unexpected session response');
+        if (!pending || message.id !== pending.id) throw new Error('Unexpected session response');
+        if (pending.stream) {
+          try { pending.onMessage?.(message); }
+          catch (error) { fail(error); return; }
+          if (message.type === 'complete' || message.type === 'error') {
+            const current = pending; pending = undefined; clearTimeout(current.timer); current.resolve(message);
+          }
+          continue;
+        }
+        if (typeof message.success !== 'boolean') throw new Error('Unexpected session response');
         const current = pending; pending = undefined; clearTimeout(current.timer); current.resolve(message);
       }
     } catch (error) { fail(error); }
@@ -74,9 +83,34 @@ export async function openSession(executable, database, { timeoutMs = 30000, max
     queue = result.catch(() => {}).finally(() => { --queued; });
     return result;
   }
+  function requestStream(operation, sql, context = {}, onMessage) {
+    if (terminal || closing) return Promise.reject(terminal ?? new Error('Session is closing'));
+    if (queued >= 64) return Promise.reject(new Error('Session request queue full'));
+    const id = String(++sequence);
+    const frame = JSON.stringify({
+      id, operation, ...(sql === undefined ? {} : { sql }),
+      ...(context.sessionId === undefined ? {} : { sessionId: context.sessionId }),
+      ...(context.cancelFile === undefined ? {} : { cancelFile: context.cancelFile }),
+      ...(context.user === undefined ? {} : { user: context.user }),
+      ...(context.password === undefined ? {} : { password: context.password }),
+    });
+    if (Buffer.byteLength(frame) > 8 * 1024 * 1024) return Promise.reject(new Error('Session request exceeds 8 MiB'));
+    ++queued;
+    const result = queue.then(() => {
+      if (terminal) throw terminal;
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => fail(new Error('Session streaming request timed out; commit state may be unknown')), timeoutMs);
+        pending = { id, timer, resolve, reject, stream: true, onMessage };
+        child.stdin.write(frame + '\n');
+      });
+    });
+    queue = result.catch(() => {}).finally(() => { --queued; });
+    return result;
+  }
   return {
     pid: child.pid,
     request,
+    requestStream,
     closed,
     async close(context = {}) {
       const timer = setTimeout(() => fail(new Error('Session close timed out')), timeoutMs);

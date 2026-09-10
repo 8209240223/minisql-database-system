@@ -2379,6 +2379,49 @@ nlohmann::json Database::executionFailure(const MiniSqlError& error, json result
     if (unavailable_ || error.code() == ErrorCode::Storage) response["commitState"] = "unknown";
     return response;
 }
+nlohmann::json Database::executeStreaming(const std::string& source,
+                                          const std::function<void(const nlohmann::json&)>& emitMeta,
+                                          const std::function<bool(const nlohmann::json&)>& emitRow) {
+    std::lock_guard<std::recursive_mutex> guard(mu_);
+    requireAvailable();
+    checkCancelled();
+    if (transaction_ == TransactionState::Aborted) throw MiniSqlError(ErrorCode::Transaction, "Transaction aborted; ROLLBACK required");
+    const auto statements = sql::parse(sql::tokenize(source));
+    if (statements.size() != 1 || (statements.front().kind != "Select" && statements.front().kind != "Explain"))
+        throw MiniSqlError(ErrorCode::InvalidArgument, "Streaming execution accepts one SELECT or EXPLAIN statement");
+    auto plans = sql::compilePlans(statements, catalog_.view());
+    materializeSubqueries(plans);
+    correlatedRowsCache_.clear();
+    const auto& plan = plans.front();
+    json columns = json::array(), columnTypes = json::array();
+    for (const auto& column : plan.output) {
+        columns.push_back(column.name);
+        columnTypes.push_back(column.type);
+    }
+    if (emitMeta) emitMeta({{"columns", std::move(columns)}, {"columnTypes", std::move(columnTypes)}, {"kind", plan.kind}});
+    std::size_t emitted = 0;
+    try {
+        auto stream = openRowStream(plan);
+        json row;
+        while (stream->next(row)) {
+            checkCancelled();
+            if (emitRow && !emitRow(row)) throw MiniSqlError(ErrorCode::Cancelled, "Streaming client disconnected");
+            ++emitted;
+        }
+        const auto usage = stream->resourceUsage();
+        stream->close();
+        return {{"success", true}, {"rows", emitted}, {"resourceUsage", usage}};
+    } catch (const MiniSqlError& error) {
+        if (error.code() != ErrorCode::InvalidArgument) throw;
+    }
+    auto result = run(plan);
+    for (auto& row : result.at("rows")) {
+        checkCancelled();
+        if (emitRow && !emitRow(row)) throw MiniSqlError(ErrorCode::Cancelled, "Streaming client disconnected");
+        ++emitted;
+    }
+    return {{"success", true}, {"rows", emitted}, {"resourceUsage", result.value("resourceUsage", json::object())}};
+}
 nlohmann::json Database::executeScript(const std::string& source, bool optimize) {
     std::lock_guard<std::recursive_mutex> guard(mu_);
     auto response = execute(source, optimize);

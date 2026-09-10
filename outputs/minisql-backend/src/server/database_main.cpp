@@ -84,6 +84,8 @@ int session(minisql::execution::Database& database, minisql::security::AccessCat
         if (!complete && frame.empty() && !overflow) return 0;
         json result, id = nullptr;
         bool close = false;
+        bool streamRequested = false;
+        bool streamed = false;
         try {
             if (!complete) throw minisql::MiniSqlError(minisql::ErrorCode::InvalidArgument, "Unterminated session frame");
             if (overflow) throw minisql::MiniSqlError(minisql::ErrorCode::InvalidArgument, "Session frame exceeds 8 MiB");
@@ -121,6 +123,24 @@ int session(minisql::execution::Database& database, minisql::security::AccessCat
                 const auto source = request["sql"].get<std::string>();
                 authorizeRequest(database, access, request, operation, source);
                 result = operation == "execute" ? database.execute(source) : database.compile(source);
+            } else if (operation == "executeStream") {
+                if (!request.contains("sql") || !request["sql"].is_string())
+                    throw minisql::MiniSqlError(minisql::ErrorCode::InvalidArgument, "Expected SQL string");
+                streamRequested = true;
+                const auto source = request["sql"].get<std::string>();
+                authorizeRequest(database, access, request, "execute", source);
+                const auto summary = database.executeStreaming(source,
+                    [&](const json& meta) {
+                        emit({{"id", id}, {"stream", true}, {"type", "meta"}, {"meta", meta}});
+                    },
+                    [&](const json& row) {
+                        emit({{"id", id}, {"stream", true}, {"type", "row"}, {"row", row}});
+                        return static_cast<bool>(std::cout);
+                    });
+                emit({{"id", id}, {"stream", true}, {"type", "complete"}, {"success", true}, {"rows", summary.value("rows", std::size_t{0})},
+                    {"resourceUsage", summary.value("resourceUsage", json::object())}});
+                streamed = true;
+                result = {{"success", true}};
             } else if (operation == "buffer") {
                 if (!request.contains("sql") || !request["sql"].is_string())
                     throw minisql::MiniSqlError(minisql::ErrorCode::InvalidArgument, "Expected buffer action string");
@@ -158,10 +178,16 @@ int session(minisql::execution::Database& database, minisql::security::AccessCat
         } catch (const std::exception& error) {
             result = minisql::MiniSqlError(minisql::ErrorCode::Internal, std::string("Session operation failed: ") + error.what()).toJson();
         }
-        result["id"] = id;
-        result["transactionState"] = database.transactionState();
+        if (streamRequested && !streamed) {
+            result["stream"] = true;
+            result["type"] = "error";
+        }
+        if (!streamed) {
+            result["id"] = id;
+            result["transactionState"] = database.transactionState();
+        }
         const bool failed = !result.value("success", false);
-        emit(std::move(result));
+        if (!streamed) emit(std::move(result));
         if (!std::cout || !complete || close || std::string(database.transactionState()) == "UNKNOWN") return failed ? 1 : 0;
     }
 }
