@@ -54,10 +54,17 @@ private:
     std::unordered_map<std::string, std::vector<sql::Statement>> correlatedAstCache_;
     // X09 3.4: 相关子查询「保守执行优化」——等值/确定性相关的 EXISTS/IN/标量按绑定
     // 参数分组，对每个不同参数物化子查询一次（collection 语义半连接），避免重复执行。
-    // 以 (subquerySql|scope) 为形缓存外层列引用，以 (shape|绑定值) 缓存结果行；
-    // 缓存生命周期仅在单条语句内（runStatement/EXPLAIN ANALYZE 入口清空）。
+    // 以 (subquerySql|scope) 为形缓存外层列引用：仅依赖 AST 形状，跨语句持久。
     std::unordered_map<std::string, std::vector<std::size_t>> correlatedColumnsCache_;
+    // X09 §6.17 后续 ②：绑定级 memo 跨语句复用。结果行缓存不再每语句清空，改为在
+    // 「数据/目录版本」变化时整体失效，使长驻 session 进程内相同 (shape|绑定值) 的物化
+    // 结果得以复用（EXPLAIN ANALYZE 实际执行前仍保守清空一次）。
+    // dataVersion_ 在任何写语句分派处自增（保守：先失效、后执行）；版本不等即整表清空。
     std::unordered_map<std::string, nlohmann::json> correlatedRowsCache_;
+    std::uint64_t dataVersion_ = 0;
+    std::uint64_t correlatedRowsCacheVersion_ = 0;
+    std::uint64_t correlatedMemoHits_ = 0;
+    std::uint64_t correlatedMemoMisses_ = 0;
     // X18 4.2: 供优化器成本估算的表行数统计（真实扫描计数，缺表返回空）。
     // const：可为 `compile()`（const）等只读路径提供估算；扫描仅唤醒缓存、不改逻辑状态，
     // 故 heap_ 标为 mutable。

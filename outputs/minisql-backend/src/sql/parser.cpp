@@ -65,6 +65,14 @@ private:
 
     bool at(const std::string& s){return i<t.size() && t[i].lexeme==s;}
     bool keyword(const std::string& s){if(i>=t.size())return false; auto v=t[i].lexeme; std::transform(v.begin(),v.end(),v.begin(),[](unsigned char c){return static_cast<char>(std::toupper(c));}); return v==s;}
+    // 耗尽 token 流时的「输入末尾」位置。诊断路径不会把 END token 入队（见
+    // database.cpp diagnostics()），若此处回落 SourceLocation{} 会得到 0:0，
+    // 前端便无法定位；改用最后一个 token 的 endLocation（即其右边界=EOL/EOF）。
+    SourceLocation eofLocation() const {
+        if(t.empty())return SourceLocation{};
+        const auto& last=t.back();
+        return (last.endLocation.line||last.endLocation.column)?last.endLocation:last.location;
+    }
 
     // Central error outlet. In strict mode it throws MiniSqlError exactly as
     // the classic parser did. In recovery mode it records the diagnostic and
@@ -82,12 +90,12 @@ private:
     }
 
     const Token& take(){
-        if(i>=t.size()) { fail(ErrorCode::Syntax, "Unexpected end of input", SourceLocation{}); }
+        if(i>=t.size()) { fail(ErrorCode::Syntax, "Unexpected end of input", eofLocation()); }
         return t[i++];
     }
     void expect(const std::string& s){
         if(!keyword(s)&&!at(s)){
-            fail(ErrorCode::Syntax, "Expected '"+s+"'", i<t.size()?t[i].location:SourceLocation{});
+            fail(ErrorCode::Syntax, "Expected '"+s+"'", i<t.size()?t[i].location:eofLocation());
         }
         ++i;
     }
@@ -121,7 +129,7 @@ private:
         expect(",");const auto scale=parameter();expect(")");
         return "decimal("+std::to_string(precision)+","+std::to_string(scale)+")";
     }
-    void semicolon(){if(at(";"))++i;else fail(ErrorCode::Syntax, "Expected ';'", i<t.size()?t[i].location:SourceLocation{});}
+    void semicolon(){if(at(";"))++i;else fail(ErrorCode::Syntax, "Expected ';'", i<t.size()?t[i].location:eofLocation());}
     Statement statement(){auto loc=t[i].location;Statement s;if(keyword("BEGIN")||keyword("COMMIT")||keyword("ROLLBACK"))s=transaction();else if(keyword("CREATE"))s=create();else if(keyword("INSERT"))s=insert();else if(keyword("SELECT"))s=select();else if(keyword("DELETE"))s=remove();else if(keyword("UPDATE"))s=update();else if(keyword("CHECKPOINT"))s=checkpointStatement();else if(keyword("DROP"))s=dropIndex();else fail(ErrorCode::Syntax, "Expected SQL statement or transaction command", loc);s.location=loc;return s;}
     Statement dropIndex(){Statement s{"DropIndex"};expect("DROP");expect("INDEX");s.indexName=identifier();if(keyword("ON")){++i;s.table=identifier();}semicolon();return s;}
     Statement checkpointStatement(){Statement s{"Checkpoint"};expect("CHECKPOINT");semicolon();return s;}

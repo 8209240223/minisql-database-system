@@ -15,9 +15,10 @@
 
 ## 验证
 
-- `tests/diagnostics-smoke.mjs`：22 项（多错误 + 合法语句混合、字符串内分号、invalid AST 拒收、位置逐字符一致）。
+- `tests/diagnostics-smoke.mjs`：**31 项**（多错误 + 合法语句混合、字符串内分号、invalid AST 拒收、位置逐字符一致；含 EOF 位置断言）。
 
 ## 边界
 
-- 无位置信息的诊断回落 `0:0-0:0`（编辑器中不可定位）；调用方应按"无跨度"处理。
+- **EOF 处错误已带真实位置**（本轮修正，§6.23-b）：诊断路径不把 END token 入队，此前解析器耗尽 token 流会回落 `SourceLocation{}` → `0:0`。现 `Parser::eofLocation()` 取最后一个 token 的 `endLocation`（其右边界＝输入末尾），`take()/expect()/semicolon()` 三处回落点改用它。示例：`SELECT ` → `1:7`；`... WHERE (id > 1` → `1:31`；多行 `WHERE (\n` → `3:8`。
+- 仍会回落 `0:0` 的仅剩**无对应 token 位置**的语义报错（如 `PRIMARY KEY cannot declare NULL`）；调用方应按"无跨度"处理。
 - 错误码表与协议全文见 [compiler-error-codes.md](compiler-error-codes.md)。

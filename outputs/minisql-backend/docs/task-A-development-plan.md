@@ -403,25 +403,45 @@ node tests\subquery-smoke.mjs tests\statistics-smoke.mjs tests\explain-smoke.mjs
 - [x] **6.21-d ANALYZE 响应**：`kind=Analyze`，`columns=[table,rowCount,columnCount,analyzedAtMs,statsVersion]`，行仅含目标表，附 `source/statsVersion/analyzedAtMs`；EXPLAIN 展示路径的统计消费保持同源。
 - [x] **6.21-e 回归**：新增 `tests/analyze-stats-smoke.mjs`（**35 checks**：初态 on-demand、ANALYZE 后 `source=analyze` + 时间戳/版本、`ANALYZE TABLE` 与关键字大小写、写语句后失效、未知表/缺表名/多余 token 三类语法错误、EXPLAIN 不受影响）。`ctest` **59/59**。
 
+### 6.22 X09 §6.17 后续②——绑定级 memo 跨语句复用（builder-A 后一轮）
+
+> 收口 §6.17 唯一「可做」的开放项：把相关子查询结果行缓存从**每语句清空**改为**数据/目录版本驱动失效**，使其在长驻 `session` 进程（桥接层经 `session-process.mjs` 复用同一 `Database`）内跨请求复用。分支 `builder-A`。
+
+- [x] **6.22-a 版本闸门**：`database.hpp` 新增 `dataVersion_ / correlatedRowsCacheVersion_ / correlatedMemoHits_ / correlatedMemoMisses_`；`runCorrelatedSubquery` 在查缓存前比对版本，不等则整表清空并同步版本（`database.cpp`）。
+- [x] **6.22-b 失效来源**：`runStatement` 对任何写语句（CreateTable/CreateIndex/DropIndex/Insert/Update/Delete）**执行前**自增 `dataVersion_`（保守：先失效、后执行，失败亦不影响正确性）。移除原先的每语句 `correlatedRowsCache_.clear()`；`correlationParams_` 仍按语句复位（属参数环境，与结果缓存正交）。`correlatedAstCache_ / correlatedColumnsCache_` 本就跨语句持久（仅依赖 AST 形状）。
+- [x] **6.22-c 可观测**：`statistics()` 增补 `correlatedMemo: {hits, misses, entries, dataVersion, cacheVersion}`（增量字段），使命中/复用可被验证，而非只能靠计时。
+- [x] **6.22-d 回归**：新增 `tests/correlated-memo-smoke.mjs`（**17 checks**，**同进程** session 模式）：首条语句 3 miss + 3 hit（6 行外层 / 3 个不同绑定值）、第二条同 SQL **全命中零新增 miss**（证跨语句复用）、`INSERT` 后 `dataVersion` +1 且结果反映新行、再重复仍复用。既有 `correlated-exec-smoke`（语句级正确性）不回归。`ctest` **59/59**；node A 线套件全绿。
+
+### 6.23 对抗性扫荡——发现并修复两处真实缺陷
+
+> 对 X12/X13/X09/X18 做边界探针（EOF/多诊断、ANALYZE 失效时机、NULL 三值、两级嵌套相关、事务内失效）。**两处为真实缺陷，已修**；**一处为能力缺口，如实记录不擅自扩大范围**。分支 `builder-A`。
+
+- [x] **6.23-a【X18 缺陷】失败写误删 ANALYZE 快照**：原实现在 `runStatement` 分派点（`if (writes)`）就删除 `<db>.analyze.json`，**先于执行**。因此「能通过规划、但执行期失败」的写语句（如唯一键冲突 `5001`）会误删仍然有效的快照，`statistics()` 被迫回退 `on-demand-scan`。任务书 §6.21-c 原文是「写语句**成功后**删除」。修复：删除动作下移到两处成功回收点（事务内 `run(plan)` 成功后；非事务 `commitWriteBatch()` 成功后），失败路径（`catch` → `rollbackBatch`）不再删除。`dataVersion_` 仍保持「先失效」，因其仅影响内存 memo（保守无害）。
+- [x] **6.23-b【X12 缺陷】EOF 处语法错误丢失位置（0:0）**：诊断路径不把 END token 入队（`database.cpp` diagnostics 遇 END 即 `process(); break;`），解析器耗尽 token 流时回落 `SourceLocation{}` → `line:0, column:0`，前端「无法定位」。修复：`Parser` 新增 `eofLocation()`（取最后一个 token 的 `endLocation`，即其右边界＝输入末尾），`take()`/`expect()`/`semicolon()` 三处回落点改用它。效果：`SELECT ` → `1:7`；`... WHERE (id > 1` → `1:31`；多行 `WHERE (\n` → `3:8`（原均为 `0:0`）。
+  - 未改 `parser.cpp:223`（`PRIMARY KEY cannot declare NULL`）的空位置回落——该处是列约束的语义报错、手头无对应 token 位置，不属本轮范围。
+- [x] **6.23-c 回归**：`tests/diagnostics-smoke.mjs` 22→**31 checks**（新增 EOF 位置断言）；`tests/analyze-stats-smoke.mjs` 35→**43 checks**（新增「失败写不失效 / 成功写仍失效」）。`ctest` **59/59**；node A 线套件全绿（planner 26 / diagnostics 31 / subquery 24 / statistics 11 / histogram 20 / cost 12 / costjoin 10 / explain 21 / analyze 43 / correlated-exec 8 / correlated-aggregate 21 / **correlated-memo 17** / decorrelate-apply 12 / derived 12 / outer-join 9）。
+- [ ] **6.23-d【X09 能力缺口，未修，如实记录】**：**两级及以上嵌套的相关引用不可用**——`SELECT id FROM t x WHERE EXISTS (SELECT 1 FROM t y WHERE EXISTS (SELECT 1 FROM t z WHERE z.id = x.id));` 报 `2003 Unknown table qualifier: x`（`catalog.cpp:242`）。根因：语义分析（`catalog.cpp`）与 `planner.cpp` 的 `correlatedScope(table)` 只维护**单层** scope，`outerColumns` 仅取**紧邻外层表**的列，未实现任务书 A3 设计范围 2/3 要求的**多层作用域链**（「每个查询块维护独立 Scope，查找顺序…外层相关 Scope」「未限定名在多层作用域中按固定规则解析」）。任务书同时要求 `tests/subquery-smoke.mjs` 含「**派生表和三层作用域测试**」，现测试仅覆盖单层相关。**判定**：这是功能缺口而非小缺陷——需同时改语义分析（scope 链）、planner（`outerColumns` 合并 / `activeCorrelated` 链式）、执行期绑定（多级绑定值），风险面覆盖 X09 全量，须单独排期与决策，本轮不擅自实施。
+
 ---
 
 ## 7. 剩余项账实核对（2026-09-10）
 
-> 依据：通读 `docs/task-A-development-plan.md` 全部 `[ ]` 项 + 逐项对照代码。**A 线（X12/X13/X09/X18）主体已闭环**，历史上正文里保留的 12 个未勾项中，10 个是**当时记录的"下一步"备注，后续提交已实现但未回勾**（本轮据实订正）。真正仍开放的只有下列 2 项 + 外部依赖项。
+> 依据：通读 `docs/task-A-development-plan.md` 全部 `[ ]` 项 + 逐项对照代码。**A 线（X12/X13/X09/X18）主体已闭环**，历史上正文里保留的 12 个未勾项中，10 个是**当时记录的"下一步"备注，后续提交已实现但未回勾**（本轮据实订正）。真正仍开放的只有下列项 + 外部依赖项。
 
 ### 7.1 A 线内、且当前可做（零外部依赖）
 
 | # | 项 | 性质 | 说明 |
 |---|---|---|---|
-| A | **绑定级 memo**（§6.17 开放项 ②） | 优化 · 低风险 | `correlatedRowsCache_` 与跨库缓存的绑定级复用，纯 `database.cpp` 内部，不动 AST/Plan/HTTP 契约。 |
-| B | **又一轮对抗性缺陷扫荡** | 质量 · 中 | 历史两轮各挖出真实缺陷（解析器栈溢出、`DATE` 字面量误判、HAVING 去相关 5001）。可对 A 线四条特性再做边界/差分扫荡。 |
+| A | ~~**绑定级 memo**（§6.17 开放项 ②）~~ | 优化 · 低风险 | **✅ 已做（§6.22）**：结果行缓存改为数据/目录版本驱动失效，跨语句复用；`statistics().correlatedMemo` 可观测。 |
+| B | ~~**又一轮对抗性缺陷扫荡**~~ | 质量 · 中 | **✅ 已做（§6.23）**：修复 X18 失败写误删快照、X12 EOF 错误丢失位置 2 处真实缺陷；发现 X09 多层作用域缺口（见 C）。 |
+| C | **X09 多层（≥2 级）嵌套作用域链**（§6.23-d） | 功能 · 高 | **未做，唯一已知真实功能缺口**：任务书 A3 设计范围 2/3 要求「每查询块独立 Scope + 多层作用域解析」，且验证项要求「派生表和**三层作用域测试**」；现状只支持单层相关。需改语义分析/planner/执行期绑定三处，风险覆盖 X09 全量，**须单独排期决策**。 |
 
 ### 7.2 A 线内、但**有意暂缓**（须改跨组契约面）
 
 | # | 项 | 暂缓理由 |
 |---|---|---|
-| C | 子查询结构化收口（§6.17 开放项 ①，去 `subquerySql` 文本重解析） | 须改 planner 中间表示与计划 JSON 结构，波及 `compile`/`explain` 输出；收益仅省一次编译期 `tokenize+parse`。任务书原文亦把它标注为"非正确性，属重解析/缓存优化"。 |
-| D | compile 响应接入新版本字段（P1 交付的编解码契约尚未接主路径） | 按任务书 8.1 接口冻结，响应接入涉及前端 `types.ts` 同步，属跨组事项。 |
+| D | 子查询结构化收口（§6.17 开放项 ①，去 `subquerySql` 文本重解析） | 须改 planner 中间表示与计划 JSON 结构，波及 `compile`/`explain` 输出；收益仅省一次编译期 `tokenize+parse`。任务书原文亦把它标注为"非正确性，属重解析/缓存优化"。 |
+| E | compile 响应接入新版本字段（P1 交付的编解码契约尚未接主路径） | 按任务书 8.1 接口冻结，响应接入涉及前端 `types.ts` 同步，属跨组事项。 |
 
 ### 7.3 依赖他人 / 无法单方面完成
 

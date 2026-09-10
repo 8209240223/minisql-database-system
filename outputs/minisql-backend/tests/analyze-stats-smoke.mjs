@@ -70,4 +70,16 @@ const explain = run('EXPLAIN SELECT * FROM t;');
 equal(explain.success, true);
 equal(explain.results[0].kind, 'Explain');
 
+// 失败写（执行期唯一键冲突）不得误删 ANALYZE 快照：语句在分派后才失败、数据未变，
+// 快照仍然有效。任务书 §6.21-c 要求"写语句**成功后**删除"，故删除点须在成功回收处。
+equal(run('CREATE TABLE u(id INT PRIMARY KEY,v INT); INSERT INTO u VALUES(1,1);').success, true);
+equal(run('ANALYZE u;').success, true);
+equal(run('', 'statistics').source, 'analyze');
+const rejectedWrite = run('INSERT INTO u VALUES(1,2);');
+equal(rejectedWrite.success, false);
+equal(rejectedWrite.error.code, 5001);
+equal(run('', 'statistics').source, 'analyze', 'failed write must not invalidate the snapshot');
+equal(run('INSERT INTO u VALUES(2,2);').success, true);
+equal(run('', 'statistics').source, 'on-demand-scan', 'successful write still invalidates the snapshot');
+
 console.log(`${checks} ANALYZE/statistics checks passed`);

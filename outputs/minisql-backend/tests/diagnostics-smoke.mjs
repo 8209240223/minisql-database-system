@@ -48,4 +48,20 @@ equal(clause.count, 2);
 equal(clause.diagnostics.every(d => d.stage === 'parser' && d.statementIndex === 0), true);
 equal(clause.diagnostics.length, 2);
 
+// X12: EOF 处的语法错误必须带真实位置。诊断路径不把 END token 入队，此前耗尽 token
+// 流会回落 SourceLocation{} → 0:0，前端在编辑器里无法定位；现取最后一个 token 的
+// 右边界（即输入末尾）作为位置。
+const eof = run('SELECT id FROM t WHERE');
+equal(eof.success, false);
+equal(eof.diagnostics.length > 0, true);
+equal(eof.diagnostics.every(d => d.line > 0 && d.column > 0), true);
+equal(eof.diagnostics[0].line, 1);
+equal(eof.diagnostics[0].column, 23);
+const eofParen = run('SELECT id FROM t WHERE (id > 1');
+equal(eofParen.diagnostics.every(d => d.line > 0 && d.column > 0), true);
+equal(eofParen.diagnostics[0].line, 1);
+const eofMultiline = run('SELECT id\nFROM t\nWHERE (\n');
+equal(eofMultiline.diagnostics.every(d => d.line > 0 && d.column > 0), true);
+equal(eofMultiline.diagnostics[0].line, 3);
+
 console.log(`${checks} batch diagnostics checks passed`);

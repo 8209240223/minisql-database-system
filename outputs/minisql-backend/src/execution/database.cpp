@@ -871,7 +871,11 @@ nlohmann::json Database::statistics() {
         {"pendingAutoCheckpointWrites", pendingAutoCheckpointWrites_}, {"pendingAutoCheckpointWalBytes", pendingAutoCheckpointWalBytes_},
         {"walBytes", file_->walBytes()}, {"dirtyPages", dirtyPages}, {"dirtyPageRatio", dirtyRatio},
         {"lastCheckpointAtMs", lastCheckpointAtMs_}, {"lastAutoCheckpointAtMs", lastAutoCheckpointAtMs_},
-        {"lastAutoCheckpointReasons", lastAutoCheckpointReasons_}};
+        {"lastAutoCheckpointReasons", lastAutoCheckpointReasons_},
+        // X09 §6.17 后续 ②：绑定级 memo 的可观测计数（命中/未命中/驻留条目/数据版本）。
+        {"correlatedMemo", {{"hits", correlatedMemoHits_}, {"misses", correlatedMemoMisses_},
+            {"entries", correlatedRowsCache_.size()}, {"dataVersion", dataVersion_},
+            {"cacheVersion", correlatedRowsCacheVersion_}}}};
 }
 nlohmann::json Database::bufferStatus() const {
     const auto& stats = buffer_.stats();
@@ -1723,7 +1727,8 @@ nlohmann::json Database::run(const sql::LogicalPlan& plan) {
     return result;
 }
 nlohmann::json Database::runStatement(const sql::LogicalPlan& plan) {
-    correlatedRowsCache_.clear();
+    // X09 §6.17 后续 ②：结果行缓存不再每语句清空——改由 dataVersion_ 版本闸门控制
+    // （见 runCorrelatedSubquery）。仅参数环境仍按语句复位。
     correlationParams_.clear();
     if (plan.kind == "Checkpoint") {
         if (transaction_ != TransactionState::Idle) throw MiniSqlError(ErrorCode::Transaction, "CHECKPOINT requires an idle transaction");
@@ -1759,11 +1764,19 @@ nlohmann::json Database::runStatement(const sql::LogicalPlan& plan) {
     }
     const bool writes = plan.kind == "CreateTable" || plan.kind == "CreateIndex" || plan.kind == "DropIndex" || plan.kind == "Insert" ||
                         plan.kind == "Update" || plan.kind == "Delete";
-    // X18: 任何写语句都使显式 ANALYZE 快照失效——删除旁路文件后 statistics() 回退实时扫描。
-    if (writes) { std::error_code ignored; std::filesystem::remove(analyzeMetadataPath(), ignored); }
+    // X18: 任何写语句都使显式 ANALYZE 快照失效——但必须「成功后」才删除（任务书 §6.21-c）。
+    // 若在执行期失败（如唯一键冲突），数据未变、快照仍然有效，不应被误删；故删除动作
+    // 下移到下方两处「写语句成功回收点」，而非此处的分派点。
+    // X09 §6.17 后续 ②：绑定级 memo 则相反，先失效、后执行（失败也不影响正确性）。
+    if (writes) ++dataVersion_;
+    const auto invalidateAnalyzeSnapshot = [&]() {
+        if (!writes) return;
+        std::error_code ignored;
+        std::filesystem::remove(analyzeMetadataPath(), ignored);
+    };
     if (transaction_ == TransactionState::Active) {
         auto result = run(plan);
-        if (writes) ++transactionWriteStatements_;
+        if (writes) { ++transactionWriteStatements_; invalidateAnalyzeSnapshot(); }
         return result;
     }
     if (!writes) return run(plan);
@@ -1772,6 +1785,7 @@ nlohmann::json Database::runStatement(const sql::LogicalPlan& plan) {
         auto result = run(plan);
         const auto committedDirtyPages = file_->stagedPageCount();
         buffer_.commitWriteBatch();
+        invalidateAnalyzeSnapshot();
         evaluateAutoCheckpoint(1, committedDirtyPages);
         return result;
     } catch (...) {
@@ -1875,8 +1889,17 @@ nlohmann::json Database::runCorrelatedSubquery(const json& expression, const jso
         tuple.push_back(row.at(id));
     }
     const std::string fullKey = prepKey + "\x1f" + tuple.dump();
-    const auto cached = correlatedRowsCache_.find(fullKey);
-    if (cached != correlatedRowsCache_.end()) return cached->second;
+    // X09 §6.17 后续 ②：绑定级 memo 的版本闸门——仅当数据/目录版本变化（任何写语句）时
+    // 整体失效；否则跨语句复用同一 (shape|绑定值) 的物化结果。
+    if (correlatedRowsCacheVersion_ != dataVersion_) {
+        correlatedRowsCache_.clear();
+        correlatedRowsCacheVersion_ = dataVersion_;
+    }
+    if (const auto cached = correlatedRowsCache_.find(fullKey); cached != correlatedRowsCache_.end()) {
+        ++correlatedMemoHits_;
+        return cached->second;
+    }
+    ++correlatedMemoMisses_;
 
     sql::Statement bound = bindOuterStatement(ast.front(), outer, row);
     const auto subplans = sql::compilePlans({std::move(bound)}, catalog_.view());
