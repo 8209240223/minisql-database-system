@@ -24,3 +24,5 @@
 
 - 新增 `include/minisql/execution/executor.hpp` 中的 `RowStream` 抽象接口，定义 `next`、`cancel`、`close` 和 `resourceUsage`。
 - 新增 `ScanRowStream`，用于扫描层的资源计量和取消点；当前作为接口层落地，尚未把所有算子整体迁移到逐行流。
+- 新增 `FilterRowStream`、`ProjectRowStream`、`LimitRowStream`，并提供 `Database::openRowStream` 打开简单 `SeqScan -> Filter -> Project -> Limit` 链。
+- HTTP 层 `queryResult` 现在回传最后一个执行节点的 `resourceUsage`，`x25-row-stream-contract.mjs` 15 项通过。

@@ -534,6 +534,7 @@ function queryResult(data, durationMs) {
     optimizedPlan: data.optimizedPlan ?? last?.optimizedPlan,
     optimizationRules: data.optimizationRules ?? last?.optimizationRules,
     executionStats: data.executionStats ?? last?.executionStats,
+    resourceUsage: last?.resourceUsage ?? data.resourceUsage,
   };
 }
 

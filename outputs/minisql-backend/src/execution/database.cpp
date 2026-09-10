@@ -652,6 +652,77 @@ private:
     bool cancelled_ = false;
 };
 
+class FilterRowStream : public RowStream {
+public:
+    FilterRowStream(std::unique_ptr<RowStream> child, std::function<bool(const nlohmann::json&)> predicate)
+        : child_(std::move(child)), predicate_(std::move(predicate)) {}
+    bool next(nlohmann::json& row) override {
+        while (child_->next(row)) if (predicate_(row)) return true;
+        return false;
+    }
+    void cancel() override { cancelled_ = true; child_->cancel(); }
+    void close() override { child_->close(); }
+    nlohmann::json resourceUsage() const override {
+        return {{"kind", "FilterRowStream"}, {"rows", rows_}, {"pending", pending_}, {"cancelled", cancelled_}};
+    }
+private:
+    std::unique_ptr<RowStream> child_;
+    std::function<bool(const nlohmann::json&)> predicate_;
+    std::size_t rows_ = 0;
+    bool pending_ = false;
+    bool cancelled_ = false;
+};
+
+class ProjectRowStream : public RowStream {
+public:
+    ProjectRowStream(std::unique_ptr<RowStream> child, std::function<nlohmann::json(const nlohmann::json&)> project)
+        : child_(std::move(child)), project_(std::move(project)) {}
+    bool next(nlohmann::json& row) override {
+        nlohmann::json input;
+        if (!child_->next(input)) return false;
+        row = project_(input);
+        ++rows_;
+        return true;
+    }
+    void cancel() override { child_->cancel(); }
+    void close() override { child_->close(); }
+    nlohmann::json resourceUsage() const override {
+        return {{"kind", "ProjectRowStream"}, {"rows", rows_}};
+    }
+private:
+    std::unique_ptr<RowStream> child_;
+    std::function<nlohmann::json(const nlohmann::json&)> project_;
+    std::size_t rows_ = 0;
+};
+
+class LimitRowStream : public RowStream {
+public:
+    LimitRowStream(std::unique_ptr<RowStream> child, std::uint64_t offset, std::optional<std::uint64_t> limit)
+        : child_(std::move(child)), offset_(offset), limit_(limit) {}
+    bool next(nlohmann::json& row) override {
+        if (limit_ && emitted_ >= *limit_) return false;
+        while (skipped_ < offset_) {
+            nlohmann::json discarded;
+            if (!child_->next(discarded)) return false;
+            ++skipped_;
+        }
+        if (!child_->next(row)) return false;
+        ++emitted_;
+        return true;
+    }
+    void cancel() override { child_->cancel(); }
+    void close() override { child_->close(); }
+    nlohmann::json resourceUsage() const override {
+        return {{"kind", "LimitRowStream"}, {"rows", emitted_}, {"skipped", skipped_}};
+    }
+private:
+    std::unique_ptr<RowStream> child_;
+    std::uint64_t offset_ = 0;
+    std::optional<std::uint64_t> limit_;
+    std::uint64_t skipped_ = 0;
+    std::uint64_t emitted_ = 0;
+};
+
 nlohmann::json Database::createSnapshot(const std::filesystem::path& target) {
     std::lock_guard<std::recursive_mutex> guard(mu_);
     requireAvailable();
@@ -1221,6 +1292,43 @@ std::unique_ptr<RowStream> Database::scanRowStream(const sql::LogicalPlan& plan)
     return std::make_unique<ScanRowStream>(heap_, table->id, rowSchema(table->definition));
 }
 
+std::unique_ptr<RowStream> Database::openRowStream(const sql::LogicalPlan& plan) {
+    checkCancelled();
+    if (plan.kind == "SeqScan") return scanRowStream(plan);
+    if (plan.kind == "Filter") {
+        if (plan.children.size() != 1) fail("Filter requires one child");
+        auto child = openRowStream(plan.children.front());
+        const auto predicate = plan.predicate;
+        return std::make_unique<FilterRowStream>(std::move(child), [this, predicate](const json& row) {
+            return accepted(evaluate(predicate, row));
+        });
+    }
+    if (plan.kind == "Project") {
+        if (plan.children.size() != 1) fail("Project requires one child");
+        auto child = openRowStream(plan.children.front());
+        const auto projections = plan.projections;
+        const auto output = plan.output;
+        return std::make_unique<ProjectRowStream>(std::move(child), [this, projections, output](const json& row) {
+            json projected = json::array();
+            if (!projections.empty()) {
+                for (const auto& expression : projections) projected.push_back(evaluate(expression, row));
+            } else {
+                for (const auto& column : output) {
+                    if (column.columnId >= row.size()) fail("Projection outside row");
+                    projected.push_back(cell(row.at(column.columnId)));
+                }
+            }
+            return projected;
+        });
+    }
+    if (plan.kind == "Limit") {
+        if (plan.children.size() != 1) fail("Limit requires one child");
+        auto child = openRowStream(plan.children.front());
+        return std::make_unique<LimitRowStream>(std::move(child), plan.offset, plan.limit);
+    }
+    throw MiniSqlError(ErrorCode::InvalidArgument, "RowStream does not support plan kind " + plan.kind);
+}
+
 nlohmann::json Database::runNode(const sql::LogicalPlan& plan) {
     checkCancelled();
     if (plan.kind == "Sort") {
@@ -1311,7 +1419,9 @@ nlohmann::json Database::runNode(const sql::LogicalPlan& plan) {
             for (const auto& expression : plan.projections) projected.push_back(evaluate(expression, row));
             result["rows"].push_back(std::move(projected));
         }
-        result["resourceUsage"] = {{"kind", "Project"}, {"rows", result.at("rows").size()}};
+        json projectUsage = {{"kind", "Project"}, {"rows", result.at("rows").size()}};
+        if (input.contains("resourceUsage")) projectUsage["child"] = input.at("resourceUsage");
+        result["resourceUsage"] = std::move(projectUsage);
         return result;
     }
     if (plan.kind == "Project" && plan.children.size() == 1 && plan.children.front().kind == "Limit" &&
@@ -1337,7 +1447,9 @@ nlohmann::json Database::runNode(const sql::LogicalPlan& plan) {
                 for (const auto& expression : plan.projections) projected.push_back(evaluate(expression, row));
                 result["rows"].push_back(std::move(projected));
             }
-            result["resourceUsage"] = {{"kind", "Project"}, {"rows", result.at("rows").size()}};
+            json projectUsage = {{"kind", "Project"}, {"rows", result.at("rows").size()}};
+            if (sub.contains("resourceUsage")) projectUsage["child"] = sub.at("resourceUsage");
+            result["resourceUsage"] = std::move(projectUsage);
             return result;
         }
     }
@@ -1701,6 +1813,7 @@ nlohmann::json Database::runNode(const sql::LogicalPlan& plan) {
     if (!indexes_.empty() && (!deletion.empty() || !updates.empty())) rebuildIndexes(table->id);
     if (plan.kind == "Update") { heap_.flush(); result["affectedRows"] = updates.size(); }
     if (plan.kind == "Delete") { heap_.flush(); result["affectedRows"] = deletion.size(); }
+    if (plan.kind == "Project") result["resourceUsage"] = {{"kind", "Project"}, {"rows", result.at("rows").size()}};
     return result;
 }
 const char* Database::transactionState() const {
