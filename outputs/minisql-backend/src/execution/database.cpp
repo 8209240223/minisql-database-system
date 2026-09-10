@@ -35,6 +35,77 @@ std::string key(std::string value) {
     std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
     return value;
 }
+bool sqlIdentifier(const std::string& value) {
+    if (value.empty() || !(std::isalpha(static_cast<unsigned char>(value.front())) || value.front() == '_')) return false;
+    return std::all_of(value.begin() + 1, value.end(), [](unsigned char c) {
+        return std::isalnum(c) || c == '_';
+    });
+}
+std::vector<std::string> lexicalAccessObjects(const std::vector<sql::Token>& tokens) {
+    std::vector<std::string> words;
+    words.reserve(tokens.size());
+    for (const auto& token : tokens) {
+        if (token.type == "END") break;
+        if (token.type == "STRING") continue;
+        words.push_back(key(token.lexeme));
+    }
+    std::unordered_set<std::string> ctes;
+    if (!words.empty() && words.front() == "with") {
+        std::size_t cursor = words.size() > 1 && words[1] == "recursive" ? 2 : 1;
+        for (;;) {
+            if (cursor >= words.size() || !sqlIdentifier(words[cursor])) break;
+            ctes.insert(words[cursor++]);
+            if (cursor < words.size() && words[cursor] == "(") {
+                std::size_t columnDepth = 1;
+                ++cursor;
+                while (cursor < words.size() && columnDepth > 0) {
+                    if (words[cursor] == "(") ++columnDepth;
+                    else if (words[cursor] == ")") --columnDepth;
+                    ++cursor;
+                }
+            }
+            if (cursor + 1 >= words.size() || words[cursor] != "as" || words[cursor + 1] != "(") break;
+            cursor += 2;
+            std::size_t depth = 1;
+            while (cursor < words.size() && depth > 0) {
+                if (words[cursor] == "(") ++depth;
+                else if (words[cursor] == ")") --depth;
+                ++cursor;
+            }
+            if (cursor >= words.size() || words[cursor] != ",") break;
+            ++cursor;
+        }
+    }
+    std::string command;
+    if (!words.empty()) {
+        command = words.front();
+        if (command == "explain") {
+            const auto found = std::find_if(words.begin(), words.end(), [](const std::string& value) {
+                return value == "select" || value == "insert" || value == "update" || value == "delete";
+            });
+            if (found != words.end()) command = *found;
+        }
+    }
+    std::vector<std::string> result;
+    const auto add = [&](const std::string& value) {
+        if (sqlIdentifier(value) && !ctes.contains(value) &&
+            std::find(result.begin(), result.end(), value) == result.end()) result.push_back(value);
+    };
+    const auto addAfter = [&](std::size_t index, bool allowParenthesized) {
+        auto cursor = index + 1;
+        if (allowParenthesized && cursor < words.size() && words[cursor] == "(") return;
+        if (cursor < words.size() && words[cursor] == "lateral") ++cursor;
+        if (cursor < words.size()) add(words[cursor]);
+    };
+    for (std::size_t index = 0; index < words.size(); ++index) {
+        const auto& word = words[index];
+        if (word == "from" || word == "join" || word == "into" || word == "update" || word == "references")
+            addAfter(index, true);
+        if (command == "drop" && (word == "table" || word == "on")) addAfter(index, false);
+        if (command == "create" && (word == "table" || word == "on")) addAfter(index, false);
+    }
+    return result;
+}
 json cell(const storage::Value& value) {
     return std::visit([](const auto& v) -> json {
         if constexpr (std::is_same_v<std::decay_t<decltype(v)>, std::monostate>) return nullptr;
@@ -493,7 +564,16 @@ std::vector<std::string> Database::resolveAccessObjects(const std::string& sourc
         for (const auto& statement : statements) visitStatement(statement);
         return result;
     } catch (const MiniSqlError&) {
-        return {};
+        std::vector<MiniSqlError> lexicalErrors;
+        const auto tokens = sql::tokenizeRecoverable(source, lexicalErrors);
+        std::vector<std::string> result;
+        std::unordered_set<std::string> seen;
+        for (const auto& object : lexicalAccessObjects(tokens)) {
+            const auto* bound = catalog_.view().find(object);
+            const auto resolved = key(bound ? bound->name : object);
+            if (seen.insert(resolved).second) result.push_back(resolved);
+        }
+        return result;
     }
 }
 nlohmann::json Database::catalog() {
