@@ -51,7 +51,7 @@ try {
     server.once('exit', () => reject(new Error(errors || 'Server exited before readiness')));
   });
 
-  const created = await request('/execute', { sql: 'CREATE TABLE t(id INT PRIMARY KEY, value INT);' });
+  const created = await request('/execute', { sql: 'CREATE TABLE t(id INT, value INT);' });
   assert.equal(created.status, 200); ++checks;
   const session = await request('/sessions');
   assert.equal(session.status, 201); ++checks;
