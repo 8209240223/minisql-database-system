@@ -789,6 +789,8 @@ const server = http.createServer(async (req, res) => {
           manifestVersion: metadata.version,
           pageFormatVersion: metadata.pageFormatVersion,
           walBytes: metadata.walBytes,
+          snapshotLsn: metadata.committedSequence,
+          chainDepth: metadata.kind === 'incremental' ? (metadata.chainDepth ?? 1) : 1,
           pageChecksum: metadata.pageChecksum,
           migrationState: metadata.version === 1 ? 'pending' : metadata.version >= 2 && metadata.version <= 4 ? 'ready' : 'unknown',
         };

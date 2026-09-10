@@ -19,3 +19,8 @@
 
 - 当前 C++ 执行器仍先把查询结果收集到内存，再由 bridge 分帧发送；尚未实现执行器级迭代器、逐行跨进程协议和客户端真正的生产者-消费者背压。
 - 尚未实现磁盘空间不足模拟、超大单分组、流式 HashJoin/HashAggregate 和完整 X25 资源预算验收。
+
+## 执行器接口增量
+
+- 新增 `include/minisql/execution/executor.hpp` 中的 `RowStream` 抽象接口，定义 `next`、`cancel`、`close` 和 `resourceUsage`。
+- 新增 `ScanRowStream`，用于扫描层的资源计量和取消点；当前作为接口层落地，尚未把所有算子整体迁移到逐行流。

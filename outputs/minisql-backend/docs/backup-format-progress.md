@@ -40,6 +40,12 @@
 
 - `node tests/backup-online-smoke.mjs`：19 项通过，覆盖在线快照、manifest 版本 4、WAL 侧车校验、快照后插入并恢复、活动会话下快照和恢复后数据一致。
 
+## 回滚目录增量
+
+- 恢复前会创建 `backups/rollback/restore-<timestamp>` 目录，并把当前页文件、WAL、`.ckpt` 一起复制进去。
+- 恢复成功后保留该目录；若后续发现恢复结果异常，可以使用它做人工回放。
+- 备份列表额外暴露 `snapshotLsn`、`chainDepth` 和 `pageChecksum`。
+
 ## 未完成
 
 - 尚未实现备份期间在线并发读写一致性快照和 WAL 非零位置重做。
