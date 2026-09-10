@@ -21,9 +21,9 @@
 
 ## X18 统计与成本
 
-- 已完成：表/列统计、distinct、NULL 比例、min/max、轻量直方图、索引 entries/height/pageCount、统计版本/刷新时间。
+- 已完成：表/列统计、distinct、NULL 比例、min/max、Top 值直方图、等宽 valueHistogram、索引 entries/height/pageCount、统计版本/刷新时间。
 - EXPLAIN：增加 `statsSource`、`costModelVersion`、确定性决胜标记、SeqScan/IndexScan 候选成本列表和 `chosenAccessPath`。
-- 必要回归：`statistics-smoke.mjs` 20 项、`explain-smoke.mjs` 21 项通过。
+- 必要回归：`statistics-smoke.mjs` 21 项、`explain-smoke.mjs` 21 项通过。
 
 ## A5 集成门禁
 

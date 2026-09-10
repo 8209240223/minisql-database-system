@@ -1022,9 +1022,27 @@ nlohmann::json Database::statistics() {
             });
             if (ranked.size() > 8) ranked.resize(8);
             json histogram = json::array();
+            json valueHistogram = json::array();
             for (const auto& [keyValue, entry] : ranked) {
                 (void)keyValue;
                 histogram.push_back({{"value", entry.first}, {"count", entry.second}});
+            }
+            if (!distinct[index].empty()) {
+                const std::vector<json> ordered(distinct[index].begin(), distinct[index].end());
+                const auto bucketCount = std::min<std::size_t>(8, ordered.size());
+                for (std::size_t bucket = 0; bucket < bucketCount; ++bucket) {
+                    const auto begin = bucket * ordered.size() / bucketCount;
+                    const auto end = (bucket + 1) * ordered.size() / bucketCount;
+                    if (begin >= end) continue;
+                    const auto& lower = ordered[begin];
+                    const auto& upper = ordered[end - 1];
+                    std::uint64_t count = 0;
+                    for (const auto& [keyValue, entry] : frequencies[index]) {
+                        (void)keyValue;
+                        if (!(entry.first < lower) && !(upper < entry.first)) count += entry.second;
+                    }
+                    valueHistogram.push_back({{"lower", lower}, {"upper", upper}, {"count", count}});
+                }
             }
             columns.push_back({{"name", table.definition.columns[index].name},
                 {"columnId", index}, {"type", key(table.definition.columns[index].type)},
@@ -1033,7 +1051,7 @@ nlohmann::json Database::statistics() {
                 {"nullRatio", rowCount == 0 ? 0.0 : static_cast<double>(nulls[index]) / static_cast<double>(rowCount)},
                 {"minValue", minimum[index] ? *minimum[index] : json(nullptr)},
                 {"maxValue", maximum[index] ? *maximum[index] : json(nullptr)},
-                {"histogram", std::move(histogram)}});
+                {"histogram", std::move(histogram)}, {"valueHistogram", std::move(valueHistogram)}});
         }
         json indexes = json::array();
         for (const auto& definition : table.definition.indexes) {

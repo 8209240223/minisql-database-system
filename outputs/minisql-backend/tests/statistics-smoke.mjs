@@ -31,6 +31,7 @@ equal(byName.id.minValue, 1);
 equal(byName.id.maxValue, 3);
 equal(byName.name.histogram[0].value, 'a');
 equal(byName.name.histogram[0].count, 2);
+assert.ok(Array.isArray(byName.id.valueHistogram) && byName.id.valueHistogram.length >= 1); ++checks;
 assert.ok(Array.isArray(table.indexes) && table.indexes.length === 1); ++checks;
 equal(table.indexes[0].name, 't_name_idx');
 assert.ok(table.indexes[0].entries >= 1); ++checks;
