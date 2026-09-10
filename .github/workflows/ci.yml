@@ -114,6 +114,11 @@ jobs:
           node tests/auto-checkpoint-smoke.mjs
           node tests/x22-fault-injection.mjs
         working-directory: outputs/minisql-backend
+      - name: 索引规模回归（1000 行）
+        env:
+          INDEX_SCALE_ROWS: 1000
+        run: node tests/index-scale-smoke.mjs
+        working-directory: outputs/minisql-backend
       - name: 会话/取消/流式/备份回归
         run: |
           node tests/session-process.mjs

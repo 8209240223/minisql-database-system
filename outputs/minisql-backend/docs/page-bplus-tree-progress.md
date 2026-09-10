@@ -24,6 +24,7 @@
 - `node tests/index-smoke.mjs`：29 项索引检查、41 项索引持久化检查、44 项重启/持久化检查通过。
 - `node tests/database-http.mjs`：真实 HTTP 执行链路通过；`node tests/session-process.mjs`：51 项 session 协议检查通过。
 - 工作台 `npm.cmd run build` 与 `npm.cmd run test:browser` 通过，页级索引检查入口与现有连接、权限、设置、拖动和移动端 DOM 回归无冲突。
+- 新增 `tests/index-scale-smoke.mjs`：1000 行 13 项、10000 行 31 项通过，覆盖批量插入、CREATE INDEX、点查、范围扫描、行数和 catalog 索引元数据。
 
 ## 尚未闭合
 

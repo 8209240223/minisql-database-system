@@ -25,7 +25,7 @@
 | X17 | EXT-OPT-003 谓词下推与连接改写 | 部分实现 | INNER JOIN 单表谓词下推、直接等值 HashJoin 改写 | LEFT JOIN、跨表条件和完整改写 |
 | X18 | EXT-OPT-004 统计信息与代价 | 部分实现 | 表/列统计、distinct、NULL 比例、stats-v1 行数/成本估计 | 索引统计、直方图和可比较代价模型 |
 | X19 | EXT-OPT-005 EXPLAIN/ANALYZE | 部分实现 | 原始/优化计划、实际行数/耗时、逐节点统计、写语句拒绝 | 完整 X19 组合验收 |
-| X20 | EXT-SYS-001 B+ 树与索引 | 部分实现 | 页级 B+ 树主路径、页类型/元页、根到叶遍历、分裂、借位/合并、重启恢复、结构 inspect、索引 HTTP/工作台入口；29+41+44 项索引检查通过 | 更高规模组合、性能/资源曲线和完整 X20 组合验收 |
+| X20 | EXT-SYS-001 B+ 树与索引 | 部分实现 | 页级 B+ 树主路径、页类型/元页、根到叶遍历、分裂、借位/合并、重启恢复、结构 inspect、索引 HTTP/工作台入口；29+41+44 项索引检查通过；新增 10000 行索引规模回归（31 项检查） | 更大规模性能曲线和完整 X20 组合验收 |
 | X21 | EXT-SYS-002 事务与原子性 | 部分实现 | DDL/DML 事务、提交/回滚、HTTP 常驻会话、失败回滚、锁等待 | 行级隔离/MVCC 和完整组合验收 |
 | X22 | EXT-SYS-003 WAL/检查点/故障注入 | 部分实现 | 重做恢复、显式/自动/后台检查点、持久化 checkpoint 记录、累积 WAL/LSN、非零截止位置重做、五阶段故障注入；62+30+88 项检查通过 | 在线备份、复杂并发恢复和完整 X22 组合验收 |
 | X23 | EXT-SYS-004 并发控制 | 已实现（声明方案） | 多会话、数据库级两阶段锁、锁等待/超时、关闭回滚、同记录竞争 44 项 | 当前方案不提供 MVCC，并行读写不在承诺范围 |
@@ -59,7 +59,7 @@
 | X17 | A | `src/optimizer/optimizer.cpp`、`src/sql/planner.cpp` | `ctest -R minisql_optimizer_contract`；`node tests/join-process.mjs` | INNER JOIN 单表谓词下推和直接等值 HashJoin 已覆盖；LEFT JOIN、跨表条件和完整改写仍部分实现 |
 | X18 | A | `src/execution/database.cpp`、`src/catalog/catalog.cpp` | `node tests/statistics-smoke.mjs`；`node tests/explain-smoke.mjs` | 表/列统计、distinct、NULL 比例和 stats-v1 成本估计已有证据；索引统计、直方图和可比较模型仍部分实现 |
 | X19 | A | `src/execution/database.cpp`、`src/optimizer/optimizer.cpp` | `node tests/explain-smoke.mjs`；`node tests/statistics-smoke.mjs` | 原始/优化计划、实际行数/耗时、逐节点统计和写语句拒绝已有证据；完整组合仍部分实现 |
-| X20 | B | `src/storage/page_bplus_tree.cpp`、`src/storage/bplus_tree.cpp`、`src/execution/database.cpp` | `node tests/index-smoke.mjs`；`ctest -R minisql_page_bplus_tree_contract`；`node tests/database-http.mjs` | 页级 B+ 树、分裂、借位/合并、重启、inspect 和 HTTP 入口已有证据；更高规模性能曲线仍部分实现 |
+| X20 | B | `src/storage/page_bplus_tree.cpp`、`src/storage/bplus_tree.cpp`、`src/execution/database.cpp` | `node tests/index-smoke.mjs`；`node tests/index-scale-smoke.mjs`；`ctest -R minisql_page_bplus_tree_contract`；`node tests/database-http.mjs` | 页级 B+ 树、分裂、借位/合并、重启、inspect、10000 行规模回归和 HTTP 入口已有证据；更大规模性能曲线仍部分实现 |
 | X21 | B | `src/execution/database.cpp`、`src/storage/page_file.cpp`、`src/server/database_main.cpp` | `node tests/transaction-process.mjs`；`node tests/session-http.mjs`；`node tests/multi-session-http.mjs` | DDL/DML 事务、提交/回滚、失败回滚、锁等待已有证据；行级隔离/MVCC 不在当前承诺范围 |
 | X22 | B | `src/storage/page_file.cpp`、`src/execution/database.cpp`、`src/server/database_main.cpp` | `node tests/journal-process.mjs`；`node tests/auto-checkpoint-smoke.mjs`；`node tests/x22-fault-injection.mjs` | WAL 重做、显式/自动/后台 checkpoint、LSN 和五阶段故障注入已有证据；在线备份和复杂并发恢复仍部分实现 |
 | X23 | B | `src/server/database_main.cpp`、`scripts/database-bridge.mjs` | `node tests/multi-session-http.mjs`；`node tests/session-process.mjs` | 多会话、数据库级两阶段锁、等待/超时和关闭回滚已覆盖；当前方案不提供 MVCC |
