@@ -275,7 +275,8 @@ double optimizerRows(const sql::LogicalPlan& plan, const Options& options) {
         return 1.0;
     }
     const auto rows = optimizerRows(plan.children.front(), options);
-    if (plan.kind == "Filter") return rows * kOptimizerDefaultFilterSelectivity;
+    if (plan.kind == "Filter")
+        return rows * (options.selectivity ? options.selectivity(plan.predicate, plan.table) : kOptimizerDefaultFilterSelectivity);
     if (plan.kind == "Limit") return plan.limit ? std::min(rows, static_cast<double>(*plan.limit)) : rows;
     if (plan.kind == "Distinct") return rows * 0.5;
     if (plan.kind == "Aggregate") return plan.groupKeys.empty() ? 1.0 : std::min(rows * 0.1, kOptimizerDefaultRows);
@@ -313,7 +314,30 @@ void rewritePlan(sql::LogicalPlan& plan, const Options& options, json& changes, 
         }
     }
     if (plan.kind != "Filter") return;
-    if (options.predicatePushdown && pushPredicateIntoJoin(plan, changes, statement)) return;
+    if (options.predicatePushdown && pushPredicateIntoJoin(plan, changes, statement)) {
+        // X18 4.2-iv: 旁路下推后 plan 已「原地」成为 Join（Filter 之上被压平）。子节点此前
+        // 在未带 Filter 时已按原始行数判过 Hash/NL（可能已改写为 HashJoin）；此刻 Filter
+        // 已下推到 join 子输入，按带过滤的真实子输入（列级直方图选择率）双向重判 Hash/NL。
+        if ((plan.kind == "NestedLoopJoin" || plan.kind == "HashJoin") && options.hashJoin && plan.children.size() == 2) {
+            std::size_t leftKey{}, rightKey{};
+            if (hashJoinKeys(plan.predicate, plan.children[0].output.size(), leftKey, rightKey)) {
+                const auto leftRows = optimizerRows(plan.children[0], options);
+                const auto rightRows = optimizerRows(plan.children[1], options);
+                if (leftRows + rightRows <= leftRows * rightRows) {
+                    if (plan.kind != "HashJoin") {
+                        record(changes, "hash-join", statement, {{"kind", "NestedLoopJoin"}}, {{"kind", "HashJoin"}});
+                        plan.kind = "HashJoin";
+                    }
+                } else if (plan.kind != "NestedLoopJoin") {
+                    // 过滤后单侧大幅收窄，Hash(11) > NL(10) → 由先前判定（原始行数）的
+                    // HashJoin 撤销为 NestedLoopJoin（确定性、成本驱动）。
+                    record(changes, "hash-join", statement, {{"kind", "HashJoin"}}, {{"kind", "NestedLoopJoin"}});
+                    plan.kind = "NestedLoopJoin";
+                }
+            }
+        }
+        return;
+    }
     if (options.removeTrueFilter && boolean(plan.predicate) && plan.predicate.at("value").get<bool>() && plan.children.size() == 1) {
         const auto& input = plan.children.front();
         if (plan.table != input.table || plan.preservesRowId != input.preservesRowId || plan.output.size() != input.output.size()) return;

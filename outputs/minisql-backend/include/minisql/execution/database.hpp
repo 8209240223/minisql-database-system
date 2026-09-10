@@ -3,6 +3,7 @@
 #include <chrono>
 #include <memory>
 #include <optional>
+#include <map>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -56,6 +57,9 @@ private:
     // const：可为 `compile()`（const）等只读路径提供估算；扫描仅唤醒缓存、不改逻辑状态，
     // 故 heap_ 标为 mutable。
     std::optional<double> estimatedTableRows(const std::string& tableName) const;
+    // X18 4.2-iv: const 的按表列统计扫描（含直方图）。statistics() 复用其输出；
+    // compile()/execute() 的优化器列级选择率惰性注入取用该项目。
+    std::map<std::string, nlohmann::json> tableStats() const;
     void evaluateAutoCheckpoint(std::size_t committedWriteStatements, std::size_t committedDirtyPages);
     std::vector<nlohmann::json>* nodeStats_ = nullptr;
     std::size_t sortMemoryRows_ = 10000;

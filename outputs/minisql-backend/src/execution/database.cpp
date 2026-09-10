@@ -60,6 +60,97 @@ json rowJson(const Row& row) {
     for (const auto& value : row) result.push_back(cell(value));
     return result;
 }
+// X18 4.2-iv: 列级选择率（直方图驱动）。复用 EXPLAIN 原有估算逻辑，抽成共享自由函数，
+// 供 EXPLAIN estimate() 与优化器 Options.selectivity 同源使用（AND/OR/NOT 连乘与交、
+// IS NULL 用 nullRatio、数值范围谓词用等宽直方图桶、等值越界归零、无直方图回退默认）。
+double columnSelectivity(const std::map<std::string, json>& byTable, const json& predicate, const std::string& table) {
+    const auto columnStat = [&](const std::string& tbl, std::size_t columnId) -> const json* {
+        const auto found = byTable.find(key(tbl));
+        if (found == byTable.end()) return nullptr;
+        for (const auto& column : found->second.at("columns"))
+            if (column.at("columnId").get<std::size_t>() == columnId) return &column;
+        return nullptr;
+    };
+    std::function<double(const json&, const std::string&)> sel;
+    sel = [&](const json& predicate, const std::string& table) -> double {
+        if (!predicate.is_object()) return 1.0;
+        if (predicate.value("kind", "") == "Literal") {
+            const auto& value = predicate.at("value");
+            if (value.is_null() || value == false) return 0.0;
+            if (value == true) return 1.0;
+            return 0.25;
+        }
+        const auto op = predicate.value("operator", "");
+        if (op == "AND") return sel(predicate.at("left"), table) * sel(predicate.at("right"), table);
+        if (op == "OR") {
+            const auto left = sel(predicate.at("left"), table), right = sel(predicate.at("right"), table);
+            return std::min(1.0, left + right - left * right);
+        }
+        if (op == "NOT") return 1.0 - sel(predicate.at("left"), table);
+        if ((op == "IS NULL" || op == "IS NOT NULL") && predicate.contains("left")) {
+            const auto& operand = predicate.at("left");
+            if (operand.value("kind", "") == "Identifier") {
+                const auto* stat = columnStat(table, operand.at("columnId").get<std::size_t>());
+                if (stat) {
+                    const auto ratio = stat->value("nullRatio", 0.0);
+                    return op == "IS NULL" ? ratio : 1.0 - ratio;
+                }
+            }
+        }
+        if (predicate.contains("left") && predicate.contains("right")) {
+            const auto& left = predicate.at("left");
+            const auto& right = predicate.at("right");
+            const json* id = left.value("kind", "") == "Identifier" ? &left : right.value("kind", "") == "Identifier" ? &right : nullptr;
+            const json* literal = left.value("kind", "") == "Literal" ? &left : right.value("kind", "") == "Literal" ? &right : nullptr;
+            if (id && literal && id->contains("columnId")) {
+                const auto* stat = columnStat(table, id->at("columnId").get<std::size_t>());
+                if (stat) {
+                    if (stat->contains("histogram") && op[0] != '=' && literal->at("value").is_number()) {
+                        const auto& h = stat->at("histogram");
+                        const auto buckets = h.at("buckets");
+                        double total = 0;
+                        for (const auto& bucket : buckets) total += bucket.get<std::size_t>();
+                        if (total > 0) {
+                            const auto bucketCount = h.at("bucketCount").get<std::size_t>();
+                            const auto span = h.at("max").get<double>() - h.at("min").get<double>();
+                            const auto value = literal->at("value").get<double>();
+                            double position = span == 0.0 ? 0.0 : (value - h.at("min").get<double>()) / span;
+                            if (position < 0.0) position = 0.0;
+                            else if (position > 1.0) position = 1.0;
+                            const auto slot = position == 1.0 ? bucketCount - 1 : static_cast<std::size_t>(position * bucketCount);
+                            double le = 0, lt = 0;
+                            for (std::size_t i = 0; i < buckets.size(); ++i) {
+                                if (i <= slot) le += buckets[i].get<std::size_t>();
+                                if (i < slot) lt += buckets[i].get<std::size_t>();
+                            }
+                            const double fracLe = le / total, fracLt = lt / total;
+                            if (op == "<") return fracLt;
+                            if (op == "<=") return fracLe;
+                            if (op == ">") return 1.0 - fracLe;
+                            if (op == ">=") return 1.0 - fracLt;
+                        }
+                    }
+                    if (op == "=") {
+                        const auto distinct = stat->value("distinctCount", std::size_t{0});
+                        if (distinct > 0 && stat->contains("min")) {
+                            const auto value = literal->at("value");
+                            if (value.is_number()) {
+                                const auto lo = stat->at("min").get<double>();
+                                const auto hi = stat->at("max").get<double>();
+                                const auto v = value.get<double>();
+                                if (v < lo || v > hi) return 0.0;
+                            }
+                        }
+                        if (distinct > 0) return 1.0 / static_cast<double>(distinct);
+                    }
+                }
+            }
+        }
+        if (op == "=" || op == "!=" || op == "<" || op == "<=" || op == ">" || op == ">=") return 0.33;
+        return 0.25;
+    };
+    return sel(predicate, table);
+}
 ExactDecimal decimalValue(const json& value, const std::string& type) {
     const auto decimal = decimalType(type);
     return decimal ? ExactDecimal::parse(value.get<std::string>(), decimal->precision, decimal->scale) : ExactDecimal::fromInteger(value.get<std::int64_t>());
@@ -368,6 +459,12 @@ nlohmann::json Database::compile(const std::string& source) const {
     const auto plans = sql::compilePlans(ast, catalog_.view());
     optimizer::Options optimizerOptions;
     optimizerOptions.tableRows = [this](const std::string& name) { return estimatedTableRows(name); };
+    // X18 4.2-iv: 惰性列级选择率——仅当优化器真的需要对 Filter 估算时才扫一次列统计。
+    std::optional<std::map<std::string, json>> byTable;
+    optimizerOptions.selectivity = [this, &byTable](const json& predicate, const std::string& table) -> double {
+        if (!byTable) byTable = tableStats();
+        return columnSelectivity(*byTable, predicate, table);
+    };
     const auto optimized = optimizer::optimize(plans, optimizerOptions);
     return {{"success", true}, {"plan", sql::serializePlans(plans)}, {"optimizedPlan", sql::serializePlans(optimized.plans)},
             {"optimizationRules", optimized.changes}, {"statements", ast.size()},
@@ -583,9 +680,11 @@ std::optional<double> Database::estimatedTableRows(const std::string& tableName)
     return std::nullopt;
 }
 
-nlohmann::json Database::statistics() {
-    requireAvailable();
-    json tables = json::array();
+// X18 4.2-iv: const 的值扫描列统计——单遍扫描构造各表 JSON（含数值列等宽直方图、
+// min/max、基数、NULL 计数与比例）。statistics() 复用其构造输出，compile/execute 的
+// 优化器列级选择率（Options.selectivity）也在其中惰性构建取用。
+std::map<std::string, nlohmann::json> Database::tableStats() const {
+    std::map<std::string, json> byTable;
     for (const auto& table : catalog_.tables()) {
         const auto schema = rowSchema(table.definition);
         std::vector<std::set<json>> distinct(schema.size());
@@ -631,9 +730,18 @@ nlohmann::json Database::statistics() {
             }
             columns.push_back(std::move(column));
         }
-        tables.push_back({{"name", table.definition.table}, {"tableId", table.id}, {"rowCount", rowCount},
-            {"allocatedPages", file_->pagesFor(table.id).size()}, {"columns", columns}});
+        byTable[key(table.definition.table)] = {{"name", table.definition.table}, {"tableId", table.id},
+            {"rowCount", rowCount}, {"allocatedPages", file_->pagesFor(table.id).size()}, {"columns", columns}};
     }
+    return byTable;
+}
+nlohmann::json Database::statistics() {
+    requireAvailable();
+    // 复用 const 的 tableStats() 单遍扫描构造各表统计（供本输出与优化器列级选择率同源）。
+    const auto byTable = tableStats();
+    json tables = json::array();
+    for (const auto& table : catalog_.tables())
+        tables.push_back(byTable.at(key(table.definition.table)));
     const auto dirtyPages = buffer_.dirtyPages();
     const auto dirtyRatio = buffer_.capacity() == 0 ? 0.0 : static_cast<double>(dirtyPages) / static_cast<double>(buffer_.capacity());
     const auto generatedAtMs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -1684,8 +1792,16 @@ nlohmann::json Database::execute(const std::string& source, bool optimize) {
                 const auto rawPlans = sql::compilePlans(target, catalog_.view());
                 if (analyze && target.front().kind != "Select")
                     throw MiniSqlError(ErrorCode::Semantic, "EXPLAIN ANALYZE permits only SELECT", location);
+                // X18 4.2-iv: 列级选择率与 EXPLAIN estimate() 同源——单遍 statistics() 建
+                // byTable，注入优化器 Options.selectivity 使过滤选择率进入 join 的成本选择。
+                const auto statsDocument = statistics();
+                std::map<std::string, json> byTable;
+                for (const auto& table : statsDocument.at("tables")) byTable[key(table.at("name").get<std::string>())] = table;
                 optimizer::Options optimizerOptions;
                 optimizerOptions.tableRows = [this](const std::string& name) { return estimatedTableRows(name); };
+                optimizerOptions.selectivity = [&byTable](const json& predicate, const std::string& table) -> double {
+                    return columnSelectivity(byTable, predicate, table);
+                };
                 const auto optimized = optimizer::optimize(rawPlans, optimizerOptions);
                 json raw = sql::serializePlans(rawPlans);
                 json optimizedJson = sql::serializePlans(optimized.plans);
@@ -1697,96 +1813,9 @@ nlohmann::json Database::execute(const std::string& source, bool optimize) {
                     }
                     return {0, 0};
                 };
-                const auto statsDocument = statistics();
-                std::map<std::string, const json*> statsByTable;
-                for (const auto& table : statsDocument.at("tables")) statsByTable[key(table.at("name").get<std::string>())] = &table;
-                const auto columnStat = [&](const std::string& table, std::size_t columnId) -> const json* {
-                    const auto found = statsByTable.find(key(table));
-                    if (found == statsByTable.end()) return nullptr;
-                    for (const auto& column : found->second->at("columns"))
-                        if (column.at("columnId").get<std::size_t>() == columnId) return &column;
-                    return nullptr;
-                };
-                std::function<double(const json&, const std::string&)> selectivity;
-                selectivity = [&](const json& predicate, const std::string& table) -> double {
-                    if (!predicate.is_object()) return 1.0;
-                    if (predicate.value("kind", "") == "Literal") {
-                        const auto& value = predicate.at("value");
-                        if (value.is_null() || value == false) return 0.0;
-                        if (value == true) return 1.0;
-                        return 0.25;
-                    }
-                    const auto op = predicate.value("operator", "");
-                    if (op == "AND") return selectivity(predicate.at("left"), table) * selectivity(predicate.at("right"), table);
-                    if (op == "OR") {
-                        const auto left = selectivity(predicate.at("left"), table), right = selectivity(predicate.at("right"), table);
-                        return std::min(1.0, left + right - left * right);
-                    }
-                    if (op == "NOT") return 1.0 - selectivity(predicate.at("left"), table);
-                    if ((op == "IS NULL" || op == "IS NOT NULL") && predicate.contains("left")) {
-                        const auto& operand = predicate.at("left");
-                        if (operand.value("kind", "") == "Identifier") {
-                            const auto* stat = columnStat(table, operand.at("columnId").get<std::size_t>());
-                            if (stat) {
-                                const auto ratio = stat->value("nullRatio", 0.0);
-                                return op == "IS NULL" ? ratio : 1.0 - ratio;
-                            }
-                        }
-                    }
-                    if (predicate.contains("left") && predicate.contains("right")) {
-                        const auto& left = predicate.at("left");
-                        const auto& right = predicate.at("right");
-                        const json* id = left.value("kind", "") == "Identifier" ? &left : right.value("kind", "") == "Identifier" ? &right : nullptr;
-                        const json* literal = left.value("kind", "") == "Literal" ? &left : right.value("kind", "") == "Literal" ? &right : nullptr;
-                        if (id && literal && id->contains("columnId")) {
-                            const auto* stat = columnStat(table, id->at("columnId").get<std::size_t>());
-                            if (stat) {
-                                // X18 4.2: 数值列（存在直方图）用等宽直方图桶累计估算范围谓词选择率，
-                                // 替代粗粒度默认值 0.33；确定性、与 4.1 直方图同源。
-                                if (stat->contains("histogram") && op[0] != '=' && literal->at("value").is_number()) {
-                                    const auto& h = stat->at("histogram");
-                                    const auto buckets = h.at("buckets");
-                                    double total = 0;
-                                    for (const auto& bucket : buckets) total += bucket.get<std::size_t>();
-                                    if (total > 0) {
-                                        const auto bucketCount = h.at("bucketCount").get<std::size_t>();
-                                        const auto span = h.at("max").get<double>() - h.at("min").get<double>();
-                                        const auto value = literal->at("value").get<double>();
-                                        double position = span == 0.0 ? 0.0 : (value - h.at("min").get<double>()) / span;
-                                        if (position < 0.0) position = 0.0;
-                                        else if (position > 1.0) position = 1.0;
-                                        const auto slot = position == 1.0 ? bucketCount - 1 : static_cast<std::size_t>(position * bucketCount);
-                                        double le = 0, lt = 0;
-                                        for (std::size_t i = 0; i < buckets.size(); ++i) {
-                                            if (i <= slot) le += buckets[i].get<std::size_t>();
-                                            if (i < slot) lt += buckets[i].get<std::size_t>();
-                                        }
-                                        const double fracLe = le / total, fracLt = lt / total;
-                                        if (op == "<") return fracLt;
-                                        if (op == "<=") return fracLe;
-                                        if (op == ">") return 1.0 - fracLe;
-                                        if (op == ">=") return 1.0 - fracLt;
-                                    }
-                                }
-                                // 等值谓词仍在统计范围内才用 1/distinct；越界与范围谓词回退默认值。
-                                if (op == "=") {
-                                    const auto distinct = stat->value("distinctCount", std::size_t{0});
-                                    if (distinct > 0 && stat->contains("min")) {
-                                        const auto value = literal->at("value");
-                                        if (value.is_number()) {
-                                            const auto lo = stat->at("min").get<double>();
-                                            const auto hi = stat->at("max").get<double>();
-                                            const auto v = value.get<double>();
-                                            if (v < lo || v > hi) return 0.0;
-                                        }
-                                    }
-                                    if (distinct > 0) return 1.0 / static_cast<double>(distinct);
-                                }
-                            }
-                        }
-                    }
-                    if (op == "=" || op == "!=" || op == "<" || op == "<=" || op == ">" || op == ">=") return 0.33;
-                    return 0.25;
+                // X18 4.2-iv: estimate() 与优化器 Options.selectivity 共用同一 byTable + columnSelectivity。
+                const auto selectivity = [&](const json& predicate, const std::string& table) -> double {
+                    return columnSelectivity(byTable, predicate, table);
                 };
                 std::function<std::pair<double, double>(const sql::LogicalPlan&)> estimate;
                 estimate = [&](const sql::LogicalPlan& plan) -> std::pair<double, double> {
@@ -1891,6 +1920,11 @@ nlohmann::json Database::execute(const std::string& source, bool optimize) {
             if (optimize) {
                 optimizer::Options optimizerOptions;
                 optimizerOptions.tableRows = [this](const std::string& name) { return estimatedTableRows(name); };
+                std::optional<std::map<std::string, json>> byTable;
+                optimizerOptions.selectivity = [this, &byTable](const json& predicate, const std::string& table) -> double {
+                    if (!byTable) byTable = tableStats();
+                    return columnSelectivity(*byTable, predicate, table);
+                };
                 plans = optimizer::optimize(plans, optimizerOptions).plans;
             }
             materializeSubqueries(plans);

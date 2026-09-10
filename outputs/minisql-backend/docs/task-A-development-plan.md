@@ -314,3 +314,14 @@ node tests\subquery-smoke.mjs tests\statistics-smoke.mjs tests\explain-smoke.mjs
 - [x] **4.2g** 更新 `tests/statistics-costjoin-smoke.mjs`：真实统计 `t`(10 行) 与 `s`(1 行)——多行两端→HashJoin、单行端(`L=10,R=1`,Hash 11>NL 10)→保留 NestedLoopJoin、双路径确定性、结果行数正确；升至 10 项通过。
 - [x] **4.2h** 回归全绿：optimizer_contract 518、planner_contract 契约、database-http（含序列化写）通过；node statistics-costjoin 10 / statistics-cost 12 / explain 21 / statistics 11 / statistics-histogram 20 / subquery 24 / derived 12 / correlated-exec 8 / index / self-foreign-key 63 通过。
 - [ ] 后续/退出：进一步让 `optimizerRows` 消费列级直方图/选择率做连乘与交之决策（当前仅用表行数），并把成本/估计并入 HTTP 契约与工作台展示；IndexScan 估计字段依赖与 B(X20) 第二段协商。
+
+### 6.14 X18 4.2-iv——优化器消费列级直方图选择率（builder-A 第十四次提交）
+
+> 让 6.13 的 `optimizerRows` 从「仅用表行数 + 统一 0.25 过滤选择率」升级为**消费列级直方图**：旁路下推后的 Filter 按谓词（AND/OR/NOT 连乘与交、范围直方图桶、等值越界归零）做列级选择率，真实改变 join 的 Hash/NL 成本选择。分支 `builder-A`。
+
+- [x] **4.2iv-a** `optimizer.hpp` `Options` 末尾新增 `std::function<double(const nlohmann::json&, const std::string&)> selectivity`（Filter 估计回调，(predicate, tableName)→[0,1]，同 `database.cpp` 的 `columnSelectivity`）。`optimizer.cpp` `optimizerRows()` 的 Filter 分支改为 `rows * (options.selectivity ? options.selectivity(...) : 0.25)`。
+- [x] **4.2iv-b** 旁路下推后 join 选择不再锁死：在 `pushPredicateIntoJoin` 触发后，按已下推的过滤子输入**双向重判** Hash/NL（`L+R<=L*R→Hash`，否则→NL；Hash(11)>NL(10) 时由先前原始行数判定的 HashJoin 撤销回 NestedLoopJoin）——过滤序列（原始 → 下推）跨迭代收敛、不振荡。
+- [x] **4.2iv-c** `database.cpp`：把原有 SELECT 过滤选择率逻辑抽为共享自由函数 `columnSelectivity(byTable, predicate, table)`（匿名命名空间）；EXPLAIN 原内联选择性闭包改用之（estimate() 与优化器 `Options.selectivity` 同源去重）。新增 const 私有 `tableStats()`（单遍扫描各表列统计含直方图）；`statistics()` 复用其输出（表序/字段不变）。compile/execute 经惰性 λ 注入 `selectivity`（遇 Filter 才扫一次列统计）。
+- [x] **4.2iv-d** 新增端到端 `tests/statistics-optimizer-selectivity-smoke.mjs`：14 项覆盖——`x.a<1`（直方图选择率 0.1，左 1 行）旁路过滤器→保留 NestedLoopJoin（无直方图则 0.25→HashJoin）；`x.a<11`（选择率 1.0）→HashJoin；连乘 `x.a<1 AND x.a>=0`→NestedLoopJoin；确定性；旁路下推 Filter 节点 `estimatedRows≈1`、`statsSource`；结果行数正确。
+- [x] **4.2iv-e** 回归全绿：ctest 59、optimizer_contract 518、planner_contract 契约、database_contract 81 通过；node statistics-optimizer-selectivity 14 / statistics-costjoin 10 / statistics-cost 12 / explain 21 / statistics 11 / statistics-histogram 20 / subquery 24 / derived 12 / correlated-exec 8 / parser 18 / planner 26 / diagnostics 22 通过。
+- [ ] 后续/退出：把成本/估计并入 HTTP 契约与工作台展示；IndexScan 估计字段依赖与 B(X20) 第二段协商。
