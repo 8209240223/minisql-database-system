@@ -90,7 +90,7 @@
 | `ctest -R minisql_access_catalog_system_contract` | X24 PersistentCatalog 系统堆表分片、回滚、重启和版本升级 | 1 项通过 |
 | `ctest -R minisql_access_binding_contract` | X24 真实 Catalog 物理表绑定、别名排除、派生表、嵌套子查询、CTE 和解析失败兜底 | 1 项通过 |
 | `node tests/access-control-http.mjs`（索引检查扩展） | X24 bridge 到 C++ session 的索引检查、嵌套/派生对象和字符串扫描调用链 | 43 项通过 |
-| `node tests/sql-object-references-contract.mjs` | X24 HTTP/CLI 对象引用扫描契约 | 8 项通过 |
+| `node tests/sql-object-references-contract.mjs` | X24 HTTP/CLI 对象引用扫描契约 | 9 项通过 |
 | `node tests/backup-smoke.mjs` | C2 备份清单迁移校验、失败分类与恢复隔离 | 50 项通过 |
 | `node tests/fuzz-model-contract.mjs` | X27 生成器/缩减器确定性、覆盖 | 10 项通过 |
 | `node tests/fuzz-process-contract.mjs` | X27 子进程隔离、超时、输出超限、异常退出 | 7 项通过 |

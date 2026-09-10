@@ -3,14 +3,19 @@ import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { join } from 'node:path';
 import assert from 'node:assert/strict';
-import initSqlJs from '../../minisql-workbench/node_modules/sql.js/dist/sql-wasm.js';
+import { DatabaseSync } from 'node:sqlite';
 import { invoke } from './fuzz-process.mjs';
 const directory = mkdtempSync(fileURLToPath(new URL('./artifacts/null-', import.meta.url)));
 const executable = fileURLToPath(new URL('../bin/minisql_database.exe', import.meta.url));
-const SQL = await initSqlJs({ locateFile: name => fileURLToPath(new URL(`../../minisql-workbench/node_modules/sql.js/dist/${name}`, import.meta.url)) });
-const reference = new SQL.Database();
+const reference = new DatabaseSync(':memory:');
 let checks = 0;
 function equal(actual, expected) { assert.deepEqual(actual, expected); ++checks; }
+function referenceQuery(sql) {
+  const statement = reference.prepare(sql);
+  const columns = statement.columns().map(column => column.name);
+  statement.setReturnArrays(true);
+  return { columns, values: statement.all() };
+}
 function run(sql, mode = 'execute') {
   if (mode === 'catalog') {
     const child = spawnSync(executable, [join(directory, 'database.pages'), mode], { encoding: 'utf8', windowsHide: true, timeout: 5000 });
@@ -21,7 +26,7 @@ function run(sql, mode = 'execute') {
 }
 function query(sql) { const result = run(sql); assert.equal(result.success, true, JSON.stringify(result)); return result.results.at(-1).rows; }
 function compare(sql) {
-  const expected = reference.exec(sql)[0]?.values ?? [];
+  const expected = referenceQuery(sql).values;
   const actual = query(sql).map(row => row.map(value => typeof value === 'boolean' ? Number(value) : value));
   equal(actual, expected);
 }
@@ -29,7 +34,7 @@ try {
   const fixture = "CREATE TABLE t(id INT NOT NULL,n INT,name VARCHAR); CREATE TABLE u(id INT NOT NULL,label VARCHAR NOT NULL);" +
     "INSERT INTO t(id,n,name) VALUES(1,2,''); INSERT INTO t(id,n,name) VALUES(2,NULL,NULL); INSERT INTO t(id,n,name) VALUES(3,NULL,'NULL');" +
     "INSERT INTO u(id,label) VALUES(1,'match'); INSERT INTO u(id,label) VALUES(1,'again'); INSERT INTO u(id,label) VALUES(9,'other');";
-  reference.run(fixture);equal(run(fixture).success, true);
+  reference.exec(fixture);equal(run(fixture).success, true);
   for (const a of ['TRUE', 'FALSE', 'NULL']) {
     compare(`SELECT NOT ${a} FROM t WHERE id=1;`);
     for (const b of ['TRUE', 'FALSE', 'NULL']) for (const op of ['AND', 'OR']) compare(`SELECT ${a} ${op} ${b} FROM t WHERE id=1;`);
