@@ -1,5 +1,7 @@
 #include "minisql/sql/planner.hpp"
 #include "minisql/sql/serialization.hpp"
+#include "minisql/sql/parser.hpp"
+#include "minisql/sql/lexer.hpp"
 #include "minisql/common/arithmetic.hpp"
 #include "minisql/common/decimal_type.hpp"
 #include "minisql/common/date.hpp"
@@ -19,6 +21,18 @@ std::string canonical(std::string value) {
     });
     return value;
 }
+
+// X09 4.x: 相关子查询去相关 —— 编译右子计划时，未被自身表作用域解析的“限定名
+// （外层别名.列）”落到关联作用域，生成 Parameter 节点（compiled-once 参数化访问）。
+// 以 thread_local 传参避免侵入所有 bindExpression/... 签名；RAII 守卫保证每次
+// compile 结束后复位，不跨语句泄漏。
+using CorrelatedScope = std::unordered_map<std::string, std::pair<std::size_t, std::string>>;
+thread_local const CorrelatedScope* activeCorrelated = nullptr;
+struct CorrelatedScopeGuard {
+    const CorrelatedScope* previous;
+    explicit CorrelatedScopeGuard(const CorrelatedScope* scope) : previous(activeCorrelated) { activeCorrelated = scope; }
+    ~CorrelatedScopeGuard() { activeCorrelated = previous; }
+};
 
 [[noreturn]] void invalid(const std::string& message) {
     throw MiniSqlError(ErrorCode::Internal, "Plan invariant: " + message);
@@ -60,6 +74,18 @@ nlohmann::json bindExpression(const Expr& expression, const catalog::Table& tabl
     nlohmann::json result = {{"kind", expression.kind}, {"line", expression.location.line},
                              {"column", expression.location.column}};
     if (expression.kind == "Identifier") {
+        // X09 4.x: 编译相关子查询的右子计划时，外层的“限定名.列”未在当前表作用域内，
+        // 落入活动关联作用域则生成 Parameter；否则照常按表作用域解析。
+        if (activeCorrelated) {
+            const auto outer = activeCorrelated->find(canonical(expression.value));
+            if (outer != activeCorrelated->end()) {
+                result["kind"] = "Parameter";
+                result["paramId"] = outer->second.first;
+                result["type"] = outer->second.second;
+                result["nullable"] = true;
+                return result;
+            }
+        }
         const auto index = columnIndex(table, expression.value);
         result["columnId"] = index;
         result["name"] = table.columns[index].name;
@@ -213,6 +239,11 @@ void lowerAggregate(LogicalPlan& project, const Statement& statement, const cata
         project.children.push_back(std::move(filter));
     } else project.children.push_back(std::move(aggregate));
 }
+// X09 4.x: 把 WHERE 顶层 AND 中“可提升的相关子查询”（EXISTS/NOT EXISTS/IN）改写为
+// SemiJoin/AntiSemiJoin 节点包裹 input，返回剩余（非子查询）谓词；无可提升时原样返回
+// predicate。仅对单表、非聚合的 SELECT/DELETE/UPDATE 调用（见 build WHERE 分支）。
+nlohmann::json decorrelateWhere(LogicalPlan& input, const nlohmann::json& predicate,
+                                const catalog::Catalog& catalog);
 LogicalPlan build(const Statement& statement, const catalog::Catalog& catalog) {
     if (statement.kind == "Begin" || statement.kind == "Commit" || statement.kind == "Rollback") {
         LogicalPlan plan;plan.kind = statement.kind;return plan;
@@ -361,14 +392,34 @@ LogicalPlan build(const Statement& statement, const catalog::Catalog& catalog) {
             input = std::move(join);
         }
         if (statement.where) {
-            LogicalPlan filter;
-            filter.kind = "Filter";
-            filter.table = plan.table;
-            filter.output = input.output;
-            filter.preservesRowId = input.preservesRowId;
-            filter.predicate = bindExpression(*statement.where, bindScope);
-            filter.children.push_back(std::move(input));
-            input = std::move(filter);
+            auto wherePredicate = bindExpression(*statement.where, bindScope);
+            const bool canDecorate = !aggregated && !derivedBase && statement.joins.empty() &&
+                statement.kind == "Select";
+            if (canDecorate) {
+                // X09 4.x: 相关子查询去相关（WHERE 顶层 AND 的可提升 EXISTS/NOT EXISTS/IN）。
+                const auto remainder = decorrelateWhere(input, wherePredicate, catalog);
+                const bool trivial = remainder.is_object() && remainder.value("kind", "") == "Literal" &&
+                    remainder.contains("value") && remainder.at("value").is_boolean() && remainder.at("value").get<bool>();
+                if (!remainder.is_null() && !trivial) {
+                    LogicalPlan filter;
+                    filter.kind = "Filter";
+                    filter.table = plan.table;
+                    filter.output = input.output;
+                    filter.preservesRowId = input.preservesRowId;
+                    filter.predicate = remainder;
+                    filter.children.push_back(std::move(input));
+                    input = std::move(filter);
+                }
+            } else {
+                LogicalPlan filter;
+                filter.kind = "Filter";
+                filter.table = plan.table;
+                filter.output = input.output;
+                filter.preservesRowId = input.preservesRowId;
+                filter.predicate = std::move(wherePredicate);
+                filter.children.push_back(std::move(input));
+                input = std::move(filter);
+            }
         }
         plan.kind = statement.kind == "Select" ? "Project" : statement.kind;
         if (statement.kind == "Update") {
@@ -470,6 +521,96 @@ LogicalPlan build(const Statement& statement, const catalog::Catalog& catalog) {
     }
     return plan;
 }
+nlohmann::json decorrelateWhere(LogicalPlan& input, const nlohmann::json& predicate,
+                                const catalog::Catalog& catalog) {
+    // 顶层 AND 拆分。
+    std::vector<nlohmann::json> conjuncts;
+    std::function<void(const nlohmann::json&)> split;
+    split = [&](const nlohmann::json& node) {
+        if (node.is_object() && node.value("kind", "") == "Binary" && node.value("operator", "") == "AND" &&
+            node.contains("left") && node.contains("right")) {
+            split(node.at("left"));
+            split(node.at("right"));
+        } else if (node.is_object()) conjuncts.push_back(node);
+    };
+    split(predicate);
+    const auto isCorrelated = [](const nlohmann::json& node) -> bool {
+        if (!node.is_object() || !node.contains("outerColumns") || !node.at("outerColumns").is_object()) return false;
+        const auto& scope = node.at("outerColumns");
+        const auto sql = node.value("subquerySql", std::string());
+        if (sql.empty()) return false;
+        try {
+            const auto toks = tokenize(sql);
+            for (std::size_t i = 0; i + 2 < toks.size(); ++i)
+                if (toks[i].type == "IDENTIFIER" && toks[i + 1].lexeme == "." && toks[i + 2].type == "IDENTIFIER" &&
+                    scope.contains(canonical(toks[i].lexeme + "." + toks[i + 2].lexeme))) return true;
+        } catch (...) { return false; }
+        return false;
+    };
+    const auto buildRight = [&](const nlohmann::json& node, nlohmann::json& paramBindingOut,
+                                bool inSubquery) -> std::pair<bool, LogicalPlan> {
+        // 一次性（compiled-once）把子查询编译为结构化右子计划；外层列按 outerColumns
+        // 序生成参量，落入活动关联作用域绑定为 Parameter。
+        paramBindingOut = nlohmann::json::array();
+        CorrelatedScope corr;
+        std::size_t paramId = 0;
+        const auto& scope = node.at("outerColumns");
+        for (auto it = scope.begin(); it != scope.end(); ++it) {
+            const auto type = it.value().at("type").get<std::string>();
+            corr[canonical(it.key())] = {paramId, type};
+            paramBindingOut.push_back({{"paramId", paramId},
+                {"columnId", it.value().at("columnId").get<std::size_t>()}, {"type", type}});
+            ++paramId;
+        }
+        std::vector<Statement> ast;
+        try { ast = parse(tokenize(node.at("subquerySql").get<std::string>() + ";")); }
+        catch (...) { return {false, {}}; }
+        if (ast.size() != 1 || ast.front().kind != "Select") return {false, {}};
+        try {
+            CorrelatedScopeGuard guard(&corr);
+            auto subplan = build(ast.front(), catalog);
+            if (inSubquery && subplan.output.size() != 1) return {false, {}};
+            return {true, std::move(subplan)};
+        } catch (...) { return {false, {}}; }
+    };
+    nlohmann::json remaining = nullptr;
+    for (const auto& conjunct : conjuncts) {
+        const bool ifExists = conjunct.value("kind", "") == "Exists" && isCorrelated(conjunct);
+        const bool ifNotExists = conjunct.value("kind", "") == "Unary" && conjunct.value("operator", "") == "NOT" &&
+            conjunct.contains("left") && conjunct.at("left").is_object() &&
+            conjunct.at("left").value("kind", "") == "Exists" && isCorrelated(conjunct.at("left"));
+        const bool ifIn = conjunct.value("kind", "") == "InSubquery" && isCorrelated(conjunct);
+        if (ifExists || ifNotExists || ifIn) {
+            const auto& target = ifNotExists ? conjunct.at("left") : conjunct;
+            nlohmann::json paramBinding;
+            auto [ok, subplan] = buildRight(target, paramBinding, ifIn);
+            nlohmann::json residual = nullptr;
+            if (ok && ifIn && conjunct.contains("left")) {
+                residual = nlohmann::json{{"kind", "Binary"}, {"operator", "="}, {"type", "bool"}, {"nullable", true},
+                    {"left", conjunct.at("left")},
+                    {"right", nlohmann::json{{"kind", "Identifier"}, {"columnId", input.output.size()},
+                        {"name", subplan.output.front().name}, {"type", subplan.output.front().type}, {"nullable", true}}}};
+            }
+            if (ok) {
+                LogicalPlan node;
+                node.kind = ifNotExists ? "AntiSemiJoin" : "SemiJoin";
+                node.table = input.table;
+                node.output = input.output;
+                node.preservesRowId = input.preservesRowId;
+                node.paramBinding = std::move(paramBinding);
+                if (!residual.is_null()) node.predicate = std::move(residual);
+                node.children.push_back(std::move(input));
+                node.children.push_back(std::move(subplan));
+                input = std::move(node);
+                continue;
+            }
+        }
+        if (remaining.is_null()) remaining = conjunct;
+        else remaining = nlohmann::json{{"kind", "Binary"}, {"operator", "AND"}, {"type", "bool"}, {"nullable", true},
+            {"left", std::move(remaining)}, {"right", conjunct}, {"line", conjunct.value("line", std::size_t{0})}};
+    }
+    return remaining;
+}
 }
 
 std::vector<LogicalPlan> compilePlans(const std::vector<Statement>& statements,
@@ -504,7 +645,7 @@ nlohmann::json serializePlans(const std::vector<LogicalPlan>& plans) {
                         {"indexName", plan.indexName}, {"uniqueIndex", plan.uniqueIndex}, {"indexColumns", plan.indexColumns}, {"indexValues", plan.indexValues}, {"indexRangeOperator", plan.indexRangeOperator}, {"indexRangeValue", plan.indexRangeValue},
                         {"output", output}, {"preservesRowId", plan.preservesRowId},
                         {"predicate", plan.predicate}, {"values", plan.values}, {"insertExpressions", plan.insertExpressions}, {"insertRows", plan.insertRows},
-                        {"columnMapping", plan.columnMapping}, {"projections", plan.projections}, {"children", nlohmann::json::array()}});
+                        {"columnMapping", plan.columnMapping}, {"projections", plan.projections}, {"paramBinding", plan.paramBinding}, {"children", nlohmann::json::array()}});
         rows[rowIndex]["limit"] = plan.limit ? nlohmann::json(std::to_string(*plan.limit)) : nlohmann::json(nullptr);
         rows[rowIndex]["offset"] = std::to_string(plan.offset);
         rows[rowIndex]["sortKeys"] = plan.sortKeys;
@@ -547,7 +688,7 @@ std::vector<LogicalPlan> deserializePlans(const nlohmann::json& document) {
         if (depth > 256 || !expression.is_object()) invalid();
         const auto kind = expression.value("kind", "");
         if (kind != "Literal" && kind != "Identifier" && kind != "Cast" &&
-            kind != "Unary" && kind != "Binary" && kind != "AggregateExpr") invalid();
+            kind != "Unary" && kind != "Binary" && kind != "AggregateExpr" && kind != "Parameter") invalid();
         if (expression.contains("left") && !expression.at("left").is_null()) validateExpression(expression.at("left"), depth + 1);
         if (expression.contains("right") && !expression.at("right").is_null()) validateExpression(expression.at("right"), depth + 1);
     };
@@ -573,6 +714,8 @@ std::vector<LogicalPlan> deserializePlans(const nlohmann::json& document) {
         item.plan.indexValues = row.value("indexValues", nlohmann::json::array());
         item.plan.indexRangeOperator = row.value("indexRangeOperator", std::string{});
         item.plan.indexRangeValue = row.value("indexRangeValue", nlohmann::json(nullptr));
+        item.plan.paramBinding = row.value("paramBinding", nlohmann::json::array());
+        if (!item.plan.paramBinding.is_array()) invalid();
         for (const auto& column : row.at("output")) {
             if (!column.is_object() || !column.contains("name") || !column.at("name").is_string() || !column.contains("type") || !column.at("type").is_string() ||
                 !column.contains("columnId") || !column.at("columnId").is_number_unsigned() || !column.contains("nullable") || !column.at("nullable").is_boolean()) invalid();

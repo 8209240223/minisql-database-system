@@ -338,3 +338,14 @@ node tests\subquery-smoke.mjs tests\statistics-smoke.mjs tests\explain-smoke.mjs
 
 ### 6.16 X18 收尾核对——hash-join 候选比较固定决胜（builder-A 第十六次提交）
 > 复核确认：`hash-join` 规则**并非**布尔开关，已是**成本驱动候选比较 + 固定决胜**——`optimizerRows`（真实行数/列级选择率）下 `L+R<=L*R→HashJoin`（相等时固定偏好 HashJoin，确定性），4.2-iv 进一步在旁路下推后双向重判（过滤收窄可撤销回 NestedLoopJoin）。`statistics-costjoin-smoke.mjs` 已断言成本驱动选择与跨编译确定性。故 X18 成本/估计主线收尾：SeqScan/IndexScan/join 估算进 HTTP 契约、工作台徽标展示、IndexScan 列级选择率均落地。
+
+### 6.17 X09 4.x——相关子查询去相关（SemiJoin/AntiSemiJoin）（builder-A 第十七次提交）
+> 把相关 `EXISTS / IN / NOT EXISTS` 从「每绑定值文本重编译」改为 **compiled-once 的结构化子计划 + 参数化执行**：planner 将 WHERE 顶层 AND 中可提升的相关子查询改写为 `SemiJoin / AntiSemiJoin` 逻辑节点，子计划外层列以 `Parameter` 节点表达，执行器按 `paramBinding` 逐左行绑定后 in-process 运行子计划。分支 `builder-A`。
+
+- [x] **4.x-a** `planner.hpp` `LogicalPlan` 新增 `paramBinding`（数组 `{paramId, columnId, type}`）；`planner.cpp` 引入 `CorrelatedScope`（thread_local + RAII 守卫，不侵入 bindExpression 签名），`bindExpression` 命中活动关联作用域的「外层别名.列」时生成 `{"kind":"Parameter","paramId",...}` 节点；`serializePlans/deserializePlans` 透传 `paramBinding`，`validateExpression` 新增 `Parameter` 白名单。
+- [x] **4.x-b** `planner.cpp` 新增 `decorrelateWhere(input, predicate, catalog)`：顶层 AND 拆分 → 识别可提升的相关 `Exists→SemiJoin`、`NOT EXISTS→AntiSemiJoin`、`IN→SemiJoin(+residual)`（残差谓词把 IN 左操作数等值判定附加到右侧过滤）；`buildRight` 一次性（compiled-once）重解析并编译子计划为右 child，外层列注入关联作用域；单表/非聚合 SELECT 才触发（`canDecorate`），其余路径保持原 Filter 折叠。
+- [x] **4.x-c** `optimizer.cpp`：`rewrite` 对 `Parameter` 透传；`optimizerRows` 为 `SemiJoin/AntiSemiJoin/Apply` 增加行数估计（Apply≈left*right、SemiJoin≈left*selectivity 复用 `Options.selectivity`、AntiSemiJoin≈left*0.5），供 EXPLAIN/成本展示。
+- [x] **4.x-d** `database.hpp` 新增 `correlationParam(paramId)` + 成员 `correlationParams_`；`database.cpp`：`evaluate` 增加 `Parameter` 分支读参数环境；`joinRows` 增加 `SemiJoin/AntiSemiJoin/Apply` 执行——按 `paramBinding` 从每左行取值绑定参数（`bindCorrelation`），in-process 运行右子计划（不再逐值重新 compile/run），SemiJoin/AntiSemiJoin 保留/过滤 `matched` 左行（SemiJoin 残差谓词在右行上求值），Apply 处理标量多行报错/空集补 NULL；`runStatement` 每次语句复位 `correlationParams_`。
+- [x] **4.x-e** 修复 `WHERE NULL` 回归：`trivial` 判断用 `contains("value") && at("value").is_boolean()` 替代 `value("value", false)`（原实现对 `value==null` 触发 `get<bool>` type_error 302，导致 optimizer_contract 挂起）。修复后 ctest 59/59、optimizer_contract 518 全绿。
+- [x] **4.x-f** 回归：ctest 59/59；node correlated-exec 8 / subquery 24 / derived 12 / explain 21 / outer-join 9 / parser 18 / planner 26 / diagnostics 22 通过；`SELECT ... WHERE EXISTS(...)` 的 EXPLAIN 顶层出现 `SemiJoin` 节点与 `paramBinding`，执行结果与集合语义一致（IN/NOT EXISTS/标量）。（注：`in-list-smoke`/`join-process` 的「拒绝 IN 子查询 / JOIN 无 ON」断言为 HEAD 已存在的基线失败，与本次去相关改动无关。）
+- [ ] 后续：相关**标量子查询→Apply** 与 **NOT IN→AntiSemiJoin+residual** 去相关（当前仍走原 `runCorrelatedSubquery` 路径，正确性有保障但未 compiled-once）；右子计划以 `Expr::subquery` 结构化 AST 优先替代文本重解析；跨库缓存与 `correlatedRowsCache_` 结合做绑定级 memo。

@@ -42,6 +42,9 @@ struct LogicalPlan {
     nlohmann::json indexValues = nlohmann::json::array();
     std::string indexRangeOperator{};
     nlohmann::json indexRangeValue = nullptr;
+    // X09 4.x: Apply/SemiJoin/AntiSemiJoin 去相关节点把外层列的 columnId 绑定为
+    // 右子计划中的参量 paramId。paramBinding 为数组 {paramId, columnId, type}。
+    nlohmann::json paramBinding = nlohmann::json::array();
 };
 
 std::vector<LogicalPlan> compilePlans(const std::vector<Statement>& statements,

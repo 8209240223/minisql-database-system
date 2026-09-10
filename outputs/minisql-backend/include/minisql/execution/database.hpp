@@ -28,7 +28,12 @@ public:
     void setSessionContext(const std::string& sessionId, const std::filesystem::path& cancelFile);
     nlohmann::json configureBuffer(const std::string& action);
     nlohmann::json runCorrelatedSubquery(const nlohmann::json& expression, const nlohmann::json& row);
+    // X09 4.x: 相关子查询去相关后，右子计划以 Parameter 节点引用外层列；Apply/SemiJoin
+    // 执行器在运行右子计划前把外层行按 paramBinding 写入该参数环境，evaluate() 的
+    // Parameter 分支读取之。仅在语句执行期内有效（每次 runStatement 复位）。
+    nlohmann::json correlationParam(std::size_t paramId) const;
 private:
+    std::vector<nlohmann::json> correlationParams_;
     nlohmann::json bufferStatus() const;
     std::shared_ptr<storage::PageFile> file_;
     storage::BufferPool buffer_;

@@ -289,6 +289,10 @@ template <typename Row>
 json evaluate(const json& expression, const Row& row) {
     const auto kind = expression.at("kind").get<std::string>();
     if (kind == "Literal") return expression.at("value");
+    if (kind == "Parameter") {
+        if (!activeDatabase) fail("Parameter evaluated outside a database context");
+        return activeDatabase->correlationParam(expression.at("paramId").get<std::size_t>());
+    }
     if (kind == "Identifier") {
         const auto index = expression.at("columnId").get<std::size_t>();
         if (index >= row.size()) fail("Plan column outside row");
@@ -876,6 +880,76 @@ nlohmann::json Database::bufferStatus() const {
 std::vector<storage::Row> Database::joinRows(const sql::LogicalPlan& plan) {
     checkCancelled();
     std::vector<storage::Row> rows;
+    // 把左行按 paramBinding 绑定进运行参数环境（apply/semi 每次左行重设）。
+    const auto bindCorrelation = [&](const storage::Row& a) {
+        correlationParams_.clear();
+        correlationParams_.resize(plan.paramBinding.size());
+        for (const auto& entry : plan.paramBinding) {
+            const auto pid = entry.at("paramId").get<std::size_t>();
+            const auto col = entry.at("columnId").get<std::size_t>();
+            if (pid >= correlationParams_.size()) fail("Correlated paramId outside range");
+            if (col >= a.size()) fail("Correlated outer column outside row");
+            correlationParams_[pid] = cell(a[col]);
+        }
+    };
+    // X09 4.x: 相关子查询去相关节点 —— 右子计划为 compiled-once 结构化子计划，其
+    // 外层引用以 Parameter 节点表示；按 paramBinding 从每左行取值写入参数环境后
+    // in-process 运行右子计划（不再逐绑定值重新 compile/run 独立语句）。
+    if (plan.kind == "SemiJoin" || plan.kind == "AntiSemiJoin" || plan.kind == "Apply") {
+        if (plan.children.size() != 2) fail("Apply/SemiJoin requires two children");
+        const auto left = joinRows(plan.children[0]);
+        if (plan.kind == "SemiJoin" || plan.kind == "AntiSemiJoin") {
+            const bool anti = plan.kind == "AntiSemiJoin";
+            for (const auto& a : left) {
+                checkCancelled();
+                bindCorrelation(a);
+                const auto right = joinRows(plan.children[1]);
+                bool matched = !right.empty();
+                if (plan.kind == "SemiJoin" && plan.predicate.is_object() && !right.empty()) {
+                    matched = false;
+                    for (const auto& b : right) {
+                        auto combined = a;
+                        combined.insert(combined.end(), b.begin(), b.end());
+                        if (accepted(evaluate(plan.predicate, combined))) { matched = true; break; }
+                    }
+                }
+                if (anti ? !matched : matched) rows.push_back(a);
+            }
+            return rows;
+        }
+        // Apply：左行拼接右子计划每行（标量语义：右 >1 行报错、=0 行补 NULL）。
+        const bool scalar = plan.values.is_object() && plan.values.value("scalar", false);
+        for (const auto& a : left) {
+            checkCancelled();
+            bindCorrelation(a);
+            const auto right = joinRows(plan.children[1]);
+            if (scalar) {
+                if (right.size() > 1) fail("Correlated scalar subquery returned more than one row");
+                auto combined = a;
+                if (right.empty()) combined.resize(a.size() + plan.children[1].output.size(), std::monostate{});
+                else combined.insert(combined.end(), right.front().begin(), right.front().end());
+                rows.push_back(std::move(combined));
+            } else {
+                for (const auto& b : right) {
+                    auto combined = a;
+                    combined.insert(combined.end(), b.begin(), b.end());
+                    rows.push_back(std::move(combined));
+                }
+            }
+        }
+        return rows;
+    }
+    if (plan.kind == "Project") {
+        if (plan.children.size() != 1) fail("Project requires one child");
+        for (const auto& row : joinRows(plan.children.front())) {
+            checkCancelled();
+            storage::Row projected;
+            projected.reserve(plan.output.size());
+            for (const auto& expression : plan.projections) projected.push_back(indexValue(evaluate(expression, row), plan.output[projected.size()].type));
+            rows.push_back(std::move(projected));
+        }
+        return rows;
+    }
     if (plan.kind == "Filter") {
         if (plan.children.size() != 1) fail("Join filter requires one child");
         rows = joinRows(plan.children.front());
@@ -1502,7 +1576,8 @@ nlohmann::json Database::runNode(const sql::LogicalPlan& plan) {
         if (input->children.size() != 1) fail("Filter requires one child");
         input = &input->children.front();
     }
-    const bool joined = (input->kind == "NestedLoopJoin" || input->kind == "HashJoin" || input->kind == "LeftJoin" || input->kind == "RightJoin" || input->kind == "FullJoin") && plan.kind == "Project";
+    const bool joined = (input->kind == "NestedLoopJoin" || input->kind == "HashJoin" || input->kind == "LeftJoin" || input->kind == "RightJoin" || input->kind == "FullJoin" ||
+                          input->kind == "SemiJoin" || input->kind == "AntiSemiJoin" || input->kind == "Apply") && (plan.kind == "Project" || plan.kind == "Update" || plan.kind == "Delete");
     if (!joined && ((input->kind != "SeqScan" && input->kind != "IndexScan") || key(input->table) != key(plan.table))) fail("Unsupported scan plan");
     for (const auto& column : plan.output) result["columns"].push_back(column.name);
     if (input->kind == "IndexScan" && plan.kind == "Project") {
@@ -1614,6 +1689,7 @@ nlohmann::json Database::run(const sql::LogicalPlan& plan) {
 }
 nlohmann::json Database::runStatement(const sql::LogicalPlan& plan) {
     correlatedRowsCache_.clear();
+    correlationParams_.clear();
     if (plan.kind == "Checkpoint") {
         if (transaction_ != TransactionState::Idle) throw MiniSqlError(ErrorCode::Transaction, "CHECKPOINT requires an idle transaction");
         buffer_.flushAll();
@@ -1725,6 +1801,10 @@ nlohmann::json Database::diagnostics(const std::string& source) const {
     }
     const bool success = std::all_of(items.begin(), items.end(), [](const json& item) { return item.value("success", false); });
     return {{"success", success}, {"diagnostics", items}, {"count", items.size()}};
+}
+nlohmann::json Database::correlationParam(std::size_t paramId) const {
+    if (paramId >= correlationParams_.size()) fail("Parameter outside correlation range");
+    return correlationParams_[paramId];
 }
 nlohmann::json Database::runCorrelatedSubquery(const json& expression, const json& row) {
     const auto sql = expression.at("subquerySql").get<std::string>();

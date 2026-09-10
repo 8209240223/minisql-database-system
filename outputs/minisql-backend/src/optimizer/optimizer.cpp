@@ -22,7 +22,7 @@ void record(json& changes, const char* rule, std::size_t statement, const json& 
 json rewrite(json expression, const Options& options, json& changes, std::size_t statement, std::size_t depth = 0) {
     if (depth > 256) throw MiniSqlError(ErrorCode::Internal, "Optimizer expression depth exceeded");
     const auto kind = expression.value("kind", "");
-    if (kind == "Literal" || kind == "Identifier" || kind == "Exists" || kind == "ScalarSubquery") return expression;
+    if (kind == "Literal" || kind == "Identifier" || kind == "Parameter" || kind == "Exists" || kind == "ScalarSubquery") return expression;
     if (kind == "InSubquery") {
         expression["left"] = rewrite(expression.at("left"), options, changes, statement, depth + 1);
         return expression;
@@ -283,6 +283,19 @@ double optimizerRows(const sql::LogicalPlan& plan, const Options& options) {
     if (plan.kind == "NestedLoopJoin" || plan.kind == "HashJoin" || plan.kind == "LeftJoin" || plan.kind == "RightJoin" || plan.kind == "FullJoin") {
         if (plan.children.size() != 2) return rows;
         return rows * optimizerRows(plan.children[1], options) * 0.1;
+    }
+    // X09 4.x: 相关子查询去相关节点的行数估计（供 EEXPLAIN/成本展示；非相等 join 子输入）。
+    if (plan.kind == "SemiJoin" || plan.kind == "AntiSemiJoin" || plan.kind == "Apply") {
+        if (plan.children.size() != 2) return rows;
+        const auto rightRows = optimizerRows(plan.children[1], options);
+        if (plan.kind == "Apply") return rows * std::max(1.0, rightRows);
+        if (plan.kind == "SemiJoin") {
+            const double sel = plan.predicate.is_object()
+                ? (options.selectivity ? options.selectivity(plan.predicate, plan.table) : kOptimizerDefaultFilterSelectivity)
+                : 0.5;
+            return rows * std::clamp(sel, 0.0, 1.0);
+        }
+        return rows * 0.5;
     }
     return rows;  // Project / Sort 行数不变
 }
