@@ -48,7 +48,8 @@ $groups = @{
         'tests/subquery-smoke.mjs',
         'tests/explain-smoke.mjs',
         'tests/statistics-smoke.mjs',
-        'tests/statistics-compile-estimate-smoke.mjs'
+        'tests/statistics-compile-estimate-smoke.mjs',
+        'tests/statistics-index-estimate-smoke.mjs'
     )
     execution = @(
         'tests/database-process.mjs',

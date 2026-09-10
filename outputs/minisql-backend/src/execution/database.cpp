@@ -151,6 +151,36 @@ double columnSelectivity(const std::map<std::string, json>& byTable, const json&
     };
     return sel(predicate, table);
 }
+// X18 4.3-iv: 按索引列统计估算 IndexScan 选择率——等值前缀逐列 `1/distinct`（越界归零）、
+// 范围列走直方图。合成与 columnSelectivity 同构的列谓词（含 columnId）逐列连乘，保证口径与
+// Filter 完全一致、源码单点复用。无该列统计时回退默认选择率 0.25。
+double indexScanSelectivity(const std::map<std::string, json>& byTable, const std::string& table,
+                            const std::vector<std::string>& indexColumns, const json& indexValues,
+                            const std::string& rangeOperator, const json& rangeValue) {
+    std::map<std::string, std::size_t> columnIds;
+    const auto found = byTable.find(key(table));
+    if (found != byTable.end())
+        for (const auto& column : found->second.at("columns"))
+            columnIds[key(column.at("name").get<std::string>())] = column.at("columnId").get<std::size_t>();
+    std::function<double(const std::string&, const std::string&, const json&)> columnSel =
+        [&](const std::string& column, const std::string& op, const json& value) -> double {
+        const auto it = columnIds.find(key(column));
+        if (it == columnIds.end()) return 0.25;
+        return columnSelectivity(byTable,
+            {{"kind", "Binary"}, {"operator", op},
+             {"left", {{"kind", "Identifier"}, {"columnId", it->second}, {"name", column}}},
+             {"right", value}},
+            table);
+    };
+    double selectivity = 1.0;
+    const auto equalities = static_cast<std::size_t>(std::min<std::size_t>(indexValues.size(), indexColumns.size()));
+    for (std::size_t i = 0; i < equalities; ++i)
+        if (indexValues[i].is_object() && indexValues[i].value("kind", "") == "Literal")
+            selectivity *= columnSel(indexColumns[i], "=", indexValues[i]);
+    if (!rangeOperator.empty() && indexValues.size() < indexColumns.size() && rangeValue.is_object())
+        selectivity *= columnSel(indexColumns[indexValues.size()], rangeOperator, rangeValue);
+    return selectivity;
+}
 ExactDecimal decimalValue(const json& value, const std::string& type) {
     const auto decimal = decimalType(type);
     return decimal ? ExactDecimal::parse(value.get<std::string>(), decimal->precision, decimal->scale) : ExactDecimal::fromInteger(value.get<std::int64_t>());
@@ -499,6 +529,11 @@ nlohmann::json Database::annotatePlanEstimates(const nlohmann::json& serialized,
     std::function<std::pair<double, double>(const sql::LogicalPlan&)> estimate;
     estimate = [&](const sql::LogicalPlan& plan) -> std::pair<double, double> {
         if (plan.kind == "SeqScan") { const auto rows = tableRows(plan.table); return {rows, rows + rows * 0.1}; }
+        if (plan.kind == "IndexScan") {
+            if (!byTable) byTable = tableStats();
+            const auto rows = tableRows(plan.table) * indexScanSelectivity(*byTable, plan.table, plan.indexColumns, plan.indexValues, plan.indexRangeOperator, plan.indexRangeValue);
+            return {rows, rows + rows * 0.05};
+        }
         if (plan.children.empty()) return {0.0, 1.0};
         auto child = estimate(plan.children.front());
         if (plan.kind == "Filter") { const auto rows = child.first * selectivity(plan.predicate, plan.table); return {rows, child.second + rows}; }
@@ -1874,6 +1909,11 @@ nlohmann::json Database::execute(const std::string& source, bool optimize) {
                     if (plan.kind == "SeqScan") {
                         const auto [rows, pages] = tableEstimate(plan.table);
                         return {rows, rows + pages};
+                    }
+                    if (plan.kind == "IndexScan") {
+                        const auto [tableRows, pages] = tableEstimate(plan.table);
+                        const auto rows = tableRows * indexScanSelectivity(byTable, plan.table, plan.indexColumns, plan.indexValues, plan.indexRangeOperator, plan.indexRangeValue);
+                        return {rows, rows + pages * 0.5};
                     }
                     if (plan.children.empty()) {
                         if (plan.kind == "Insert") return {static_cast<double>(std::max(plan.values.size(), plan.insertRows.size())), 1.0};
