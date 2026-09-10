@@ -41,6 +41,18 @@ int main() {
             "SELECT * FROM public_records WHERE id IN (SELECT id FROM secret_records);");
         require(nested == std::vector<std::string>{"public_records", "secret_records"},
             "catalog resolves nested subquery sources");
+        const auto cte = database.resolveAccessObjects(
+            "WITH visible AS (SELECT id FROM SECRET_RECORDS) SELECT * FROM visible;");
+        require(cte == std::vector<std::string>{"secret_records"},
+            "catalog resolves CTE source after parser fallback and excludes CTE alias");
+        const auto namedCte = database.resolveAccessObjects(
+            "WITH visible(id) AS (SELECT id FROM SECRET_RECORDS) SELECT id FROM visible;");
+        require(namedCte == std::vector<std::string>{"secret_records"},
+            "catalog resolves named-column CTE source and excludes its alias");
+        const auto unsupported = database.resolveAccessObjects(
+            "WITH visible AS (SELECT id FROM PUBLIC_RECORDS) SELECT * FROM visible JOIN SECRET_RECORDS ON visible.id = SECRET_RECORDS.id;");
+        require(unsupported == std::vector<std::string>{"public_records", "secret_records"},
+            "catalog binds unsupported CTE query sources conservatively");
     }
     removeArtifacts(path);
     return 0;

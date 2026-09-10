@@ -61,6 +61,15 @@ export function tableReferences(sql, keyword) {
     for (;;) {
       if (!identifier(words[cursor])) break;
       ctes.add(words[cursor++]);
+      if (words[cursor] === '(') {
+        let columnDepth = 1;
+        ++cursor;
+        while (cursor < words.length && columnDepth) {
+          if (words[cursor] === '(') ++columnDepth;
+          else if (words[cursor] === ')') --columnDepth;
+          ++cursor;
+        }
+      }
       if (words[cursor] !== 'as' || words[cursor + 1] !== '(') break;
       cursor += 2;
       let depth = 1;
