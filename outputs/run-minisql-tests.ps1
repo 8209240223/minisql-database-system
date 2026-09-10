@@ -68,6 +68,7 @@ $groups = @{
         'tests/x22-fault-injection.mjs',
         'tests/journal-process.mjs',
         'tests/index-smoke.mjs',
+        'tests/index-performance-curve.mjs',
         'tests/backup-smoke.mjs',
         'tests/external-sort-smoke.mjs',
         'tests/external-aggregate-smoke.mjs'

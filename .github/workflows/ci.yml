@@ -119,6 +119,9 @@ jobs:
           INDEX_SCALE_ROWS: 1000
         run: node tests/index-scale-smoke.mjs
         working-directory: outputs/minisql-backend
+      - name: 索引性能曲线（1000/5000/10000 行）
+        run: node tests/index-performance-curve.mjs
+        working-directory: outputs/minisql-backend
       - name: 会话/取消/流式/备份回归
         run: |
           node tests/session-process.mjs

@@ -25,6 +25,7 @@
 - `node tests/database-http.mjs`：真实 HTTP 执行链路通过；`node tests/session-process.mjs`：51 项 session 协议检查通过。
 - 工作台 `npm.cmd run build` 与 `npm.cmd run test:browser` 通过，页级索引检查入口与现有连接、权限、设置、拖动和移动端 DOM 回归无冲突。
 - 新增 `tests/index-scale-smoke.mjs`：1000 行 15 项（height=2, pages=33）、10000 行 33 项（height=3, pages=323）通过，覆盖批量插入、CREATE INDEX、点查、范围扫描、行数和 catalog 索引元数据。
+- 新增 `tests/index-performance-curve.mjs`：1000/5000/10000 行耗时约 0.46s / 0.80s / 3.41s，树高 2/3/3，页数 33/162/323，并输出 `tests/artifacts/index-performance-curve.json`。
 
 ## 尚未闭合
 
