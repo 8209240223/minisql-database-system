@@ -390,3 +390,13 @@ node tests\subquery-smoke.mjs tests\statistics-smoke.mjs tests\explain-smoke.mjs
 - [x] **6.20-b AST 文档**：`serializeAstDocument` 写入 `schemaVersion/schemaMinor/nodeVersion/producerVersion`；`deserializeAst` 改用版本闸门——未知主版本（如 `schemaVersion:2`）拒绝，`schemaMinor` 高于当前（1 > 0）拒绝，`nodeVersion` 未知主版本拒绝，缺省次版本按 0 兼容读。
 - [x] **6.20-c Plan 文档**：新增 `serializePlanDocument(plans)`（writer，输出 `schemaVersion/schemaMinor/planVersion/producerVersion/planKind/plans`，与 `serializePlans` 往返一致）；`deserializePlans` 改用同一版本闸门。**不改动 compile 响应既有结构**（`database.cpp`/`compile_main.cpp` 的 `schemaVersion:1`）——按任务书 8.1 接口冻结，响应接入（含前端 `types.ts` 同步）留待跨组同步，本提交只完成编解码契约。
 - [x] **6.20-d 回归**：`tests/planner_contract.cpp` 新增 12 项断言（版本化往返、主版拒绝、更高次版拒绝、`nodeVersion`/`planVersion` 未知主版拒绝、同主版次版兼容读、`serializeAstDocument`/`serializePlanDocument` 字段存在）；`ctest` **59/59**；node `planner-regression` 26 项通过。
+
+### 6.21 X18 显式 ANALYZE——统计刷新入口与刷新记录
+
+> 收口任务书 A4 范围 2（"统计刷新使用显式 `ANALYZE` 或受控后台任务，记录刷新时间和统计版本"）。此前 `statistics()` 恒为 `source=on-demand-scan`，无显式刷新入口，也无刷新时间/版本的持久记录。分支 `builder-A`。
+
+- [x] **6.21-a 语法与执行**：`Database::execute` 在语句分派处识别 `ANALYZE [TABLE] <name>`（与 `EXPLAIN` 同为分派级特判，**不改 AST/Plan 契约**）。校验表存在（`catalog_.view().find`），命中后单遍 `tableStats()` 刷新全库表统计。
+- [x] **6.21-b 刷新记录持久化**：把 `{table, analyzedAtMs, version:"stats-v1-histogram", tables}` 写入数据库旁的 `<db>.analyze.json`。`statistics()` 改为优先读该快照，输出 `source:"analyze"`、`generatedAtMs`/`lastAnalyzeAtMs` 为刷新时间；缺失时回退实时扫描（`source:"on-demand-scan"`、`lastAnalyzeAtMs=0`）。
+- [x] **6.21-c 失效规则**：`runStatement` 对任何写语句（CreateTable/CreateIndex/DropIndex/Insert/Update/Delete）**成功后删除**旁路文件——ANALYZE 快照随即失效，`statistics()` 回退实时扫描。
+- [x] **6.21-d ANALYZE 响应**：`kind=Analyze`，`columns=[table,rowCount,columnCount,analyzedAtMs,statsVersion]`，行仅含目标表，附 `source/statsVersion/analyzedAtMs`；EXPLAIN 展示路径的统计消费保持同源。
+- [x] **6.21-e 回归**：新增 `tests/analyze-stats-smoke.mjs`（**35 checks**：初态 on-demand、ANALYZE 后 `source=analyze` + 时间戳/版本、`ANALYZE TABLE` 与关键字大小写、写语句后失效、未知表/缺表名/多余 token 三类语法错误、EXPLAIN 不受影响）。`ctest` **59/59**。

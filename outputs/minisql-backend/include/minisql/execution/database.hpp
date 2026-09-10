@@ -65,6 +65,11 @@ private:
     // X18 4.2-iv: const 的按表列统计扫描（含直方图）。statistics() 复用其输出；
     // compile()/execute() 的优化器列级选择率惰性注入取用该项目。
     std::map<std::string, nlohmann::json> tableStats() const;
+    // X18: 显式 ANALYZE 的刷新记录路径（`<db>.analyze.json`）。ANALYZE 写入刷新时间 +
+    // 统计版本 + 表快照；任何写语句成功后删除该文件即失效。statistics() 跨进程读它并
+    // 报告 source=analyze，缺失/被删时回退实时 on-demand-scan。
+    std::filesystem::path analyzeMetadataPath() const;
+    std::optional<nlohmann::json> loadAnalyzeMetadata() const;
     // X18 4.3: 把成本/估计元数据（estimatedRows/estimatedCost/statsSource）落到
     // compile() 顶层 plan / optimizedPlan 的每个节点上，并入 HTTP 契约供工作台展示。
     // 沿用优化器同源的 estimatedTableRows + columnSelectivity；惰性扫描列统计仅在有 Filter 时触发。

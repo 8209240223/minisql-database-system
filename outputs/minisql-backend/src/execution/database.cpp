@@ -17,6 +17,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <fstream>
 #include <functional>
 #include <limits>
 
@@ -826,19 +827,44 @@ std::map<std::string, nlohmann::json> Database::tableStats() const {
     }
     return byTable;
 }
+std::filesystem::path Database::analyzeMetadataPath() const {
+    auto path = file_->path();
+    path += ".analyze.json";
+    return path;
+}
+std::optional<nlohmann::json> Database::loadAnalyzeMetadata() const {
+    std::error_code error;
+    const auto path = analyzeMetadataPath();
+    if (!std::filesystem::exists(path, error) || error) return std::nullopt;
+    try {
+        std::ifstream stream(path, std::ios::binary);
+        if (!stream) return std::nullopt;
+        json document;
+        stream >> document;
+        if (!document.is_object() || !document.contains("tables") || !document.at("tables").is_array()) return std::nullopt;
+        return document;
+    } catch (const std::exception&) { return std::nullopt; }
+}
 nlohmann::json Database::statistics() {
     requireAvailable();
-    // 复用 const 的 tableStats() 单遍扫描构造各表统计（供本输出与优化器列级选择率同源）。
-    const auto byTable = tableStats();
+    // X18: 显式 ANALYZE 的持久快照优先（跨进程有效）；缺失或已被写语句删除时回退实时扫描。
+    const auto analyzed = loadAnalyzeMetadata();
     json tables = json::array();
-    for (const auto& table : catalog_.tables())
-        tables.push_back(byTable.at(key(table.definition.table)));
+    if (analyzed) tables = analyzed->at("tables");
+    else {
+        // 复用 const 的 tableStats() 单遍扫描构造各表统计（供本输出与优化器列级选择率同源）。
+        const auto byTable = tableStats();
+        for (const auto& table : catalog_.tables())
+            tables.push_back(byTable.at(key(table.definition.table)));
+    }
     const auto dirtyPages = buffer_.dirtyPages();
     const auto dirtyRatio = buffer_.capacity() == 0 ? 0.0 : static_cast<double>(dirtyPages) / static_cast<double>(buffer_.capacity());
-    const auto generatedAtMs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+    const auto analyzedAtMs = analyzed ? analyzed->value("analyzedAtMs", std::uint64_t{0}) : std::uint64_t{0};
+    const auto generatedAtMs = analyzed ? analyzedAtMs : static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count());
-    return {{"success", true}, {"tables", tables}, {"scope", "table-and-column"}, {"source", "on-demand-scan"},
-        {"version", "stats-v1-histogram"}, {"generatedAtMs", generatedAtMs},
+    return {{"success", true}, {"tables", tables}, {"scope", "table-and-column"},
+        {"source", analyzed ? "analyze" : "on-demand-scan"},
+        {"version", "stats-v1-histogram"}, {"generatedAtMs", generatedAtMs}, {"lastAnalyzeAtMs", analyzedAtMs},
         {"checkpointCount", checkpointCount_}, {"autoCheckpointWrites", autoCheckpointWrites_},
         {"autoCheckpointWalBytes", autoCheckpointWalBytes_}, {"autoCheckpointDirtyPages", autoCheckpointDirtyPages_},
         {"autoCheckpointDirtyRatio", autoCheckpointDirtyRatio_}, {"autoCheckpointIntervalMs", autoCheckpointIntervalMs_},
@@ -1733,6 +1759,8 @@ nlohmann::json Database::runStatement(const sql::LogicalPlan& plan) {
     }
     const bool writes = plan.kind == "CreateTable" || plan.kind == "CreateIndex" || plan.kind == "DropIndex" || plan.kind == "Insert" ||
                         plan.kind == "Update" || plan.kind == "Delete";
+    // X18: 任何写语句都使显式 ANALYZE 快照失效——删除旁路文件后 statistics() 回退实时扫描。
+    if (writes) { std::error_code ignored; std::filesystem::remove(analyzeMetadataPath(), ignored); }
     if (transaction_ == TransactionState::Active) {
         auto result = run(plan);
         if (writes) ++transactionWriteStatements_;
@@ -2091,6 +2119,43 @@ nlohmann::json Database::execute(const std::string& source, bool optimize) {
                         {"ioErrors", ioAfter.errors - ioBefore.errors}};
                 }
                 results.push_back(std::move(explanation));
+                statement.clear();
+                return;
+            }
+            if (key(statement.front().lexeme) == "analyze") {
+                const auto location = statement.front().location;
+                if (transaction_ == TransactionState::Aborted)
+                    throw MiniSqlError(ErrorCode::Transaction, "Transaction aborted; ROLLBACK required");
+                std::size_t begin = 1;
+                std::size_t end = statement.size();
+                if (end > begin && statement.back().type == "DELIMITER") --end;
+                if (begin < end && key(statement.at(begin).lexeme) == "table") ++begin;
+                if (begin + 1 != end || statement.at(begin).type != "IDENTIFIER")
+                    throw MiniSqlError(ErrorCode::Syntax, "ANALYZE expects a single table name", location);
+                const auto tableName = statement.at(begin).lexeme;
+                if (catalog_.view().find(tableName) == nullptr)
+                    throw MiniSqlError(ErrorCode::Catalog, "Unknown table in ANALYZE: " + tableName, location);
+                // X18: 单遍扫描刷新全库表统计，并把刷新时间 + 统计版本 + 表快照持久化到旁路文件，
+                // 供 statistics() 跨进程报告 source=analyze（写语句成功后删除该文件即失效）。
+                const auto byTable = tableStats();
+                json tables = json::array();
+                for (const auto& table : catalog_.tables()) tables.push_back(byTable.at(key(table.definition.table)));
+                const auto analyzedAtMs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::system_clock::now().time_since_epoch()).count());
+                const json document = {{"table", tableName}, {"analyzedAtMs", analyzedAtMs},
+                    {"version", "stats-v1-histogram"}, {"tables", tables}};
+                std::ofstream stream(analyzeMetadataPath(), std::ios::binary | std::ios::trunc);
+                if (!stream) throw MiniSqlError(ErrorCode::Storage, "Unable to persist ANALYZE statistics", location);
+                stream << document.dump();
+                json rows = json::array();
+                for (const auto& table : tables)
+                    if (key(table.at("name").get<std::string>()) == key(tableName))
+                        rows.push_back({table.at("name"), table.at("rowCount"), table.at("columns").size(), analyzedAtMs, "stats-v1-histogram"});
+                results.push_back({{"kind", "Analyze"}, {"table", tableName},
+                    {"columns", {"table", "rowCount", "columnCount", "analyzedAtMs", "statsVersion"}},
+                    {"columnTypes", {"varchar", "bigint", "bigint", "bigint", "varchar"}},
+                    {"rows", rows}, {"affectedRows", 0}, {"commitState", "committed"},
+                    {"source", "analyze"}, {"statsVersion", "stats-v1-histogram"}, {"analyzedAtMs", analyzedAtMs}});
                 statement.clear();
                 return;
             }
