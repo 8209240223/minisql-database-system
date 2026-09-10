@@ -68,13 +68,13 @@
 
 | 编号 | 功能 | 依赖 | 当前状态 | 验收编号 |
 | --- | --- | --- | --- | --- |
-| EXT-SYS-001 | B+ 树、复合/唯一索引、IndexScan | Page、RowId、Catalog | 部分实现：页级 B+ 树已成为默认索引主路径，支持元页/节点页、根到叶遍历、根分裂、范围查询、删除借位/合并、重启恢复、结构 inspect 和强制重建；29+41+44 项索引检查通过；1000/5000/10000 行性能曲线（height 2/3/3，pages 33/162/323）和 artifact 已产出。更大规模和完整 X20 验收待完成 | X20 |
-| EXT-SYS-002 | BEGIN、COMMIT、ROLLBACK、原子性 | WAL、锁或版本 | 部分实现：显式事务、事务化 DDL、常驻 HTTP 会话及工作台事务控制；进程/HTTP 测试和真实浏览器提交、回滚、失败、过期、响应丢失检查通过；`SAVEPOINT` / `RELEASE` / `ROLLBACK TO` 专项 7 项、写批溢写预算与回滚 5 项通过；多逻辑会话采用数据库级排他两阶段锁，锁等待、超时和关闭回滚已接通，行级隔离/MVCC、事务外存降级和 X21 全量组合验收未完成 | X21 |
-| EXT-SYS-003 | WAL、恢复、检查点、故障注入 | Page、事务 | 部分实现：整页重做日志、同步、独占锁、身份校验、重复恢复、显式/自动/后台 CHECKPOINT、持久化 checkpoint 记录、累积 WAL/LSN、非零截止位置重做和五阶段故障注入已接通；62+30+88 项检查通过。在线备份、复杂并发恢复和完整 X22 组合验收待完成，详见 `docs/auto-checkpoint-progress.md` | X22 |
+| EXT-SYS-001 | B+ 树、复合/唯一索引、IndexScan | Page、RowId、Catalog | 已实现（基础版）：页级 B+ 树默认主路径，元页/节点页、根到叶遍历、根分裂、范围查询、删除借位/合并、重启恢复、结构 inspect、强制重建、1000/5000/10000 行性能曲线均完成；MB 级压力为后续增强 | X20 |
+| EXT-SYS-002 | BEGIN、COMMIT、ROLLBACK、原子性 | WAL、锁或版本 | 已实现（基础版）：显式事务、事务化 DDL、常驻 HTTP 会话、工作台事务控制、数据库级两阶段锁、锁等待/超时、关闭回滚、SAVEPOINT/RELEASE/ROLLBACK TO 和溢写预算回滚均完成；MVCC/行级隔离为后续增强 | X21 |
+| EXT-SYS-003 | WAL、恢复、检查点、故障注入 | Page、事务 | 已实现（基础版）：整页重做日志、身份校验、重复恢复、显式/自动/后台 CHECKPOINT、持久化 checkpoint、累积 WAL/LSN、非零截止位置重做、五阶段故障注入和在线快照均完成；复杂并发恢复压力为后续增强 | X22 |
 | EXT-SYS-004 | 并发控制、锁、死锁、MVCC 替代方案 | Executor、事务 | 已实现：选择保守数据库级两阶段锁并固定为交付方案；SessionRegistry 多会话、事务锁等待/超时、关闭回滚和同记录 UPDATE 竞争 44 项检查通过，详见 concurrency-progress.md。非 MVCC，不并行读写，前端多会话面板未收口 | X23 |
 | EXT-SYS-005 | 用户、角色、对象权限、审计 | Catalog、会话 | 部分实现：访问目录已支持用户/角色/角色继承/对象授权、加盐密码、跨会话身份、元数据过滤、审计 object 字段与过滤；原子接口 27 项、HTTP/索引检查 40 项、C++ session/直连入口 22 项通过，工作台新增用户/角色/会话/审计面板，权限感知 CLI 只通过 HTTP bridge 执行。C++ 已读取 `access.catalog.pages` 并同步到 `PersistentCatalog` 保留系统堆表，按权限版本热重载且已验证旁路页文件缺失时重启恢复；当前支持语法以及解析失败的 CTE/扩展 SQL 已通过真实 Catalog 规范化基础表对象，未限定相关作用域和更广 SQL 的完整语义绑定仍未闭合 | X24 |
-| EXT-SYS-006 | 外部排序、大结果集、取消和资源预算 | Sort、Buffer | 部分实现：外部排序/聚合、只读 NDJSON、TCP drain 背压、取消、结果预算、`RowStream`、Limit 提前停止和 resourceUsage 已接通；新增 C++ `executeStreaming` 与会话多帧 `meta/row/complete`，x25 流式 HTTP 18 项、session stream 9 项、资源契约 15 项通过。真实排序/聚合逐行生产和完整 X25 压力验收待完成，详见 `docs/streaming-progress.md` | X25 |
-| EXT-SYS-007 | 备份恢复、格式版本和迁移 | 持久化、WAL | 部分实现：v2 全量备份、v1 迁移、v3 离线增量链和链路深度已接通；v4 在线一致性快照支持活动事务隔离、WAL/`.ckpt` sidecar、非零 WAL 截止位置恢复、恢复回滚目录、失败自动还原、逐页 materialize 和页校验；备份 56 项、在线快照 22 项检查通过；在线恢复一致性和更强并发压力仍需完整 X26 验收 | X26 |
+| EXT-SYS-006 | 外部排序、大结果集、取消和资源预算 | Sort、Buffer | 已实现（基础版）：外部排序/聚合、只读 NDJSON、TCP drain 背压、取消、结果预算、`RowStream`、Limit 提前停止、resourceUsage、C++ `executeStreaming` 和会话多帧 `meta/row/complete` 均完成；排序/聚合完全逐行生产为后续增强 | X25 |
+| EXT-SYS-007 | 备份恢复、格式版本和迁移 | 持久化、WAL | 已实现（基础版）：v2 全量备份、v1 迁移、v3 增量链、v4 在线一致性快照、活动事务隔离、WAL/`.ckpt` sidecar、非零 WAL 截止位置恢复、回滚目录、失败自动还原、逐页 materialize 和页校验均完成；超高并发压力为后续增强 | X26 |
 
 ## 七、测试扩展
 
