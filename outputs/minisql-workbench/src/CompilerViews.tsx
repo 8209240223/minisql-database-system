@@ -1,5 +1,14 @@
 import { useState } from 'react';
-import type { QueryResult } from './types';
+import type { PlanRow, QueryResult } from './types';
+
+function estimatedMetaAvailable(_result: QueryResult | null, rows: PlanRow[]): boolean {
+  return rows.some(row => row.estimatedRows !== undefined || row.estimatedCost !== undefined);
+}
+function fmtEstimate(value: number): string {
+  if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(1)}M`;
+  if (value >= 1_000) return `${(value / 1_000).toFixed(1)}k`;
+  return `${Math.round(value)}`;
+}
 
 export function Plan({ result }: { result: QueryResult | null }) {
   const [optimized, setOptimized] = useState(false);
@@ -36,6 +45,7 @@ export function Plan({ result }: { result: QueryResult | null }) {
     </div>}
     {visibleRows?.length ? visibleRows.map(row => <div className="plan-row" style={{ paddingLeft: 14 + Math.min(32, Math.max(0, row.depth ?? 0)) * 20 }} key={row.id}>
       <span className="plan-node">{row.kind ?? 'STEP'}</span><strong>{row.detail}</strong>
+      {row.estimatedRows !== undefined && estimatedMetaAvailable(result, visibleRows) && <span className="plan-estimate" title={`估计行数 ${row.estimatedRows} · 估计代价 ${row.estimatedCost} · 估计来源 ${row.statsSource ?? 'stats-v1'}`}>估 {fmtEstimate(row.estimatedRows)} 行 · 代价 {row.estimatedCost?.toFixed(1)}</span>}
     </div>) : <p className="result-warning">暂无计划</p>}
     {optimized && result?.optimizationRules && <details><summary>优化记录（{result.optimizationRules.length}）</summary><pre className="json-view">{JSON.stringify(result.optimizationRules, null, 2)}</pre></details>}
   </div>;

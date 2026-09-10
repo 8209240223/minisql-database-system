@@ -466,14 +466,66 @@ nlohmann::json Database::compile(const std::string& source) const {
         return columnSelectivity(*byTable, predicate, table);
     };
     const auto optimized = optimizer::optimize(plans, optimizerOptions);
-    return {{"success", true}, {"plan", sql::serializePlans(plans)}, {"optimizedPlan", sql::serializePlans(optimized.plans)},
+    // X18 4.3: 顶层 plan/optimizedPlan 每个节点附上 estimatedRows/estimatedCost/statsSource，
+    // 与 EXPLAIN 展示路径同源的统计口径（estimatedTableRows + columnSelectivity）。
+    const auto annotatedRaw = annotatePlanEstimates(sql::serializePlans(plans), plans);
+    const auto annotatedOpt = annotatePlanEstimates(sql::serializePlans(optimized.plans), optimized.plans);
+    return {{"success", true}, {"plan", annotatedRaw}, {"optimizedPlan", annotatedOpt},
             {"optimizationRules", optimized.changes}, {"statements", ast.size()},
             {"optimizer", {{"iterations", optimized.iterations}, {"converged", optimized.converged},
                            {"diagnostics", optimized.diagnostics}, {"rules", optimizer::ruleDescriptors()}}},
             {"tokens", sql::serializeTokens(tokens)}, {"ast", sql::serializeAst(ast)},
             {"schemaVersion", 1}, {"planKind", "logical"},
+            {"estimateModel", "stats-v1"}, {"estimatedRowsAvailable", true},
             {"stages", {{"lexer", "passed"}, {"parser", "passed"}, {"semantic", "passed"},
                         {"planner", "passed"}, {"optimizer", "passed"}, {"executor", "notRun"}}}};
+}
+// X18 4.3: 为序列化计划节点附加成本/估计元数据。节点 DFS 顺序与 serializePlans 的 id 一致
+// （id 即 nodes 下标）。行数用 optimizedTableRows（与优化器同源），过滤选择率用惰性
+// columnSelectivity（仅当存在 Filter 时扫一次列统计）。
+nlohmann::json Database::annotatePlanEstimates(const nlohmann::json& serialized, const std::vector<sql::LogicalPlan>& plans) const {
+    std::vector<const sql::LogicalPlan*> nodes;
+    std::function<void(const sql::LogicalPlan&)> visit = [&](const sql::LogicalPlan& plan) {
+        nodes.push_back(&plan);
+        for (const auto& child : plan.children) visit(child);
+    };
+    for (const auto& plan : plans) visit(plan);
+    std::optional<std::map<std::string, json>> byTable;
+    const auto selectivity = [&](const json& predicate, const std::string& table) -> double {
+        if (!byTable) byTable = tableStats();
+        return columnSelectivity(*byTable, predicate, table);
+    };
+    const auto tableRows = [&](const std::string& name) -> double { return estimatedTableRows(name).value_or(0.0); };
+    std::function<std::pair<double, double>(const sql::LogicalPlan&)> estimate;
+    estimate = [&](const sql::LogicalPlan& plan) -> std::pair<double, double> {
+        if (plan.kind == "SeqScan") { const auto rows = tableRows(plan.table); return {rows, rows + rows * 0.1}; }
+        if (plan.children.empty()) return {0.0, 1.0};
+        auto child = estimate(plan.children.front());
+        if (plan.kind == "Filter") { const auto rows = child.first * selectivity(plan.predicate, plan.table); return {rows, child.second + rows}; }
+        if (plan.kind == "Sort") { const auto rows = child.first; return {rows, child.second + rows * std::log2(std::max(1.0, rows))}; }
+        if (plan.kind == "Limit") return {plan.limit ? std::min(child.first, static_cast<double>(*plan.limit)) : child.first, child.second};
+        if (plan.kind == "Distinct") return {child.first * 0.5, child.second + child.first * 0.5};
+        if (plan.kind == "Aggregate") return {plan.groupKeys.empty() ? 1.0 : std::min(child.first * 0.1, 1000.0), child.second + child.first};
+        if (plan.kind == "NestedLoopJoin" || plan.kind == "LeftJoin" || plan.kind == "RightJoin" || plan.kind == "FullJoin" || plan.kind == "HashJoin") {
+            if (plan.children.size() != 2) return {0.0, child.second};
+            const auto right = estimate(plan.children[1]);
+            const auto joined = child.first * right.first;
+            const auto cost = child.second + right.second + (plan.kind == "HashJoin" ? child.first + right.first : joined * 0.1);
+            return {joined * (plan.kind == "HashJoin" ? 1.0 : 0.1), cost};
+        }
+        return {child.first, child.second + child.first};
+    };
+    json output = serialized;
+    for (auto& node : output) {
+        if (!node.is_object() || !node.contains("id") || !node.at("id").is_number_unsigned()) continue;
+        const auto index = node.at("id").get<std::size_t>();
+        if (index >= nodes.size()) continue;
+        const auto estimated = estimate(*nodes[index]);
+        node["estimatedRows"] = estimated.first;
+        node["estimatedCost"] = estimated.second;
+        node["statsSource"] = "stats-v1";
+    }
+    return output;
 }
 nlohmann::json Database::catalog() {
     requireAvailable();

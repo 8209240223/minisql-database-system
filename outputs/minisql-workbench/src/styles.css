@@ -22,6 +22,7 @@ button:disabled{opacity:.45;cursor:not-allowed}
 .status-warn{background:#d18a32}.health-label{font-size:10px;color:#37856f;white-space:nowrap}.status-warn+.health-label{color:#b46d27}
 .plan-toolbar{min-height:38px;display:flex;align-items:center;gap:10px;padding:6px 14px;border-bottom:1px solid #edf0f2;background:#fbfcfd}.plan-toolbar input{min-width:220px;height:27px;padding:0 8px;border:1px solid #dfe4e7;border-radius:4px;background:#fff;color:#36434a;font-size:11px;outline:none}.plan-toolbar input:focus{border-color:#1d756a;box-shadow:0 0 0 2px #e4f1ef}.plan-toolbar .query-meta{margin-left:auto}.plan-toolbar .toolbar-btn{height:27px;padding:4px 9px;border:1px solid #dfe4e7;border-radius:4px;background:#fff}
 .dark-mode .plan-toolbar{border-color:#39454b;background:#283136}.dark-mode .plan-toolbar input{border-color:#4a575e;background:#303a40;color:#e8edf0}.dark-mode .plan-toolbar .toolbar-btn{border-color:#4a575e;background:#303a40;color:#d7e0e3}
+.plan-estimate{margin-left:auto;font-size:10px;color:#37856f;background:#e7f2ef;border:1px solid #c8e2dc;border-radius:10px;padding:1px 8px;white-space:nowrap}.dark-mode .plan-estimate{color:#9fd4c8;background:#22343a;border-color:#39665f}
 
 /* 展开列时改为文档流布局，避免绝对定位覆盖后续表节点。 */
 .table-node{flex-wrap:wrap;align-items:center}

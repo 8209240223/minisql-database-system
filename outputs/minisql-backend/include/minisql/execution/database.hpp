@@ -60,6 +60,10 @@ private:
     // X18 4.2-iv: const 的按表列统计扫描（含直方图）。statistics() 复用其输出；
     // compile()/execute() 的优化器列级选择率惰性注入取用该项目。
     std::map<std::string, nlohmann::json> tableStats() const;
+    // X18 4.3: 把成本/估计元数据（estimatedRows/estimatedCost/statsSource）落到
+    // compile() 顶层 plan / optimizedPlan 的每个节点上，并入 HTTP 契约供工作台展示。
+    // 沿用优化器同源的 estimatedTableRows + columnSelectivity；惰性扫描列统计仅在有 Filter 时触发。
+    nlohmann::json annotatePlanEstimates(const nlohmann::json& serialized, const std::vector<sql::LogicalPlan>& plans) const;
     void evaluateAutoCheckpoint(std::size_t committedWriteStatements, std::size_t committedDirtyPages);
     std::vector<nlohmann::json>* nodeStats_ = nullptr;
     std::size_t sortMemoryRows_ = 10000;

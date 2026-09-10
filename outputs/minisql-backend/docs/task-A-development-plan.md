@@ -324,4 +324,14 @@ node tests\subquery-smoke.mjs tests\statistics-smoke.mjs tests\explain-smoke.mjs
 - [x] **4.2iv-c** `database.cpp`：把原有 SELECT 过滤选择率逻辑抽为共享自由函数 `columnSelectivity(byTable, predicate, table)`（匿名命名空间）；EXPLAIN 原内联选择性闭包改用之（estimate() 与优化器 `Options.selectivity` 同源去重）。新增 const 私有 `tableStats()`（单遍扫描各表列统计含直方图）；`statistics()` 复用其输出（表序/字段不变）。compile/execute 经惰性 λ 注入 `selectivity`（遇 Filter 才扫一次列统计）。
 - [x] **4.2iv-d** 新增端到端 `tests/statistics-optimizer-selectivity-smoke.mjs`：14 项覆盖——`x.a<1`（直方图选择率 0.1，左 1 行）旁路过滤器→保留 NestedLoopJoin（无直方图则 0.25→HashJoin）；`x.a<11`（选择率 1.0）→HashJoin；连乘 `x.a<1 AND x.a>=0`→NestedLoopJoin；确定性；旁路下推 Filter 节点 `estimatedRows≈1`、`statsSource`；结果行数正确。
 - [x] **4.2iv-e** 回归全绿：ctest 59、optimizer_contract 518、planner_contract 契约、database_contract 81 通过；node statistics-optimizer-selectivity 14 / statistics-costjoin 10 / statistics-cost 12 / explain 21 / statistics 11 / statistics-histogram 20 / subquery 24 / derived 12 / correlated-exec 8 / parser 18 / planner 26 / diagnostics 22 通过。
-- [ ] 后续/退出：把成本/估计并入 HTTP 契约与工作台展示；IndexScan 估计字段依赖与 B(X20) 第二段协商。
+- [x] **4.2iv-f** 后续跟进（本节相关）：把成本/估计并入 HTTP 契约（见 6.15）。
+
+### 6.15 X18 4.3——成本/估计并入 HTTP 契约与工作台展示（builder-A 第十五次提交）
+> 让统计驱动的成本/估值走出「仅 EXPLAIN 展示」，落入普通查询的 HTTP 契约：`compile()` 顶层 `plan` / `optimizedPlan` 每个节点带 `estimatedRows` / `estimatedCost` / `statsSource`，顶层加 `estimateModel` / `estimatedRowsAvailable`；工作台计划视图渲染时以徽标展示估值。分支 `builder-A`。
+
+- [x] **4.3-a** `database.hpp` 声明私有 `annotatePlanEstimates(serialized, plans)`；`database.cpp` 实现——DFS 收集节点（顺序与 `serializePlans` 的 id 一致，id 即 nodes 下标），行数用 `estimatedTableRows`（与优化器同源），过滤选择率用惰性 `columnSelectivity`（仅遇 Filter 扫一次 `tableStats()`），按计划树递归估算 `estimatedRows` / `estimatedCost`（SeqScan、Filter、Sort、Limit、Distinct、Aggregate、NestedLoop/Left/Right/Full/HashJoin），并打 `statsSource="stats-v1"`。
+- [x] **4.3-b** `compile()` 返回体改为 `annotatePlanEstimates(serializePlans(...))` 分别作用于 `plan` 与 `optimizedPlan`，顶层新增 `estimateModel="stats-v1"`、`estimatedRowsAvailable=true`；保留全部既有字段（kind/detail/id……）不被覆盖。EXPLAIN 结果（execute 路径）继续携带同源字段，口径一致。
+- [x] **4.3-c** 工作台：`types.ts` `PlanRow` 增加可选 `estimatedRows` / `estimatedCost` / `statsSource`；`CompilerViews.tsx` 计划行在存在估计时渲染右对齐徽标 `估 <rows> 行 · 代价 <cost>`（title 展开三字段），辅助 `estimatedMetaAvailable` / `fmtEstimate`（k/M 缩写）；`styles.css` 新增 `.plan-estimate`（含 dark-mode）。
+- [x] **4.3-d** 新增端到端 `tests/statistics-compile-estimate-smoke.mjs`：15 项覆盖——顶层 plan/optimizedPlan 每节点带三字段、`estimateModel`/`estimatedRowsAvailable`、SeqScan 估行=全表、Filter 直方图选择率生效、id 渐增 DFS 序不破坏、既有字段保留、跨次确定性、EXPLAIN 结果节点仍带字段。并加入 `run-minisql-tests.ps1` compiler 组。
+- [x] **4.3-e** 回归全绿：planner_contract / optimizer_contract 518 / database_contract 81 / compile 契约通过；node compiler 组（新增 15 项统计契约）与 http 组（database/session/multi-session/access-control/observability/cancel/result-budget/x25-stream）通过；前端 `tsc -b && vite build` 通过。
+- [ ] 后续/退出：接入真实统计后依列级选择率优化的成本已进入 HTTP，仍缺 IndexScan 估计字段（依赖与 B(X20) 第二段协商）以及成本驱动的候选比较固定决胜（当前 join 用布尔 `hash-join` 规则）。
