@@ -228,6 +228,18 @@ function writeDatabaseAtomically(buffer, walBuffer, ckptBuffer) {
     renameSync(ckptTemporary, database + '.ckpt');
   } else if (existsSync(database + '.ckpt')) unlinkSync(database + '.ckpt');
 }
+
+function createRestoreRollback() {
+  const rollbackDirectory = resolve(backupDirectory, 'rollback');
+  mkdirSync(rollbackDirectory, { recursive: true });
+  const rollbackPath = resolve(rollbackDirectory, `restore-${Date.now()}`);
+  mkdirSync(rollbackPath, { recursive: true });
+  copyFileSync(database, resolve(rollbackPath, 'db.pages'));
+  for (const suffix of ['.wal', '.ckpt']) {
+    if (existsSync(database + suffix)) copyFileSync(database + suffix, resolve(rollbackPath, 'db.pages' + suffix));
+  }
+  return rollbackPath;
+}
 const auditPath = process.env.MINISQL_AUDIT_LOG ?? resolve(dirname(database), 'audit.log');
 const auditLimitBytes = 16 * 1024 * 1024;
 function appendAudit(entry) {
@@ -777,6 +789,7 @@ const server = http.createServer(async (req, res) => {
           manifestVersion: metadata.version,
           pageFormatVersion: metadata.pageFormatVersion,
           walBytes: metadata.walBytes,
+          pageChecksum: metadata.pageChecksum,
           migrationState: metadata.version === 1 ? 'pending' : metadata.version >= 2 && metadata.version <= 4 ? 'ready' : 'unknown',
         };
       });
@@ -844,6 +857,7 @@ const server = http.createServer(async (req, res) => {
             walBytes: Number(result.walBytes ?? 0), walCutoffBytes: Number(result.walCutoffBytes ?? 0),
             committedSequence: Number(result.committedSequence ?? 0), catalogVersion: Number(result.catalogVersion ?? 0),
             indexVersion: Number(result.indexVersion ?? 0),
+            pageChecksum: sha256(file),
           };
           writeFileSync(file + '.json', JSON.stringify(metadata), 'utf8');
           send(200, { success: true, backup: name, kind: 'snapshot', bytes: metadata.bytes,
@@ -888,17 +902,20 @@ const server = http.createServer(async (req, res) => {
           await enqueue(async () => {
             await callDatabase('execute', 'CHECKPOINT;');
             copyFileSync(database, file);
-            writeFileSync(file + '.json', JSON.stringify({ version: 2, name, createdAt: new Date().toISOString(), bytes: statSync(file).size, sha256: sha256(file), pageFormatVersion: pageFormatVersion(file), walBytes: 0 }), 'utf8');
+          writeFileSync(file + '.json', JSON.stringify({ version: 2, name, createdAt: new Date().toISOString(), bytes: statSync(file).size, sha256: sha256(file), pageFormatVersion: pageFormatVersion(file), walBytes: 0, pageChecksum: sha256(file) }), 'utf8');
           });
           send(200, { success: true, backup: name, bytes: statSync(file).size, sha256: sha256(file) });
         }
       } else {
+        let rollbackUsed;
         await enqueue(async () => {
           const reconstructed = await reconstructBackup(body.name);
+          const rollbackPath = createRestoreRollback();
           writeDatabaseAtomically(reconstructed.buffer, reconstructed.walBuffer, reconstructed.ckptBuffer);
           await callDatabase('catalog');
+          rollbackUsed = existsSync(rollbackPath) ? rollbackPath : undefined;
         });
-        send(200, { success: true, restored: body.name, bytes: statSync(database).size });
+        send(200, { success: true, restored: body.name, bytes: statSync(database).size, rollback: rollbackUsed });
       }
     } catch (error) { send(error.status ?? 503, { success: false, error: { message: error.message } }); }
     return;
