@@ -1,6 +1,6 @@
 import http from 'node:http';
 import { spawn } from 'node:child_process';
-import { appendFileSync, closeSync, copyFileSync, existsSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { appendFileSync, closeSync, copyFileSync, existsSync, ftruncateSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync, writeSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createHash, randomUUID } from 'node:crypto';
@@ -213,6 +213,46 @@ async function reconstructBackup(name, depth = 0) {
   if (header.basePages !== base.pages) throw httpError(422, 'Incremental base page count mismatch');
   return { buffer, pages: header.finalPages, manifest: metadata,
     walBuffer: base.walBuffer ?? Buffer.alloc(0), ckptBuffer: base.ckptBuffer ?? Buffer.alloc(0) };
+}
+
+async function materializeBackup(name, target, depth = 0) {
+  const artifact = backupArtifactFile(name);
+  if (!artifact) throw httpError(404, 'Backup not found');
+  if (artifact.kind === 'full') {
+    const metadata = normalizeFullManifest(JSON.parse(readFileSync(artifact.manifest, 'utf8')), artifact.file, artifact.manifest);
+    copyFileSync(artifact.file, target);
+    for (const suffix of ['.wal', '.ckpt']) {
+      const source = artifact.file + suffix;
+      const destination = target + suffix;
+      if (metadata.version === 4 && existsSync(source)) copyFileSync(source, destination);
+      else if (existsSync(destination)) unlinkSync(destination);
+    }
+    return { pages: Math.floor(statSync(target).size / backupPageSize), manifest: metadata };
+  }
+  if (depth > 8) throw httpError(422, 'Backup chain too deep');
+  const delta = readFileSync(artifact.file);
+  const metadata = JSON.parse(readFileSync(artifact.manifest, 'utf8'));
+  if (metadata.sha256 !== sha256(artifact.file) || metadata.version !== 3 || metadata.kind !== 'incremental')
+    throw httpError(422, 'Incremental backup checksum or version mismatch');
+  const header = parseDeltaHeader(delta);
+  if (metadata.pageFormatVersion === undefined || metadata.base === undefined) throw httpError(422, 'Incremental manifest incomplete');
+  const base = await materializeBackup(metadata.base, target, depth + 1);
+  if (header.basePages !== base.pages) throw httpError(422, 'Incremental base page count mismatch');
+  const descriptor = openSync(target, 'r+');
+  try {
+    let offset = 64;
+    for (let index = 0; index < header.records; ++index) {
+      if (offset + 8 > delta.length) throw httpError(422, 'Incremental backup truncated');
+      const id = Number(delta.readBigUInt64LE(offset));
+      offset += 8;
+      if (id >= header.finalPages || offset + backupPageSize > delta.length) throw httpError(422, 'Incremental backup page out of range');
+      writeSync(descriptor, delta, offset, backupPageSize, id * backupPageSize);
+      offset += backupPageSize;
+    }
+    if (offset !== delta.length) throw httpError(422, 'Incremental backup trailing data');
+    ftruncateSync(descriptor, header.finalPages * backupPageSize);
+  } finally { closeSync(descriptor); }
+  return { pages: header.finalPages, manifest: metadata };
 }
 
 function backupChainDepth(name, seen = new Set()) {
@@ -954,10 +994,17 @@ const server = http.createServer(async (req, res) => {
         let rollbackUsed;
         await enqueue(async () => {
           try {
-            const reconstructed = await reconstructBackup(body.name);
+            const temporaryPages = database + '.restore.tmp';
+            if (existsSync(temporaryPages)) unlinkSync(temporaryPages);
+            await materializeBackup(body.name, temporaryPages);
             const rollbackPath = createRestoreRollback();
             rollbackUsed = rollbackPath;
-            writeDatabaseAtomically(reconstructed.buffer, reconstructed.walBuffer, reconstructed.ckptBuffer);
+            renameSync(temporaryPages, database);
+            for (const suffix of ['.wal', '.ckpt']) {
+              const source = temporaryPages + suffix;
+              if (existsSync(source)) renameSync(source, database + suffix);
+              else if (existsSync(database + suffix)) unlinkSync(database + suffix);
+            }
             await callDatabase('catalog');
           } catch (error) {
             if (rollbackUsed && restoreRollbackDirectory(rollbackUsed)) {

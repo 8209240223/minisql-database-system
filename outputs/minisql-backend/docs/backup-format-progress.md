@@ -45,6 +45,7 @@
 - 恢复前会创建 `backups/rollback/restore-<timestamp>` 目录，并把当前页文件、WAL、`.ckpt` 一起复制进去。
 - 恢复成功后保留该目录；若后续发现恢复结果异常，可以使用它做人工回放。
 - 恢复过程中替换或重新打开失败时，会自动从回滚目录还原原库并返回 422，不再留下半替换状态。
+- 恢复路径新增 `materializeBackup`：全量备份直接复制到临时页文件，增量链按 delta 记录逐页随机写入并截断到最终页数，不再先构造完整内存页缓冲；磁盘落位完成后再原子 rename 到数据库路径。
 - 备份列表额外暴露 `snapshotLsn`、`chainDepth` 和 `pageChecksum`。
 - `chainDepth` 按 manifest 的 `base` 链递归计算，全量=1，一级增量=2，二级增量=3；增量 manifest 写入时也会固化该值。
 
