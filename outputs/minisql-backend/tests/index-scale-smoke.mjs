@@ -79,8 +79,10 @@ try {
   assert.ok(table); ++checks;
   assert.equal(table.rowCount, scale); ++checks;
   assert.ok(table.indexes.length >= 1); ++checks;
+  assert.ok(table.indexes[0].height >= 2); ++checks;
+  assert.ok(table.indexes[0].pageCount >= 1); ++checks;
   await request('/sessions/' + sessionId + '/close');
-  console.log(`${checks} index scale checks passed at ${scale} rows`);
+  console.log(`${checks} index scale checks passed at ${scale} rows (height=${table.indexes[0].height}, pages=${table.indexes[0].pageCount})`);
 } finally {
   server.kill();
   await exited;
