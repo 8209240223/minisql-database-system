@@ -81,5 +81,12 @@ int main() {
     require(lr.states.size() >= 2);
     const auto accept = std::find_if(lr.actions.begin(), lr.actions.end(), [](const auto& entry) { return entry.second == "accept"; });
     require(accept != lr.actions.end());
+    const auto lalr = minisql::sql::buildLalr({
+        {"S", {"A"}},
+        {"A", {"a"}},
+    });
+    require(!lalr.states.empty());
+    const auto lalrAccept = std::find_if(lalr.actions.begin(), lalr.actions.end(), [](const auto& entry) { return entry.second == "accept"; });
+    require(lalrAccept != lalr.actions.end());
     std::cout << "Catalog snapshot, plan JSON and AST JSON contract checks passed\n";
 }

@@ -18,7 +18,7 @@
 | X10 | EXT-SQL-010 投影与别名 | 部分实现 | 表达式、输出别名、表别名、限定列、混合限定星号和歧义检查 | 嵌套作用域与稳定计算列身份 |
 | X11 | EXT-SQL-011 约束与多行 VALUES | 部分实现 | NOT NULL、DEFAULT、主键、复合键、UNIQUE、CHECK、外键、多行 VALUES 原子性 | 完整验收与稳定性风险跟踪 |
 | X12 | EXT-CMP-001 诊断与纠错 | 已实现（基础版） | 单语句多诊断、恢复模式 tokenizer、clause-level recovery、错误位置、工作台多诊断列表与点击定位、未知表/列编辑距离建议、写操作不执行；diagnostics-smoke 24 项通过 | 更高级的智能纠错策略为后续增强 |
-| X13 | EXT-CMP-002 可扩展 AST/LR | 已实现（基础版） | AST/Plan/Catalog schema versioning、未知主版本拒绝、迁移入口、中断恢复、稳定列 identity（`表名.列名`）、canonical LR(0) 表生成器；parser-regression 18 项、迁移契约 20 项、planner contract 通过 | 更完整的 LR/LALR 生成器为后续增强 |
+| X13 | EXT-CMP-002 可扩展 AST/LR | 已实现（基础版） | AST/Plan/Catalog schema versioning、未知主版本拒绝、迁移入口、中断恢复、稳定列 identity（`表名.列名`）、canonical LR(0)、LR(1) 和 LALR 表生成器；parser-regression 18 项、迁移契约 20 项、planner contract 通过 | 冲突诊断和文法优化为后续增强 |
 | X14 | EXT-CMP-003 AST/Plan JSON | 部分实现 | 数组/版本包装、反序列化、往返、损坏结构拒绝、schema versioning、工作台展示 | 完整 Schema 迁移与稳定列身份 |
 | X15 | EXT-OPT-001 规则框架 | 部分实现 | 4 条规则、固定点、禁用规则、预算、收敛诊断、三值折叠 | 通用注册和其余规则 |
 | X16 | EXT-OPT-002 列裁剪与冗余节点 | 部分实现 | 恒真/恒假/NULL Filter、简单列裁剪、Schema/执行等价检查 | 连接、聚合和复杂表达式列裁剪 |
