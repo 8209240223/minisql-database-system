@@ -241,6 +241,18 @@ function createRestoreRollback() {
   }
   return rollbackPath;
 }
+
+function restoreRollbackDirectory(rollbackPath) {
+  const pages = resolve(rollbackPath, 'db.pages');
+  if (!existsSync(pages)) return false;
+  copyFileSync(pages, database);
+  for (const suffix of ['.wal', '.ckpt']) {
+    const source = resolve(rollbackPath, 'db.pages' + suffix);
+    if (existsSync(source)) copyFileSync(source, database + suffix);
+    else if (existsSync(database + suffix)) unlinkSync(database + suffix);
+  }
+  return true;
+}
 const auditPath = process.env.MINISQL_AUDIT_LOG ?? resolve(dirname(database), 'audit.log');
 const auditLimitBytes = 16 * 1024 * 1024;
 function appendAudit(entry) {
@@ -926,11 +938,19 @@ const server = http.createServer(async (req, res) => {
       } else {
         let rollbackUsed;
         await enqueue(async () => {
-          const reconstructed = await reconstructBackup(body.name);
-          const rollbackPath = createRestoreRollback();
-          writeDatabaseAtomically(reconstructed.buffer, reconstructed.walBuffer, reconstructed.ckptBuffer);
-          await callDatabase('catalog');
-          rollbackUsed = existsSync(rollbackPath) ? rollbackPath : undefined;
+          try {
+            const reconstructed = await reconstructBackup(body.name);
+            const rollbackPath = createRestoreRollback();
+            rollbackUsed = rollbackPath;
+            writeDatabaseAtomically(reconstructed.buffer, reconstructed.walBuffer, reconstructed.ckptBuffer);
+            await callDatabase('catalog');
+          } catch (error) {
+            if (rollbackUsed && restoreRollbackDirectory(rollbackUsed)) {
+              await callDatabase('catalog');
+              throw Object.assign(new Error(`Restore failed and original database was restored: ${error.message}`), { status: 422 });
+            }
+            throw error;
+          }
         });
         send(200, { success: true, restored: body.name, bytes: statSync(database).size, rollback: rollbackUsed });
       }
