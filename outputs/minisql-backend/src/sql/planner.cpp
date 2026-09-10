@@ -56,6 +56,14 @@ nlohmann::json correlatedScope(const catalog::Table& table) {
     }
     return scope;
 }
+bool containsSubquery(const Expr& expression) {
+    if (expression.kind == "Exists" || expression.kind == "InSubquery" || expression.kind == "ScalarSubquery") return true;
+    return (expression.left && containsSubquery(*expression.left)) || (expression.right && containsSubquery(*expression.right));
+}
+bool containsNegatedSubquery(const Expr& expression) {
+    if (expression.kind == "Unary" && canonical(expression.value) == "not" && expression.left && containsSubquery(*expression.left)) return true;
+    return (expression.left && containsNegatedSubquery(*expression.left)) || (expression.right && containsNegatedSubquery(*expression.right));
+}
 nlohmann::json bindExpression(const Expr& expression, const catalog::Table& table, std::size_t depth = 0) {
     if (depth > 256) invalid("expression depth exceeded");
     nlohmann::json result = {{"kind", expression.kind}, {"line", expression.location.line},
@@ -382,6 +390,8 @@ LogicalPlan build(const Statement& statement, const catalog::Catalog& catalog) {
         if (statement.where) {
             LogicalPlan filter;
             filter.kind = "Filter";
+            filter.subqueryJoinKind = containsNegatedSubquery(*statement.where) ? "AntiJoin" :
+                containsSubquery(*statement.where) ? "SemiJoin" : "";
             filter.table = plan.table;
             filter.output = input.output;
             filter.preservesRowId = input.preservesRowId;
@@ -528,7 +538,7 @@ nlohmann::json serializePlans(const std::vector<LogicalPlan>& plans) {
         }
         rows.push_back({{"id", id}, {"parent", parent}, {"depth", depth}, {"statementIndex", statementIndex},
                         {"kind", plan.kind}, {"detail", plan.kind + " " + plan.table}, {"table", plan.table},
-                        {"indexName", plan.indexName}, {"savepointName", plan.savepointName}, {"uniqueIndex", plan.uniqueIndex}, {"indexColumns", plan.indexColumns}, {"indexValues", plan.indexValues}, {"indexRangeOperator", plan.indexRangeOperator}, {"indexRangeValue", plan.indexRangeValue},
+                        {"indexName", plan.indexName}, {"savepointName", plan.savepointName}, {"subqueryJoinKind", plan.subqueryJoinKind}, {"uniqueIndex", plan.uniqueIndex}, {"indexColumns", plan.indexColumns}, {"indexValues", plan.indexValues}, {"indexRangeOperator", plan.indexRangeOperator}, {"indexRangeValue", plan.indexRangeValue},
                         {"output", output}, {"preservesRowId", plan.preservesRowId},
                         {"predicate", plan.predicate}, {"values", plan.values}, {"insertExpressions", plan.insertExpressions}, {"insertRows", plan.insertRows},
                         {"columnMapping", plan.columnMapping}, {"projections", plan.projections}, {"children", nlohmann::json::array()}});
@@ -596,6 +606,7 @@ std::vector<LogicalPlan> deserializePlans(const nlohmann::json& document) {
         item.plan.preservesRowId = row.at("preservesRowId").get<bool>();
     item.plan.indexName = row.value("indexName", std::string{});
     item.plan.savepointName = row.value("savepointName", std::string{});
+    item.plan.subqueryJoinKind = row.value("subqueryJoinKind", std::string{});
         item.plan.uniqueIndex = row.value("uniqueIndex", false);
         item.plan.indexColumns = row.value("indexColumns", std::vector<std::string>{});
         item.plan.indexValues = row.value("indexValues", nlohmann::json::array());

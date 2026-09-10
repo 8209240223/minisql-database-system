@@ -17,6 +17,8 @@ equal(run('CREATE TABLE t(id INT); CREATE TABLE s(id INT); CREATE TABLE sn(id IN
 equal(query('SELECT id FROM t WHERE id IN (SELECT id FROM s) ORDER BY id;').rows, [[2],[3]]);
 equal(query('SELECT id FROM t WHERE id NOT IN (SELECT id FROM s) ORDER BY id;').rows, [[1]]);
 equal(query('SELECT id FROM t WHERE EXISTS (SELECT id FROM s WHERE s.id=2) ORDER BY id;').rows, [[1],[2],[3]]);
+assert.ok(query('EXPLAIN SELECT id FROM t WHERE EXISTS (SELECT id FROM s WHERE s.id=2);').plan.some(row => row.subqueryJoinKind === 'SemiJoin'));
+++checks;
 equal(query('SELECT id,id IN (SELECT id FROM s) AS flag FROM t ORDER BY id;').rows, [[1,false],[2,true],[3,true]]);
 equal(query('SELECT id FROM t WHERE id IN (SELECT id FROM sn) ORDER BY id;').rows, [[2]]);
 equal(query('SELECT id FROM t WHERE id NOT IN (SELECT id FROM sn) ORDER BY id;').rows, []);

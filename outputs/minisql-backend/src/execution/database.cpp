@@ -1353,7 +1353,7 @@ std::unique_ptr<RowStream> Database::scanRowStream(const sql::LogicalPlan& plan)
 std::unique_ptr<RowStream> Database::openRowStream(const sql::LogicalPlan& plan) {
     checkCancelled();
     if (plan.kind == "SeqScan") return scanRowStream(plan);
-    if (plan.kind == "Filter") {
+    if (plan.kind == "Filter" || plan.kind == "SemiJoin" || plan.kind == "AntiJoin") {
         if (plan.children.size() != 1) fail("Filter requires one child");
         auto child = openRowStream(plan.children.front());
         const auto predicate = plan.predicate;
@@ -1484,7 +1484,7 @@ nlohmann::json Database::runNode(const sql::LogicalPlan& plan) {
             {"groups", result.at("rows").size()}, {"external", false}};
         return result;
     }
-    if (plan.kind == "Filter") {
+    if (plan.kind == "Filter" || plan.kind == "SemiJoin" || plan.kind == "AntiJoin") {
         if (plan.children.size() != 1) fail("Filter requires one child");
         auto input = run(plan.children.front());
         for (const auto& column : plan.output) result["columns"].push_back(column.name);
