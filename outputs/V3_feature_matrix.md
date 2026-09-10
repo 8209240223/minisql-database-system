@@ -34,10 +34,49 @@
 | X26 | EXT-SYS-007 备份恢复与迁移 | 部分实现 | v2 全量备份、v1 迁移、v3 增量链、校验、原子恢复、42 项检查 | 在线一致性快照、非零 WAL 重做、迁移失败回滚目录 |
 | X27 | EXT-QA-001 Fuzz 与长期回归 | 部分实现 | SELECT 差分 500 项、DDL/DML 状态机、3 种固定种子 96 步回归、2 种固定种子 512 步长跑、固定持续时间/轮次可配置重复 soak、逐文件语料复现、失败 artifact 重放入口、失败分类、DATE/BOOL 回归、五阶段跨进程崩溃恢复组合、4 种子 × 512 步 × 4096 条压力数据的溢写/资源回归、CI 入口 | 多小时长期运行资源趋势仍需在长期环境执行 |
 
+## C4 证据索引
+
+下表把每个 X 编号连接到当前代码路径和可复跑命令。命令均从对应工作目录执行；`run-minisql-tests.ps1 -Suite all` 会顺序覆盖编译器、执行、存储、HTTP 和工作台基础回归。状态只反映当前证据，不代表仍列为“部分实现”的需求缺口已经消失。
+
+| 编号 | 主责 | 代码路径 | 主要可复跑命令 | 证据与边界 |
+| --- | --- | --- | --- | --- |
+| X01 | A | `src/common/arithmetic.hpp`、`src/sql/planner.cpp`、`src/execution/database.cpp` | `node tests/arithmetic64-differential.mjs`；`node tests/insert-expression-process.mjs`；`node tests/decimal-arithmetic-process.mjs` | WHERE/投影/DML 算术、溢出、除零和短路已覆盖；完整类型组合仍部分实现 |
+| X02 | A/B | `src/storage/heap.cpp`、`src/sql/planner.cpp`、`src/execution/database.cpp` | `node tests/null-process.mjs`；`node tests/outer-join-smoke.mjs`；`node tests/aggregate-process.mjs` | NULL 位图、三值逻辑、排序、DISTINCT、LEFT JOIN、聚合已覆盖；全组合边界仍部分实现 |
+| X03 | A/B | `src/common/cast.hpp`、`src/common/decimal.hpp`、`src/common/date.hpp`、`src/storage/heap.cpp` | `node tests/bigint-process.mjs`；`node tests/decimal-column-process.mjs`；`node tests/float-process.mjs`；`node tests/date-column-process.mjs`；`node tests/cast-process.mjs`；`node tests/varchar-column-process.mjs` | 主要类型、CAST、持久化和重启已覆盖；完整组合及优化器偶发夹具仍部分实现 |
+| X04 | B | `src/sql/planner.cpp`、`src/execution/database.cpp`、`src/storage/heap.cpp` | `node tests/update-process.mjs`；`node tests/transaction-process.mjs`；`node tests/index-smoke.mjs` | 多赋值、旧行求值、过滤、变长迁移、事务和约束已覆盖；完整索引维护组合仍部分实现 |
+| X05 | B | `src/execution/external_sort.cpp`、`src/execution/database.cpp` | `node tests/external-sort-smoke.mjs`；`node tests/planner-regression.mjs` | 多键排序、NULL、分页、外部 run/归并已覆盖；完整组合仍部分实现 |
+| X06 | B | `src/execution/database.cpp`、`src/execution/external_sort.cpp` | `node tests/aggregate-process.mjs`；`node tests/avg-process.mjs`；`node tests/external-aggregate-smoke.mjs` | 聚合、GROUP BY、HAVING、NULL 和外部分组已覆盖；FLOAT 全组合与执行器流式输入仍部分实现 |
+| X07 | B | `src/sql/planner.cpp`、`src/execution/database.cpp` | `node tests/aggregate-process.mjs`；`node tests/null-process.mjs`；`node tests/external-sort-smoke.mjs` | 投影去重、表达式、NULL、排序分页和重启路径已有证据；外存溢写组合仍部分实现 |
+| X08 | A/B | `src/sql/parser.cpp`、`src/sql/planner.cpp`、`src/execution/database.cpp` | `node tests/join-process.mjs`；`node tests/outer-join-smoke.mjs` | INNER/LEFT、多表、自连接、ON 绑定、HashJoin 和补 NULL 已覆盖；外存连接及完整改写仍部分实现 |
+| X09 | A | `src/sql/parser.cpp`、`src/sql/planner.cpp`、`src/execution/database.cpp` | `node tests/subquery-smoke.mjs`；`node tests/derived-smoke.mjs`；`node tests/correlated-exec-smoke.mjs` | IN/EXISTS/标量、派生表、限定相关作用域和按值复用已覆盖；未限定相关作用域与完整 Apply/SemiJoin 仍部分实现 |
+| X10 | A | `src/sql/parser.cpp`、`src/sql/planner.cpp`、`src/execution/database.cpp` | `node tests/alias-process.mjs`；`node tests/join-process.mjs`；`node tests/derived-smoke.mjs` | 表别名、限定列、星号和歧义检查已有证据；嵌套作用域与稳定计算列身份仍部分实现 |
+| X11 | A/B | `src/sql/planner.cpp`、`src/catalog/catalog.cpp`、`src/execution/database.cpp` | `node tests/named-constraint-process.mjs`；`node tests/multirow-process.mjs`；`node tests/foreign-key-process.mjs`；`node tests/composite-key-process.mjs` | NOT NULL、DEFAULT、主键、复合键、UNIQUE、CHECK、外键和多行 VALUES 已覆盖；完整组合仍部分实现 |
+| X12 | A | `src/sql/lexer.cpp`、`src/sql/parser.cpp`、`src/execution/database.cpp` | `node tests/diagnostics-smoke.mjs`；`node tests/parser-regression.mjs` | 批量诊断、恢复模式 tokenizer、错误范围和写操作不执行已覆盖；单语句多诊断与智能纠错仍部分实现 |
+| X13 | A | `src/sql/parser.cpp`、`src/sql/serialization.cpp`、`src/catalog/persistent_catalog.cpp` | `node tests/parser-regression.mjs`；`node tests/catalog_migration_contract.cpp`；`ctest -R minisql_catalog_migration_contract` | AST/Plan/Catalog schema versioning 与迁移入口已有证据；完整 AST 扩展机制仍部分实现 |
+| X14 | A | `src/sql/serialization.cpp`、`src/sql/planner.cpp`、`src/optimizer/optimizer.cpp` | `node tests/parser-regression.mjs`；`node tests/planner-regression.mjs`；`node tests/explain-smoke.mjs` | JSON 数组/版本包装、往返和损坏结构拒绝已有证据；完整迁移与稳定列身份仍部分实现 |
+| X15 | A | `src/optimizer/optimizer.cpp`、`include/minisql/optimizer/optimizer.hpp` | `ctest -R minisql_optimizer_contract`；`node tests/explain-smoke.mjs` | 规则固定点、禁用、预算、收敛诊断和三值折叠已有证据；通用注册与其余规则仍部分实现 |
+| X16 | A | `src/optimizer/optimizer.cpp`、`src/sql/planner.cpp` | `ctest -R minisql_optimizer_contract`；`node tests/explain-smoke.mjs` | 恒真/恒假/NULL Filter 和简单列裁剪已有证据；连接、聚合和复杂表达式裁剪仍部分实现 |
+| X17 | A | `src/optimizer/optimizer.cpp`、`src/sql/planner.cpp` | `ctest -R minisql_optimizer_contract`；`node tests/join-process.mjs` | INNER JOIN 单表谓词下推和直接等值 HashJoin 已覆盖；LEFT JOIN、跨表条件和完整改写仍部分实现 |
+| X18 | A | `src/execution/database.cpp`、`src/catalog/catalog.cpp` | `node tests/statistics-smoke.mjs`；`node tests/explain-smoke.mjs` | 表/列统计、distinct、NULL 比例和 stats-v1 成本估计已有证据；索引统计、直方图和可比较模型仍部分实现 |
+| X19 | A | `src/execution/database.cpp`、`src/optimizer/optimizer.cpp` | `node tests/explain-smoke.mjs`；`node tests/statistics-smoke.mjs` | 原始/优化计划、实际行数/耗时、逐节点统计和写语句拒绝已有证据；完整组合仍部分实现 |
+| X20 | B | `src/storage/page_bplus_tree.cpp`、`src/storage/bplus_tree.cpp`、`src/execution/database.cpp` | `node tests/index-smoke.mjs`；`ctest -R minisql_page_bplus_tree_contract`；`node tests/database-http.mjs` | 页级 B+ 树、分裂、借位/合并、重启、inspect 和 HTTP 入口已有证据；更高规模性能曲线仍部分实现 |
+| X21 | B | `src/execution/database.cpp`、`src/storage/page_file.cpp`、`src/server/database_main.cpp` | `node tests/transaction-process.mjs`；`node tests/session-http.mjs`；`node tests/multi-session-http.mjs` | DDL/DML 事务、提交/回滚、失败回滚、锁等待已有证据；行级隔离/MVCC 不在当前承诺范围 |
+| X22 | B | `src/storage/page_file.cpp`、`src/execution/database.cpp`、`src/server/database_main.cpp` | `node tests/journal-process.mjs`；`node tests/auto-checkpoint-smoke.mjs`；`node tests/x22-fault-injection.mjs` | WAL 重做、显式/自动/后台 checkpoint、LSN 和五阶段故障注入已有证据；在线备份和复杂并发恢复仍部分实现 |
+| X23 | B | `src/server/database_main.cpp`、`scripts/database-bridge.mjs` | `node tests/multi-session-http.mjs`；`node tests/session-process.mjs` | 多会话、数据库级两阶段锁、等待/超时和关闭回滚已覆盖；当前方案不提供 MVCC |
+| X24 | C | `src/security/access_catalog.cpp`、`src/execution/database.cpp`、`scripts/access-catalog.mjs`、`scripts/database-bridge.mjs`、`src/catalog/persistent_catalog.cpp`、`src/server/database_main.cpp` | `node tests/access-store-contract.mjs`；`node tests/access-catalog-atomic-contract.mjs`；`node tests/access-atomic-http.mjs`；`node tests/access-control-process.mjs`；`node tests/access-control-http.mjs`；`ctest -R minisql_access_catalog_system_contract`；`ctest -R minisql_access_binding_contract`；`node tests/cli-contract.mjs` | C1 权限、审计、页式目录、PersistentCatalog、身份热重载、Catalog/CTE 绑定和工作台入口已验证；未限定相关作用域与更广 SQL 完整语义绑定仍受 A/X09 边界影响 |
+| X25 | B/C | `src/execution/external_sort.cpp`、`src/execution/database.cpp`、`scripts/database-bridge.mjs`、`src/server/database_main.cpp` | `node tests/external-sort-smoke.mjs`；`node tests/external-aggregate-smoke.mjs`；`node tests/cancel-smoke.mjs`；`node tests/result-budget-smoke.mjs`；`node tests/x25-stream-http.mjs` | 外部 run、NDJSON、背压、取消、结果预算和工作台字段已有证据；执行器级迭代/提前停止仍部分实现 |
+| X26 | B | `scripts/database-bridge.mjs`、`src/storage/page_file.cpp`、`src/execution/database.cpp` | `node tests/backup-smoke.mjs`；`ctest -R minisql_catalog_migration_contract` | 全量备份、迁移、增量链、校验和原子恢复已有证据；在线一致性快照、非零 WAL 重做和失败目录回滚仍部分实现 |
+| X27 | C | `tests/fuzz-state-machine.mjs`、`tests/fuzz-state-machine-differential.mjs`、`tests/fuzz-state-machine-crash-recovery.mjs`、`tests/fuzz-state-machine-pressure.mjs`、`tests/fuzz-state-machine-soak.mjs`、`tests/fuzz/*` | `node tests/fuzz-differential.mjs`；`node tests/fuzz-state-machine-differential.mjs`；`node tests/fuzz-state-machine-long-run.mjs`；`node tests/fuzz-state-machine-crash-recovery.mjs`；`node tests/fuzz-state-machine-pressure.mjs`；`node tests/fuzz-state-machine-soak.mjs`；`node tests/fuzz-state-machine-replay-contract.mjs`；`node tests/fuzz/reproducibility-contract.mjs` | 固定种子、DDL/DML、崩溃恢复、压力资源、重放和 CI 入口已验证；无限输入和多小时资源曲线仍需长期环境证据 |
+
+### C4 当前判定
+
+C4 的交付物已经具备：X01-X27 均有负责人、代码路径、验证命令、证据范围和未闭合边界；全套分组回归 `powershell -ExecutionPolicy Bypass -File ./outputs/run-minisql-tests.ps1 -Suite all` 已通过。C4 不把“有证据”偷换成“需求已全部实现”，因此 X01-X22、X24-X27 中仍有明确边界的条目继续标记为“部分实现”。
+
 ## 本轮新增闭环
 
 - X24：`access-catalog.mjs` 的原子用户/角色/授权操作映射到 HTTP 资源端点；CLI 通过 HTTP bridge 携带身份；C++ session 和直连二进制入口从 `access.catalog.pages` 同步到 `PersistentCatalog` 保留系统堆表，对当前支持语句以及解析失败的 CTE/扩展 SQL 先通过真实 Catalog 规范化基础表对象，再执行身份/对象权限校验，并按权限版本热重载；重启时已验证旁路页文件不可用仍可使用系统表快照。
 - X27：状态机差分脚本优先选择 `build/windows/Release/minisql_database.exe`，小规模、3 种 96 步回归和 2 种 512 步长跑均通过；新增可配置重复 soak 入口、DATE/BOOL 字面量规划回归、五阶段跨进程崩溃恢复组合和 4 种子 × 512 步 × 4096 条压力数据的溢写/资源回归，固定种子逐文件复现契约、失败 artifact 重放入口和 Windows 引擎回归均已接入 CI/本地验收链。
+- 全套分组回归：迁移 `join-process.mjs`、`aggregate-process.mjs`、`null-process.mjs` 的参考引擎到 Node 24 `node:sqlite`，移除对已删除 `sql.js`/Demo Worker 的依赖；`run-minisql-tests.ps1 -Suite all` 的编译、执行、存储、HTTP 和工作台基础回归全部通过。
 - C2：工作台已加入用户/密码身份、权限/审计/会话、锁等待和取消、客户端请求超时、资源预算、备份列表与恢复操作入口；真实浏览器 DOM 回归已覆盖连接错误/恢复、身份请求头、权限会话、设置、侧栏拖动、390px 移动端无溢出，以及成功/失败查询、客户端超时、活动请求取消、全量备份、替换恢复、损坏备份失败隔离和恢复后查询。
 
 ## 判定
