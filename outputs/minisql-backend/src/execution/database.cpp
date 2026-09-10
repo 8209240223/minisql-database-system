@@ -6,6 +6,7 @@
 #include "minisql/common/float.hpp"
 #include "minisql/storage/bplus_tree.hpp"
 #include "minisql/storage/page_bplus_tree.hpp"
+#include "minisql/storage/heap.hpp"
 #include "minisql/execution/external_sort.hpp"
 #include "minisql/sql/serialization.hpp"
 #include <filesystem>
@@ -622,6 +623,35 @@ nlohmann::json Database::checkpoint() {
     return {{"success", true}, {"kind", "Checkpoint"}, {"wal", "truncated"}};
 }
 
+class ScanRowStream : public RowStream {
+public:
+    ScanRowStream(storage::HeapStore& heap, std::uint64_t tableId, storage::RowSchema schema)
+        : heap_(heap), tableId_(tableId), schema_(std::move(schema)) {
+        refs_ = heap_.refsFor(tableId_);
+    }
+    bool next(nlohmann::json& row) override {
+        if (cancelled_) throw MiniSqlError(ErrorCode::Cancelled, "Query cancelled");
+        if (cursor_ >= refs_.size()) return false;
+        row = rowJson(heap_.read(tableId_, schema_, refs_[cursor_]));
+        ++cursor_;
+        ++rows_;
+        return true;
+    }
+    void cancel() override { cancelled_ = true; }
+    void close() override { refs_.clear(); }
+    nlohmann::json resourceUsage() const override {
+        return {{"kind", "ScanRowStream"}, {"rows", rows_}, {"pending", refs_.size() - cursor_}};
+    }
+private:
+    storage::HeapStore& heap_;
+    std::uint64_t tableId_;
+    storage::RowSchema schema_;
+    std::vector<storage::RowRef> refs_;
+    std::size_t cursor_ = 0;
+    std::size_t rows_ = 0;
+    bool cancelled_ = false;
+};
+
 nlohmann::json Database::createSnapshot(const std::filesystem::path& target) {
     std::lock_guard<std::recursive_mutex> guard(mu_);
     requireAvailable();
@@ -731,7 +761,7 @@ void Database::backgroundSchedulerLoop() {
 }
 std::string Database::tableFingerprint(std::uint64_t tableId) {
     const catalog::StoredTable* stored = nullptr;
-    for (const auto& table : catalog_.tables()) if (table.id == tableId) { stored = &table; break; }
+    for (const auto& table : catalog_.tables()) if (static_cast<std::uint64_t>(table.id) == tableId) { stored = &table; break; }
     if (!stored) throw MiniSqlError(ErrorCode::Catalog, "Index table identity not found");
     std::uint64_t hash = 1469598103934665603ULL;
     const auto mix = [&](const std::uint8_t* bytes, std::size_t size) {
@@ -811,7 +841,7 @@ bool Database::loadIndexPages(storage::BPlusTree& tree, std::uint64_t owner, con
 }
 void Database::rebuildIndexes(std::uint64_t tableId) {
     const catalog::StoredTable* stored = nullptr;
-    for (const auto& table : catalog_.tables()) if (table.id == tableId) { stored = &table; break; }
+    for (const auto& table : catalog_.tables()) if (static_cast<std::uint64_t>(table.id) == tableId) { stored = &table; break; }
     if (!stored) throw MiniSqlError(ErrorCode::Catalog, "Index table identity not found");
     const auto* definition = catalog_.view().find(stored->definition.table);
     if (!definition) throw MiniSqlError(ErrorCode::Catalog, "Index table definition not found");
@@ -850,7 +880,7 @@ void Database::rebuildIndexes(std::uint64_t tableId) {
 }
 void Database::validateUniqueIndexes(std::uint64_t tableId, const storage::Row& row, const std::optional<storage::RowRef>& ignored) {
     const catalog::StoredTable* stored = nullptr;
-    for (const auto& table : catalog_.tables()) if (table.id == tableId) { stored = &table; break; }
+    for (const auto& table : catalog_.tables()) if (static_cast<std::uint64_t>(table.id) == tableId) { stored = &table; break; }
     if (!stored) throw MiniSqlError(ErrorCode::Catalog, "Index table identity not found");
     for (const auto& index : indexes_) {
         if (key(index->table) != key(stored->definition.table) || !index->unique) continue;
@@ -1184,6 +1214,13 @@ json Database::aggregateRows(const sql::LogicalPlan& plan) {
     if (active) emit();
     return rows;
 }
+std::unique_ptr<RowStream> Database::scanRowStream(const sql::LogicalPlan& plan) {
+    const catalog::StoredTable* table = nullptr;
+    for (const auto& candidate : catalog_.tables()) if (key(candidate.definition.table) == key(plan.table)) table = &candidate;
+    if (!table) throw MiniSqlError(ErrorCode::Catalog, "Plan references missing table");
+    return std::make_unique<ScanRowStream>(heap_, table->id, rowSchema(table->definition));
+}
+
 nlohmann::json Database::runNode(const sql::LogicalPlan& plan) {
     checkCancelled();
     if (plan.kind == "Sort") {

@@ -122,6 +122,7 @@ jobs:
           node tests/cancel-smoke.mjs
           node tests/x25-stream-http.mjs
           node tests/backup-smoke.mjs
+          node tests/backup-online-smoke.mjs
         working-directory: outputs/minisql-backend
       - name: SELECT 差分回归
         run: node tests/fuzz-differential.mjs
