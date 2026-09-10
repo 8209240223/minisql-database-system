@@ -38,6 +38,7 @@ const lexerStages = multiLex.diagnostics.filter(d => d.stage === 'lexer');
 equal(lexerStages.length, 2); // two '@' errors are both reported
 equal(lexerStages.every(d => d.recoverable === true && d.statementIndex === 0), true);
 equal(multiLex.diagnostics.every(d => Number.isInteger(d.endLine) && Number.isInteger(d.endColumn)), true);
+equal(multiLex.diagnostics.every(d => typeof d.source === 'string'), true);
 // the valid statements after the lexical errors still succeed
 equal(multiLex.diagnostics.filter(d => d.success === true).length, 3);
 

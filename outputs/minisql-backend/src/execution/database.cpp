@@ -2044,6 +2044,18 @@ nlohmann::json Database::diagnostics(const std::string& source) const {
         return "internal";
     };
     std::size_t statementIndex = 0;
+    const auto sourceLine = [&](std::size_t line) {
+        if (line == 0) return std::string{};
+        std::size_t current = 1, begin = 0;
+        while (begin <= source.size() && current < line) {
+            const auto end = source.find('\n', begin);
+            if (end == std::string::npos) return std::string{};
+            begin = end + 1;
+            ++current;
+        }
+        const auto end = source.find('\n', begin);
+        return source.substr(begin, end == std::string::npos ? std::string::npos : end - begin);
+    };
     const auto closestName = [](const std::string& target, const std::vector<std::string>& candidates) {
         if (target.empty()) return std::string{};
         const auto lower = [](std::string value) {
@@ -2105,6 +2117,7 @@ nlohmann::json Database::diagnostics(const std::string& source) const {
             {"line", loc.line}, {"column", loc.column},
             {"endLine", loc.endLine ? loc.endLine : loc.line},
             {"endColumn", loc.endColumn ? loc.endColumn : loc.column},
+            {"source", sourceLine(loc.line)},
             {"recoverable", true}, {"statementIndex", statementIndex}});
     };
     // Tokenize in recovery mode so every lexical error is reported, not only
@@ -2134,6 +2147,7 @@ nlohmann::json Database::diagnostics(const std::string& source) const {
                 {"line", item.location.line}, {"column", item.location.column},
                 {"endLine", item.location.endLine ? item.location.endLine : item.location.line},
                 {"endColumn", item.location.endColumn ? item.location.endColumn : item.location.column},
+                {"source", sourceLine(item.location.line)},
                 {"statementIndex", statementIndex}});
         }
         ++statementIndex;

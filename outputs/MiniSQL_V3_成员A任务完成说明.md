@@ -6,8 +6,8 @@
 ## X12 诊断与纠错
 
 - 已完成：多词法错误恢复、子句级多诊断、错误 AST 拒绝、错误起止位置、`statementIndex`、基础纠错建议。
-- 工作台：错误列表可显示多条诊断并点击定位到原始 SQL 行；未知表/列使用编辑距离给出接近名称建议。
-- 必要回归：`diagnostics-smoke.mjs` 24 项、`parser-regression.mjs` 18 项通过，前端 `npm run build` 通过。
+- 工作台：错误列表可显示多条诊断并点击定位到原始 SQL 行；每条诊断包含原始 `source` 片段，未知表/列使用编辑距离给出接近名称建议。
+- 必要回归：`diagnostics-smoke.mjs` 25 项、`parser-regression.mjs` 18 项通过，前端 `npm run build` 通过。
 
 ## X13 版本与迁移
 
