@@ -23,7 +23,7 @@
 
 ## 验证
 
-- `node tests/backup-smoke.mjs`：42 项检查通过。
+- `node tests/backup-smoke.mjs`：56 项检查通过。
 - 覆盖 v2 manifest 字段、未知版本拒绝、v1 到 v2 迁移、恢复后数据一致、备份列表和活动会话拒绝。
 - 覆盖全量 base1、增量 inc1、二次链 inc2、恢复、列表 kind/base、链上 manifest 损坏拒绝。
 - Release 构建和 HTTP 回归通过。
@@ -46,6 +46,7 @@
 - 恢复成功后保留该目录；若后续发现恢复结果异常，可以使用它做人工回放。
 - 恢复过程中替换或重新打开失败时，会自动从回滚目录还原原库并返回 422，不再留下半替换状态。
 - 备份列表额外暴露 `snapshotLsn`、`chainDepth` 和 `pageChecksum`。
+- `chainDepth` 按 manifest 的 `base` 链递归计算，全量=1，一级增量=2，二级增量=3；增量 manifest 写入时也会固化该值。
 
 ## 未完成
 

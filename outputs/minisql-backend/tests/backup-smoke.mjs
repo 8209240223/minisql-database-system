@@ -77,6 +77,7 @@ try {
   equal(inc1Manifest.version, 3);
   equal(inc1Manifest.kind, 'incremental');
   equal(inc1Manifest.base, 'base1.pages');
+  equal(inc1Manifest.chainDepth, 2);
 
   equal((await request('/execute', { sql: 'INSERT INTO t VALUES(4);' })).status, 200);
   equal((await request('/restore', { name: 'inc1.delta' })).status, 200);
@@ -93,6 +94,13 @@ try {
   equal(listedIncremental.kind, 'incremental');
   equal(listedIncremental.manifestVersion, 3);
   equal(listedIncremental.base, 'base1.pages');
+  equal(listedIncremental.chainDepth, 2);
+  const listedSecond = chainedList.data.entries.find(entry => entry.name === 'inc2.delta');
+  assert.ok(listedSecond); ++checks;
+  equal(listedSecond.chainDepth, 3);
+  const listedBase = chainedList.data.entries.find(entry => entry.name === 'base1.pages');
+  assert.ok(listedBase); ++checks;
+  equal(listedBase.chainDepth, 1);
   writeFileSync(join(root, 'backups', 'inc1.delta.json'), JSON.stringify({ ...inc1Manifest, version: 99 }), 'utf8');
   equal((await request('/restore', { name: 'inc2.delta' })).status, 422);
 

@@ -214,6 +214,20 @@ async function reconstructBackup(name, depth = 0) {
   return { buffer, pages: header.finalPages, manifest: metadata,
     walBuffer: base.walBuffer ?? Buffer.alloc(0), ckptBuffer: base.ckptBuffer ?? Buffer.alloc(0) };
 }
+
+function backupChainDepth(name, seen = new Set()) {
+  const artifact = backupArtifactFile(name);
+  if (!artifact || artifact.kind === 'full') return 1;
+  if (seen.has(artifact.name)) throw httpError(422, 'Backup chain cycle detected');
+  seen.add(artifact.name);
+  const metadata = JSON.parse(readFileSync(artifact.manifest, 'utf8'));
+  if (!metadata.base) return 1;
+  return 1 + backupChainDepth(metadata.base, seen);
+}
+
+function safeChainDepth(name) {
+  try { return backupChainDepth(name); } catch { return 1; }
+}
 function writeDatabaseAtomically(buffer, walBuffer, ckptBuffer) {
   const temporary = database + '.restore.tmp';
   writeFileSync(temporary, buffer);
@@ -817,7 +831,7 @@ const server = http.createServer(async (req, res) => {
           pageFormatVersion: metadata.pageFormatVersion,
           walBytes: metadata.walBytes,
           snapshotLsn: metadata.committedSequence,
-          chainDepth: metadata.kind === 'incremental' ? (metadata.chainDepth ?? 1) : 1,
+          chainDepth: metadata.kind === 'incremental' ? (metadata.chainDepth ?? safeChainDepth(name)) : 1,
           pageChecksum: metadata.pageChecksum,
           migrationState: metadata.version === 1 ? 'pending' : metadata.version >= 2 && metadata.version <= 4 ? 'ready' : 'unknown',
         };
@@ -923,6 +937,7 @@ const server = http.createServer(async (req, res) => {
               sha256: sha256(target.file),
               pageFormatVersion: baseReconstructed.manifest.pageFormatVersion,
               walBytes: 0,
+              chainDepth: safeChainDepth(body.base) + 1,
             }), 'utf8');
           });
           send(200, { success: true, backup: target.name, kind: 'incremental', base: backupArtifactFile(body.base).name, bytes: statSync(target.file).size, sha256: sha256(target.file) });
