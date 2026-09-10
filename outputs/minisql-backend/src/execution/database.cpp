@@ -2523,6 +2523,7 @@ nlohmann::json Database::executeStreaming(const std::string& source,
     std::lock_guard<std::recursive_mutex> guard(mu_);
     requireAvailable();
     checkCancelled();
+    ActiveDatabaseScope active(this);
     if (transaction_ == TransactionState::Aborted) throw MiniSqlError(ErrorCode::Transaction, "Transaction aborted; ROLLBACK required");
     const auto statements = sql::parse(sql::tokenize(source));
     if (statements.size() != 1 || (statements.front().kind != "Select" && statements.front().kind != "Explain"))

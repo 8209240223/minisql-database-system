@@ -21,6 +21,13 @@ try {
   assert.deepEqual(frames.filter(frame => frame.type === 'row').map(frame => frame.row), [[2], [3]]); ++checks;
   assert.ok(frames.some(frame => frame.type === 'complete')); ++checks;
 
+  const correlatedFrames = [];
+  const correlated = await session.requestStream('executeStream',
+    'SELECT x.id, (SELECT COUNT(*) FROM t y WHERE y.id <= x.id) AS c FROM t x ORDER BY x.id;',
+    {}, frame => correlatedFrames.push(frame));
+  assert.equal(correlated.type, 'complete'); ++checks;
+  assert.deepEqual(correlatedFrames.filter(frame => frame.type === 'row').map(frame => frame.row), [[1,1],[2,2],[3,3],[4,4]]); ++checks;
+
   const invalidFrames = [];
   const invalid = await session.requestStream('executeStream', 'INSERT INTO t VALUES(5,50);', {}, frame => invalidFrames.push(frame));
   assert.equal(invalid.type, 'error'); ++checks;
