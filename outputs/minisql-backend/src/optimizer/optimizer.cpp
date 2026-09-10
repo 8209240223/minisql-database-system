@@ -275,8 +275,14 @@ void rewritePlan(sql::LogicalPlan& plan, const Options& options, json& changes, 
     for (auto& row : plan.insertRows)
         for (auto& expression : row.at("expressions")) expression = rewrite(expression, options, changes, statement);
     if (plan.kind == "Project" && options.pruneColumns && pruneProjectColumns(plan, changes, statement)) return;
-    if (plan.kind != "Filter" && plan.kind != "NestedLoopJoin" && plan.kind != "LeftJoin" && plan.kind != "HashJoin") return;
+    if (plan.kind != "Filter" && plan.kind != "SemiJoin" && plan.kind != "AntiJoin" && plan.kind != "Apply" &&
+        plan.kind != "NestedLoopJoin" && plan.kind != "LeftJoin" && plan.kind != "HashJoin") return;
     plan.predicate = rewrite(plan.predicate, options, changes, statement);
+    if (options.decorrelateSubquery && plan.kind == "Filter" && !plan.subqueryJoinKind.empty()) {
+        record(changes, "decorrelate-subquery", statement, {{"kind", "Filter"}, {"subqueryJoinKind", plan.subqueryJoinKind}},
+            {{"kind", plan.subqueryJoinKind}, {"execution", "grouped-parameter-instances"}});
+        plan.kind = plan.subqueryJoinKind;
+    }
     if (plan.kind == "NestedLoopJoin" && options.hashJoin && plan.children.size() == 2) {
         std::size_t leftKey{}, rightKey{};
         if (hashJoinKeys(plan.predicate, plan.children[0].output.size(), leftKey, rightKey)) {
@@ -363,6 +369,7 @@ nlohmann::json ruleDescriptors() {
         {{"ruleId", "predicate-pushdown"}, {"scope", "plan"}, {"precondition", "INNER join Filter with side-local, side-effect-free comparison/boolean predicates"}, {"postcondition", "Same rows, NULL results and error timing for safe predicates"}},
         {{"ruleId", "hash-join"}, {"scope", "plan"}, {"precondition", "INNER NestedLoopJoin with direct left/right column equality"}, {"postcondition", "Same inner-join rows, duplicates and NULL non-matching semantics"}},
         {{"ruleId", "prune-columns"}, {"scope", "plan"}, {"precondition", "Project over SeqScan with optional single Filter; projections are explicit"}, {"postcondition", "Scan output metadata contains exactly referenced columns; row values and errors unchanged"}}
+        ,{{"ruleId", "decorrelate-subquery"}, {"scope", "plan"}, {"precondition", "Filter carries SemiJoin/AntiJoin/Apply subquery classification"}, {"postcondition", "Promote to typed subquery node while preserving grouped-parameter execution semantics"}}
     });
 }
 Result optimize(const std::vector<sql::LogicalPlan>& plans, Options options) {
@@ -377,6 +384,7 @@ Result optimize(const std::vector<sql::LogicalPlan>& plans, Options options) {
         else if (id == "predicate-pushdown") options.predicatePushdown = false;
         else if (id == "hash-join") options.hashJoin = false;
         else if (id == "prune-columns") options.pruneColumns = false;
+        else if (id == "decorrelate-subquery") options.decorrelateSubquery = false;
         else throw MiniSqlError(ErrorCode::InvalidArgument, "Unknown optimizer rule: " + id);
     }
     checkBudget(plans, options.maxNodes);

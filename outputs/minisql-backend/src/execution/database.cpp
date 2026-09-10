@@ -1104,7 +1104,7 @@ nlohmann::json Database::bufferStatus() const {
 std::vector<storage::Row> Database::joinRows(const sql::LogicalPlan& plan) {
     checkCancelled();
     std::vector<storage::Row> rows;
-    if (plan.kind == "Filter" || plan.kind == "SemiJoin" || plan.kind == "AntiJoin") {
+    if (plan.kind == "Filter" || plan.kind == "SemiJoin" || plan.kind == "AntiJoin" || plan.kind == "Apply") {
         if (plan.children.size() != 1) fail("Join filter requires one child");
         rows = joinRows(plan.children.front());
         for (auto iterator = rows.begin(); iterator != rows.end();) {
@@ -1194,7 +1194,7 @@ json Database::aggregateRows(const sql::LogicalPlan& plan) {
     if (plan.children.size() != 1) fail("Aggregate requires one child");
     const auto* input = &plan.children.front();
     const json* predicate = nullptr;
-    if (input->kind == "Filter" || input->kind == "SemiJoin" || input->kind == "AntiJoin") {
+    if (input->kind == "Filter" || input->kind == "SemiJoin" || input->kind == "AntiJoin" || input->kind == "Apply") {
         if (input->children.size() != 1) fail("Aggregate filter requires one child");
         predicate = &input->predicate;
         input = &input->children.front();
@@ -1353,7 +1353,7 @@ std::unique_ptr<RowStream> Database::scanRowStream(const sql::LogicalPlan& plan)
 std::unique_ptr<RowStream> Database::openRowStream(const sql::LogicalPlan& plan) {
     checkCancelled();
     if (plan.kind == "SeqScan") return scanRowStream(plan);
-    if (plan.kind == "Filter" || plan.kind == "SemiJoin" || plan.kind == "AntiJoin") {
+    if (plan.kind == "Filter" || plan.kind == "SemiJoin" || plan.kind == "AntiJoin" || plan.kind == "Apply") {
         if (plan.children.size() != 1) fail("Filter requires one child");
         auto child = openRowStream(plan.children.front());
         const auto predicate = plan.predicate;
@@ -1484,7 +1484,7 @@ nlohmann::json Database::runNode(const sql::LogicalPlan& plan) {
             {"groups", result.at("rows").size()}, {"external", false}};
         return result;
     }
-    if (plan.kind == "Filter" || plan.kind == "SemiJoin" || plan.kind == "AntiJoin") {
+    if (plan.kind == "Filter" || plan.kind == "SemiJoin" || plan.kind == "AntiJoin" || plan.kind == "Apply") {
         if (plan.children.size() != 1) fail("Filter requires one child");
         auto input = run(plan.children.front());
         for (const auto& column : plan.output) result["columns"].push_back(column.name);
@@ -1822,7 +1822,7 @@ nlohmann::json Database::runNode(const sql::LogicalPlan& plan) {
     }
     const auto* input = &plan.children.front();
     const json* predicate = nullptr;
-    if (input->kind == "Filter" || input->kind == "SemiJoin" || input->kind == "AntiJoin") {
+    if (input->kind == "Filter" || input->kind == "SemiJoin" || input->kind == "AntiJoin" || input->kind == "Apply") {
         predicate = &input->predicate;
         if (input->children.size() != 1) fail("Filter requires one child");
         input = &input->children.front();
@@ -2315,7 +2315,7 @@ nlohmann::json Database::execute(const std::string& source, bool optimize) {
                         return {0.0, 1.0};
                     }
                     auto child = estimate(plan.children.front());
-                    if (plan.kind == "Filter" || plan.kind == "SemiJoin" || plan.kind == "AntiJoin") {
+                    if (plan.kind == "Filter" || plan.kind == "SemiJoin" || plan.kind == "AntiJoin" || plan.kind == "Apply") {
                         const auto rows = child.first * selectivity(plan.predicate, plan.table);
                         return {rows, child.second + rows};
                     }

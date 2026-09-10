@@ -14,7 +14,7 @@
 | X06 | EXT-SQL-006 GROUP BY、聚合、HAVING | 部分实现 | 五类聚合、NULL 处理、分组、HAVING、外部分组、多 run 合并 | FLOAT 全组合、流式输入和完整预算验收 |
 | X07 | EXT-SQL-007 DISTINCT | 部分实现 | 完整投影去重、表达式、NULL、排序分页、重启 | 外存溢写和完整组合验收 |
 | X08 | EXT-SQL-008 JOIN | 部分实现 | INNER/LEFT JOIN、多表、自连接、ON 绑定、补 NULL、HashJoin | 外存连接和完整改写验收 |
-| X09 | EXT-SQL-009 子查询 | 已实现（基础版） | IN、NOT IN、EXISTS、标量、限定名相关作用域、派生表、结构化按值绑定、重复参数分组复用、基础 Apply/SemiJoin 计划标记、NULL、UPDATE/DELETE；derived-smoke 12 项、correlated-exec-smoke 8 项、subquery-smoke 24 项通过 | 完整优化器去相关重写为后续增强 |
+| X09 | EXT-SQL-009 子查询 | 已实现（基础版） | IN、NOT IN、EXISTS、标量、限定名相关作用域、派生表、结构化按值绑定、重复参数分组复用、Apply/SemiJoin/AntiJoin 计划节点、优化器 `decorrelate-subquery` 改写、NULL、UPDATE/DELETE；derived-smoke 12 项、correlated-exec-smoke 8 项、subquery-smoke 25 项通过 | 更激进的跨边界 Join 重写为后续增强 |
 | X10 | EXT-SQL-010 投影与别名 | 部分实现 | 表达式、输出别名、表别名、限定列、混合限定星号和歧义检查 | 嵌套作用域与稳定计算列身份 |
 | X11 | EXT-SQL-011 约束与多行 VALUES | 部分实现 | NOT NULL、DEFAULT、主键、复合键、UNIQUE、CHECK、外键、多行 VALUES 原子性 | 完整验收与稳定性风险跟踪 |
 | X12 | EXT-CMP-001 诊断与纠错 | 已实现（基础版） | 单语句多诊断、恢复模式 tokenizer、clause-level recovery、错误位置、工作台多诊断列表与点击定位、基础纠错建议、写操作不执行；diagnostics-smoke 22 项通过 | 更高级的智能纠错策略为后续增强 |

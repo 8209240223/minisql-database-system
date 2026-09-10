@@ -16,7 +16,7 @@
 
 ## X09 子查询与作用域
 
-- 已完成：IN/NOT IN、EXISTS、标量子查询、派生表、限定名相关作用域、结构化按值绑定、重复参数分组复用、基础 Apply/SemiJoin 计划标记。
+- 已完成：IN/NOT IN、EXISTS、标量子查询、派生表、限定名相关作用域、结构化按值绑定、重复参数分组复用、Apply/SemiJoin/AntiJoin 计划节点，以及优化器 `decorrelate-subquery` 改写规则。
 - 必要回归：`subquery-smoke.mjs` 24 项、`derived-smoke.mjs` 12 项、`correlated-exec-smoke.mjs` 8 项通过。
 
 ## X18 统计与成本
@@ -31,4 +31,4 @@
 
 ## 后续增强
 
-- 完整优化器去相关、更完整的 LR/LALR 生成器、复杂直方图和候选计划成本比较保留为后续增强，不阻塞 A 基础版完成。
+- 更完整的 LR/LALR 生成器、复杂直方图和候选计划成本比较保留为后续增强，不阻塞 A 基础版完成。

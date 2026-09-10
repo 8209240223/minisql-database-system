@@ -11,6 +11,7 @@ struct Options {
     bool hashJoin = true;
     bool pruneColumns = true;
     bool constantArithmetic = true;
+    bool decorrelateSubquery = true;
     std::size_t maxIterations = 16;
     std::size_t maxNodes = 65536;
     std::vector<std::string> disabledRules{};
