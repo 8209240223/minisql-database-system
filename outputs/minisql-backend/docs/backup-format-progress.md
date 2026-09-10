@@ -1,6 +1,6 @@
 # 备份格式与迁移实现进度
 
-日期：2026-09-09。对应 EXT-SYS-007 和 X26，当前为部分实现，不表示 X26 全量验收通过。
+日期：2026-09-10。对应 EXT-SYS-007 和 X26，当前为部分实现，不表示 X26 全量验收通过。
 
 ## 已实现
 
@@ -28,10 +28,16 @@
 - 覆盖全量 base1、增量 inc1、二次链 inc2、恢复、列表 kind/base、链上 manifest 损坏拒绝。
 - Release 构建和 HTTP 回归通过。
 
+## 在线一致性快照与迁移回滚
+
+- 引擎新增 `snapshot` 子命令（Database::snapshotInfo）：在无活动事务且无写批时 flush 全部缓冲并执行一次检查点，返回提交序号、WAL 状态、脏页水位、目录版本与索引版本，作为一致性快照位置。
+- `/backup` 备份前调用该一致性快照替代裸 CHECKPOINT，并把 `snapshot{committedSequence, walBytes, dirtyWatermark, catalogVersion, indexVersion, checkpointedAt}` 写入 manifest（version 2/3 保留原字段，新增可选 `snapshot` 对象，不做版本号升级，避免破坏既有回归断言）。
+- `/restore` 在原子替换前把当前库复制为迁移回滚副本 `backups/<name>.rollback-<ts>.pages`；替换成功则删除回滚副本，替换失败则保留原库与回滚副本供检查，且不删除 `.wal` 以免破坏原库恢复链。
+- `/backups` 列表额外暴露 `snapshot` 快照信息与 `chainDepth`（增量链深度）、`verified`。
+
 ## 未完成
 
-- 尚未实现备份期间在线并发读写一致性快照和 WAL 非零位置重做。
+- 尚未实现备份期间在线并发读写一致性快照和 WAL 非零位置重做；快照仍要求无活动会话（409）。
 - 增量备份仍要求无活动会话，恢复前仍会在内存中完整重建页文件，未实现页面流式恢复。
-- 尚未实现自动迁移失败回滚点：校验失败发生在写库前，因此不会破坏当前库，但没有保留临时回滚目录。
-- WAL 截止位置当前固定为 0，因为备份前已执行 CHECKPOINT；尚未支持从非零 WAL 位置重做。
+- WAL 截止位置当前固定为 0，因为备份前已执行一致性检查点；尚未支持从非零 WAL 位置在恢复时重做。
 - X26 全量验收仍待完成。

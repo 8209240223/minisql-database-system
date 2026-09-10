@@ -182,6 +182,7 @@ void PageFile::beginWriteBatch() {
     snapshot->active = active_;
     snapshot->owners = owners_;
     snapshot->free = free_;
+    snapshot->txId = ++txSequence_;
     snapshot->startLsn = walBytes();
     batch_ = std::move(snapshot);
 }
@@ -236,8 +237,10 @@ void PageFile::commitWriteBatch() {
         writeUnsigned(header, 0, 4, journalMagic);writeUnsigned(header, 8, 4, 1);writeUnsigned(header, 12, 4, kPageSize);
         writeUnsigned(header, 16, 8, ordered.size());writeUnsigned(header, 24, 8, count_);
         writeUnsigned(header, 32, 8, identity_[0]);writeUnsigned(header, 40, 8, identity_[1]);
-        writeUnsigned(header, 48, 8, batch_->count);writeUnsigned(header, 56, 8, seq);writeUnsigned(header, 64, 8, 0);
-        writeUnsigned(header, 72, 8, startLsn);writeUnsigned(header, 80, 8, startLsn);
+        writeUnsigned(header, 48, 8, batch_->count);writeUnsigned(header, 56, 8, seq);writeUnsigned(header, 64, 8, batch_->txId);
+        // 扩展字节 = 头(1 页) + 每条(记录 1 页 + 数据 1 页) + 提交标记(1 页)；endLsn 为本次扩展末尾偏移。
+        const auto endLsn = startLsn + 2 * (ordered.size() + 1) * kPageSize;
+        writeUnsigned(header, 72, 8, startLsn);writeUnsigned(header, 80, 8, endLsn);
         writeUnsigned(header, 88, 8, checkpointRecord_.present ? checkpointRecord_.walCutoffBytes : 0);seal(header);
         putPage(output, header);
         for (const auto& [id, bytes] : ordered) {

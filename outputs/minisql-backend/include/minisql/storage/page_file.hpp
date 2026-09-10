@@ -64,6 +64,7 @@ private:
     std::uint64_t count_ = 1;
     std::uint64_t lastCommitWalBytes_ = 0;
     std::uint64_t committedSequence_ = 0;
+    std::uint64_t txSequence_ = 0;      // 事务 id 分配器：随每次 beginWriteBatch 递增，仅用于 WAL 头标识
     std::uint64_t dirtyWatermark_ = 1;
     CheckpointRecord checkpointRecord_;
     bool failed_ = false;
@@ -76,6 +77,7 @@ private:
         std::unordered_map<PageId, std::uint64_t> active, owners;
         std::vector<PageRef> free;
         std::unordered_map<PageId, PageBytes> pages;
+        std::uint64_t txId = 0;       // 事务 id：本批次唯一递增标识，随 WAL 扩展头持久化
         std::uint64_t startLsn = 0;   // 批次在 WAL 中的起始字节偏移，回滚时截断其后未提交的预备扩展
         bool published = false;
     };

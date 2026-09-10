@@ -18,9 +18,14 @@
 - bridge 新增只读会话路由 `POST /api/sessions/:id/index-inspect`，带表级 `READ` 权限与审计；`runSessionOperation` 支持透传上下文。
 - 工作台 Web（`client.ts`/`App.tsx`/`IndexInspect.tsx`）：侧栏表展开区列出索引，点击即触发检查；新增 `Inspect` 输出面板展示树高/节点/叶链/校验标记/结构问题及页明细。
 
-## 未含（仅剩全量回归）
+## B1（X20）收尾状态（契约层结论，2026-09-10 复核）
 
-- 全量回归：本仓库本地沙箱无法完成 vcpkg 依赖安装（`vcpkg install` 引导挂起、0 下载缓存），亦无 node 可编译前端 TS，故 **execution/server 及前端改动未在本环境编译/回归**。请在有 vcpkg + node 环境跑：
+- **契约层即 B1 的 storage 收尾结论**：`page_bplus_tree_contract` 以最小依赖桩 harness 编译，496 项全绿，且 exe 构建时间晚于源码、与当前实现同步。页级 B+ 树结构能力（分裂递归、删除借位/合并/根收缩、`inspect()` 校验、陈旧代次拒绝、同进程重开恢复）已验证，无需修复。
+- **集成层遗留，明确记入 B5 存储与恢复集成门禁**，待完整 `minisql_database.exe` 构建后执行：
+  1. UPDATE 键变化后索引与全扫一致（含复合键前缀范围完整覆盖）——`index-smoke.mjs`
+  2. 事务回滚后索引恢复——`index-smoke.mjs`/`database-http.mjs`
+  3. 跨进程重启后叶链/根页恢复——`index-smoke.mjs` 重开段
+- 全量回归阻塞原因：本仓库本地沙箱无法完成 vcpkg 依赖安装（`vcpkg install` 引导挂起、0 下载缓存），亦无 node 可编译前端 TS，故 **execution/server 及前端改动未在本环境编译/回归**。请在有 vcpkg + node 环境跑：
   - `cmake --preset windows && cmake --build --preset windows-debug && ctest --preset windows-debug`
   - `cd outputs\minisql-workbench && npm install && npm run build && npm run preview`（联调 bridge 端口）
   - 及 `tests/index-smoke.mjs` 与 HTTP 会话链路。若页级默认引发回归，可设 `MINISQL_INDEX_ENGINE=memory` 回退旧内存引擎对比。

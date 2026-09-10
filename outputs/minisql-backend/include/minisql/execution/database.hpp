@@ -8,6 +8,7 @@
 #include <atomic>
 #include <condition_variable>
 #include "minisql/catalog/persistent_catalog.hpp"
+#include "minisql/execution/executor.hpp"
 #include "minisql/sql/planner.hpp"
 #include "minisql/storage/bplus_tree.hpp"
 
@@ -24,11 +25,21 @@ public:
     nlohmann::json catalog();
     nlohmann::json statistics();
     nlohmann::json checkpoint();
+    // 在线一致性快照信息（B4/X26）：空闲时 flush 全部 buffeer 并执行一次检查点，使数据库文件
+    // 落入一致状态，并返回当前提交序号、WAL 状态、脏页水位与目录/索引版本，供备份 manifest 记录。
+    nlohmann::json snapshotInfo();
     nlohmann::json indexInspect(const std::string& table, const std::string& index);   // 页级索引结构校验（页类型/height/keyCount/兄弟指针/叶链/根可达）
     ~Database();
     void setSessionContext(const std::string& sessionId, const std::filesystem::path& cancelFile);
     nlohmann::json configureBuffer(const std::string& action);
     nlohmann::json runCorrelatedSubquery(const nlohmann::json& expression, const nlohmann::json& row);
+    // 执行器级流式读执行（X25 跨进程协议入口）：解析单条 SELECT，构建 RowStream 并施加
+    // 资源预算后逐行产出。onMeta 在首行前回调（含 columns/columnTypes）；onRow 每行回调一次；
+    // waitBackpressure 在每行产出后回调（若提供），供跨进程背压/取消确认使用（内部持有 mu_）。
+    nlohmann::json streamQuery(const std::string& sql,
+                               const std::function<void(nlohmann::json&&)>& onMeta,
+                               const std::function<void(Row&&)>& onRow,
+                               const std::function<void(std::size_t rowIndex)>& waitBackpressure = {});
 private:
     nlohmann::json bufferStatus() const;
     void evaluateAutoCheckpoint(std::size_t committedWriteStatements, std::size_t committedDirtyPages);
@@ -48,9 +59,18 @@ private:
     nlohmann::json runStatement(const sql::LogicalPlan& plan);
     nlohmann::json run(const sql::LogicalPlan& plan);
     nlohmann::json runNode(const sql::LogicalPlan& plan);
+    // 执行器级流式读路径（X25）：SeqScan/Filter/Project/Sort/Limit/Distinct 组合成 RowStream，
+    // 并施加行数/临时文件字节/sort run 数预算，达预算立即停止。经由 MINISQL_EXECUTOR=stream 启用。
+    bool streamEligible(const sql::LogicalPlan& plan) const;
+    std::unique_ptr<RowStream> buildStream(const sql::LogicalPlan& plan);
+    nlohmann::json runStream(const sql::LogicalPlan& plan);
     std::vector<nlohmann::json>* nodeStats_ = nullptr;
     std::size_t sortMemoryRows_ = 10000;
     std::size_t aggregateMemoryRows_ = 10000;
+    bool streamReads_ = false;              // MINISQL_EXECUTOR=stream 时启用 RowStream 读路径
+    std::uint64_t maxTempFileBytes_ = 0;    // 临时文件字节预算（0=不限）
+    std::size_t maxSortRuns_ = 0;           // 排序 run 数预算（0=不限）
+    std::size_t maxAggregateStates_ = 0;    // 聚合状态数预算（0=不限）
     std::size_t autoCheckpointWrites_ = 0;
     std::uint64_t autoCheckpointWalBytes_ = 0;
     std::size_t autoCheckpointDirtyPages_ = 0;

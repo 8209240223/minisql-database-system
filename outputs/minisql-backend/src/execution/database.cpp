@@ -274,6 +274,19 @@ Database::Database(const std::filesystem::path& path, std::size_t frames, storag
         char* end = nullptr;const auto parsed = std::strtoull(configured, &end, 10);
         if (end && *end == '\0' && parsed > 0 && parsed <= 10000000) maxResultRows_ = static_cast<std::size_t>(parsed);
     }
+    if (const char* configured = std::getenv("MINISQL_EXECUTOR"); configured && std::string(configured) == "stream") streamReads_ = true;
+    if (const char* configured = std::getenv("MINISQL_RESULT_TEMP_BYTES")) {
+        char* end = nullptr;const auto parsed = std::strtoull(configured, &end, 10);
+        if (end && *end == '\0' && parsed > 0 && parsed <= 1024ull * 1024ull * 1024ull * 1024ull) maxTempFileBytes_ = parsed;
+    }
+    if (const char* configured = std::getenv("MINISQL_RESULT_SORT_RUNS")) {
+        char* end = nullptr;const auto parsed = std::strtoull(configured, &end, 10);
+        if (end && *end == '\0' && parsed > 0 && parsed <= 1000000) maxSortRuns_ = static_cast<std::size_t>(parsed);
+    }
+    if (const char* configured = std::getenv("MINISQL_RESULT_STATES")) {
+        char* end = nullptr;const auto parsed = std::strtoull(configured, &end, 10);
+        if (end && *end == '\0' && parsed > 0 && parsed <= 1000000) maxAggregateStates_ = static_cast<std::size_t>(parsed);
+    }
     sortTempDirectory_ = std::getenv("MINISQL_TEMP_DIR") ? std::filesystem::path(std::getenv("MINISQL_TEMP_DIR")) : path.parent_path() / ".minisql-sort";
     if (const char* configured = std::getenv("MINISQL_SESSION_ID"); configured && *configured) sessionId_ = configured;
     if (const char* configured = std::getenv("MINISQL_CANCEL_FILE"); configured && *configured) cancelFile_ = configured;
@@ -372,6 +385,24 @@ nlohmann::json Database::checkpoint() {
     lastCheckpointAtMs_ = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count());
     return {{"success", true}, {"kind", "Checkpoint"}, {"wal", "truncated"}};
+}
+nlohmann::json Database::snapshotInfo() {
+    std::lock_guard<std::recursive_mutex> guard(mu_);
+    requireAvailable();
+    // 一致性快照要求事务空闲且无进行中的写批，否则拒绝以避免把未提交或半写状态纳入备份。
+    if (transaction_ != TransactionState::Idle)
+        throw MiniSqlError(ErrorCode::Transaction, "Consistent snapshot requires an idle transaction");
+    if (file_->writeBatchActive())
+        throw MiniSqlError(ErrorCode::Transaction, "Consistent snapshot requires an idle write batch");
+    buffer_.flushAll();
+    file_->checkpoint({catalogVersion_, indexVersion_});
+    const auto after = file_->checkpointRecord();
+    return {{"success", true}, {"committedSequence", file_->committedSequence()},
+            {"walBytes", file_->walBytes()}, {"dirtyWatermark", file_->dirtyWatermark()},
+            {"catalogVersion", catalogVersion_}, {"indexVersion", indexVersion_},
+            {"walCutoffBytes", after.walCutoffBytes},
+            {"checkpointedAt", static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count())}};
 }
 nlohmann::json Database::indexInspect(const std::string& table, const std::string& index) {
     std::lock_guard<std::recursive_mutex> guard(mu_);
@@ -1393,6 +1424,7 @@ void Database::rollbackBatch() {
 }
 nlohmann::json Database::run(const sql::LogicalPlan& plan) {
     checkCancelled();
+    if (streamReads_ && streamEligible(plan)) return runStream(plan);
     const auto started = std::chrono::steady_clock::now();
     auto result = runNode(plan);
     if (nodeStats_) {
@@ -1401,6 +1433,152 @@ nlohmann::json Database::run(const sql::LogicalPlan& plan) {
     }
     return result;
 }
+
+bool Database::streamEligible(const sql::LogicalPlan& plan) const {
+    const auto& kind = plan.kind;
+    if (kind == "SeqScan") return true;
+    if (kind == "Filter" || kind == "Project" || kind == "Sort" || kind == "Limit" || kind == "Distinct") {
+        for (const auto& child : plan.children) if (!streamEligible(child)) return false;
+        return true;
+    }
+    return false;
+}
+
+std::unique_ptr<RowStream> Database::buildStream(const sql::LogicalPlan& plan) {
+    if (plan.kind == "SeqScan") {
+        const catalog::StoredTable* table = nullptr;
+        for (const auto& candidate : catalog_.tables()) if (key(candidate.definition.table) == key(plan.table)) table = &candidate;
+        if (!table) fail("Stream scan references missing table");
+        const auto schema = rowSchema(table->definition);
+        std::vector<Row> rows;
+        heap_.scan(table->id, schema, [&](storage::RowRef, const storage::Row& row) {
+            checkCancelled();
+            rows.push_back(rowJson(row));
+        });
+        return materializeStream(std::move(rows));
+    }
+    if (plan.kind == "Filter") {
+        if (plan.children.size() != 1) fail("Stream filter requires one child");
+        const auto predicate = plan.predicate;
+        return filterStream(buildStream(plan.children.front()), [this, predicate](const Row& row) {
+            return accepted(evaluate(predicate, row));
+        });
+    }
+    if (plan.kind == "Project") {
+        if (plan.children.size() != 1) fail("Stream projection requires one child");
+        const auto projections = plan.projections;
+        const auto output = plan.output;
+        return projectStream(buildStream(plan.children.front()), [this, projections, output](const Row& row) {
+            Row projected = Row::array();
+            if (!projections.empty()) for (const auto& expression : projections) projected.push_back(evaluate(expression, row));
+            else for (const auto& column : output) {
+                if (column.columnId >= row.size()) fail("Stream projection outside row");
+                projected.push_back(cell(row[column.columnId]));
+            }
+            return projected;
+        });
+    }
+    if (plan.kind == "Sort") {
+        if (plan.children.size() != 1) fail("Stream sort requires one child");
+        const auto sortKeys = plan.sortKeys;
+        const auto childOutput = plan.children.front().output;
+        const auto outputSize = plan.output.size();
+        const auto less = [sortKeys, childOutput](const Row& left, const Row& right) {
+            for (const auto& sort : sortKeys) {
+                const auto index = sort.at("index").get<std::size_t>();
+                const auto& a = left.at(index);
+                const auto& b = right.at(index);
+                if (a == b) continue;
+                if (a.is_null() || b.is_null()) return a.is_null() ? sort.at("nullsFirst").get<bool>() : !sort.at("nullsFirst").get<bool>();
+                if (decimalType(childOutput.at(index).type)) {
+                    const auto& type = childOutput.at(index).type;
+                    const auto order = decimalValue(a, type).compare(decimalValue(b, type));
+                    if (order == 0) continue;
+                    return sort.at("descending").get<bool>() ? order > 0 : order < 0;
+                }
+                return sort.at("descending").get<bool>() ? a > b : a < b;
+            }
+            return false;
+        };
+        const auto operationId = sessionId_ + "-q" + std::to_string(currentQueryId_) + "-s" + std::to_string(++sortSequence_);
+        auto sorted = sortStream(buildStream(plan.children.front()), less, sortMemoryRows_, sortTempDirectory_, operationId, [this] { checkCancelled(); });
+        // 与 runNode 的 Sort 一致：排序后裁剪到 output 列数（下层可能携带额外列）。
+        return projectStream(std::move(sorted), [outputSize](const Row& row) {
+            Row trimmed = Row::array();
+            const auto count = std::min<std::size_t>(row.size(), outputSize);
+            for (std::size_t i = 0; i < count; ++i) trimmed.push_back(row[i]);
+            return trimmed;
+        });
+    }
+    if (plan.kind == "Limit") {
+        const auto limit = plan.limit.value_or(std::numeric_limits<std::uint64_t>::max());
+        if (limit == 0) return materializeStream({});   // 恒假过滤改写：Limit 0 无需子节点
+        if (plan.children.size() != 1) fail("Stream limit requires one child");
+        return limitStream(buildStream(plan.children.front()), static_cast<std::size_t>(plan.offset), limit);
+    }
+    if (plan.kind == "Distinct") {
+        if (plan.children.size() != 1 || plan.children.front().kind != "Project") fail("Stream distinct requires a projection child");
+        return distinctStream(buildStream(plan.children.front()));
+    }
+    fail("Unsupported streaming plan");
+}
+
+nlohmann::json Database::runStream(const sql::LogicalPlan& plan) {
+    json result = {{"kind", plan.kind}, {"columns", json::array()}, {"rows", json::array()}, {"affectedRows", 0}};
+    for (const auto& column : plan.output) result["columns"].push_back(column.name);
+    auto stream = buildStream(plan);
+    stream = budgetStream(std::move(stream), RowBudget{maxResultRows_, maxTempFileBytes_, maxSortRuns_, maxAggregateStates_});
+    Row row;
+    try {
+        while (stream->next(row)) result["rows"].push_back(std::move(row));
+    } catch (...) {
+        stream->close();
+        throw;
+    }
+    stream->close();
+    return result;
+}
+
+nlohmann::json Database::streamQuery(const std::string& sql,
+                                     const std::function<void(nlohmann::json&&)>& onMeta,
+                                     const std::function<void(Row&&)>& onRow,
+                                     const std::function<void(std::size_t rowIndex)>& waitBackpressure) {
+    std::lock_guard<std::recursive_mutex> guard(mu_);
+    requireAvailable();
+    checkCancelled();
+    if (transaction_ == TransactionState::Aborted)
+        throw MiniSqlError(ErrorCode::Transaction, "Transaction aborted; ROLLBACK required");
+    ActiveDatabaseScope active(this);
+    currentQueryId_ = ++querySequence_;
+    const auto ast = sql::parse(sql::tokenize(sql));
+    if (ast.size() != 1 || ast.front().kind != "Select")
+        throw MiniSqlError(ErrorCode::Semantic, "Streaming requires a single SELECT statement");
+    auto plans = optimizer::optimize(sql::compilePlans(ast, catalog_.view())).plans;
+    materializeSubqueries(plans);
+    if (plans.size() != 1 || !streamEligible(plans.front()))
+        throw MiniSqlError(ErrorCode::NotImplemented, "Streaming is not supported for this statement");
+    const auto& plan = plans.front();
+    json columns = json::array();
+    json columnTypes = json::array();
+    for (const auto& column : plan.output) { columns.push_back(column.name); columnTypes.push_back(column.type); }
+    if (onMeta) onMeta({{"columns", std::move(columns)}, {"columnTypes", std::move(columnTypes)}});
+    auto stream = budgetStream(buildStream(plan), RowBudget{maxResultRows_, maxTempFileBytes_, maxSortRuns_, maxAggregateStates_});
+    std::size_t rowCount = 0;
+    Row row;
+    try {
+        while (stream->next(row)) {
+            if (onRow) onRow(std::move(row));
+            ++rowCount;
+            if (waitBackpressure) waitBackpressure(rowCount);
+        }
+    } catch (...) {
+        stream->close();
+        throw;
+    }
+    stream->close();
+    return {{"rowCount", rowCount}};
+}
+
 nlohmann::json Database::runStatement(const sql::LogicalPlan& plan) {
     if (plan.kind == "IndexInspect") return indexInspect(plan.table, plan.indexName);
     if (plan.kind == "Checkpoint") {

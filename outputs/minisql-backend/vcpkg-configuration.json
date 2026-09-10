@@ -1,0 +1,7 @@
+{
+  "default-registry": {
+    "kind": "git",
+    "repository": "file:///D:/databasework/minisql-database-system/outputs/minisql-backend/.tools/vcpkg-registry",
+    "baseline": "6f1ddd6b6878e7e66fcc35c65ba1d8feec2e01f8"
+  }
+}
