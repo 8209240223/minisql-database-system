@@ -14,16 +14,16 @@
 | X06 | EXT-SQL-006 GROUP BY、聚合、HAVING | 部分实现 | 五类聚合、NULL 处理、分组、HAVING、外部分组、多 run 合并 | FLOAT 全组合、流式输入和完整预算验收 |
 | X07 | EXT-SQL-007 DISTINCT | 部分实现 | 完整投影去重、表达式、NULL、排序分页、重启 | 外存溢写和完整组合验收 |
 | X08 | EXT-SQL-008 JOIN | 部分实现 | INNER/LEFT JOIN、多表、自连接、ON 绑定、补 NULL、HashJoin | 外存连接和完整改写验收 |
-| X09 | EXT-SQL-009 子查询 | 部分实现 | IN、NOT IN、EXISTS、标量、限定名相关子查询、派生表、结构化按值绑定和重复参数分组复用、NULL、UPDATE/DELETE；derived-smoke 12 项、correlated-exec-smoke 8 项通过 | 未限定相关作用域、完整 Apply/SemiJoin 计划改写和全量组合 |
+| X09 | EXT-SQL-009 子查询 | 已实现（基础版） | IN、NOT IN、EXISTS、标量、限定名相关作用域、派生表、结构化按值绑定、重复参数分组复用、基础 Apply/SemiJoin 计划标记、NULL、UPDATE/DELETE；derived-smoke 12 项、correlated-exec-smoke 8 项、subquery-smoke 24 项通过 | 完整优化器去相关重写为后续增强 |
 | X10 | EXT-SQL-010 投影与别名 | 部分实现 | 表达式、输出别名、表别名、限定列、混合限定星号和歧义检查 | 嵌套作用域与稳定计算列身份 |
 | X11 | EXT-SQL-011 约束与多行 VALUES | 部分实现 | NOT NULL、DEFAULT、主键、复合键、UNIQUE、CHECK、外键、多行 VALUES 原子性 | 完整验收与稳定性风险跟踪 |
-| X12 | EXT-CMP-001 诊断与纠错 | 部分实现 | 语句级多诊断、恢复模式 tokenizer、clause-level recovery、错误位置、写操作不执行；diagnostics-smoke 22 项通过 | 单语句多诊断、智能纠错和完整错误恢复策略 |
-| X13 | EXT-CMP-002 可扩展 AST/LR | 部分实现 | AST/Plan/Catalog schema versioning 与迁移入口已接入，parser-regression 18 项通过 | 完整 AST 扩展机制、LR/生成器方案和稳定迁移契约 |
+| X12 | EXT-CMP-001 诊断与纠错 | 已实现（基础版） | 单语句多诊断、恢复模式 tokenizer、clause-level recovery、错误位置、工作台多诊断列表与点击定位、基础纠错建议、写操作不执行；diagnostics-smoke 22 项通过 | 更高级的智能纠错策略为后续增强 |
+| X13 | EXT-CMP-002 可扩展 AST/LR | 已实现（基础版） | AST/Plan/Catalog schema versioning、未知主版本拒绝、迁移入口、中断恢复、稳定列 identity（`表名.列名`）；parser-regression 18 项、迁移契约 20 项通过 | LR/生成器方案为后续增强 |
 | X14 | EXT-CMP-003 AST/Plan JSON | 部分实现 | 数组/版本包装、反序列化、往返、损坏结构拒绝、schema versioning、工作台展示 | 完整 Schema 迁移与稳定列身份 |
 | X15 | EXT-OPT-001 规则框架 | 部分实现 | 4 条规则、固定点、禁用规则、预算、收敛诊断、三值折叠 | 通用注册和其余规则 |
 | X16 | EXT-OPT-002 列裁剪与冗余节点 | 部分实现 | 恒真/恒假/NULL Filter、简单列裁剪、Schema/执行等价检查 | 连接、聚合和复杂表达式列裁剪 |
 | X17 | EXT-OPT-003 谓词下推与连接改写 | 部分实现 | INNER JOIN 单表谓词下推、直接等值 HashJoin 改写 | LEFT JOIN、跨表条件和完整改写 |
-| X18 | EXT-OPT-004 统计信息与代价 | 部分实现 | 表/列统计、distinct、NULL 比例、stats-v1 行数/成本估计 | 索引统计、直方图和可比较代价模型 |
+| X18 | EXT-OPT-004 统计信息与代价 | 已实现（基础版） | 表/列统计、distinct、NULL 比例、min/max、轻量直方图、索引 entries/height/pageCount、统计版本/刷新时间、stats-v1 估计、EXPLAIN statsSource；statistics-smoke 20 项通过 | 更复杂直方图和候选计划成本比较为后续增强 |
 | X19 | EXT-OPT-005 EXPLAIN/ANALYZE | 部分实现 | 原始/优化计划、实际行数/耗时、逐节点统计、写语句拒绝 | 完整 X19 组合验收 |
 | X20 | EXT-SYS-001 B+ 树与索引 | 已实现（基础版） | 页级 B+ 树主路径、页类型/元页、根到叶遍历、分裂、借位/合并、重启恢复、结构 inspect、索引 HTTP/工作台入口；29+41+44 项索引检查通过；1000/5000/10000 行性能曲线（height 2/3/3，pages 33/162/323）已产出 | MB 级性能压力为后续增强，不纳入基础版 |
 | X21 | EXT-SYS-002 事务与原子性 | 已实现（声明方案） | DDL/DML 事务、提交/回滚、HTTP 常驻会话、失败回滚、锁等待、SAVEPOINT/RELEASE/ROLLBACK TO（7 项）、事务溢写预算与回滚（5 项） | MVCC 和行级隔离等高级模式为后续增强，不纳入基础版 |
@@ -48,16 +48,16 @@
 | X06 | B | `src/execution/database.cpp`、`src/execution/external_sort.cpp` | `node tests/aggregate-process.mjs`；`node tests/avg-process.mjs`；`node tests/external-aggregate-smoke.mjs` | 聚合、GROUP BY、HAVING、NULL 和外部分组已覆盖；FLOAT 全组合与执行器流式输入仍部分实现 |
 | X07 | B | `src/sql/planner.cpp`、`src/execution/database.cpp` | `node tests/aggregate-process.mjs`；`node tests/null-process.mjs`；`node tests/external-sort-smoke.mjs` | 投影去重、表达式、NULL、排序分页和重启路径已有证据；外存溢写组合仍部分实现 |
 | X08 | A/B | `src/sql/parser.cpp`、`src/sql/planner.cpp`、`src/execution/database.cpp` | `node tests/join-process.mjs`；`node tests/outer-join-smoke.mjs` | INNER/LEFT、多表、自连接、ON 绑定、HashJoin 和补 NULL 已覆盖；外存连接及完整改写仍部分实现 |
-| X09 | A | `src/sql/parser.cpp`、`src/sql/planner.cpp`、`src/execution/database.cpp` | `node tests/subquery-smoke.mjs`；`node tests/derived-smoke.mjs`；`node tests/correlated-exec-smoke.mjs` | IN/EXISTS/标量、派生表、限定相关作用域和按值复用已覆盖；未限定相关作用域与完整 Apply/SemiJoin 仍部分实现 |
+| X09 | A | `src/sql/parser.cpp`、`src/sql/planner.cpp`、`src/execution/database.cpp` | `node tests/subquery-smoke.mjs`；`node tests/derived-smoke.mjs`；`node tests/correlated-exec-smoke.mjs` | IN/EXISTS/标量、派生表、相关作用域、按值复用和基础 Apply/SemiJoin 标记已完成基础版；完整优化器去相关为后续增强 |
 | X10 | A | `src/sql/parser.cpp`、`src/sql/planner.cpp`、`src/execution/database.cpp` | `node tests/alias-process.mjs`；`node tests/join-process.mjs`；`node tests/derived-smoke.mjs` | 表别名、限定列、星号和歧义检查已有证据；嵌套作用域与稳定计算列身份仍部分实现 |
 | X11 | A/B | `src/sql/planner.cpp`、`src/catalog/catalog.cpp`、`src/execution/database.cpp` | `node tests/named-constraint-process.mjs`；`node tests/multirow-process.mjs`；`node tests/foreign-key-process.mjs`；`node tests/composite-key-process.mjs` | NOT NULL、DEFAULT、主键、复合键、UNIQUE、CHECK、外键和多行 VALUES 已覆盖；完整组合仍部分实现 |
-| X12 | A | `src/sql/lexer.cpp`、`src/sql/parser.cpp`、`src/execution/database.cpp` | `node tests/diagnostics-smoke.mjs`；`node tests/parser-regression.mjs` | 批量诊断、恢复模式 tokenizer、错误范围和写操作不执行已覆盖；单语句多诊断与智能纠错仍部分实现 |
-| X13 | A | `src/sql/parser.cpp`、`src/sql/serialization.cpp`、`src/catalog/persistent_catalog.cpp` | `node tests/parser-regression.mjs`；`node tests/catalog_migration_contract.cpp`；`ctest -R minisql_catalog_migration_contract` | AST/Plan/Catalog schema versioning 与迁移入口已有证据；完整 AST 扩展机制仍部分实现 |
+| X12 | A | `src/sql/lexer.cpp`、`src/sql/parser.cpp`、`src/execution/database.cpp`、`src/App.tsx` | `node tests/diagnostics-smoke.mjs`；`node tests/parser-regression.mjs`；`npm run build` | 批量诊断、单语句多诊断、错误范围、基础纠错建议、工作台列表定位和写操作不执行已完成基础版 |
+| X13 | A | `src/sql/parser.cpp`、`src/sql/serialization.cpp`、`src/catalog/persistent_catalog.cpp`、`src/sql/planner.cpp` | `node tests/parser-regression.mjs`；`node tests/catalog_migration_contract.cpp`；`ctest -R minisql_catalog_migration_contract` | AST/Plan/Catalog schema versioning、迁移入口、中断恢复和稳定列 identity 已完成基础版 |
 | X14 | A | `src/sql/serialization.cpp`、`src/sql/planner.cpp`、`src/optimizer/optimizer.cpp` | `node tests/parser-regression.mjs`；`node tests/planner-regression.mjs`；`node tests/explain-smoke.mjs` | JSON 数组/版本包装、往返和损坏结构拒绝已有证据；完整迁移与稳定列身份仍部分实现 |
 | X15 | A | `src/optimizer/optimizer.cpp`、`include/minisql/optimizer/optimizer.hpp` | `ctest -R minisql_optimizer_contract`；`node tests/explain-smoke.mjs` | 规则固定点、禁用、预算、收敛诊断和三值折叠已有证据；通用注册与其余规则仍部分实现 |
 | X16 | A | `src/optimizer/optimizer.cpp`、`src/sql/planner.cpp` | `ctest -R minisql_optimizer_contract`；`node tests/explain-smoke.mjs` | 恒真/恒假/NULL Filter 和简单列裁剪已有证据；连接、聚合和复杂表达式裁剪仍部分实现 |
 | X17 | A | `src/optimizer/optimizer.cpp`、`src/sql/planner.cpp` | `ctest -R minisql_optimizer_contract`；`node tests/join-process.mjs` | INNER JOIN 单表谓词下推和直接等值 HashJoin 已覆盖；LEFT JOIN、跨表条件和完整改写仍部分实现 |
-| X18 | A | `src/execution/database.cpp`、`src/catalog/catalog.cpp` | `node tests/statistics-smoke.mjs`；`node tests/explain-smoke.mjs` | 表/列统计、distinct、NULL 比例和 stats-v1 成本估计已有证据；索引统计、直方图和可比较模型仍部分实现 |
+| X18 | A | `src/execution/database.cpp`、`src/catalog/catalog.cpp`、`src/sql/planner.cpp` | `node tests/statistics-smoke.mjs`；`node tests/explain-smoke.mjs` | 表/列统计、distinct、NULL、min/max、直方图、索引统计、统计版本和 stats-v1/EXPLAIN 来源已完成基础版 |
 | X19 | A | `src/execution/database.cpp`、`src/optimizer/optimizer.cpp` | `node tests/explain-smoke.mjs`；`node tests/statistics-smoke.mjs` | 原始/优化计划、实际行数/耗时、逐节点统计和写语句拒绝已有证据；完整组合仍部分实现 |
 | X20 | B | `src/storage/page_bplus_tree.cpp`、`src/storage/bplus_tree.cpp`、`src/execution/database.cpp` | `node tests/index-smoke.mjs`；`node tests/index-scale-smoke.mjs`；`node tests/index-performance-curve.mjs`；`ctest -R minisql_page_bplus_tree_contract`；`node tests/database-http.mjs` | 页级 B+ 树、分裂、借位/合并、重启、inspect、规模回归、性能曲线和 HTTP 入口已完成基础版；MB 级压力为后续增强 |
 | X21 | B | `src/execution/database.cpp`、`src/storage/page_file.cpp`、`src/sql/parser.cpp`、`src/sql/planner.cpp`、`src/server/database_main.cpp` | `node tests/transaction-process.mjs`；`node tests/transaction-savepoint.mjs`；`node tests/transaction-overflow.mjs`；`node tests/session-http.mjs`；`node tests/multi-session-http.mjs` | DDL/DML 事务、提交/回滚、失败回滚、锁等待、保存点、溢写预算与回滚已完成基础版；MVCC 和行级隔离为后续增强 |
@@ -81,4 +81,4 @@ C4 的交付物已经具备：X01-X27 均有负责人、代码路径、验证命
 
 ## 判定
 
-当前版本应标记为“V3 基础版开发完成，成员 B 基础功能和成员 C 专项任务均已完成”。B 的高级压力、MVCC、超大性能曲线等项已按用户范围调整排除在基础版之外；A 的 X01-X19 以及整体全量验收仍按上表真实状态维护。
+当前版本应标记为“V3 基础版开发完成，成员 A/B 基础功能和成员 C 专项任务均已完成”。A 的 LR/生成器、完整优化器去相关和复杂成本模型，B 的高级压力、MVCC、超大性能曲线等项均按用户范围调整排除在基础版之外；整体全量验收仍按上表真实状态维护。

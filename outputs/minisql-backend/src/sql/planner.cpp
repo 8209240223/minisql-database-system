@@ -83,20 +83,29 @@ nlohmann::json bindExpression(const Expr& expression, const catalog::Table& tabl
     } else if (expression.kind == "Exists") {
         if (expression.subquerySql.empty()) invalid("missing EXISTS subquery");
         result["subquerySql"] = expression.subquerySql;
-        result["outerColumns"] = correlatedScope(table);
+        const auto outer = correlatedScope(table);
+        result["outerColumns"] = outer;
+        result["planKind"] = outer.empty() ? "SemiJoin" : "Apply";
+        result["decorrelation"] = outer.empty() ? "none" : "grouped-parameter-instances";
         result["type"] = "bool";
         result["nullable"] = false;
     } else if (expression.kind == "ScalarSubquery") {
         if (expression.subquerySql.empty()) invalid("missing scalar subquery");
         result["subquerySql"] = expression.subquerySql;
-        result["outerColumns"] = correlatedScope(table);
+        const auto outer = correlatedScope(table);
+        result["outerColumns"] = outer;
+        result["planKind"] = outer.empty() ? "ScalarSubquery" : "Apply";
+        result["decorrelation"] = outer.empty() ? "none" : "grouped-parameter-instances";
         result["type"] = "null";
         result["nullable"] = true;
     } else if (expression.kind == "InSubquery") {
         if (!expression.left || expression.subquerySql.empty()) invalid("missing IN subquery operand");
         result["left"] = bindExpression(*expression.left, table, depth + 1);
         result["subquerySql"] = expression.subquerySql;
-        result["outerColumns"] = correlatedScope(table);
+        const auto outer = correlatedScope(table);
+        result["outerColumns"] = outer;
+        result["planKind"] = outer.empty() ? "SemiJoin" : "Apply";
+        result["decorrelation"] = outer.empty() ? "none" : "grouped-parameter-instances";
         result["type"] = "bool";
         result["nullable"] = true;
     } else if (expression.kind == "AggregateExpr") {
@@ -147,7 +156,9 @@ nlohmann::json bindExpression(const Expr& expression, const catalog::Table& tabl
 std::vector<PlanColumn> schema(const catalog::Table& table) {
     std::vector<PlanColumn> output;
     for (std::size_t i = 0; i < table.columns.size(); ++i) {
-        output.push_back({table.columns[i].name, table.columns[i].type, i, table.columns[i].nullable, table.columns[i].defaultValue, table.columns[i].primaryKey, table.columns[i].unique, table.columns[i].references});
+        const auto qualifier = table.columns[i].qualifier.empty() ? table.name : table.columns[i].qualifier;
+        output.push_back({table.columns[i].name, table.columns[i].type, i, table.columns[i].nullable, table.columns[i].defaultValue,
+            table.columns[i].primaryKey, table.columns[i].unique, table.columns[i].references, qualifier + "." + table.columns[i].name});
     }
     return output;
 }
@@ -512,7 +523,7 @@ nlohmann::json serializePlans(const std::vector<LogicalPlan>& plans) {
         const auto rowIndex = rows.size();
         nlohmann::json output = nlohmann::json::array();
         for (const auto& column : plan.output) {
-            output.push_back({{"name", column.name}, {"type", column.type}, {"columnId", column.columnId}, {"nullable", column.nullable},
+            output.push_back({{"name", column.name}, {"type", column.type}, {"columnId", column.columnId}, {"identity", column.identity}, {"nullable", column.nullable},
                 {"defaultValue", column.defaultValue ? nlohmann::json(*column.defaultValue) : nlohmann::json(nullptr)}, {"primaryKey", column.primaryKey}, {"unique", column.unique}, {"references", serializeReference(column.references)}});
         }
         rows.push_back({{"id", id}, {"parent", parent}, {"depth", depth}, {"statementIndex", statementIndex},
@@ -594,6 +605,7 @@ std::vector<LogicalPlan> deserializePlans(const nlohmann::json& document) {
             if (!column.is_object() || !column.contains("name") || !column.at("name").is_string() || !column.contains("type") || !column.at("type").is_string() ||
                 !column.contains("columnId") || !column.at("columnId").is_number_unsigned() || !column.contains("nullable") || !column.at("nullable").is_boolean()) invalid();
             PlanColumn value{column.at("name").get<std::string>(), column.at("type").get<std::string>(), column.at("columnId").get<std::size_t>(), column.at("nullable").get<bool>()};
+            value.identity = column.value("identity", std::string{});
             if (column.contains("defaultValue") && !column.at("defaultValue").is_null()) value.defaultValue = column.at("defaultValue").get<std::string>();
             value.primaryKey = column.value("primaryKey", false);
             value.unique = column.value("unique", false);

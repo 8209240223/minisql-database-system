@@ -994,29 +994,66 @@ nlohmann::json Database::statistics() {
         const auto schema = rowSchema(table.definition);
         std::vector<std::set<json>> distinct(schema.size());
         std::vector<std::uint64_t> nulls(schema.size(), 0);
+        std::vector<std::optional<json>> minimum(schema.size());
+        std::vector<std::optional<json>> maximum(schema.size());
+        std::vector<std::map<std::string, std::pair<json, std::uint64_t>>> frequencies(schema.size());
         std::uint64_t rowCount = 0;
         heap_.scan(table.id, schema, [&](storage::RowRef, const storage::Row& row) {
             ++rowCount;
             for (std::size_t index = 0; index < row.size(); ++index) {
                 if (std::holds_alternative<std::monostate>(row[index])) ++nulls[index];
-                else distinct[index].insert(cell(row[index]));
+                else {
+                    auto value = cell(row[index]);
+                    distinct[index].insert(value);
+                    if (!minimum[index] || value < *minimum[index]) minimum[index] = value;
+                    if (!maximum[index] || *maximum[index] < value) maximum[index] = value;
+                    auto& bucket = frequencies[index][value.dump()];
+                    bucket.first = std::move(value);
+                    ++bucket.second;
+                }
             }
         });
         json columns = json::array();
         for (std::size_t index = 0; index < table.definition.columns.size(); ++index) {
+            std::vector<std::pair<std::string, std::pair<json, std::uint64_t>>> ranked(frequencies[index].begin(), frequencies[index].end());
+            std::sort(ranked.begin(), ranked.end(), [](const auto& left, const auto& right) {
+                if (left.second.second != right.second.second) return left.second.second > right.second.second;
+                return left.first < right.first;
+            });
+            if (ranked.size() > 8) ranked.resize(8);
+            json histogram = json::array();
+            for (const auto& [keyValue, entry] : ranked) {
+                (void)keyValue;
+                histogram.push_back({{"value", entry.first}, {"count", entry.second}});
+            }
             columns.push_back({{"name", table.definition.columns[index].name},
                 {"columnId", index}, {"type", key(table.definition.columns[index].type)},
                 {"distinctCount", distinct[index].size()},
                 {"nullCount", nulls[index]},
-                {"nullRatio", rowCount == 0 ? 0.0 : static_cast<double>(nulls[index]) / static_cast<double>(rowCount)}});
+                {"nullRatio", rowCount == 0 ? 0.0 : static_cast<double>(nulls[index]) / static_cast<double>(rowCount)},
+                {"minValue", minimum[index] ? *minimum[index] : json(nullptr)},
+                {"maxValue", maximum[index] ? *maximum[index] : json(nullptr)},
+                {"histogram", std::move(histogram)}});
+        }
+        json indexes = json::array();
+        for (const auto& definition : table.definition.indexes) {
+            const RuntimeIndex* runtime = nullptr;
+            for (const auto& candidate : indexes_) if (key(candidate->table) == key(table.definition.table) && key(candidate->name) == key(definition.name)) { runtime = candidate.get(); break; }
+            indexes.push_back({{"name", definition.name}, {"columns", definition.columns}, {"unique", definition.unique},
+                {"entries", runtime ? runtime->size() : 0}, {"height", runtime ? runtime->height() : 1},
+                {"pageCount", runtime && runtime->pageFile ? file_->pagesFor(indexOwnerId(table.definition.table, definition.name)).size() : 0},
+                {"statsSource", runtime ? (runtime->pageFile ? "page-bplus-tree" : "memory-bplus-tree") : "missing"}});
         }
         tables.push_back({{"name", table.definition.table}, {"tableId", table.id}, {"rowCount", rowCount},
-            {"allocatedPages", file_->pagesFor(table.id).size()}, {"columns", columns}});
+            {"allocatedPages", file_->pagesFor(table.id).size()}, {"columns", columns}, {"indexes", std::move(indexes)}});
     }
     const auto dirtyPages = buffer_.dirtyPages();
     const auto dirtyRatio = buffer_.capacity() == 0 ? 0.0 : static_cast<double>(dirtyPages) / static_cast<double>(buffer_.capacity());
     const auto& record = file_->checkpointRecord();
-    return {{"success", true}, {"tables", tables}, {"scope", "table-and-column"}, {"source", "on-demand-scan"},
+    const auto refreshedAt = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count());
+    return {{"success", true}, {"tables", tables}, {"scope", "table-column-index"}, {"source", "on-demand-scan"},
+        {"statisticsVersion", 1}, {"refreshedAt", refreshedAt}, {"histogramBuckets", 8},
         {"checkpointCount", checkpointCount_}, {"autoCheckpointWrites", autoCheckpointWrites_},
         {"autoCheckpointWalBytes", autoCheckpointWalBytes_}, {"autoCheckpointDirtyPages", autoCheckpointDirtyPages_},
         {"autoCheckpointDirtyRatio", autoCheckpointDirtyRatio_}, {"autoCheckpointIntervalMs", autoCheckpointIntervalMs_},
@@ -1991,8 +2028,19 @@ nlohmann::json Database::diagnostics(const std::string& source) const {
     std::size_t statementIndex = 0;
     const auto append = [&](const MiniSqlError& error) {
         const auto& loc = error.location();
+        std::string suggestion = error.suggestion();
+        if (suggestion.empty()) {
+            const std::string message = error.what();
+            if (message.find("Table does not exist") != std::string::npos || message.find("missing table") != std::string::npos)
+                suggestion = "Check the table name and confirm the table was created.";
+            else if (message.find("Column does not exist") != std::string::npos || message.find("Unknown column") != std::string::npos)
+                suggestion = "Check the column name and table alias.";
+            else if (message.find("Expected FROM") != std::string::npos)
+                suggestion = "Add FROM before the table name.";
+        }
         items.push_back({{"success", false}, {"stage", stageFor(error.code())},
             {"code", static_cast<int>(error.code())}, {"message", error.what()},
+            {"suggestion", std::move(suggestion)},
             {"line", loc.line}, {"column", loc.column},
             {"endLine", loc.endLine ? loc.endLine : loc.line},
             {"endColumn", loc.endColumn ? loc.endColumn : loc.column},
@@ -2297,12 +2345,13 @@ nlohmann::json Database::execute(const std::string& source, bool optimize) {
                     const auto planIndex = node.at("id").get<std::size_t>();
                     if (planIndex >= planNodes.size()) fail("EXPLAIN plan node index is invalid");
                     const auto estimated = estimate(*planNodes[planIndex]);
-                    rows.push_back({node.at("kind"), node.at("detail"), estimated.first, estimated.second, "stats-v1"});
+                    rows.push_back({node.at("kind"), node.at("detail"), estimated.first, estimated.second, "stats-v1", "table-column-statistics-or-default"});
                 }
-                json explanation = {{"kind", "Explain"}, {"columns", {"node", "detail", "estimatedRows", "estimatedCost", "estimateSource"}},
-                    {"columnTypes", {"varchar", "varchar", "bigint", "float", "varchar"}}, {"rows", rows}, {"affectedRows", 0},
+                json explanation = {{"kind", "Explain"}, {"columns", {"node", "detail", "estimatedRows", "estimatedCost", "estimateSource", "statsSource"}},
+                    {"columnTypes", {"varchar", "varchar", "bigint", "float", "varchar", "varchar"}}, {"rows", rows}, {"affectedRows", 0},
                     {"plan", raw}, {"optimizedPlan", optimizedJson}, {"optimizationRules", optimized.changes},
-                    {"estimatedRowsAvailable", true}, {"costModel", "stats-v1"}, {"executed", false},
+                    {"estimatedRowsAvailable", true}, {"costModel", "stats-v1"}, {"costModelVersion", 1},
+                    {"deterministicTieBreak", "estimated-cost-then-plan-kind"}, {"executed", false},
                     {"commitState", "notApplicable"}};
                 if (analyze) {
                     const auto before = buffer_.stats();

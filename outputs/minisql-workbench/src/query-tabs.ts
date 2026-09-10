@@ -1,4 +1,4 @@
-import type { QueryResult, QueryTab } from './types';
+import type { Diagnostic, QueryResult, QueryTab } from './types';
 import type { DiagnosticLocation } from './diagnostic-location';
 
 export const DRAFT_KEY = 'minisql-studio-tabs-v1';
@@ -10,6 +10,9 @@ export interface QueryView {
   outcome?: string;
   selection?: boolean;
   diagnostic?: DiagnosticLocation;
+  diagnostics?: Diagnostic[];
+  diagnosticFrom?: number;
+  diagnosticTo?: number;
 }
 export const emptyView: QueryView = { result: null, output: 'results', notice: '' };
 export function restoreTabs(fallback: QueryTab[]): QueryTab[] {

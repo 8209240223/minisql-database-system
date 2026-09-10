@@ -12,6 +12,7 @@ struct PlanColumn {
     bool primaryKey = false;
     bool unique = false;
     std::optional<std::pair<std::string,std::string>> references{};
+    std::string identity{};
 };
 
 struct LogicalPlan {

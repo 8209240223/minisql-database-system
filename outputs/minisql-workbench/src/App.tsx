@@ -13,7 +13,7 @@ import { IndexInspectView } from './IndexInspect';
 import { configureBuffer } from './client';
 import { Plug, Unplug, Check, Undo2, CirclePlay, Pencil, Upload, Download } from 'lucide-react';
 import { Plan, Diagnostics } from './CompilerViews';
-import type { BackupEntry, Capabilities, Connection, ConnectionProfile, HistoryItem, QueryTab, Table } from './types';
+import type { BackupEntry, Capabilities, Connection, ConnectionProfile, Diagnostic, HistoryItem, QueryTab, Table } from './types';
 import { Results } from './Results';
 import { DRAFT_KEY, emptyView, restoreTabs } from './query-tabs';
 import type { QueryView } from './query-tabs';
@@ -72,7 +72,7 @@ function App() {
   const [views, setViews] = useState<Record<string, QueryView>>({});
   const liveTabs = useRef(new Set(tabs.map(tab => tab.id)));
   liveTabs.current = new Set(tabs.map(tab => tab.id));
-  const { result, output, notice, source: resultSource, outcome, selection: selectedResult, diagnostic } = views[active] ?? emptyView;
+  const { result, output, notice, source: resultSource, outcome, selection: selectedResult, diagnostic, diagnostics, diagnosticFrom, diagnosticTo } = views[active] ?? emptyView;
   const editor = useRef<EditorView | undefined>(undefined);
   const [editorInstance, setEditorInstance] = useState<EditorView>();
   const fileInput = useRef<HTMLInputElement>(null);
@@ -84,7 +84,7 @@ function App() {
     setViews(previous => liveTabs.current.has(id) ? { ...previous, [id]: { ...(previous[id] ?? emptyView), ...patch } } : previous);
   }
   function setOutput(value: QueryView['output']) { updateView({ output: value }); }
-  function setNotice(value: string) { updateView({ notice: value, diagnostic: undefined }); }
+  function setNotice(value: string) { updateView({ notice: value, diagnostic: undefined, diagnostics: undefined }); }
   function settlePending(value: string) {
     setViews(previous => Object.fromEntries(Object.entries(previous).map(([id, view]) => [id, view.outcome === 'pending' ? { ...view, outcome: value } : view])));
   }
@@ -393,11 +393,18 @@ const [accessOpen, setAccessOpen] = useState(false);
       if (!compile) { await refresh(); await refreshStorage(); }
     } catch (e) {
       const failure = clientTimedOut ? Object.assign(new Error(`客户端请求超时，已发送取消请求。`), e && typeof e === 'object' ? e : {}) : e;
-      const message = failure instanceof Error ? failure.message : String(failure); handleFailure(failure);
+      const baseMessage = failure instanceof Error ? failure.message : String(failure);
+      const suggestion = (failure as { suggestion?: string }).suggestion;
+      const message = suggestion ? `${baseMessage}；${suggestion}` : baseMessage;
+      handleFailure(failure);
+      const responseDiagnostics = (failure as { response?: { diagnostics?: Diagnostic[] } }).response?.diagnostics ?? [];
       if ((e as { transactionState?: string }).transactionState === 'ABORTED') await refresh();
       if (command === undefined) {
         const position = e as { line?: number; column?: number };
-        updateView({ diagnostic: mapDiagnostic(documentSource, submittedFrom, submittedTo, position.line ?? 0, position.column ?? 0) });
+        updateView({ diagnostics: responseDiagnostics.length ? responseDiagnostics : undefined,
+          diagnosticFrom: submittedFrom, diagnosticTo: submittedTo,
+          diagnostic: mapDiagnostic(documentSource, submittedFrom, submittedTo,
+            responseDiagnostics[0]?.line ?? position.line ?? 0, responseDiagnostics[0]?.column ?? position.column ?? 0) });
       }
       recordHistory(source, compile, Date.now() - started, 0, message);
     } finally { window.clearTimeout(timeoutTimer); if (hardTimeoutTimer !== undefined) window.clearTimeout(hardTimeoutTimer); busy.current = false; setRunning(false); setRunningTab(undefined); }
@@ -443,6 +450,15 @@ const [accessOpen, setAccessOpen] = useState(false);
     if (!view || !diagnostic || view.state.doc.toString() !== diagnostic.source) return;
     view.dispatch({ selection: { anchor: diagnostic.offset, head: diagnostic.offset + diagnostic.length },
       effects: EditorView.scrollIntoView(diagnostic.offset, { y: 'center' }) });
+    view.focus();
+  }
+  function locateDiagnosticItem(item: Diagnostic) {
+    const view = editor.current;
+    const location = mapDiagnostic(diagnostic?.source ?? current.sql, diagnosticFrom ?? 0, diagnosticTo ?? (diagnostic?.source ?? current.sql).length,
+      item.line ?? 0, item.column ?? 0);
+    if (!view || !location) return;
+    view.dispatch({ selection: { anchor: location.offset, head: location.offset + location.length },
+      effects: EditorView.scrollIntoView(location.offset, { y: 'center' }) });
     view.focus();
   }
   function shortcut(event: React.KeyboardEvent) {
@@ -557,7 +573,7 @@ const [accessOpen, setAccessOpen] = useState(false);
         <div className="query-state"><span title={current.name}>{current.name}</span><button className="icon-btn" aria-label="重命名查询" title="重命名查询" onClick={renameTab}><Pencil size={14}/></button>{current.dirty && <small>已修改</small>}{runningTab === active && <small role="status">执行中</small>}{result && resultSource !== current.sql && <small data-testid="stale-result">结果对应旧 SQL</small>}{['pending','rolledBack','unknown'].includes(outcome ?? '') && <small data-testid="result-outcome">{outcome === 'pending' ? '未提交结果' : outcome === 'rolledBack' ? '事务已回滚' : '提交状态未知'}</small>}</div>
         <div className="file-toolbar"><button className="icon-btn" aria-label="导入 SQL" title="导入 SQL" onClick={() => fileInput.current?.click()}><Upload size={15}/></button><button className="icon-btn" aria-label="导出 SQL" title="导出 SQL" onClick={exportSql}><Download size={15}/></button>{selectedResult && <small data-testid="selection-result">选区结果</small>}{diagnostic && <><button className="icon-btn" aria-label="定位错误" title={`第 ${diagnostic.line} 行，第 ${diagnostic.column} 列`} disabled={current.sql.replace(/\r\n|\r/g, '\n') !== diagnostic.source} onClick={locateDiagnostic}><Search size={15}/></button><small data-testid="diagnostic-position">第 {diagnostic.line} 行，第 {diagnostic.column} 列{current.sql.replace(/\r\n|\r/g, '\n') !== diagnostic.source ? ' · 原 SQL 已修改' : ''}</small></>}</div>
         <section className="editor-wrap"><CodeMirror key={active} onCreateEditor={view => { editor.current = view; setEditorInstance(view); }} value={current?.sql ?? ''} height="100%" theme="light" extensions={editorExtensions} onChange={updateSql} basicSetup={{ lineNumbers: true, foldGutter: true, highlightActiveLine: true, autocompletion: true }} /></section>
-        <section className="output"><div className="output-tabs"><button className={output === 'results' ? 'selected' : ''} onClick={() => setOutput('results')}><Table2 size={14}/> Result <span>{result?.rows.length ?? 0}</span></button><button className={output === 'plan' ? 'selected' : ''} onClick={() => setOutput('plan')}><Activity size={14}/> Plan <span>{result?.plan.length ?? 0}</span></button><button className={output === 'ast' ? 'selected' : ''} onClick={() => setOutput('ast')}><Braces size={14}/> AST</button><button className={output === 'tokens' ? 'selected' : ''} onClick={() => setOutput('tokens')}><Terminal size={14}/> Diagnostics</button><button className={output === 'inspect' ? 'selected' : ''} onClick={() => setOutput('inspect')}><Database size={14}/> Inspect</button><div className="output-spacer"/><span className="query-meta">{result ? `${result.durationMs.toFixed(1)} ms · ${result.affectedRows} affected` : 'Ready'}</span></div><div className="output-body">{notice ? <div className="error-state"><span>!</span><div><strong>Query failed</strong><p>{notice}</p><button onClick={() => setNotice('')}>Dismiss</button></div></div> : output === 'results' ? <Results result={result}/> : output === 'plan' ? <Plan result={result}/> : output === 'ast' ? <pre className="json-view">{result?.ast ? JSON.stringify(result.ast, null, 2) : 'Compile a query to inspect its AST.'}</pre> : output === 'tokens' ? <Diagnostics result={result}/> : <IndexInspectView info={inspectInfo}/>}</div></section>
+        <section className="output"><div className="output-tabs"><button className={output === 'results' ? 'selected' : ''} onClick={() => setOutput('results')}><Table2 size={14}/> Result <span>{result?.rows.length ?? 0}</span></button><button className={output === 'plan' ? 'selected' : ''} onClick={() => setOutput('plan')}><Activity size={14}/> Plan <span>{result?.plan.length ?? 0}</span></button><button className={output === 'ast' ? 'selected' : ''} onClick={() => setOutput('ast')}><Braces size={14}/> AST</button><button className={output === 'tokens' ? 'selected' : ''} onClick={() => setOutput('tokens')}><Terminal size={14}/> Diagnostics</button><button className={output === 'inspect' ? 'selected' : ''} onClick={() => setOutput('inspect')}><Database size={14}/> Inspect</button><div className="output-spacer"/><span className="query-meta">{result ? `${result.durationMs.toFixed(1)} ms · ${result.affectedRows} affected` : 'Ready'}</span></div><div className="output-body">{notice ? <div className="error-state"><span>!</span><div><strong>Query failed</strong><p>{notice}</p>{diagnostics && diagnostics.length > 1 && <div className="diagnostic-list">{diagnostics.map((item, index) => <button key={`${item.statementIndex ?? index}-${item.column ?? 0}`} onClick={() => locateDiagnosticItem(item)}><b>{item.code ?? 'SQL'}</b> 第 {item.line ?? 1} 行，第 {item.column ?? 1} 列：{item.message}</button>)}</div>}<button onClick={() => setNotice('')}>Dismiss</button></div></div> : output === 'results' ? <Results result={result}/> : output === 'plan' ? <Plan result={result}/> : output === 'ast' ? <pre className="json-view">{result?.ast ? JSON.stringify(result.ast, null, 2) : 'Compile a query to inspect its AST.'}</pre> : output === 'tokens' ? <Diagnostics result={result}/> : <IndexInspectView info={inspectInfo}/>}</div></section>
       </main>
       <aside className="rightbar">{historyContent}<div className="right-bottom"><Search size={14}/><input placeholder="Search tables" value={filter} onChange={e => setFilter(e.target.value)}/></div></aside>
     </div>

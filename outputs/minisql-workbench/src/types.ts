@@ -1,7 +1,7 @@
 export type Cell = string | number | boolean | null;
 export interface Column { name: string; type: string; primaryKey: boolean; nullable: boolean; defaultValue?: string | null; unique?: boolean; references?: { table: string; column: string } | null }
 export interface Table { name: string; columns: Column[]; indexes?: { name: string; columns: string[]; unique: boolean }[]; rowCount: number; keys?: { primary: boolean; columns: string[] }[]; foreignKeys?: { columns: string[]; table: string; referencedColumns: string[] }[]; checks?: Record<string, unknown>[]; constraintNames?: { name: string; kind: string; index: number }[] }
-export interface Diagnostic { message: string; stage?: string; line?: number; column?: number }
+export interface Diagnostic { code?: number; message: string; suggestion?: string; stage?: string; line?: number; column?: number; endLine?: number; endColumn?: number; statementIndex?: number }
 export interface PlanRow { id: number; parent: number; detail: string; depth?: number; kind?: string }
 export interface QueryResult {
   executionStats?: { scope: 'query'; nodeStatisticsAvailable: boolean; actualRows: number; durationMs: number; loops: number; hits: number; misses: number; diskReads: number; diskWrites: number; stagedPageReads: number; stagedPageWrites: number; ioErrors: number };

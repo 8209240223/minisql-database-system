@@ -42,7 +42,7 @@
 | EXT-SQL-006 | GROUP BY、聚合、HAVING | NULL、Aggregate | 部分实现：五种聚合及 GROUP BY/HAVING 已可执行；整数、DECIMAL 表达式与持久化列聚合已有真实结果检查，低内存阈值下的外部分组、多 run 归并和状态合并专项检查通过。FLOAT 完整组合、流式输入、完整资源预算和 X06 全量验收仍待完成，详见 aggregate-progress.md、external-aggregate-progress.md、decimal-progress.md 与 decimal-storage-progress.md | X06 |
 | EXT-SQL-007 | DISTINCT | Project、哈希/排序 | 部分实现：完整投影行去重、表达式、NULL、排序分页及重启已有检查；外存溢写和完整组合验收待完成 | X07 |
 | EXT-SQL-008 | INNER/LEFT JOIN | 多表作用域、NULL | 部分实现：INNER/LEFT JOIN、多表/自连接、ON 绑定、补 NULL 与歧义检查；哈希连接、外存及完整组合验证待完成 | X08 |
-| EXT-SQL-009 | 子查询、IN、EXISTS、标量子查询 | 多层作用域、Apply | 部分实现：非相关 IN/NOT IN、EXISTS、标量子查询、限定名相关子查询和派生表已接通，覆盖 NULL、空结果、投影、UPDATE/DELETE、ANALYZE 和错误拒绝；未限定相关作用域、Apply/SemiJoin 和全量组合待完成 | X09 |
+| EXT-SQL-009 | 子查询、IN、EXISTS、标量子查询 | 多层作用域、Apply | 已实现（基础版）：非相关 IN/NOT IN、EXISTS、标量子查询、限定名相关作用域、派生表、结构化按值绑定、重复参数分组复用和基础 Apply/SemiJoin 计划标记已接通；完整优化器去相关为后续增强 | X09 |
 | EXT-SQL-010 | 投影表达式和别名 | 表达式、Schema | 部分实现：表达式、输出/表别名、限定列、INNER JOIN 后混合限定星号及歧义检查已接；嵌套作用域及稳定计算列身份待完成 | X10 |
 | EXT-SQL-011 | NOT NULL、DEFAULT、PRIMARY KEY、UNIQUE、CHECK、外键、多行 VALUES | Catalog、约束、事务 | 已接入 NOT NULL、DEFAULT、单列/复合键、CHECK、具名约束及外键；新增多行 VALUES 单语句原子提交、批内键检查与自引用最终状态检查，111 项专项检查通过；完整验收及未关闭稳定性风险仍需跟进 | X11 |
 
@@ -50,8 +50,8 @@
 
 | 编号 | 功能 | 依赖 | 当前状态 | 验收编号 |
 | --- | --- | --- | --- | --- |
-| EXT-CMP-001 | 错误恢复、批量诊断、智能纠错 | Parser、Catalog | 部分实现：新增语句级批量诊断接口，可返回多语句语法/语义错误且不执行写操作；Token 级恢复、单语句多诊断和智能纠错待完成 | X12 |
-| EXT-CMP-002 | 可扩展 AST、LR/生成器方案 | AST 接口、序列化 | 部分实现：AST/Plan/Catalog schema versioning 与迁移入口已接入，并有解析器回归；完整 AST 扩展机制、LR/生成器方案和稳定迁移契约待完成 | X13 |
+| EXT-CMP-001 | 错误恢复、批量诊断、智能纠错 | Parser、Catalog | 已实现（基础版）：语句级和单语句多诊断、Token 恢复、错误位置、基础纠错建议、工作台多条诊断定位和无写操作保证已完成；高级纠错策略为后续增强 | X12 |
+| EXT-CMP-002 | 可扩展 AST、LR/生成器方案 | AST 接口、序列化 | 已实现（基础版）：AST/Plan/Catalog schema versioning、迁移入口、中断恢复和稳定列 identity 已完成；LR/生成器方案为后续增强 | X13 |
 | EXT-CMP-003 | AST/Plan JSON、结构展示、版本迁移 | AST、Plan | 部分实现：AST 与 Plan 均支持数组/版本包装反序列化和序列化往返，损坏 ID、父链和表达式会拒绝；完整 Schema 迁移、稳定列身份和 X14 验收待完成 | X14 |
 
 ## 五、优化器扩展
@@ -61,7 +61,7 @@
 | EXT-OPT-001 | 规则框架、固定点、等价性验证 | Logical Plan | 部分实现：4 条规则、按 ID 禁用、固定点、节点/轮数预算、收敛诊断及类型/Schema 保护；新增 NULL 比较和完整三值常量折叠，501 项优化器检查与 HTTP 回归通过。通用注册及其余规则待完成，见 optimizer-progress.md | X15 |
 | EXT-OPT-002 | 列裁剪、恒真/恒假和冗余节点消除 | Schema、Plan | 部分实现：恒真/恒假/NULL Filter 改写和简单 Project->Filter?->SeqScan 列裁剪已接通，投影/过滤引用列和字面量投影均有 Schema/执行等价检查；复杂连接、聚合和表达式列身份裁剪待完成 | X16 |
 | EXT-OPT-003 | 谓词下推、连接改写 | JOIN、NULL | 部分实现：INNER JOIN 单侧、无 CAST/算术/子查询的安全谓词可下推；直接左右列等值连接改写为 HashJoin，LEFT JOIN、跨表条件和完整连接改写待完成 | X17 |
-| EXT-OPT-004 | 统计信息与简单代价模型 | Catalog、Index | 部分实现：新增表/列统计接口，返回行数、页数、distinct、NULL 数和 NULL 比例；EXPLAIN 使用 stats-v1 选择率估计；完整列/索引统计、直方图和可比较代价模型待完成 | X18 |
+| EXT-OPT-004 | 统计信息与简单代价模型 | Catalog、Index | 已实现（基础版）：表/列统计、distinct、NULL、min/max、轻量直方图、索引 entries/height/pageCount、统计版本/刷新时间和 stats-v1/EXPLAIN statsSource 已完成；复杂直方图和候选计划成本比较为后续增强 | X18 |
 | EXT-OPT-005 | EXPLAIN、EXPLAIN ANALYZE、执行统计 | Plan、Executor | 部分实现：EXPLAIN 不执行目标语句，只读 EXPLAIN ANALYZE 返回实际行数、耗时、缓存增量和逐节点实际行数/耗时；写语句拒绝和完整 X19 验收待收口 | X19 |
 
 ## 六、存储与数据库系统扩展
