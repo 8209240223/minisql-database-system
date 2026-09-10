@@ -262,3 +262,14 @@ node tests\subquery-smoke.mjs tests\statistics-smoke.mjs tests\explain-smoke.mjs
 - [x] **3.4e** 新增端到端 `tests/correlated-exec-smoke.mjs`：8 项覆盖 EXISTS/IN/NOT EXISTS/标量相关的分组半连接结果正确，以及「同一库先后两条语句、后一条须反映新写入（验证语句级清缓存）」，全部通过。
 - [x] **3.4f** 回归全绿：ctest C++ contract 全 59 用例通过；node correlated-exec 8 / subquery 24 / derived 12 / statistics 11 / explain 21 / parser 18 / planner 26 / diagnostics 22 通过；optimizer_contract 518 项通过。
 - [ ] 遗留：真正 **Apply/SemiJoin/AntiJoin 计划节点 + 优化器去相关**（消除每行重编译的 `compiled-once` 参数化执行）是更大工程，涉及 planner 生成结构化子计划与 serialization/executor 同步改造，留待后续项目阶段（非本轮范围，经用户确认）。
+
+### 6.9 X18 统计增量切片 —— 数值列直方图 + min/max + 生成时间（builder-A 第九次提交）
+
+> X18 Phase 4.1（统计收集）的首个**自包含增量切片**：仅改 executor 的 `statistics()`，为数值列（int/bigint/float）收集 min/max 与等宽直方图，并给统计信息追加 `version`/`generatedAtMs`。不触 parser/planner/optimizer，可单文件验证。分支 `builder-A`。
+
+- [x] **4.1a** `execution/database.cpp` `statistics()`：列 JSON 中对非空 distinct 集合补充 `min`（`*distinct.begin()`）与 `max`（`*distinct.rbegin()`）。
+- [x] **4.1b** 数值列（`type`∈`int`/`bigint`/`float`）额外构造**等宽直方图**：`bucketCount=min(16, distinctCount)`，按区间 `[min,max]` 归一化位置分槽累计各 distinct 值的频次；`span=max-min`。空 distinct、退化为单值（`span==0`，全部落入 0 号位）、浮点边界统一处理。
+- [x] **4.1c** 顶层统计 JSON 追加 `version="stats-v1-histogram"` 与 `generatedAtMs`（`system_clock` 毫秒时间戳），在不破坏既有 `scope/source/checkpointCount` 等字段前提下标记本次统计的版本与刷新时刻。
+- [x] **4.1d** 新增端到端 `tests/statistics-histogram-smoke.mjs`：20 项覆盖行数/基数/null 计数/min/max、数值列直方图存在且 `1..bucketCount<=16`、直方图桶求和等于 distinct 计数、以及非数值/单值列的稳健性，全部通过。
+- [x] **4.1e** 回归全绿：node statistics-histogram 20 / correlated-exec 8 / statistics 11 / subquery 24 / derived 12 / explain 21 通过；optimizer_contract 518 项、planner_contract 契约通过。
+- [ ] 后续：基于本切片的 stat 元数据在 optimizer 实现**成本估算模型**（4.2：SeqScan/IndexScan/NestedLoop/HashJoin/Sort 成本公式 + 固定决胜规则 + 「同统计→同计划」确定性测试），并将 EXPLAIN 估值/成本字段并入 HTTP 契约。
