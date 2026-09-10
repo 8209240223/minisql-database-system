@@ -77,7 +77,9 @@ try {
   const inserted = await request('/execute', { sql: 'INSERT INTO t VALUES(3),(4);' });
   equal(inserted.status, 200);
   equal((await request('/execute', { sql: 'SELECT * FROM t ORDER BY id;' })).data.rows, [[1], [2], [3], [4]]);
-  equal((await request('/restore', { name: 'online-snap.pages' })).status, 200);
+  const restored = await request('/restore', { name: 'online-snap.pages' });
+  equal(restored.status, 200);
+  assert.ok(existsSync(restored.data.rollback)); ++checks;
   equal((await request('/execute', { sql: 'SELECT * FROM t ORDER BY id;' })).data.rows, [[1], [2]]);
 
   const sessions = await request('/sessions');
@@ -89,7 +91,9 @@ try {
   equal(onlineDuringTransaction.data.kind, 'snapshot');
   equal((await request('/sessions/' + sessionId + '/execute', { sql: 'COMMIT;' })).status, 200);
   await request('/sessions/' + sessionId + '/close');
-  equal((await request('/restore', { name: 'active-snap.pages' })).status, 200);
+  const activeRestored = await request('/restore', { name: 'active-snap.pages' });
+  equal(activeRestored.status, 200);
+  assert.ok(existsSync(activeRestored.data.rollback)); ++checks;
   equal((await request('/execute', { sql: 'SELECT * FROM t ORDER BY id;' })).data.rows, [[1], [2]]);
 
   console.log(`${checks} online backup checks passed`);
