@@ -1372,6 +1372,27 @@ nlohmann::json Database::runNode(const sql::LogicalPlan& plan) {
             for (const auto& column : plan.output) columns.push_back(column.name);
             return {{"kind", "Limit"}, {"columns", columns}, {"rows", json::array()}, {"affectedRows", 0}};
         }
+        try {
+            auto stream = openRowStream(plan.children.front());
+            json rows = json::array();
+            json row;
+            for (std::uint64_t skipped = 0; skipped < plan.offset; ++skipped) {
+                if (!stream->next(row)) break;
+            }
+            std::uint64_t emitted = 0;
+            while (!plan.limit || emitted < *plan.limit) {
+                if (!stream->next(row)) break;
+                rows.push_back(std::move(row));
+                ++emitted;
+            }
+            stream->close();
+            json columns = json::array();
+            for (const auto& column : plan.output) columns.push_back(column.name);
+            return {{"kind", "Limit"}, {"columns", std::move(columns)}, {"rows", std::move(rows)},
+                {"affectedRows", 0}, {"resourceUsage", {{"kind", "LimitRowStream"}, {"rows", emitted}}}};
+        } catch (const MiniSqlError& error) {
+            if (error.code() != ErrorCode::InvalidArgument) throw;
+        }
         auto result = run(plan.children.front());
         const auto size = result.at("rows").size();
         const auto begin = std::min<std::uint64_t>(plan.offset, size);
