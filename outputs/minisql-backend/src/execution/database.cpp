@@ -1288,7 +1288,10 @@ nlohmann::json Database::runNode(const sql::LogicalPlan& plan) {
     json result = {{"kind", plan.kind}, {"columns", json::array()}, {"rows", json::array()}, {"affectedRows", 0}};
     if (plan.kind == "Aggregate") {
         for (const auto& column : plan.output) result["columns"].push_back(column.name);
-        result["rows"] = aggregateRows(plan);return result;
+        result["rows"] = aggregateRows(plan);
+        result["resourceUsage"] = {{"kind", "Aggregate"}, {"rows", result.at("rows").size()},
+            {"groups", result.at("rows").size()}, {"external", false}};
+        return result;
     }
     if (plan.kind == "Filter") {
         if (plan.children.size() != 1) fail("Filter requires one child");
@@ -1308,6 +1311,7 @@ nlohmann::json Database::runNode(const sql::LogicalPlan& plan) {
             for (const auto& expression : plan.projections) projected.push_back(evaluate(expression, row));
             result["rows"].push_back(std::move(projected));
         }
+        result["resourceUsage"] = {{"kind", "Project"}, {"rows", result.at("rows").size()}};
         return result;
     }
     if (plan.kind == "Project" && plan.children.size() == 1 && plan.children.front().kind == "Limit" &&
@@ -1333,6 +1337,7 @@ nlohmann::json Database::runNode(const sql::LogicalPlan& plan) {
                 for (const auto& expression : plan.projections) projected.push_back(evaluate(expression, row));
                 result["rows"].push_back(std::move(projected));
             }
+            result["resourceUsage"] = {{"kind", "Project"}, {"rows", result.at("rows").size()}};
             return result;
         }
     }
