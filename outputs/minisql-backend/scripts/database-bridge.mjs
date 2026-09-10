@@ -133,6 +133,7 @@ function deltaBackupFile(raw) {
 }
 function normalizeFullManifest(metadata, file, manifest) {
   if (metadata.sha256 !== sha256(file)) throw httpError(422, 'Backup checksum mismatch');
+  if (metadata.pageChecksum !== undefined && metadata.pageChecksum !== sha256(file)) throw httpError(422, 'Backup page checksum mismatch');
   const detectedPageVersion = pageFormatVersion(file);
   if (metadata.version === 1) {
     const migrated = { ...metadata, version: 2, pageFormatVersion: detectedPageVersion, walBytes: 0 };

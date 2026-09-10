@@ -1253,6 +1253,8 @@ nlohmann::json Database::runNode(const sql::LogicalPlan& plan) {
         result["columns"] = json::array();
         for (const auto& column : plan.output) result["columns"].push_back(column.name);
         result["kind"] = "Sort";
+        result["resourceUsage"] = {{"kind", "Sort"}, {"rows", rows.size()},
+            {"external", rows.size() > sortMemoryRows_}, {"memoryRows", sortMemoryRows_}};
         return result;
     }
     if (plan.kind == "Limit") {
@@ -1270,6 +1272,7 @@ nlohmann::json Database::runNode(const sql::LogicalPlan& plan) {
         for (std::uint64_t i = 0; i < count; ++i) rows.push_back(std::move(result["rows"][begin + i]));
         result["rows"] = std::move(rows);
         result["kind"] = "Limit";
+        result["resourceUsage"] = {{"kind", "Limit"}, {"rows", rows.size()}};
         return result;
     }
     if (plan.kind == "Distinct") {
@@ -1292,6 +1295,7 @@ nlohmann::json Database::runNode(const sql::LogicalPlan& plan) {
         auto input = run(plan.children.front());
         for (const auto& column : plan.output) result["columns"].push_back(column.name);
         for (auto& row : input["rows"]) if (accepted(evaluate(plan.predicate, row))) result["rows"].push_back(std::move(row));
+        result["resourceUsage"] = {{"kind", "Filter"}, {"rows", result.at("rows").size()}};
         return result;
     }
     if (plan.kind == "Project" && plan.children.size() == 1 &&
