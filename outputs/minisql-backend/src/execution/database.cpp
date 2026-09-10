@@ -588,18 +588,46 @@ nlohmann::json Database::statistics() {
         });
         json columns = json::array();
         for (std::size_t index = 0; index < table.definition.columns.size(); ++index) {
-            columns.push_back({{"name", table.definition.columns[index].name},
-                {"columnId", index}, {"type", key(table.definition.columns[index].type)},
+            const auto type = key(table.definition.columns[index].type);
+            json column = {{"name", table.definition.columns[index].name},
+                {"columnId", index}, {"type", type},
                 {"distinctCount", distinct[index].size()},
                 {"nullCount", nulls[index]},
-                {"nullRatio", rowCount == 0 ? 0.0 : static_cast<double>(nulls[index]) / static_cast<double>(rowCount)}});
+                {"nullRatio", rowCount == 0 ? 0.0 : static_cast<double>(nulls[index]) / static_cast<double>(rowCount)}};
+            if (!distinct[index].empty()) {
+                column["min"] = *distinct[index].begin();
+                column["max"] = *distinct[index].rbegin();
+                if (type == "int" || type == "bigint" || type == "float") {
+                    // X18: 单遍扫描的 distinct 值等宽直方图（数值列）。
+                    const auto span = distinct[index].rbegin()->get<double>() - distinct[index].begin()->get<double>();
+                    auto lower = distinct[index].begin()->get<double>();
+                    auto upper = distinct[index].rbegin()->get<double>();
+                    if (lower > upper) std::swap(lower, upper);
+                    const std::size_t buckets = std::min<std::size_t>(16, distinct[index].size());
+                    std::vector<std::size_t> counts(buckets, 0);
+                    const double width = upper - lower;
+                    for (const auto& value : distinct[index]) {
+                        double position = width == 0.0 ? 0.0 : (value.get<double>() - lower) / width;
+                        if (position < 0.0) position = 0.0;
+                        else if (position > 1.0) position = 1.0;
+                        const auto slot = position == 1.0 ? buckets - 1 : static_cast<std::size_t>(position * buckets);
+                        ++counts[slot];
+                    }
+                    column["histogram"] = {{"bucketCount", buckets}, {"min", lower}, {"max", upper},
+                        {"span", span}, {"buckets", counts}};
+                }
+            }
+            columns.push_back(std::move(column));
         }
         tables.push_back({{"name", table.definition.table}, {"tableId", table.id}, {"rowCount", rowCount},
             {"allocatedPages", file_->pagesFor(table.id).size()}, {"columns", columns}});
     }
     const auto dirtyPages = buffer_.dirtyPages();
     const auto dirtyRatio = buffer_.capacity() == 0 ? 0.0 : static_cast<double>(dirtyPages) / static_cast<double>(buffer_.capacity());
+    const auto generatedAtMs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count());
     return {{"success", true}, {"tables", tables}, {"scope", "table-and-column"}, {"source", "on-demand-scan"},
+        {"version", "stats-v1-histogram"}, {"generatedAtMs", generatedAtMs},
         {"checkpointCount", checkpointCount_}, {"autoCheckpointWrites", autoCheckpointWrites_},
         {"autoCheckpointWalBytes", autoCheckpointWalBytes_}, {"autoCheckpointDirtyPages", autoCheckpointDirtyPages_},
         {"autoCheckpointDirtyRatio", autoCheckpointDirtyRatio_}, {"autoCheckpointIntervalMs", autoCheckpointIntervalMs_},
