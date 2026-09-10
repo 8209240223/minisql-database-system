@@ -47,5 +47,8 @@ const clause = run('SELECT * FROM t WHERE = GROUP BY x ORDER BY ;');
 equal(clause.count, 2);
 equal(clause.diagnostics.every(d => d.stage === 'parser' && d.statementIndex === 0), true);
 equal(clause.diagnostics.length, 2);
+equal(run('CREATE TABLE people(id INT);', 'execute').success, true);
+const typo = run('SELECT * FROM peopl;');
+assert.match(typo.diagnostics[0].suggestion ?? '', /people/); ++checks;
 
 console.log(`${checks} batch diagnostics checks passed`);

@@ -2026,15 +2026,58 @@ nlohmann::json Database::diagnostics(const std::string& source) const {
         return "internal";
     };
     std::size_t statementIndex = 0;
+    const auto closestName = [](const std::string& target, const std::vector<std::string>& candidates) {
+        if (target.empty()) return std::string{};
+        const auto lower = [](std::string value) {
+            std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            return value;
+        };
+        const auto normalizedTarget = lower(target);
+        std::string best;
+        std::size_t bestDistance = std::numeric_limits<std::size_t>::max();
+        for (const auto& candidate : candidates) {
+            const auto normalizedCandidate = lower(candidate);
+            std::vector<std::size_t> previous(normalizedCandidate.size() + 1), current(normalizedCandidate.size() + 1);
+            for (std::size_t i = 0; i <= normalizedCandidate.size(); ++i) previous[i] = i;
+            for (std::size_t i = 1; i <= normalizedTarget.size(); ++i) {
+                current[0] = i;
+                for (std::size_t j = 1; j <= normalizedCandidate.size(); ++j)
+                    current[j] = std::min({previous[j] + 1, current[j - 1] + 1,
+                        previous[j - 1] + (normalizedTarget[i - 1] == normalizedCandidate[j - 1] ? 0 : 1)});
+                std::swap(previous, current);
+            }
+            const auto distance = previous.back();
+            if (distance < bestDistance || (distance == bestDistance && normalizedCandidate < lower(best))) {
+                bestDistance = distance;
+                best = candidate;
+            }
+        }
+        const auto limit = std::max<std::size_t>(1, std::min<std::size_t>(3, normalizedTarget.size() / 2 + 1));
+        return bestDistance <= limit ? best : std::string{};
+    };
     const auto append = [&](const MiniSqlError& error) {
         const auto& loc = error.location();
         std::string suggestion = error.suggestion();
         if (suggestion.empty()) {
             const std::string message = error.what();
             if (message.find("Table does not exist") != std::string::npos || message.find("missing table") != std::string::npos)
-                suggestion = "Check the table name and confirm the table was created.";
+            {
+                const auto separator = message.find(':');
+                const auto target = message.substr(separator == std::string::npos ? 0 : separator + 1);
+                std::vector<std::string> candidates;
+                for (const auto& table : catalog_.tables()) candidates.push_back(table.definition.table);
+                const auto matched = closestName(target, candidates);
+                suggestion = matched.empty() ? "Check the table name and confirm the table was created." : "Did you mean: " + matched + "?";
+            }
             else if (message.find("Column does not exist") != std::string::npos || message.find("Unknown column") != std::string::npos)
-                suggestion = "Check the column name and table alias.";
+            {
+                const auto separator = message.find(':');
+                const auto target = message.substr(separator == std::string::npos ? 0 : separator + 1);
+                std::vector<std::string> candidates;
+                for (const auto& table : catalog_.tables()) for (const auto& column : table.definition.columns) candidates.push_back(column.name);
+                const auto matched = closestName(target, candidates);
+                suggestion = matched.empty() ? "Check the column name and table alias." : "Did you mean: " + matched + "?";
+            }
             else if (message.find("Expected FROM") != std::string::npos)
                 suggestion = "Add FROM before the table name.";
         }
