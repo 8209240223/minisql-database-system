@@ -11,8 +11,8 @@
 
 ## X13 版本与迁移
 
-- 已完成：AST/Plan/Catalog schema versioning、未知主版本拒绝、迁移入口、中断恢复、稳定列 identity（`表名.列名`）。
-- 必要回归：`catalog_migration_contract.exe` 20 项、`parser-regression.mjs` 18 项通过。
+- 已完成：AST/Plan/Catalog schema versioning、未知主版本拒绝、迁移入口、中断恢复、稳定列 identity（`表名.列名`），以及可复用的 canonical LR(0) 表生成器。
+- 必要回归：`catalog_migration_contract.exe` 20 项、`parser-regression.mjs` 18 项、`planner_contract.exe`（含 LR(0) accept 状态）通过。
 
 ## X09 子查询与作用域
 
@@ -31,4 +31,4 @@
 
 ## 后续增强
 
-- 完整优化器去相关、真实 Apply/SemiJoin 执行节点、LR/生成器方案、复杂直方图和候选计划成本比较保留为后续增强，不阻塞 A 基础版完成。
+- 完整优化器去相关、更完整的 LR/LALR 生成器、复杂直方图和候选计划成本比较保留为后续增强，不阻塞 A 基础版完成。

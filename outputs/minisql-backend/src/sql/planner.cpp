@@ -389,7 +389,8 @@ LogicalPlan build(const Statement& statement, const catalog::Catalog& catalog) {
         }
         if (statement.where) {
             LogicalPlan filter;
-            filter.kind = "Filter";
+            filter.kind = containsNegatedSubquery(*statement.where) ? "AntiJoin" :
+                containsSubquery(*statement.where) ? "SemiJoin" : "Filter";
             filter.subqueryJoinKind = containsNegatedSubquery(*statement.where) ? "AntiJoin" :
                 containsSubquery(*statement.where) ? "SemiJoin" : "";
             filter.table = plan.table;

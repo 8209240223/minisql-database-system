@@ -1104,7 +1104,7 @@ nlohmann::json Database::bufferStatus() const {
 std::vector<storage::Row> Database::joinRows(const sql::LogicalPlan& plan) {
     checkCancelled();
     std::vector<storage::Row> rows;
-    if (plan.kind == "Filter") {
+    if (plan.kind == "Filter" || plan.kind == "SemiJoin" || plan.kind == "AntiJoin") {
         if (plan.children.size() != 1) fail("Join filter requires one child");
         rows = joinRows(plan.children.front());
         for (auto iterator = rows.begin(); iterator != rows.end();) {
@@ -1194,7 +1194,7 @@ json Database::aggregateRows(const sql::LogicalPlan& plan) {
     if (plan.children.size() != 1) fail("Aggregate requires one child");
     const auto* input = &plan.children.front();
     const json* predicate = nullptr;
-    if (input->kind == "Filter") {
+    if (input->kind == "Filter" || input->kind == "SemiJoin" || input->kind == "AntiJoin") {
         if (input->children.size() != 1) fail("Aggregate filter requires one child");
         predicate = &input->predicate;
         input = &input->children.front();
@@ -1822,7 +1822,7 @@ nlohmann::json Database::runNode(const sql::LogicalPlan& plan) {
     }
     const auto* input = &plan.children.front();
     const json* predicate = nullptr;
-    if (input->kind == "Filter") {
+    if (input->kind == "Filter" || input->kind == "SemiJoin" || input->kind == "AntiJoin") {
         predicate = &input->predicate;
         if (input->children.size() != 1) fail("Filter requires one child");
         input = &input->children.front();
@@ -2315,7 +2315,7 @@ nlohmann::json Database::execute(const std::string& source, bool optimize) {
                         return {0.0, 1.0};
                     }
                     auto child = estimate(plan.children.front());
-                    if (plan.kind == "Filter") {
+                    if (plan.kind == "Filter" || plan.kind == "SemiJoin" || plan.kind == "AntiJoin") {
                         const auto rows = child.first * selectivity(plan.predicate, plan.table);
                         return {rows, child.second + rows};
                     }
