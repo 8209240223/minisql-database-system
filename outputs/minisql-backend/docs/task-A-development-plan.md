@@ -304,3 +304,13 @@ node tests\subquery-smoke.mjs tests\statistics-smoke.mjs tests\explain-smoke.mjs
 - [x] **4.2c** 新增端到端 `tests/statistics-costjoin-smoke.mjs`：6 项验证多行等值连接选 HashJoin 且替换掉 NestedLoop、同 SQL 多次优化 join 选择序列一致（确定性）、HashJoin 路径返回正确行数；并留注「当前 parser 不支持派生表+JOIN、优化器对表按默认行数估算，SQL 层暂难构造单行端→NL 分支，留待派生表 JOIN/真实统计接入后验证」。
 - [x] **4.2d** 回归全绿：optimizer_contract 518、planner_contract 契约通过；node statistics-cost 12 / statistics-costjoin 6 / explain 21 / statistics 11 / statistics-histogram 20 / subquery 24 / derived 12 / correlated-exec 8 / index 29 通过；database-http、bridge 集成 7 通过。
 - [ ] 后续/退出：接入真实统计后让 `optimizerRows` 消费 `statistics()`/直方图（不再统一默认 1000），使单行/低基数场景真正影响 join 选择；把成本/估计并入 HTTP 契约与工作台展示；IndexScan 估计字段依赖与 B(X20) 第二段协商。
+
+### 6.13 X18 4.2 闭环——优化器消费真实表行数统计（builder-A 第十三次提交）
+
+> 让 6.12 的成本模型**真实生效**：把表行数统计注入优化器，替代「统一默认 1000」。由此单行端等值连接在真实统计下正确选择 NestedLoopJoin，多行两端选 HashJoin——成本驱动从「形同虚设」变为「实际决策」。分支 `builder-A`。
+
+- [x] **4.2e** `optimizer.hpp` `Options` 末尾新增 `std::function<std::optional<double>(const std::string&)> tableRows`（放在结构末尾，保持既有 `{true,false,false}` 聚合初始化兼容）；`optimizer.cpp` `optimizerRows()` 改为接收 `Options` 并对 `SeqScan` 优先 `options.tableRows(name)`，缺表/未提供回退 `kOptimizerDefaultRows`。
+- [x] **4.2f** `database.hpp/.cpp`：新增 const 私有 `estimatedTableRows(name)`（真实 `heap_.scan` 计数）；`heap_` 标 `mutable`（允许 const `compile()` 只读路径暖缓存估算）；三处 `optimizer::optimize()` 调用（compile / EXPLAIN / execute）统一注入 `optimizerOptions.tableRows=[this]...`，让优化/执行/解释三条路径共享同一成本输入。
+- [x] **4.2g** 更新 `tests/statistics-costjoin-smoke.mjs`：真实统计 `t`(10 行) 与 `s`(1 行)——多行两端→HashJoin、单行端(`L=10,R=1`,Hash 11>NL 10)→保留 NestedLoopJoin、双路径确定性、结果行数正确；升至 10 项通过。
+- [x] **4.2h** 回归全绿：optimizer_contract 518、planner_contract 契约、database-http（含序列化写）通过；node statistics-costjoin 10 / statistics-cost 12 / explain 21 / statistics 11 / statistics-histogram 20 / subquery 24 / derived 12 / correlated-exec 8 / index / self-foreign-key 63 通过。
+- [ ] 后续/退出：进一步让 `optimizerRows` 消费列级直方图/选择率做连乘与交之决策（当前仅用表行数），并把成本/估计并入 HTTP 契约与工作台展示；IndexScan 估计字段依赖与 B(X20) 第二段协商。

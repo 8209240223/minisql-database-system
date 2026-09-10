@@ -17,20 +17,26 @@ function joinKinds(sql) {
   assert.equal(result.success, true, JSON.stringify(result));
   return result.results.at(-1).optimizedPlan.filter((n) => n.kind === 'HashJoin' || n.kind === 'NestedLoopJoin').map((n) => n.kind);
 }
+// 真实统计：t 多行（10 行），s 单行（1 行）。
 equal(run('CREATE TABLE t(a INT, b INT); INSERT INTO t VALUES(1,9),(2,8),(3,7),(4,6),(5,5),(6,4),(7,3),(8,2),(9,1),(10,0);').success, true);
+equal(run('CREATE TABLE s(a INT); INSERT INTO s VALUES(5);').success, true);
 
-// 多行等值连接：成本上 Hash(L+M) < NestedLoop(L*M) → 选 HashJoin，且无 NestedLoopJoin 节点（已替换）。
-const kinds = joinKinds('SELECT x.a FROM t x JOIN t y ON x.a=y.a;');
-ok(kinds.includes('HashJoin'), 'multi-row equality join chosen as HashJoin by cost');
-ok(!kinds.includes('NestedLoopJoin'), 'hash join replaced nested loop on multi-row sides');
+// 多行两端（真实 L=M=10）：Hash(20) <= NL(100) → 选 HashJoin。
+const multi = joinKinds('SELECT x.a FROM t x JOIN t y ON x.a=y.a;');
+ok(multi.includes('HashJoin'), 'multi-row equality join chosen as HashJoin by cost');
+ok(!multi.includes('NestedLoopJoin'), 'hash join replaced nested loop on multi-row sides');
+
+// 单行端（真实 s=1 行，L=10,R=1）：Hash(11) > NL(10) → 保留 NestedLoopJoin（成本驱动新行为）。
+const single = joinKinds('SELECT x.a FROM t x JOIN s y ON x.a=y.a;');
+ok(single.includes('NestedLoopJoin'), 'single-row-side join keeps NestedLoopJoin by cost');
+ok(!single.includes('HashJoin'), 'single-row-side join not rewritten to hash');
 
 // 确定性：同 SQL 同统计多次优化，join 选择序列一致（成本模型无随机/容器序依赖）。
-equal(joinKinds('SELECT x.a FROM t x JOIN t y ON x.a=y.a;'), kinds, 'join choice deterministic across compiles');
-equal(joinKinds('SELECT x.a FROM t x JOIN t y ON x.a=y.a;'), kinds, 'join choice stable on repeated compile');
+equal(joinKinds('SELECT x.a FROM t x JOIN t y ON x.a=y.a;'), multi, 'join choice deterministic across compiles');
+equal(joinKinds('SELECT x.a FROM t x JOIN s y ON x.a=y.a;'), single, 'single-row join choice is stable');
 
-// 结果正确性不受优化 join 选择影响：HashJoin 路径返回正确行数。
+// 结果正确性不受优化 join 选择影响。
 equal(run('SELECT COUNT(*) AS c FROM t x JOIN t y ON x.a=y.a;').results.at(-1).rows, [[10]]);
+equal(run('SELECT COUNT(*) AS c FROM t x JOIN s y ON x.a=y.a;').results.at(-1).rows, [[1]]);
 
-// 注意：当前 parser 不支持「派生表 + JOIN」，且优化器对表统一按有界默认行数估算，
-// SQL 层面暂无法构造单行端走到「保留 NestedLoopJoin」分支；该新分支留待派生表 JOIN / 真实统计接入后再验证。
 console.log(`${checks} statistics-costjoin checks passed`);

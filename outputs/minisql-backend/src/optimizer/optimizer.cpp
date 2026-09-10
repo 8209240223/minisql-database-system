@@ -263,24 +263,25 @@ bool pushPredicateIntoJoin(sql::LogicalPlan& filter, json& changes, std::size_t 
     record(changes, "predicate-pushdown", statement, before, sql::serializePlans({filter}));
     return true;
 }
-// X18 4.2: 优化器侧确定性成本估算（无运行统计时用有界默认值）。
-// 仅依据计划结构，同输入恒得同结果，用于候选执行策略的成本比较与固定决胜。
+// X18 4.2: 优化器侧确定性成本估算。仅依据计划结构 + 可选的表行数回调，
+// 同输入恒得同结果，用于候选执行策略的成本比较与固定决胜。
 constexpr double kOptimizerDefaultRows = 1000.0;
 constexpr double kOptimizerDefaultFilterSelectivity = 0.25;
-double optimizerRows(const sql::LogicalPlan& plan) {
-    if (plan.kind == "SeqScan") return kOptimizerDefaultRows;
+double optimizerRows(const sql::LogicalPlan& plan, const Options& options) {
+    if (plan.kind == "SeqScan")
+        return options.tableRows ? options.tableRows(plan.table).value_or(kOptimizerDefaultRows) : kOptimizerDefaultRows;
     if (plan.children.empty()) {
         if (plan.kind == "Insert") return static_cast<double>(std::max(plan.values.size(), plan.insertRows.size()));
         return 1.0;
     }
-    const auto rows = optimizerRows(plan.children.front());
+    const auto rows = optimizerRows(plan.children.front(), options);
     if (plan.kind == "Filter") return rows * kOptimizerDefaultFilterSelectivity;
     if (plan.kind == "Limit") return plan.limit ? std::min(rows, static_cast<double>(*plan.limit)) : rows;
     if (plan.kind == "Distinct") return rows * 0.5;
     if (plan.kind == "Aggregate") return plan.groupKeys.empty() ? 1.0 : std::min(rows * 0.1, kOptimizerDefaultRows);
     if (plan.kind == "NestedLoopJoin" || plan.kind == "HashJoin" || plan.kind == "LeftJoin" || plan.kind == "RightJoin" || plan.kind == "FullJoin") {
         if (plan.children.size() != 2) return rows;
-        return rows * optimizerRows(plan.children[1]) * 0.1;
+        return rows * optimizerRows(plan.children[1], options) * 0.1;
     }
     return rows;  // Project / Sort 行数不变
 }
@@ -303,8 +304,8 @@ void rewritePlan(sql::LogicalPlan& plan, const Options& options, json& changes, 
         if (hashJoinKeys(plan.predicate, plan.children[0].output.size(), leftKey, rightKey)) {
             // X18 4.2: 成本驱动候选选择 + 固定决胜——Hash 成本 L+M，NestedLoop 成本 L*M；
             // 相等时不依赖容器序、固定偏好 HashJoin（确定性）。
-            const auto leftRows = optimizerRows(plan.children[0]);
-            const auto rightRows = optimizerRows(plan.children[1]);
+            const auto leftRows = optimizerRows(plan.children[0], options);
+            const auto rightRows = optimizerRows(plan.children[1], options);
             if (leftRows + rightRows <= leftRows * rightRows) {
                 record(changes, "hash-join", statement, {{"kind", "NestedLoopJoin"}}, {{"kind", "HashJoin"}});
                 plan.kind = "HashJoin";

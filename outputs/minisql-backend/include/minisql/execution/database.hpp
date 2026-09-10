@@ -2,6 +2,7 @@
 #include <cstdint>
 #include <chrono>
 #include <memory>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -30,7 +31,7 @@ private:
     nlohmann::json bufferStatus() const;
     std::shared_ptr<storage::PageFile> file_;
     storage::BufferPool buffer_;
-    storage::HeapStore heap_;
+    mutable storage::HeapStore heap_;
     catalog::PersistentCatalog catalog_;
     bool unavailable_ = false;
     enum class TransactionState { Idle, Active, Aborted };
@@ -51,6 +52,10 @@ private:
     // 缓存生命周期仅在单条语句内（runStatement/EXPLAIN ANALYZE 入口清空）。
     std::unordered_map<std::string, std::vector<std::size_t>> correlatedColumnsCache_;
     std::unordered_map<std::string, nlohmann::json> correlatedRowsCache_;
+    // X18 4.2: 供优化器成本估算的表行数统计（真实扫描计数，缺表返回空）。
+    // const：可为 `compile()`（const）等只读路径提供估算；扫描仅唤醒缓存、不改逻辑状态，
+    // 故 heap_ 标为 mutable。
+    std::optional<double> estimatedTableRows(const std::string& tableName) const;
     void evaluateAutoCheckpoint(std::size_t committedWriteStatements, std::size_t committedDirtyPages);
     std::vector<nlohmann::json>* nodeStats_ = nullptr;
     std::size_t sortMemoryRows_ = 10000;

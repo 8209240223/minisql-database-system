@@ -366,7 +366,9 @@ nlohmann::json Database::compile(const std::string& source) const {
     const auto tokens = sql::tokenize(source);
     const auto ast = sql::parse(tokens);
     const auto plans = sql::compilePlans(ast, catalog_.view());
-    const auto optimized = optimizer::optimize(plans);
+    optimizer::Options optimizerOptions;
+    optimizerOptions.tableRows = [this](const std::string& name) { return estimatedTableRows(name); };
+    const auto optimized = optimizer::optimize(plans, optimizerOptions);
     return {{"success", true}, {"plan", sql::serializePlans(plans)}, {"optimizedPlan", sql::serializePlans(optimized.plans)},
             {"optimizationRules", optimized.changes}, {"statements", ast.size()},
             {"optimizer", {{"iterations", optimized.iterations}, {"converged", optimized.converged},
@@ -571,6 +573,16 @@ void Database::validateUniqueIndexes(std::uint64_t tableId, const storage::Row& 
         }
     }
 }
+std::optional<double> Database::estimatedTableRows(const std::string& tableName) const {
+    for (const auto& table : catalog_.tables())
+        if (key(table.definition.table) == key(tableName)) {
+            double rows = 0;
+            heap_.scan(table.id, rowSchema(table.definition), [&](storage::RowRef, const storage::Row&) { ++rows; });
+            return rows;
+        }
+    return std::nullopt;
+}
+
 nlohmann::json Database::statistics() {
     requireAvailable();
     json tables = json::array();
@@ -1672,7 +1684,9 @@ nlohmann::json Database::execute(const std::string& source, bool optimize) {
                 const auto rawPlans = sql::compilePlans(target, catalog_.view());
                 if (analyze && target.front().kind != "Select")
                     throw MiniSqlError(ErrorCode::Semantic, "EXPLAIN ANALYZE permits only SELECT", location);
-                const auto optimized = optimizer::optimize(rawPlans);
+                optimizer::Options optimizerOptions;
+                optimizerOptions.tableRows = [this](const std::string& name) { return estimatedTableRows(name); };
+                const auto optimized = optimizer::optimize(rawPlans, optimizerOptions);
                 json raw = sql::serializePlans(rawPlans);
                 json optimizedJson = sql::serializePlans(optimized.plans);
                 const auto tableEstimate = [&](const std::string& name) -> std::pair<double, double> {
@@ -1874,7 +1888,11 @@ nlohmann::json Database::execute(const std::string& source, bool optimize) {
             if (transaction_ == TransactionState::Aborted && ast.front().kind != "Rollback")
                 throw MiniSqlError(ErrorCode::Transaction, "Transaction aborted; ROLLBACK required");
             auto plans = sql::compilePlans(ast, catalog_.view());
-            if (optimize) plans = optimizer::optimize(plans).plans;
+            if (optimize) {
+                optimizer::Options optimizerOptions;
+                optimizerOptions.tableRows = [this](const std::string& name) { return estimatedTableRows(name); };
+                plans = optimizer::optimize(plans, optimizerOptions).plans;
+            }
             materializeSubqueries(plans);
             for (const auto& plan : plans) {
                 auto result = runStatement(plan);
