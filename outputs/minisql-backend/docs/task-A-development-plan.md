@@ -71,10 +71,10 @@ node tests\explain-smoke.mjs
 > 顺序遵循接口冻结规则（任务书 8.1）：Phase0/1 先冻结 A 对外契约，再进实现；IndexScan 计划字段与 B 协商后再做。
 
 ### Phase 0 —— 基线 + 契约冻结
-- [ ] 跑 §0 基线回归，记录通过数。
-- [ ] R1 扩展 `SourceLocation` → 增 `endLine/endColumn`（默认回退起止）。影响文件：`common/error.hpp`；同步 `ast`/`Expr` 序列化字段读取。
-- [ ] R2 定义统一 `Diagnostic` 结构（code/message/line/column/endLine/endColumn/statementIndex/stage/source）与 JSON 契约，写 `docs/diagnostics-progress.md`。
-- [ ] R3 `serialization.hpp` 定义版本常量：`AST_NODE_VERSION/PLAN_VERSION/PRODUCER_VERSION/CATALOG_SCHEMA_VERSION`，主版本未知→拒绝，小版本→兼容读。
+- [x] 跑 §0 基线回归，记录通过数。（自 §6.2 起各提交反复记录，见 §6.18 基线漂移核对）
+- [x] R1 扩展 `SourceLocation` → 增 `endLine/endColumn`（默认回退起止）。**已落地**：`include/minisql/common/error.hpp:23-24`；`ast`/`Expr` 序列化字段读取同步。
+- [x] R2 定义统一 `Diagnostic` 结构（code/message/line/column/endLine/endColumn/statementIndex/stage/source）与 JSON 契约。**已落地**：`Database::diagnostics()` 输出该结构。**命名差异（已知悉）**：任务书原指 `docs/diagnostics-progress.md` 未单列，后端错误码/多诊断协议并入 `docs/compiler-error-codes.md`，前端 UI 侧为 `docs/workbench-diagnostics-progress.md`。
+- [x] R3 `serialization.hpp` 定义版本常量：`AST_NODE_VERSION/PLAN_VERSION/PRODUCER_VERSION/CATALOG_SCHEMA_VERSION`，主版本未知→拒绝，小版本→兼容读。**已落地**：§6.3 落地常量，§6.20 补全 `nodeVersion/planVersion` 与同主版小版本兼容读闸门。
 - **跨组交付**：诊断 JSON 快照、AST/Plan 版本字段 → 告知 B/C（types.ts 同步）。
 
 ### Phase 1 —— X12 Token 级错误恢复 + 单语句多诊断
@@ -249,7 +249,7 @@ node tests\subquery-smoke.mjs tests\statistics-smoke.mjs tests\explain-smoke.mjs
 - [x] **3.5b** `database.hpp`：新增 `correlatedAstCache_`（`unordered_map<subquerySql, vector<Statement>>`）——按 subquerySql 缓存已解析的结构化 AST。
 - [x] **3.5c** `runCorrelatedSubquery()`：弃用「tokenize 整段子查询文本 → 外层列字面量改写 → 重解析」路径，改为「缓存 AST → 每行对缓存做一次结构化 by-value 绑定 → 以当前 catalog 编译 → 执行」。仍保留原有外层列越界、非 SELECT、类型化字面量校验语义；缓存经当前 catalog 重新编译，schema 变更仍即时生效。
 - [x] **3.5d** 回归全绿：ctest C++ contract 全 59 用例通过；node subquery 24 / derived 12 / statistics 11 / explain 21 / parser 18 / planner 26 / diagnostics 22 通过；optimizer_contract 518 项通过。
-- [ ] 遗留：真正的 **Apply/SemiJoin 计划节点 + 优化器去相关**（`compiled-once` 参数化执行，进一步消除每行重编译）留待 3.4/后续阶段；本阶段已消除逐行**文本重解析** 路径。
+- [x] 遗留（**已闭环**）：真正的 **Apply/SemiJoin 计划节点 + 优化器去相关**（`compiled-once` 参数化执行）已由 §6.17（4.x-a~j）落地——`SemiJoin/AntiSemiJoin/Apply` 节点 + `paramBinding` 逐左行绑定执行，已消除逐行重编译。
 
 ### 6.8 X09 Phase 3.4 记录 —— 保守执行优化（builder-A 第八次提交）
 
@@ -261,7 +261,7 @@ node tests\subquery-smoke.mjs tests\statistics-smoke.mjs tests\explain-smoke.mjs
 - [x] **3.4d** `database.hpp`：新增 `correlatedColumnsCache_`（形状→引用列）与 `correlatedRowsCache_`（形状|绑定值→结果行）。
 - [x] **3.4e** 新增端到端 `tests/correlated-exec-smoke.mjs`：8 项覆盖 EXISTS/IN/NOT EXISTS/标量相关的分组半连接结果正确，以及「同一库先后两条语句、后一条须反映新写入（验证语句级清缓存）」，全部通过。
 - [x] **3.4f** 回归全绿：ctest C++ contract 全 59 用例通过；node correlated-exec 8 / subquery 24 / derived 12 / statistics 11 / explain 21 / parser 18 / planner 26 / diagnostics 22 通过；optimizer_contract 518 项通过。
-- [ ] 遗留：真正 **Apply/SemiJoin/AntiJoin 计划节点 + 优化器去相关**（消除每行重编译的 `compiled-once` 参数化执行）是更大工程，涉及 planner 生成结构化子计划与 serialization/executor 同步改造，留待后续项目阶段（非本轮范围，经用户确认）。
+- [x] 遗留（**已闭环**）：**Apply/SemiJoin/AntiJoin 计划节点 + 优化器去相关**（`compiled-once` 参数化执行）已由 §6.17（4.x-a~j）实现，含 planner 结构化子计划 + serialization/executor 同步改造。
 
 ### 6.9 X18 统计增量切片 —— 数值列直方图 + min/max + 生成时间（builder-A 第九次提交）
 
@@ -272,7 +272,7 @@ node tests\subquery-smoke.mjs tests\statistics-smoke.mjs tests\explain-smoke.mjs
 - [x] **4.1c** 顶层统计 JSON 追加 `version="stats-v1-histogram"` 与 `generatedAtMs`（`system_clock` 毫秒时间戳），在不破坏既有 `scope/source/checkpointCount` 等字段前提下标记本次统计的版本与刷新时刻。
 - [x] **4.1d** 新增端到端 `tests/statistics-histogram-smoke.mjs`：20 项覆盖行数/基数/null 计数/min/max、数值列直方图存在且 `1..bucketCount<=16`、直方图桶求和等于 distinct 计数、以及非数值/单值列的稳健性，全部通过。
 - [x] **4.1e** 回归全绿：node statistics-histogram 20 / correlated-exec 8 / statistics 11 / subquery 24 / derived 12 / explain 21 通过；optimizer_contract 518 项、planner_contract 契约通过。
-- [ ] 后续：基于本切片的 stat 元数据在 optimizer 实现**成本估算模型**（4.2：SeqScan/IndexScan/NestedLoop/HashJoin/Sort 成本公式 + 固定决胜规则 + 「同统计→同计划」确定性测试），并将 EXPLAIN 估值/成本字段并入 HTTP 契约。
+- [x] 后续（**已闭环**）：stat 元数据驱动的**成本估算模型**（4.2）已由 §6.12/§6.13/§6.14 落地（SeqScan/IndexScan/NestedLoop/HashJoin/Sort 成本公式 + 固定决胜 + 「同统计→同计划」确定性测试）；EXPLAIN 估值/成本字段并入 HTTP 契约见 §6.15。
 
 ### 6.10 X18 成本模型增量切片 —— 直方图驱动的范围/等值选择性（builder-A 第十次提交）
 
@@ -283,7 +283,7 @@ node tests\subquery-smoke.mjs tests\statistics-smoke.mjs tests\explain-smoke.mjs
 - [x] **4.2c** 缺直方图（varchar 等非数值列、缺失统计）回退原默认选择率，不崩溃；`IS NULL/IS NOT NULL` 仍用 `nullRatio`，`AND/OR/NOT` 组合仍用既有布尔折叠。
 - [x] **4.2d** 新增端到端 `tests/statistics-cost-smoke.mjs`：9 项覆盖范围谓词估计行数收缩且随阈值单调、越界范围/等值归零、确定性（同 SQL 同统计重复 EXPLAIN 一致）、非数值列安全回退，全部通过。
 - [x] **4.2e** 回归全绿：node statistics-cost 9 / statistics-histogram 20 / statistics 11 / explain 21 / subquery 24 / derived 12 / correlated-exec 8 通过；optimizer_contract 518、planner_contract 契约通过。
-- [ ] 后续：将估计进一步落到 plan 节点的 `statsSource/estimatedRows/estimatedCost` 字段并接入 optimizer 候选比较与**固定决胜**（4.2 主体、4.3），以及成本/估值字段并入 HTTP 契约（退出条件）。
+- [x] 后续（**已闭环**）：估计字段落 plan 节点（§6.11）、接入 optimizer 候选比较与**固定决胜**（§6.12/§6.16）、成本/估值并入 HTTP 契约（§6.15）均已完成。
 
 ### 6.11 X18 4.3 增量——估计元数据落到 EXPLAIN plan JSON（builder-A 第十一次提交）
 
@@ -293,7 +293,7 @@ node tests\subquery-smoke.mjs tests\statistics-smoke.mjs tests\explain-smoke.mjs
 - [x] **4.3b** EXPLAIN 展示 `rows` 直接读已标注字段，与 plan JSON 完全同源（`estimatedRows`/`estimatedCost`/`estimateSource="stats-v1"`）。
 - [x] **4.3c** 增补 `tests/statistics-cost-smoke.mjs`：断言 `optimizedPlan/Filter` 节点携带三个估计字段、与展示行估计行数相等、多次编译成本确定性；成本测试升至 12 项通过。
 - [x] **4.3d** 回归全绿：node statistics-cost 12 / statistics-histogram 20 / statistics 11 / explain 21 / subquery 24 / derived 12 / correlated-exec 8 / planner-regression 26 通过；database-http（含序列化写）、database-process、bridge-regression 通过；optimizer_contract 518 通过。
-- [ ] 后续/退出：把预估成本接入 optimizer**候选比较 + 固定决胜**（`hash-join` 等改为成本驱动而非无条件布尔），并将 EXPLAIN 估计字段并入 HTTP 契约/工作台展示；IndexScan 估计字段依赖与 B(X20) 第二段协商。
+- [x] 后续/退出（**已闭环**）：预估成本已接入 optimizer**候选比较 + 固定决胜**（§6.12 `L+R<=L*R`、相等固定偏好 HashJoin；§6.16 复核确认非布尔开关）；EXPLAIN 估计字段并入 HTTP 契约/工作台（§6.15）；IndexScan 估计字段已由 A 侧完成（§6.15 4.3-iv `indexScanSelectivity` + `statistics-index-estimate-smoke` 13 项），B(X20) 侧仅余对齐确认。
 
 ### 6.12 X18 4.2 主体——优化器成本驱动 join 选择（builder-A 第十二次提交）
 
@@ -303,7 +303,7 @@ node tests\subquery-smoke.mjs tests\statistics-smoke.mjs tests\explain-smoke.mjs
 - [x] **4.2b** hash-join 规则改造：`NestedLoopJoin` 满足等值键后，比较 `HashCost=L+R` 与 `NL Cost=L*M`；**只当 `L+R <= L*M` 才改写为 HashJoin**（相等时固定偏好 HashJoin，决胜不依赖容器序/随机值）。多行两端→HashJoin（与既有 518 契约保持一致）；估算行数≤1 的一侧→保留 NestedLoopJoin（新行为）。
 - [x] **4.2c** 新增端到端 `tests/statistics-costjoin-smoke.mjs`：6 项验证多行等值连接选 HashJoin 且替换掉 NestedLoop、同 SQL 多次优化 join 选择序列一致（确定性）、HashJoin 路径返回正确行数；并留注「当前 parser 不支持派生表+JOIN、优化器对表按默认行数估算，SQL 层暂难构造单行端→NL 分支，留待派生表 JOIN/真实统计接入后验证」。
 - [x] **4.2d** 回归全绿：optimizer_contract 518、planner_contract 契约通过；node statistics-cost 12 / statistics-costjoin 6 / explain 21 / statistics 11 / statistics-histogram 20 / subquery 24 / derived 12 / correlated-exec 8 / index 29 通过；database-http、bridge 集成 7 通过。
-- [ ] 后续/退出：接入真实统计后让 `optimizerRows` 消费 `statistics()`/直方图（不再统一默认 1000），使单行/低基数场景真正影响 join 选择；把成本/估计并入 HTTP 契约与工作台展示；IndexScan 估计字段依赖与 B(X20) 第二段协商。
+- [x] 后续/退出（**已闭环**）：`optimizerRows` 已消费真实表行数（§6.13）与列级直方图选择率（§6.14），单行/低基数场景实际影响 join 选择；成本/估计并入 HTTP 契约与工作台（§6.15）；IndexScan 估计字段见 §6.15 4.3-iv。
 
 ### 6.13 X18 4.2 闭环——优化器消费真实表行数统计（builder-A 第十三次提交）
 
@@ -313,7 +313,7 @@ node tests\subquery-smoke.mjs tests\statistics-smoke.mjs tests\explain-smoke.mjs
 - [x] **4.2f** `database.hpp/.cpp`：新增 const 私有 `estimatedTableRows(name)`（真实 `heap_.scan` 计数）；`heap_` 标 `mutable`（允许 const `compile()` 只读路径暖缓存估算）；三处 `optimizer::optimize()` 调用（compile / EXPLAIN / execute）统一注入 `optimizerOptions.tableRows=[this]...`，让优化/执行/解释三条路径共享同一成本输入。
 - [x] **4.2g** 更新 `tests/statistics-costjoin-smoke.mjs`：真实统计 `t`(10 行) 与 `s`(1 行)——多行两端→HashJoin、单行端(`L=10,R=1`,Hash 11>NL 10)→保留 NestedLoopJoin、双路径确定性、结果行数正确；升至 10 项通过。
 - [x] **4.2h** 回归全绿：optimizer_contract 518、planner_contract 契约、database-http（含序列化写）通过；node statistics-costjoin 10 / statistics-cost 12 / explain 21 / statistics 11 / statistics-histogram 20 / subquery 24 / derived 12 / correlated-exec 8 / index / self-foreign-key 63 通过。
-- [ ] 后续/退出：进一步让 `optimizerRows` 消费列级直方图/选择率做连乘与交之决策（当前仅用表行数），并把成本/估计并入 HTTP 契约与工作台展示；IndexScan 估计字段依赖与 B(X20) 第二段协商。
+- [x] 后续/退出（**已闭环**）：`optimizerRows` 已消费列级直方图/选择率做连乘与交（§6.14 `Options.selectivity`）；成本/估计并入 HTTP 契约与工作台（§6.15）。
 
 ### 6.14 X18 4.2-iv——优化器消费列级直方图选择率（builder-A 第十四次提交）
 
@@ -352,7 +352,9 @@ node tests\subquery-smoke.mjs tests\statistics-smoke.mjs tests\explain-smoke.mjs
 - [x] **4.x-h** 相关**标量子查询→Apply(scalar)** 去相关：`decorrelateWhere` 识别纯布尔标量（`ifScalarBool`）与比较型标量（`ifScalarComp`，子查询在 Binary left 或 right），生成 `Apply` 节点（`values={"scalar":true}`），残差把子查询一侧替换为追加标量列 Identifier 并保持操作数位置；执行器 `Apply` 标量分支求值残差谓词过滤（空集补 NULL→比较 NULL→排除、多行报 `ExecutionError`）。EXPLAIN 顶层出现 `Apply` + `values.scalar` + `paramBinding` + 残差谓词。
 - [x] **4.x-i** 回归：新增 `tests/decorrelate-apply-smoke.mjs`（12 checks：NOT IN / IN / NOT EXISTS / EXISTS / 标量等值 / 标量左比较 / 空集标量 / 派生表基座 IN & NOT IN & 标量）。node parser 18 / planner 26 / diagnostics 22 / subquery 24 / explain 21 / outer-join 9 / statistics 11 / histogram 20 / cost 12 / costjoin 10 / optimizer-selectivity 14 / correlated-exec 8 / derived 12 / decorrelate-apply 12 通过；C++ contracts：optimizer 518 / planner / parser_subquery 3 / database 全绿。
 - [x] **4.x-j** 收口 `ScalarSubquery` 在 **HAVING / 聚合投影 / ORDER BY** 位置的相关求值，并修正「子计划含聚合时去相关产出不可执行节点」的缺口（详见 §6.19）。
-- [ ] 后续（非正确性，属重解析/缓存优化）：右子计划以 `Expr::subquery` 结构化 AST 优先替代文本重解析；跨库缓存与 `correlatedRowsCache_` 结合做绑定级 memo。
+- [ ] 后续（非正确性，属重解析/缓存优化）——**仍开放**：
+  - [ ] ① 右子计划以 `Expr::subquery` 结构化 AST 优先替代文本重解析。**暂缓**：须改 planner 中间表示与计划 JSON 结构，波及 `compile`/`explain` 输出，属跨组契约面；收益仅省编译期一次 `tokenize+parse`，风险与收益不成比例。
+  - [ ] ② 跨库缓存与 `correlatedRowsCache_` 结合做**绑定级 memo**。**可做**：纯 `database.cpp` 内部、零契约影响。
 
 ### 6.18 基线漂移核对与修复（builder-A 第十八次提交）
 
@@ -400,3 +402,34 @@ node tests\subquery-smoke.mjs tests\statistics-smoke.mjs tests\explain-smoke.mjs
 - [x] **6.21-c 失效规则**：`runStatement` 对任何写语句（CreateTable/CreateIndex/DropIndex/Insert/Update/Delete）**成功后删除**旁路文件——ANALYZE 快照随即失效，`statistics()` 回退实时扫描。
 - [x] **6.21-d ANALYZE 响应**：`kind=Analyze`，`columns=[table,rowCount,columnCount,analyzedAtMs,statsVersion]`，行仅含目标表，附 `source/statsVersion/analyzedAtMs`；EXPLAIN 展示路径的统计消费保持同源。
 - [x] **6.21-e 回归**：新增 `tests/analyze-stats-smoke.mjs`（**35 checks**：初态 on-demand、ANALYZE 后 `source=analyze` + 时间戳/版本、`ANALYZE TABLE` 与关键字大小写、写语句后失效、未知表/缺表名/多余 token 三类语法错误、EXPLAIN 不受影响）。`ctest` **59/59**。
+
+---
+
+## 7. 剩余项账实核对（2026-09-10）
+
+> 依据：通读 `docs/task-A-development-plan.md` 全部 `[ ]` 项 + 逐项对照代码。**A 线（X12/X13/X09/X18）主体已闭环**，历史上正文里保留的 12 个未勾项中，10 个是**当时记录的"下一步"备注，后续提交已实现但未回勾**（本轮据实订正）。真正仍开放的只有下列 2 项 + 外部依赖项。
+
+### 7.1 A 线内、且当前可做（零外部依赖）
+
+| # | 项 | 性质 | 说明 |
+|---|---|---|---|
+| A | **绑定级 memo**（§6.17 开放项 ②） | 优化 · 低风险 | `correlatedRowsCache_` 与跨库缓存的绑定级复用，纯 `database.cpp` 内部，不动 AST/Plan/HTTP 契约。 |
+| B | **又一轮对抗性缺陷扫荡** | 质量 · 中 | 历史两轮各挖出真实缺陷（解析器栈溢出、`DATE` 字面量误判、HAVING 去相关 5001）。可对 A 线四条特性再做边界/差分扫荡。 |
+
+### 7.2 A 线内、但**有意暂缓**（须改跨组契约面）
+
+| # | 项 | 暂缓理由 |
+|---|---|---|
+| C | 子查询结构化收口（§6.17 开放项 ①，去 `subquerySql` 文本重解析） | 须改 planner 中间表示与计划 JSON 结构，波及 `compile`/`explain` 输出；收益仅省一次编译期 `tokenize+parse`。任务书原文亦把它标注为"非正确性，属重解析/缓存优化"。 |
+| D | compile 响应接入新版本字段（P1 交付的编解码契约尚未接主路径） | 按任务书 8.1 接口冻结，响应接入涉及前端 `types.ts` 同步，属跨组事项。 |
+
+### 7.3 依赖他人 / 无法单方面完成
+
+- **与 B 联调**：X09 完成判据要求与 B 的 IndexScan/HashJoin/事务组合回归；X18 的 IndexScan 计划字段已由 A 侧实现（§6.15 4.3-iv），B(X20) 侧仅余对齐确认。
+- **合入 main 前评审**：需成员评审（任务书 §5）。
+- **X20 / X24 / X25 / X26 / X27**：**B/C 领域，A 线不碰。**
+
+### 7.4 已知口径差异（不改代码，仅记录）
+
+- R2 命名的 `docs/diagnostics-progress.md` 未单列：后端并入 `docs/compiler-error-codes.md`，前端在 `docs/workbench-diagnostics-progress.md`。
+- `docs/compiler-progress.md` / `docs/optimizer-progress.md` 为 2026-09-08 早期版本，已被 §6 执行记录与 `docs/x12|x13|x09|x18-*-progress.md` 覆盖，仅作历史留存。
