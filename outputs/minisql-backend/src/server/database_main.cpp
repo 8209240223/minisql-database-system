@@ -14,6 +14,35 @@ int session(minisql::execution::Database& database) {
         value["integerEncoding"] = "safe-number-or-decimal-string";
         std::cout << minisql::wireJson(std::move(value)).dump() << '\n' << std::flush;
     };
+    // 流式 NDJSON 帧：与 emit 相同，但不附加 integerEncoding（逐行协议由 HTTP 层声明编码）。
+    const auto emitStream = [](json value) {
+        std::cout << minisql::wireJson(std::move(value)).dump() << '\n' << std::flush;
+    };
+    // 读取跨进程背压控制帧：{"ack": id} 表示下游已消费上一行并允许继续；{"cancel": id} 取消。
+    constexpr std::size_t maxControlBytes = 1024;
+    const auto readStreamControl = [](const json& id) {
+        std::string line;
+        bool overflow = false, complete = false;
+        char ch;
+        while (std::cin.get(ch)) {
+            if (ch == '\n') { complete = true; break; }
+            if (line.size() < maxControlBytes) line.push_back(ch);
+            else overflow = true;
+        }
+        if (!complete) throw minisql::MiniSqlError(minisql::ErrorCode::Cancelled, "Stream peer closed during transfer");
+        if (overflow) throw minisql::MiniSqlError(minisql::ErrorCode::InvalidArgument, "Stream control frame exceeds 1 KiB");
+        try {
+            const auto control = json::parse(line, [](int depth, json::parse_event_t, json&) {
+                if (depth > 4) throw minisql::MiniSqlError(minisql::ErrorCode::InvalidArgument, "Stream control nesting limit exceeded");
+                return true;
+            });
+            if (control.value("cancel", std::string{}) == id.get<std::string>())
+                throw minisql::MiniSqlError(minisql::ErrorCode::Cancelled, "Query cancelled by client");
+            if (control.value("ack", std::string{}) == id.get<std::string>()) return;
+        } catch (const minisql::MiniSqlError&) { throw; }
+        catch (...) {}
+        throw minisql::MiniSqlError(minisql::ErrorCode::InvalidArgument, "Expected stream acknowledgement");
+    };
     emit({{"type", "ready"}, {"protocolVersion", 1}, {"transactionState", database.transactionState()}});
     constexpr std::size_t maxFrameBytes = 8 * 1024 * 1024;
     for (;;) {
@@ -75,6 +104,39 @@ int session(minisql::execution::Database& database) {
                     !request.contains("index") || !request["index"].is_string())
                     throw minisql::MiniSqlError(minisql::ErrorCode::InvalidArgument, "Expected table and index strings");
                 result = database.indexInspect(request["table"].get<std::string>(), request["index"].get<std::string>());
+            } else if (operation == "stream") {
+                if (!request.contains("sql") || !request["sql"].is_string())
+                    throw minisql::MiniSqlError(minisql::ErrorCode::InvalidArgument, "Expected SQL string");
+                const auto source = request["sql"].get<std::string>();
+                try {
+                    json columns = json::array(), columnTypes = json::array();
+                    std::size_t streamedRows = 0;
+                    const auto summary = database.streamQuery(source,
+                        [&](json&& meta) {
+                            columns = meta.at("columns");
+                            columnTypes = meta.at("columnTypes");
+                            emitStream({{"type", "meta"}, {"id", id}, {"success", true}, {"columns", columns}, {"columnTypes", columnTypes}});
+                        },
+                        [&](minisql::execution::Row&& row) {
+                            emitStream({{"type", "row"}, {"id", id}, {"index", streamedRows}, {"values", std::move(row)}});
+                            ++streamedRows;
+                        },
+                        [&](std::size_t) { readStreamControl(id); });
+                    emitStream({{"type", "complete"}, {"id", id}, {"success", true}, {"rowCount", summary.at("rowCount")},
+                                {"columns", columns}, {"columnTypes", columnTypes},
+                                {"transactionState", database.transactionState()}});
+                } catch (const minisql::MiniSqlError& error) {
+                    emitStream({{"type", "error"}, {"id", id}, {"success", false}, {"error", error.toJson()},
+                                {"transactionState", database.transactionState()}});
+                    if (!std::cout) return 1;
+                } catch (const std::exception& error) {
+                    emitStream({{"type", "error"}, {"id", id}, {"success", false},
+                                {"error", minisql::MiniSqlError(minisql::ErrorCode::Internal, std::string("Stream operation failed: ") + error.what()).toJson()},
+                                {"transactionState", database.transactionState()}});
+                    if (!std::cout) return 1;
+                }
+                if (!std::cout) return 1;
+                continue;
             } else if (operation == "close") {
                 close = true;
                 if (std::string(database.transactionState()) == "ACTIVE" || std::string(database.transactionState()) == "ABORTED")
@@ -99,9 +161,9 @@ int session(minisql::execution::Database& database) {
 
 int main(int argc, char** argv) {
     try {
-        if (argc != 3) throw minisql::MiniSqlError(minisql::ErrorCode::InvalidArgument, "Usage: minisql_database <database.pages> <execute|compile|diagnostics|statistics|catalog|session>");
+        if (argc != 3) throw minisql::MiniSqlError(minisql::ErrorCode::InvalidArgument, "Usage: minisql_database <database.pages> <execute|compile|diagnostics|statistics|catalog|session|snapshot>");
         const std::string mode = argv[2];
-        if (mode != "execute" && mode != "compile" && mode != "diagnostics" && mode != "statistics" && mode != "catalog" && mode != "session")
+        if (mode != "execute" && mode != "compile" && mode != "diagnostics" && mode != "statistics" && mode != "catalog" && mode != "session" && mode != "snapshot")
             throw minisql::MiniSqlError(minisql::ErrorCode::InvalidArgument, "Unknown database command");
         std::filesystem::path path;
 #ifdef _WIN32
@@ -119,7 +181,8 @@ int main(int argc, char** argv) {
         minisql::execution::Database database(path);
         if (mode == "session") return session(database);
         nlohmann::json result;
-        if (mode == "catalog") result = database.catalog();
+        if (mode == "snapshot") result = database.snapshotInfo();
+        else if (mode == "catalog") result = database.catalog();
         else {
             const std::string source{std::istreambuf_iterator<char>(std::cin), {}};
             result = mode == "execute" ? database.executeScript(source) : mode == "diagnostics" ? database.diagnostics(source) : mode == "statistics" ? database.statistics() : database.compile(source);

@@ -1,5 +1,7 @@
 # MiniSQL 索引页落盘进度
 
+> **状态：已被取代（2026-09-10）**。本文档描述"整棵树分页镜像"的旧存储方案；B1（X20）已用节点级持久化的 `PageBPlusTree` 取代它，实现索引页 `INDEX_META/INTERNAL/LEAF` 类型编号、按子页指针逐页遍历、删除借位/合并/根收缩。最新状态见 `docs/page-bplus-tree-progress.md`，本文保留作历史与兼容入口说明。
+
 ## 本轮实现
 
 - B+ 树新增 `dump` / `restore` 字符串接口，原有 JSON sidecar 的 `save` / `load` 保留为兼容入口。

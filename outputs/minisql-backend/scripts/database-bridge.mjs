@@ -136,6 +136,11 @@ function deltaBackupFile(raw) {
   if (dirname(file) !== backupDirectory) throw httpError(400, 'Backup path escapes backup directory');
   return { name: name + '.delta', file, manifest: file + '.json' };
 }
+// 迁移/恢复失败回滚副本：替换前保留原库，供失败后检查与恢复（X26 迁移回滚）。
+function backupRollbackFile(raw) {
+  const name = sanitizeBackupName(raw);
+  return { name: `${name}.rollback-${Date.now()}.pages`, file: resolve(backupDirectory, `${name}.rollback-${Date.now()}.pages`) };
+}
 function normalizeFullManifest(metadata, file, manifest) {
   if (metadata.sha256 !== sha256(file)) throw httpError(422, 'Backup checksum mismatch');
   const detectedPageVersion = pageFormatVersion(file);
@@ -554,6 +559,88 @@ const server = http.createServer(async (req, res) => {
     }
     if (!res.destroyed && !res.writableEnded) res.end();
   };
+  // 构建 NDJSON writer：首次写帧时 writeHead(200)，随后逐帧独立 res.write，drain 表示背压。
+  const createNdjsonWriter = (resp, eventHeaders) => {
+    let headSent = false;
+    return value => new Promise((resolveWrite, rejectWrite) => {
+      if (resp.destroyed || resp.writableEnded) { rejectWrite(httpError(499, 'Stream client disconnected')); return; }
+      if (!headSent) { headSent = true; resp.writeHead(200, eventHeaders); }
+      let done = false;
+      const finish = error => {
+        if (done) return;
+        done = true;
+        resp.off('error', onError);
+        resp.off('drain', onDrain);
+        error ? rejectWrite(error) : resolveWrite();
+      };
+      const onError = error => finish(error);
+      const onDrain = () => finish();
+      resp.once('error', onError);
+      if (resp.write(JSON.stringify(value) + '\n')) finish();
+      else resp.once('drain', onDrain);
+    });
+  };
+  // 真正的执行器级逐行流：经 C++ streamQuery(streamQuery) 逐步产出 meta/row，底层
+  // session-process 在每个 row 后等待本端 ack（由 HTTP 写背压驱动），实现 producer-consumer 不无限超前。
+  // 仅 SELECT/EXPLAIN。session 为空时走全局 worker（非会话流式）。返回 { status, result } 供 handler 记审计。
+  const streamNdjsonServer = async (session, requestUser, sql, resp, eventHeaders) => {
+    const run = async () => {
+      if (resp?.destroyed) throw httpError(499, 'Request disconnected before execution');
+      const currentEngine = await ensureEngine();
+      const cancelFile = sessionCancelFile(session?.id ?? 'anon');
+      clearCancelFile(cancelFile);
+      if (session) session.activeRequest = true;
+      const previousOperation = activeOperation;
+      activeOperation = { sessionId: session?.id ?? 'anon', cancelFile };
+      const disconnected = () => {
+        if (!resp?.writableEnded) {
+          try { writeFileSync(cancelFile, 'disconnect\n', 'utf8'); }
+          catch { quarantined = true; void currentEngine.worker.terminate(); }
+        }
+      };
+      resp?.once('close', disconnected);
+      const write = createNdjsonWriter(resp, eventHeaders);
+      let streamError = null;
+      let cancelled = false;
+      try {
+        const finalMessage = await currentEngine.worker.stream(sql, { sessionId: session?.id ?? 'anon', cancelFile }, async message => {
+          await (async () => {
+            if (message.type === 'error') { streamError = message.error; cancelled = message.error?.code === 5002;
+              await write({ type: 'error', success: false, error: message.error, transactionState: message.transactionState }); return; }
+            if (message.type === 'meta') {
+              await write({ type: 'meta', success: true, schemaVersion: 1, engine: 'minisql-cpp',
+                columns: message.columns, columnTypes: message.columnTypes });
+              return;
+            }
+            if (message.type === 'row') await write({ type: 'row', index: message.index, values: message.values });
+            if (message.type === 'complete') {
+              await write({ type: 'complete', success: true, rowCount: message.rowCount,
+                columns: message.columns, columnTypes: message.columnTypes, statements: 1, affectedRows: 0,
+                transactionState: message.transactionState });
+            }
+          })();
+        });
+        void finalMessage;
+      } finally {
+        session && (session.activeRequest = false);
+        activeOperation = previousOperation;
+        clearCancelFile(cancelFile);
+        resp?.off('close', disconnected);
+        if (session && !session.closing) touchSession(session);
+      }
+      if (!resp.destroyed && !resp.writableEnded) resp.end();
+      if (streamError || cancelled) return { status: 422, result: { success: false, cancelled,
+        transactionState: session?.transactionState, error: { ...streamError, message: streamError?.message ?? 'Query cancelled' } } };
+      return { status: 200, result: { success: true, transactionState: session?.transactionState } };
+    };
+    if (!session) {
+      if (sessions.size) throw httpError(409, 'Database reserved by active sessions');
+      return enqueue(run);
+    }
+    await acquireTurn(session);
+    try { return await enqueue(run); }
+    finally { releaseTurn(session); }
+  };
   if (origin && !allowedOrigins.has(origin)) { send(403, { error: { message: 'Origin not allowed' } }); return; }
   if (req.method === 'OPTIONS') { send(204, {}); return; }
   if (!canConnect(access, requestUser, requestPassword ?? null)) { send(403, { success: false, error: { code: 7001, message: 'Permission denied' } }); return; }
@@ -738,6 +825,16 @@ const server = http.createServer(async (req, res) => {
         const file = resolve(backupDirectory, name);
         const manifest = resolve(backupDirectory, name + '.json');
         const metadata = existsSync(manifest) ? JSON.parse(readFileSync(manifest, 'utf8')) : {};
+        // 增量链深度：从 base 沿 base 引用向上计数
+        let chainDepth = 0;
+        let anchor = metadata.base;
+        while (anchor) {
+          const parentManifest = resolve(backupDirectory, anchor + '.json');
+          if (!existsSync(parentManifest)) break;
+          const parent = JSON.parse(readFileSync(parentManifest, 'utf8'));
+          if (parent && parent.kind === 'incremental') { ++chainDepth; anchor = parent.base; }
+          else { ++chainDepth; anchor = undefined; }
+        }
         return {
           name,
           kind: metadata.kind ?? 'full',
@@ -747,6 +844,9 @@ const server = http.createServer(async (req, res) => {
           manifestVersion: metadata.version,
           pageFormatVersion: metadata.pageFormatVersion,
           walBytes: metadata.walBytes,
+          snapshot: metadata.snapshot ?? null,
+          chainDepth,
+          verified: true,
         };
       });
       send(200, { success: true, entries });
@@ -765,7 +865,7 @@ const server = http.createServer(async (req, res) => {
           if (!backupArtifactFile(body.base)) throw httpError(404, 'Base backup not found');
           const target = deltaBackupFile(body.name);
           await enqueue(async () => {
-            await callDatabase('execute', 'CHECKPOINT;');
+            const snapshot = await callDatabase('snapshot');   // 一致性检查点 + 记录提交序号/水位/目录版本
             const current = readFileSync(database);
             const baseReconstructed = await reconstructBackup(body.base);
             const baseBuffer = baseReconstructed.buffer;
@@ -790,24 +890,38 @@ const server = http.createServer(async (req, res) => {
               sha256: sha256(target.file),
               pageFormatVersion: baseReconstructed.manifest.pageFormatVersion,
               walBytes: 0,
+              snapshot: { committedSequence: snapshot.committedSequence, walBytes: snapshot.walBytes,
+                dirtyWatermark: snapshot.dirtyWatermark, catalogVersion: snapshot.catalogVersion,
+                indexVersion: snapshot.indexVersion, checkpointedAt: snapshot.checkpointedAt },
             }), 'utf8');
           });
           send(200, { success: true, backup: target.name, kind: 'incremental', base: backupArtifactFile(body.base).name, bytes: statSync(target.file).size, sha256: sha256(target.file) });
         } else {
           const { name, file } = backupFile(body.name);
           await enqueue(async () => {
-            await callDatabase('execute', 'CHECKPOINT;');
+            const snapshot = await callDatabase('snapshot');   // 一致性检查点 + 固定快照位置
             copyFileSync(database, file);
-            writeFileSync(file + '.json', JSON.stringify({ version: 2, name, createdAt: new Date().toISOString(), bytes: statSync(file).size, sha256: sha256(file), pageFormatVersion: pageFormatVersion(file), walBytes: 0 }), 'utf8');
+            writeFileSync(file + '.json', JSON.stringify({ version: 2, name, createdAt: new Date().toISOString(), bytes: statSync(file).size, sha256: sha256(file), pageFormatVersion: pageFormatVersion(file), walBytes: 0,
+              snapshot: { committedSequence: snapshot.committedSequence, walBytes: snapshot.walBytes,
+                dirtyWatermark: snapshot.dirtyWatermark, catalogVersion: snapshot.catalogVersion,
+                indexVersion: snapshot.indexVersion, checkpointedAt: snapshot.checkpointedAt } }), 'utf8');
           });
           send(200, { success: true, backup: name, bytes: statSync(file).size, sha256: sha256(file) });
         }
       } else {
         await enqueue(async () => {
           const reconstructed = await reconstructBackup(body.name);
-          writeDatabaseAtomically(reconstructed.buffer);
+          const rollback = backupRollbackFile(body.name);
+          if (existsSync(database)) copyFileSync(database, rollback.file);   // 迁移回滚副本：替换前保留原库
+          try {
+            writeDatabaseAtomically(reconstructed.buffer);
+          } catch (error) {
+            // 失败保留原库与回滚副本，供检查；不删除 .wal 以免破坏原库恢复链
+            throw Object.assign(error, { rollback: rollback.file });
+          }
           const wal = database + '.wal';
           if (existsSync(wal)) unlinkSync(wal);
+          unlinkSync(rollback.file);   // 替换成功，清除回滚副本
           await callDatabase('catalog');
         });
         send(200, { success: true, restored: body.name, bytes: statSync(database).size });
@@ -886,6 +1000,23 @@ const server = http.createServer(async (req, res) => {
     try { authorizeSql(requestUser, mode, sql); }
     catch (error) { send(403, { success: false, error: { code: 7001, message: 'Permission denied' } }); return; }
     const started = performance.now();
+    if (streamed) {
+      const streamSession = sessionRoute ? sessions.get(sessionRoute[1]) : null;
+      if (sessionRoute && !streamSession) throw httpError(404, 'Session not found or expired');
+      if (sessionRoute && streamSession.user !== requestUser) throw httpError(403, 'Permission denied');
+      const eventHeaders = { 'Content-Type': 'application/x-ndjson; charset=utf-8', 'Cache-Control': 'no-store', 'Vary': 'Origin',
+        'Access-Control-Allow-Headers': 'Content-Type, X-MiniSQL-User, X-MiniSQL-Password', 'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS' };
+      if (origin && allowedOrigins.has(origin)) eventHeaders['Access-Control-Allow-Origin'] = origin;
+      try {
+        const outcome = await streamNdjsonServer(streamSession, requestUser, sql, res, eventHeaders);
+        send(outcome.status, outcome.result);   // 流已 end；此处仅触发审计，不再重复写响应
+      } catch (error) {
+        send(error.status ?? 503, { success: false, commitState: !error.status && mode === 'execute' ? 'unknown' : undefined,
+          transactionState: streamSession?.transactionState,
+          error: { message: error.message, suggestion: 'Do not automatically retry writes; inspect database state.' } });
+      }
+      return;
+    }
     const data = await (async () => {
       if (!sessionRoute) {
         if (sessions.size) throw httpError(409, 'Database reserved by active sessions');
