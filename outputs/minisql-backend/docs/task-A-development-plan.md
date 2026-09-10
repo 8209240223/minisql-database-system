@@ -237,7 +237,7 @@ node tests\subquery-smoke.mjs tests\statistics-smoke.mjs tests\explain-smoke.mjs
 - [x] **3.3d** `execution/database.cpp` `runNode()`：外层 Select 投影于“成形子计划”（派生表）之上时先 `run()` 物化内层关系、再对外层投影求值；普通 Select（Filter 下接裸 Scan）路径不变，避免截胡。
 - [x] **3.3e** 契约测试：`tests/parser_subquery_contract.cpp` 链接改 `minisql_planner`，新增 3 项 `compilePlans` 派生规划校验（根 Project/别名/**外层输出列名**/投影为派生列引用；未知外层列拒绝）。
 - [x] **3.3f** 新增端到端 `tests/derived-smoke.mjs`：12 项（内层 filter+alias、外层 WHERE、`select *` 展开、qualified 引用、聚合/DISTINCT 派生表、多层派生、重复列名拒绝、缺别名拒绝、别名遮蔽原表）。
-- [x] **3.3g** 回归全绿：C++ contract 全 59 用例通过；node derived 12 / subquery 24 / parser 18 / planner 26 / explain 21 / outer-join 9 / aggregate-plan 75 / update 30 / insert 45 / database 7 通过（join-process、aggregate-process 因 workbench 未装 `sql.js` 差分依赖而无法运行，属环境缺失、与本次改动无关）。
+- [x] **3.3g** 回归全绿：C++ contract 全 59 用例通过；node derived 12 / subquery 24 / parser 18 / planner 26 / explain 21 / outer-join 9 / aggregate-plan 75 / update 30 / insert 45 / database 7 通过；join-process、aggregate-process、null-process 已迁移到 Node 24 `node:sqlite`，不再依赖已删除的 `sql.js`/Demo Worker。
 
 > 下一步 **3.3/3.4**：把相关子查询（EXISTS/IN/标量）从“文本重解析 + 外层列字面量替换”迁移到 by-value 参数绑定的 Apply/SemiJoin 计划节点与优化器去相关改写。
 
