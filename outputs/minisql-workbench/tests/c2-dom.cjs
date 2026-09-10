@@ -21,9 +21,11 @@ const assert = require('node:assert/strict');
   page.on('pageerror', error => errors.push(error.message));
   try {
     await page.goto(process.env.MINISQL_UI_URL ?? 'http://127.0.0.1:4173', { waitUntil: 'networkidle' });
+    await page.locator('.connection-mode').filter({ hasText: '自研 MiniSQL' }).waitFor();
     await page.getByRole('button', { name: 'MiniSQL C++', exact: true }).click();
     const connectionDialog = page.getByRole('dialog', { name: '连接管理' });
     await connectionDialog.waitFor();
+    assert.equal(await connectionDialog.getByText('本地演示', { exact: false }).count() > 0, true, '连接管理显示本地演示模式');
     assert.equal(await connectionDialog.getByRole('button', { name: '连接', exact: true }).isDisabled(), true, '活动会话禁止切换连接');
     await page.getByRole('button', { name: '断开会话' }).click();
     await page.waitForTimeout(250);
@@ -99,6 +101,13 @@ const assert = require('node:assert/strict');
     await confirmation;
     assert.equal(await page.getByRole('button', { name: '删除连接 QA Connection' }).count(), 0, '连接配置可以删除');
 
+    await page.setViewportSize({ width: 1024, height: 768 });
+    const tablet = await page.evaluate(() => ({
+      scrollWidth: document.documentElement.scrollWidth,
+      clientWidth: document.documentElement.clientWidth,
+    }));
+    assert.ok(tablet.scrollWidth <= tablet.clientWidth + 1, `1024 视口不产生横向溢出: ${JSON.stringify(tablet)}`);
+
     await page.setViewportSize({ width: 390, height: 844 });
     await page.getByRole('button', { name: '打开更多工具' }).click();
     assert.equal(await page.locator('.mobile-tools-menu').getByRole('button', { name: '设置', exact: true }).count(), 1);
@@ -114,6 +123,10 @@ const assert = require('node:assert/strict');
     console.log('C2 browser regression passed: connection CRUD/test, password isolation, access/session/settings panels, resizer, mobile menu/overflow and identity header; no images');
   } finally {
     await page.getByRole('button', { name: '断开会话' }).click({ timeout: 1000 }).catch(() => {});
+    await page.waitForFunction(() => {
+      const button = document.querySelector('button[aria-label="连接会话"]');
+      return button && !button.disabled;
+    }, undefined, { timeout: 3000 }).catch(() => {});
     await browser.close();
   }
 })().catch(error => { console.error(error); process.exitCode = 1; });

@@ -8,7 +8,7 @@ add_executable(minisql_tests
 target_link_libraries(minisql_tests PRIVATE minisql_server GTest::gtest_main Threads::Threads)
 target_include_directories(minisql_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 include(GoogleTest)
-gtest_discover_tests(minisql_tests DISCOVERY_TIMEOUT 30
+add_test(NAME minisql_tests COMMAND minisql_tests
     WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}")
 add_test(NAME cli.process_smoke COMMAND "${CMAKE_COMMAND}"
     "-DPROGRAM=$<TARGET_FILE:minisql>"

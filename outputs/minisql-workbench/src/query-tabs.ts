@@ -4,7 +4,7 @@ import type { DiagnosticLocation } from './diagnostic-location';
 export const DRAFT_KEY = 'minisql-studio-tabs-v1';
 export interface QueryView {
   result: QueryResult | null;
-  output: 'results' | 'plan' | 'ast' | 'tokens' | 'inspect';
+  output: 'results' | 'plan' | 'ast' | 'tokens' | 'diagnostics' | 'inspect';
   notice: string;
   source?: string;
   outcome?: string;

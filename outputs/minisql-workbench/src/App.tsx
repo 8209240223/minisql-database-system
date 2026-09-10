@@ -10,16 +10,19 @@ import type { IndexInspect } from './client';
 import { AccessControl } from './AccessControl';
 import { StorageStatisticsView } from './StorageStatistics';
 import { IndexInspectView } from './IndexInspect';
+import { TableInspectView } from './TableInspect';
 import { configureBuffer } from './client';
-import { Plug, Unplug, Check, Undo2, CirclePlay, Pencil, Upload, Download } from 'lucide-react';
-import { Plan, Diagnostics } from './CompilerViews';
-import type { BackupEntry, Capabilities, Connection, ConnectionProfile, Diagnostic, HistoryItem, QueryTab, Table } from './types';
+import { Plug, Unplug, Check, Undo2, CirclePlay, Pencil, Upload, Download, WandSparkles } from 'lucide-react';
+import { Plan, Diagnostics, TokenStream } from './CompilerViews';
+import type { BackupEntry, Capabilities, Connection, ConnectionProfile, Diagnostic, HistoryItem, QueryTab, SqlToken, Table } from './types';
 import { Results } from './Results';
 import { DRAFT_KEY, emptyView, restoreTabs } from './query-tabs';
 import type { QueryView } from './query-tabs';
+import './query-tabs.css';
 import { decodeSqlFile, sqlFilename, MAX_SQL_FILE_BYTES } from './sql-files';
 import { mapDiagnostic } from './diagnostic-location';
 import { mutationWarning } from './sql-safety';
+import { formatMiniSql } from './sql-format';
 import { HISTORY_KEY, MAX_HISTORY_SQL, limitHistory, restoreHistory, filterHistory } from './query-history';
 
 const starter = `-- MiniSQL Studio
@@ -31,27 +34,43 @@ ORDER BY e.score DESC
 LIMIT 12;`;
 const connectionDefaults = {
   mode: 'api' as const,
+  kind: 'native' as const,
   name: 'MiniSQL C++',
   url: import.meta.env.VITE_MINISQL_API ?? 'http://127.0.0.1:8081/api',
 };
+const demoConnectionDefaults = {
+  mode: 'api' as const,
+  kind: 'demo' as const,
+  name: 'MiniSQL 本地演示',
+  url: import.meta.env.VITE_MINISQL_DEMO_API ?? 'http://127.0.0.1:8082/api',
+};
+const connectionKindLabel = (kind: Connection['kind']) => kind === 'demo' ? '本地演示' : '自研 MiniSQL';
 const CONNECTIONS_KEY = 'minisql-studio-connections-v1';
 const CLIENT_TIMEOUT_KEY = 'minisql-client-timeout-ms';
 const DEFAULT_CLIENT_TIMEOUT_MS = 120000;
 const editorExtensions = [sql(), lintGutter()];
 
 function restoreConnectionProfiles(): ConnectionProfile[] {
-  const fallback: ConnectionProfile = { ...connectionDefaults, user: 'admin' };
+  const fallback: ConnectionProfile[] = [
+    { ...connectionDefaults, user: 'admin' },
+    { ...demoConnectionDefaults, user: 'admin' },
+  ];
   try {
     const value: unknown = JSON.parse(localStorage.getItem(CONNECTIONS_KEY) ?? 'null');
-    if (!Array.isArray(value) || value.length === 0 || value.length > 20) return [fallback];
+    if (!Array.isArray(value) || value.length === 0 || value.length > 20) return fallback;
     const profiles = value.filter((item): item is ConnectionProfile => Boolean(item) && typeof item === 'object' &&
       (item as ConnectionProfile).mode === 'api' && typeof (item as ConnectionProfile).name === 'string' &&
       (item as ConnectionProfile).name.trim().length > 0 && (item as ConnectionProfile).name.length <= 100 &&
       typeof (item as ConnectionProfile).url === 'string' && (item as ConnectionProfile).url.length <= 2048 &&
-      typeof (item as ConnectionProfile).user === 'string' && (item as ConnectionProfile).user.length <= 64);
-    const names = new Set(profiles.map(profile => profile.name));
-    return profiles.length === value.length && names.size === profiles.length ? profiles : [fallback];
-  } catch { return [fallback]; }
+      typeof (item as ConnectionProfile).user === 'string' && (item as ConnectionProfile).user.length <= 64 &&
+      ((item as ConnectionProfile).kind === undefined || ['native', 'demo'].includes((item as ConnectionProfile).kind as string)));
+    const normalized = profiles.map(profile => ({
+      ...profile,
+      kind: profile.kind ?? (profile.url.includes(':8082') ? 'demo' as const : 'native' as const),
+    }));
+    const names = new Set(normalized.map(profile => profile.name));
+    return normalized.length === value.length && names.size === normalized.length ? normalized : fallback;
+  } catch { return fallback; }
 }
 
 function App() {
@@ -75,6 +94,7 @@ function App() {
   const { result, output, notice, source: resultSource, outcome, selection: selectedResult, diagnostic, diagnostics, diagnosticFrom, diagnosticTo } = views[active] ?? emptyView;
   const editor = useRef<EditorView | undefined>(undefined);
   const [editorInstance, setEditorInstance] = useState<EditorView>();
+  const tabScrollRef = useRef<HTMLDivElement>(null);
   const fileInput = useRef<HTMLInputElement>(null);
   const [draftSaved, setDraftSaved] = useState(true);
   const importing = useRef(false);
@@ -110,6 +130,8 @@ const [accessOpen, setAccessOpen] = useState(false);
   const [systemBusy, setSystemBusy] = useState(false);
   const [health, setHealth] = useState<string>();
   const [inspectInfo, setInspectInfo] = useState<IndexInspect>();
+  const [tableInspect, setTableInspect] = useState<Table>();
+  const pendingAutoRun = useRef<{ id: string; sql: string } | undefined>(undefined);
   const historyDialog = useRef<HTMLDialogElement>(null);
   const autoConnectStarted = useRef(false);
   const visibleHistory = useMemo(() => filterHistory(history, historyQuery), [history, historyQuery]);
@@ -244,6 +266,12 @@ const [accessOpen, setAccessOpen] = useState(false);
     catch (error) { handleFailure(error); }
     finally { busy.current = false; setRunning(false); }
   }
+  function inspectTable(table: Table) {
+    setTableInspect(table);
+    setInspectInfo(undefined);
+    setNotice('');
+    setOutput('inspect');
+  }
   useEffect(() => {
     try { localStorage.setItem(DRAFT_KEY, JSON.stringify(tabs)); setDraftSaved(true); }
     catch { setDraftSaved(false); }
@@ -260,6 +288,53 @@ const [accessOpen, setAccessOpen] = useState(false);
     window.addEventListener('pagehide', release);
     return () => window.removeEventListener('pagehide', release);
   }, [connection.url, sessionId]);
+  useEffect(() => {
+    const scroller = tabScrollRef.current;
+    if (!scroller) return;
+    let drag: { pointerId: number; startX: number; startScrollLeft: number; moved: boolean } | undefined;
+    const finish = (event: PointerEvent) => {
+      if (!drag || drag.pointerId !== event.pointerId) return;
+      try { scroller.releasePointerCapture(event.pointerId); } catch { /* Pointer capture may already be released. */ }
+      scroller.classList.remove('dragging');
+    };
+    const start = (event: PointerEvent) => {
+      if (event.button !== 0) return;
+      if (event.target instanceof Element && event.target.closest('button, a, input, textarea, select')) return;
+      drag = { pointerId: event.pointerId, startX: event.clientX, startScrollLeft: scroller.scrollLeft, moved: false };
+      scroller.setPointerCapture(event.pointerId);
+    };
+    const move = (event: PointerEvent) => {
+      if (!drag || drag.pointerId !== event.pointerId) return;
+      const offset = event.clientX - drag.startX;
+      if (!drag.moved && Math.abs(offset) < 4) return;
+      drag.moved = true;
+      scroller.classList.add('dragging');
+      scroller.scrollLeft = drag.startScrollLeft - offset;
+    };
+    const clickGuard = (event: MouseEvent) => {
+      if (drag?.moved) {
+        event.preventDefault();
+        event.stopPropagation();
+      }
+    };
+    scroller.addEventListener('pointerdown', start);
+    scroller.addEventListener('pointermove', move);
+    scroller.addEventListener('pointerup', finish);
+    scroller.addEventListener('pointercancel', finish);
+    scroller.addEventListener('click', clickGuard, true);
+    return () => {
+      scroller.removeEventListener('pointerdown', start);
+      scroller.removeEventListener('pointermove', move);
+      scroller.removeEventListener('pointerup', finish);
+      scroller.removeEventListener('pointercancel', finish);
+      scroller.removeEventListener('click', clickGuard, true);
+      scroller.classList.remove('dragging');
+    };
+  }, []);
+  useEffect(() => {
+    const activeTab = tabScrollRef.current?.querySelector<HTMLElement>('.query-tab.active');
+    activeTab?.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'center' });
+  }, [active]);
   function openConnectionManager() {
     setConnectionDraft({ ...connection, sessionId: undefined });
     setEditingConnectionName(connection.name);
@@ -283,7 +358,7 @@ const [accessOpen, setAccessOpen] = useState(false);
       const parsed = new URL(url);
       if (!['http:', 'https:'].includes(parsed.protocol)) throw new Error();
     } catch { setConnectionFeedback('API 地址必须是有效的 HTTP 或 HTTPS 地址。'); return undefined; }
-    return { mode: 'api', name, url, user, password: connectionDraft.password };
+    return { mode: 'api', kind: connectionDraft.kind, name, url, user, password: connectionDraft.password };
   }
   function saveConnectionDraft(): Connection | undefined {
     const next = normalizeConnectionDraft();
@@ -292,7 +367,7 @@ const [accessOpen, setAccessOpen] = useState(false);
       setConnectionFeedback(`连接名称 ${next.name} 已存在。`);
       return undefined;
     }
-    const profile: ConnectionProfile = { mode: 'api', name: next.name, url: next.url, user: next.user };
+    const profile: ConnectionProfile = { mode: 'api', kind: next.kind, name: next.name, url: next.url, user: next.user };
     setSavedConnections(previous => [...previous.filter(item => item.name !== editingConnectionName && item.name !== profile.name), profile]);
     setConnection(next);
     setConnectionDraft(next);
@@ -411,6 +486,20 @@ const [accessOpen, setAccessOpen] = useState(false);
   }
   function addTab() { if (tabs.length >= 50) { setNotice('最多保留 50 个查询标签。'); return; } const id = crypto.randomUUID(); setTabs(v => [...v, { id, name: `query_${v.length + 1}.sql`, sql: '-- New query\n' }]); setActive(id); }
   function insertTable(table: Table) { updateSql(`${current.sql}\nSELECT * FROM ${table.name};`); }
+  function queryColumn(table: Table, column: Table['columns'][number]) {
+    if (tabs.length >= 50) { setNotice('最多保留 50 个查询标签。'); return; }
+    const id = crypto.randomUUID();
+    const sql = `SELECT ${column.name} FROM ${table.name};`;
+    setTabs(previous => [...previous, { id, name: `${table.name}.${column.name}.sql`, sql }]);
+    setActive(id);
+    pendingAutoRun.current = { id, sql };
+  }
+  useEffect(() => {
+    if (!pendingAutoRun.current || pendingAutoRun.current.id !== active) return;
+    const run = pendingAutoRun.current;
+    pendingAutoRun.current = undefined;
+    void execute(false);
+  }, [tabs, active]);
   function closeTab(id: string) {
     if (tabs.length === 1) return;
     if (id === runningTab) { setNotice('该标签正在执行，请等待请求结束。'); return; }
@@ -445,6 +534,15 @@ const [accessOpen, setAccessOpen] = useState(false);
     const link = document.createElement('a');link.href = url;link.download = sqlFilename(current.name);link.click();
     setTimeout(() => URL.revokeObjectURL(url), 1000);
   }
+  async function formatCurrentSql() {
+    try {
+      const formatted = await formatMiniSql(current.sql);
+      updateSql(formatted);
+      setNotice('');
+    } catch (error) {
+      setNotice(error instanceof Error ? `SQL 格式化失败：${error.message}` : 'SQL 格式化失败。');
+    }
+  }
   function locateDiagnostic() {
     const view = editor.current;
     if (!view || !diagnostic || view.state.doc.toString() !== diagnostic.source) return;
@@ -459,6 +557,17 @@ const [accessOpen, setAccessOpen] = useState(false);
     if (!view || !location) return;
     view.dispatch({ selection: { anchor: location.offset, head: location.offset + location.length },
       effects: EditorView.scrollIntoView(location.offset, { y: 'center' }) });
+    view.focus();
+  }
+  function locateToken(token: SqlToken) {
+    const view = editor.current;
+    if (!view) return;
+    const lineNumber = Math.min(view.state.doc.lines, Math.max(1, token.line));
+    const line = view.state.doc.line(lineNumber);
+    const from = Math.min(line.to, line.from + Math.max(0, token.column - 1));
+    const to = Math.min(line.to, from + Math.max(1, token.text.length));
+    view.dispatch({ selection: { anchor: from, head: to },
+      effects: EditorView.scrollIntoView(from, { y: 'center' }) });
     view.focus();
   }
   function shortcut(event: React.KeyboardEvent) {
@@ -488,7 +597,7 @@ const [accessOpen, setAccessOpen] = useState(false);
       <div className="connection-list" aria-label="已保存连接">
         {savedConnections.map(profile => <div className={profile.name === connectionDraft.name ? 'connection-item selected' : 'connection-item'} key={profile.name}>
           <button className="connection-item-select" onClick={() => selectConnection(profile)} disabled={!!sessionId}>
-            <strong>{profile.name}</strong><small>{profile.url}</small><span>{profile.user}</span>
+            <strong>{profile.name}</strong><small>{connectionKindLabel(profile.kind)} · {profile.url}</small><span>{profile.user}</span>
           </button>
           <button className="icon-btn" aria-label={`编辑连接 ${profile.name}`} title={`编辑连接 ${profile.name}`} onClick={() => { setConnectionDraft({ ...profile, password: '' }); setEditingConnectionName(profile.name); setConnectionFeedback(undefined); setConnectionTest(undefined); }}><Pencil size={14}/></button>
           <button className="icon-btn" aria-label={`删除连接 ${profile.name}`} title={`删除连接 ${profile.name}`} disabled={savedConnections.length === 1 || (!!sessionId && profile.name === connection.name)} onClick={() => removeConnection(profile)}><Trash2 size={14}/></button>
@@ -496,6 +605,7 @@ const [accessOpen, setAccessOpen] = useState(false);
       </div>
       <div className="connection-form">
         <strong>{editingConnectionName ? '编辑连接' : '新建连接'}</strong>
+        <label>模式<select value={connectionDraft.kind} onChange={event => setConnectionDraft(current => ({ ...current, kind: event.target.value as Connection['kind'] }))}><option value="native">自研 MiniSQL</option><option value="demo">本地演示</option></select></label>
         <label>名称<input value={connectionDraft.name} onChange={event => setConnectionDraft(current => ({ ...current, name: event.target.value }))}/></label>
         <label>API 地址<input value={connectionDraft.url} onChange={event => setConnectionDraft(current => ({ ...current, url: event.target.value }))} placeholder="http://127.0.0.1:8081/api"/></label>
         <label>用户<input value={connectionDraft.user} onChange={event => setConnectionDraft(current => ({ ...current, user: event.target.value }))}/></label>
@@ -533,7 +643,7 @@ const [accessOpen, setAccessOpen] = useState(false);
     {!draftSaved && <div className="draft-alert" role="alert">草稿保存失败：当前修改仅保留在此页面，请导出 SQL 后再关闭。</div>}
     {!historySaved && <div className="draft-alert" role="alert">历史保存失败：本次历史修改尚未写入本地存储。</div>}
     {historyOmitted && <div className="draft-alert" role="status">本次 SQL 超过历史单条容量，未加入历史；执行结果不受影响。</div>}
-    <header className="topbar"><div className="brand"><div className="brand-mark"><Database size={17}/></div><span>MiniSQL</span><b>Studio</b></div><div className="top-actions"><button className="connection-select" disabled={running} title="打开连接管理" onClick={openConnectionManager}><span className={health === 'ok' ? 'status-dot' : 'status-dot status-warn'}/>{connection.name}<ChevronDown size={14}/></button>{health && <span className="health-label" title="C++ bridge 健康状态">{health === 'ok' ? '服务正常' : '服务降级'}</span>}<button className="history-toggle" title="打开查询历史" aria-haspopup="dialog" onClick={() => setHistoryDialogOpen(true)}><History size={17}/></button><button className="settings-toggle" title="打开权限与审计" aria-label="打开权限与审计" onClick={() => setAccessOpen(true)}><Shield size={17}/></button><button className="settings-toggle" title="打开设置" aria-label="打开设置" onClick={() => setSettingsOpen(true)}><Settings2 size={17}/></button><button className="mobile-more" title="更多工具" aria-label="打开更多工具" aria-expanded={mobileMenuOpen} onClick={() => setMobileMenuOpen(value => !value)}><MoreHorizontal size={17}/></button><button className="avatar" title={`当前用户 ${connection.user}`}>{connection.user.slice(0, 1).toUpperCase() || '?'}</button>{mobileMenuOpen && <div className="mobile-tools-menu"><button onClick={() => { setMobileMenuOpen(false); setAccessOpen(true); }}><Shield size={14}/>权限与审计</button><button onClick={() => { setMobileMenuOpen(false); setSettingsOpen(true); }}><Settings2 size={14}/>设置</button><button onClick={() => { setMobileMenuOpen(false); setHistoryDialogOpen(true); }}><History size={14}/>查询历史</button></div>}</div></header>
+    <header className="topbar"><div className="brand"><div className="brand-mark"><Database size={17}/></div><span>MiniSQL</span><b>Studio</b></div><div className="top-actions"><button className="connection-select" disabled={running} title="打开连接管理" onClick={openConnectionManager}><span className={health === 'ok' ? 'status-dot' : 'status-dot status-warn'}/>{connection.name}<ChevronDown size={14}/></button><span className="connection-mode">{connectionKindLabel(connection.kind)}</span>{health && <span className="health-label" title="C++ bridge 健康状态">{health === 'ok' ? '服务正常' : '服务降级'}</span>}<button className="history-toggle" title="打开查询历史" aria-haspopup="dialog" onClick={() => setHistoryDialogOpen(true)}><History size={17}/></button><button className="settings-toggle" title="打开权限与审计" aria-label="打开权限与审计" onClick={() => setAccessOpen(true)}><Shield size={17}/></button><button className="settings-toggle" title="打开设置" aria-label="打开设置" onClick={() => setSettingsOpen(true)}><Settings2 size={17}/></button><button className="mobile-more" title="更多工具" aria-label="打开更多工具" aria-expanded={mobileMenuOpen} onClick={() => setMobileMenuOpen(value => !value)}><MoreHorizontal size={17}/></button><button className="avatar" title={`当前用户 ${connection.user}`}>{connection.user.slice(0, 1).toUpperCase() || '?'}</button>{mobileMenuOpen && <div className="mobile-tools-menu"><button onClick={() => { setMobileMenuOpen(false); setAccessOpen(true); }}><Shield size={14}/>权限与审计</button><button onClick={() => { setMobileMenuOpen(false); setSettingsOpen(true); }}><Settings2 size={14}/>设置</button><button onClick={() => { setMobileMenuOpen(false); setHistoryDialogOpen(true); }}><History size={14}/>查询历史</button></div>}</div></header>
     <div className="transaction-toolbar" aria-label="事务控制">
       <span role="status" data-testid="transaction-state">{!sessionId ? transactionState === 'EXPIRED' ? '会话已过期' : '未连接' : ({ IDLE: '自动提交', ACTIVE: '事务进行中 · 未提交', ABORTED: '事务失败 · 必须回滚', UNKNOWN: '提交状态未知' }[transactionState] ?? transactionState)}</span>
       <button className="icon-btn" title="连接会话" aria-label="连接会话" disabled={running || !!sessionId} onClick={() => void connect()}><Plug size={16}/></button>
@@ -561,19 +671,19 @@ const [accessOpen, setAccessOpen] = useState(false);
             </div>
             {treeExpanded.tables && visibleTables.map(table => <div className="table-node" key={table.name}>
               <button className="tree-chevron" aria-label={expanded[table.name] ? '折叠表 ' + table.name : '展开表 ' + table.name} onClick={() => setExpanded(v => ({ ...v, [table.name]: !v[table.name] }))}>{expanded[table.name] ? <ChevronDown size={13}/> : <ChevronRight size={13}/>}</button>
-              <Table2 size={14}/><button className="tree-label" onClick={() => insertTable(table)}>{table.name}</button><span className="row-count">{table.rowCount}</span>
+              <Table2 size={14}/><button className="tree-label" title="查看表详情" onClick={() => inspectTable(table)}>{table.name}</button><button className="tree-query" title={`生成 SELECT * FROM ${table.name}`} aria-label={`查询 ${table.name}`} onClick={() => insertTable(table)}><FileCode2 size={13}/></button><span className="row-count">{table.rowCount}</span>
               {expanded[table.name] && <div className="columns">{table.columns.map(column => {
                 const isPrimary = column.primaryKey || table.keys?.some(key => key.primary && key.columns.includes(column.name));
-                return <div className="column-node" key={column.name}><span className={isPrimary ? 'pk' : 'col-dot'}>{isPrimary ? '◆' : '·'}</span><span>{column.name}</span><small>{column.type}</small></div>;
+                return <button className="column-node" key={column.name} title={`筛选 ${table.name}.${column.name}`} aria-label={`筛选 ${table.name}.${column.name}`} onClick={() => queryColumn(table, column)}><span className={isPrimary ? 'pk' : 'col-dot'}>{isPrimary ? '◆' : '·'}</span><span>{column.name}</span><small>{column.type}</small></button>;
               })}</div>}{expanded[table.name] && table.indexes?.length ? <div className="indexes">{table.indexes.map(index => <button className="index-node" key={index.name} title="检查索引页级结构" onClick={() => inspectTableIndex(table.name, index.name)}><span className="pk">⌗</span><span>{index.name}</span><small>{index.columns.join(', ')}</small></button>)}</div> : null}</div>)}
           </>}
         </>}
       </div><div className="sidebar-bottom"><button><CircleHelp size={15}/> Documentation</button><span>v0.1.0 · C++ engine</span></div></aside>
-      <main className="main"><div className="query-tabs">{tabs.map(tab => <button className={tab.id === active ? 'query-tab active' : 'query-tab'} key={tab.id} onClick={() => setActive(tab.id)}><FileCode2 size={14}/>{tab.name}<X size={13} onClick={e => { e.stopPropagation(); closeTab(tab.id); }}/></button>)}<button className="new-tab" title="新建查询" onClick={addTab}><Plus size={16}/></button><div className="tab-spacer"/><button className="toolbar-btn" disabled={running || (!sessionId || ['UNKNOWN','ABORTED'].includes(transactionState))} onClick={() => execute(true)}><Braces size={15}/> Explain</button><button className="run-btn" onClick={() => execute(false)} disabled={running || (!sessionId || transactionState === 'UNKNOWN')}><Play size={15} fill="currentColor"/>{running ? 'Running...' : 'Run'}</button></div>
+      <main className="main"><div className="query-tabs"><div className="tab-scroll" ref={tabScrollRef}>{tabs.map(tab => <button className={tab.id === active ? 'query-tab active' : 'query-tab'} key={tab.id} onClick={() => setActive(tab.id)}><FileCode2 size={14}/><span>{tab.name}</span><X size={13} onClick={e => { e.stopPropagation(); closeTab(tab.id); }}/></button>)}<button className="new-tab" title="新建查询" onClick={addTab}><Plus size={16}/></button></div><div className="tab-actions"><button className="toolbar-btn" disabled={running || (!sessionId || ['UNKNOWN','ABORTED'].includes(transactionState))} onClick={() => execute(true)}><Braces size={15}/> Explain</button><button className="run-btn" onClick={() => execute(false)} disabled={running || (!sessionId || transactionState === 'UNKNOWN')}><Play size={15} fill="currentColor"/>{running ? 'Running...' : 'Run'}</button></div></div>
         <div className="query-state"><span title={current.name}>{current.name}</span><button className="icon-btn" aria-label="重命名查询" title="重命名查询" onClick={renameTab}><Pencil size={14}/></button>{current.dirty && <small>已修改</small>}{runningTab === active && <small role="status">执行中</small>}{result && resultSource !== current.sql && <small data-testid="stale-result">结果对应旧 SQL</small>}{['pending','rolledBack','unknown'].includes(outcome ?? '') && <small data-testid="result-outcome">{outcome === 'pending' ? '未提交结果' : outcome === 'rolledBack' ? '事务已回滚' : '提交状态未知'}</small>}</div>
-        <div className="file-toolbar"><button className="icon-btn" aria-label="导入 SQL" title="导入 SQL" onClick={() => fileInput.current?.click()}><Upload size={15}/></button><button className="icon-btn" aria-label="导出 SQL" title="导出 SQL" onClick={exportSql}><Download size={15}/></button>{selectedResult && <small data-testid="selection-result">选区结果</small>}{diagnostic && <><button className="icon-btn" aria-label="定位错误" title={`第 ${diagnostic.line} 行，第 ${diagnostic.column} 列`} disabled={current.sql.replace(/\r\n|\r/g, '\n') !== diagnostic.source} onClick={locateDiagnostic}><Search size={15}/></button><small data-testid="diagnostic-position">第 {diagnostic.line} 行，第 {diagnostic.column} 列{current.sql.replace(/\r\n|\r/g, '\n') !== diagnostic.source ? ' · 原 SQL 已修改' : ''}</small></>}</div>
+        <div className="file-toolbar"><button className="icon-btn" aria-label="导入 SQL" title="导入 SQL" onClick={() => fileInput.current?.click()}><Upload size={15}/></button><button className="icon-btn" aria-label="导出 SQL" title="导出 SQL" onClick={exportSql}><Download size={15}/></button><button className="icon-btn" aria-label="格式化 SQL" title="格式化 SQL" onClick={formatCurrentSql}><WandSparkles size={15}/></button>{selectedResult && <small data-testid="selection-result">选区结果</small>}{diagnostic && <><button className="icon-btn" aria-label="定位错误" title={`第 ${diagnostic.line} 行，第 ${diagnostic.column} 列`} disabled={current.sql.replace(/\r\n|\r/g, '\n') !== diagnostic.source} onClick={locateDiagnostic}><Search size={15}/></button><small data-testid="diagnostic-position">第 {diagnostic.line} 行，第 {diagnostic.column} 列{current.sql.replace(/\r\n|\r/g, '\n') !== diagnostic.source ? ' · 原 SQL 已修改' : ''}</small></>}</div>
         <section className="editor-wrap"><CodeMirror key={active} onCreateEditor={view => { editor.current = view; setEditorInstance(view); }} value={current?.sql ?? ''} height="100%" theme="light" extensions={editorExtensions} onChange={updateSql} basicSetup={{ lineNumbers: true, foldGutter: true, highlightActiveLine: true, autocompletion: true }} /></section>
-        <section className="output"><div className="output-tabs"><button className={output === 'results' ? 'selected' : ''} onClick={() => setOutput('results')}><Table2 size={14}/> Result <span>{result?.rows.length ?? 0}</span></button><button className={output === 'plan' ? 'selected' : ''} onClick={() => setOutput('plan')}><Activity size={14}/> Plan <span>{result?.plan.length ?? 0}</span></button><button className={output === 'ast' ? 'selected' : ''} onClick={() => setOutput('ast')}><Braces size={14}/> AST</button><button className={output === 'tokens' ? 'selected' : ''} onClick={() => setOutput('tokens')}><Terminal size={14}/> Diagnostics</button><button className={output === 'inspect' ? 'selected' : ''} onClick={() => setOutput('inspect')}><Database size={14}/> Inspect</button><div className="output-spacer"/><span className="query-meta">{result ? `${result.durationMs.toFixed(1)} ms · ${result.affectedRows} affected` : 'Ready'}</span></div><div className="output-body">{notice ? <div className="error-state"><span>!</span><div><strong>Query failed</strong><p>{notice}</p>{diagnostics && diagnostics.length > 1 && <div className="diagnostic-list">{diagnostics.map((item, index) => <button key={`${item.statementIndex ?? index}-${item.column ?? 0}`} onClick={() => locateDiagnosticItem(item)}><b>{item.code ?? 'SQL'}</b> 第 {item.line ?? 1} 行，第 {item.column ?? 1} 列：{item.message}</button>)}</div>}<button onClick={() => setNotice('')}>Dismiss</button></div></div> : output === 'results' ? <Results result={result}/> : output === 'plan' ? <Plan result={result}/> : output === 'ast' ? <pre className="json-view">{result?.ast ? JSON.stringify(result.ast, null, 2) : 'Compile a query to inspect its AST.'}</pre> : output === 'tokens' ? <Diagnostics result={result}/> : <IndexInspectView info={inspectInfo}/>}</div></section>
+        <section className="output"><div className="output-tabs"><button className={output === 'results' ? 'selected' : ''} onClick={() => setOutput('results')}><Table2 size={14}/> Result <span>{result?.rows.length ?? 0}</span></button><button className={output === 'plan' ? 'selected' : ''} onClick={() => setOutput('plan')}><Activity size={14}/> Plan <span>{result?.plan.length ?? 0}</span></button><button className={output === 'ast' ? 'selected' : ''} onClick={() => setOutput('ast')}><Braces size={14}/> AST</button><button className={output === 'tokens' ? 'selected' : ''} onClick={() => setOutput('tokens')}><Terminal size={14}/> Token 流 <span>{result?.tokens?.length ?? 0}</span></button><button className={output === 'diagnostics' ? 'selected' : ''} onClick={() => setOutput('diagnostics')}><Search size={14}/> Diagnostics</button><button className={output === 'inspect' ? 'selected' : ''} onClick={() => setOutput('inspect')}><Database size={14}/> Inspect</button><div className="output-spacer"/><span className="query-meta">{result ? `${result.durationMs.toFixed(1)} ms · ${result.affectedRows} affected` : 'Ready'}</span></div><div className="output-body">{notice ? <div className="error-state"><span>!</span><div><strong>Query failed</strong><p>{notice}</p>{diagnostics?.[0] && (diagnostics[0].actual || diagnostics[0].expected?.length) && <p>实际：{diagnostics[0].actual || '空'} · 期望：{diagnostics[0].expected?.join(' | ') || '未提供'}</p>}{diagnostics && diagnostics.length > 1 && <div className="diagnostic-list">{diagnostics.map((item, index) => <button key={`${item.statementIndex ?? index}-${item.column ?? 0}`} onClick={() => locateDiagnosticItem(item)}><b>{item.code ?? 'SQL'}</b> 第 {item.line ?? 1} 行，第 {item.column ?? 1} 列：{item.message}</button>)}</div>}<button onClick={() => setNotice('')}>Dismiss</button></div></div> : output === 'results' ? <Results result={result}/> : output === 'plan' ? <Plan result={result}/> : output === 'ast' ? <pre className="json-view">{result?.ast ? JSON.stringify(result.ast, null, 2) : 'Compile a query to inspect its AST.'}</pre> : output === 'tokens' ? <TokenStream result={result} onSelect={locateToken}/> : output === 'diagnostics' ? <Diagnostics result={result}/> : inspectInfo ? <IndexInspectView info={inspectInfo}/> : <TableInspectView table={tableInspect}/>}</div></section>
       </main>
       <aside className="rightbar">{historyContent}<div className="right-bottom"><Search size={14}/><input placeholder="Search tables" value={filter} onChange={e => setFilter(e.target.value)}/></div></aside>
     </div>

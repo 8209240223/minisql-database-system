@@ -23,7 +23,7 @@ function Invoke-NodeTests([string[]]$Files) {
 function Invoke-FrontendTests {
     Push-Location $frontend
     try {
-        foreach ($script in @('test:safety', 'test:history', 'test:csv', 'build')) {
+        foreach ($script in @('test:safety', 'test:history', 'test:csv', 'test:format', 'test:virtual', 'test:demo', 'build')) {
             Write-Host "`n>>> npm.cmd run $script" -ForegroundColor Cyan
             npm.cmd run $script
             if ($LASTEXITCODE -ne 0) { throw "Frontend step failed: $script" }

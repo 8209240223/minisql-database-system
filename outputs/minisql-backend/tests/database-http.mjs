@@ -71,11 +71,14 @@ try {
   assert.equal(compiled.data.ast[1].kind, 'Select');
   assert.equal(compiled.data.tokens[0].text, 'CREATE');
   assert.equal(compiled.data.tokens[0].line, 1);
+  assert.equal(compiled.data.protocolVersion, 1);
+  assert.equal(typeof compiled.data.requestId, 'string');
   assert.equal(compiled.data.stages.executor, 'notRun');
   assert.equal(compiled.data.stages.semantic, 'passed');
   assert.equal(compiled.data.optimizer.converged, true);
   assert.ok(compiled.data.optimizer.iterations >= 1);
-  assert.equal(compiled.data.optimizer.rules.length, 8);
+  assert.ok(compiled.data.optimizer.rules.length >= 9);
+  assert.ok(compiled.data.optimizer.rules.some(rule => rule.ruleId === 'decorrelate-subquery'));
   const nullPlan = await post('/compile', 'SELECT NULL AND FALSE AS a, NULL OR TRUE AS b, NOT NULL AS c, NULL=1 AS d FROM t;');
   assert.equal(nullPlan.status, 200);
   const folded = nullPlan.data.optimizedPlan.find(node => node.kind === 'Project').projections;

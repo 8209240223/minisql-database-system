@@ -7,7 +7,10 @@
     "test:safety": "node --test tests/sql-safety.test.mjs",
     "test:history": "node --test tests/query-history.test.mjs",
     "test:csv": "node --test tests/result-csv.test.mjs",
+    "test:format": "node tests/sql-format.test.mjs",
+    "test:virtual": "node tests/virtual-window.test.mjs",
     "test:dom": "node tests/c2-dom.cjs",
+    "test:demo": "node tests/demo-mode-smoke.cjs",
     "test:browser": "node tests/compiler-dom.cjs && node tests/c2-dom.cjs && node tests/c2-resilience-dom.cjs",
     "dev": "vite --host 127.0.0.1",
     "build": "tsc -b && vite build",
@@ -21,7 +24,8 @@
     "csv-stringify": "6.6.0",
     "lucide-react": "^0.468.0",
     "react": "^19.0.0",
-    "react-dom": "^19.0.0"
+    "react-dom": "^19.0.0",
+    "sql-formatter": "15.8.2"
   },
   "devDependencies": {
     "@types/react": "^19.0.0",

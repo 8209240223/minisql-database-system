@@ -20,8 +20,9 @@ async function api(connection: Connection, path: string, options?: RequestInit) 
 }
 
 async function streamApi(connection: Connection, path: string, sql: string, signal: AbortSignal) {
+  const requestId = crypto.randomUUID();
   const response = await fetch(`${connection.url.replace(/\/$/, '')}${path}`, {
-    method: 'POST', headers: requestHeaders(connection, { 'Content-Type': 'application/json' }), body: JSON.stringify({ sql }), signal,
+    method: 'POST', headers: requestHeaders(connection, { 'Content-Type': 'application/json' }), body: JSON.stringify({ sql, requestId }), signal,
   });
   const reader = response.body?.getReader();
   if (!reader) throw new Error(`API 未返回可读取的流 (${response.status})`);
@@ -187,8 +188,9 @@ export async function getSessions(connection: Connection): Promise<SessionEntry[
 }
 
 export async function cancelSession(connection: Connection, sessionId: string) {
+  const requestId = crypto.randomUUID();
   const response = await fetch(`${connection.url.replace(/\/$/, '')}/sessions/${encodeURIComponent(sessionId)}/cancel`, {
-    method: 'POST', headers: requestHeaders(connection), signal: AbortSignal.timeout(10000),
+    method: 'POST', headers: requestHeaders(connection, { 'Content-Type': 'application/json' }), body: JSON.stringify({ requestId }), signal: AbortSignal.timeout(10000),
   });
   const data = await response.json().catch(() => { throw new Error(`取消请求返回非 JSON 响应 (${response.status})`); });
   if (response.status === 202 && data.cancelled) return data;
@@ -262,7 +264,7 @@ export async function runSql(connection: Connection, sql: string, compile: boole
     return { ...data, plan: data.plan ?? [], durationMs: data.durationMs ?? 0, affectedRows: data.affectedRows ?? 0, statements: data.statements ?? 1 };
   }
   const data = await api(connection, sessionPath(connection, compile ? '/compile' : '/execute'), {
-    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sql }), signal,
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sql, requestId: crypto.randomUUID() }), signal,
   });
   if (!Array.isArray(data.rows) || !Array.isArray(data.columns)) throw new Error('API 响应不符合 QueryResult 契约。');
   return { ...data, plan: data.plan ?? [], durationMs: data.durationMs ?? 0, affectedRows: data.affectedRows ?? 0, statements: data.statements ?? 1 };

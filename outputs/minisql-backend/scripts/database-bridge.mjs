@@ -10,11 +10,17 @@ import { can, canConnect, defaultAccess, normalizeAccess, publicAccess,
   createUser, dropUser, createRole, dropRole, setPassword, addRole, removeRole, grant, revoke } from './access-catalog.mjs';
 import { openStore, readHeader, writeStore } from './access-store.mjs';
 
+function cliOption(name) {
+  const index = process.argv.indexOf(name);
+  return index >= 0 && index + 1 < process.argv.length ? process.argv[index + 1] : undefined;
+}
+const bridgePort = Number(cliOption('--port') ?? process.env.PORT ?? 8081);
+if (!Number.isInteger(bridgePort) || bridgePort < 0 || bridgePort > 65535) throw new Error('Invalid bridge port');
 const releaseExecutable = fileURLToPath(new URL('../build/windows/Release/minisql_database.exe', import.meta.url));
 const executable = process.env.MINISQL_DATABASE_EXE ?? (existsSync(releaseExecutable) ? releaseExecutable : fileURLToPath(new URL('../bin/minisql_database.exe', import.meta.url)));
-const database = resolve(process.env.MINISQL_DB ?? fileURLToPath(new URL('../data/workbench.pages', import.meta.url)));
+const database = resolve(cliOption('--database') ?? process.env.MINISQL_DB ?? fileURLToPath(new URL('../data/workbench.pages', import.meta.url)));
 mkdirSync(dirname(database), { recursive: true });
-const accessPath = resolve(process.env.MINISQL_ACCESS_FILE ?? resolve(dirname(database), 'access.catalog.json'));
+const accessPath = resolve(cliOption('--access-file') ?? process.env.MINISQL_ACCESS_FILE ?? resolve(dirname(database), 'access.catalog.json'));
 const openedAccess = openStore(accessPath, { defaults: defaultAccess, normalize: normalizeAccess });
 const accessPagesFile = openedAccess.pagesFile;
 let access = openedAccess.catalog;
@@ -612,6 +618,7 @@ function queryResult(data, durationMs) {
 const server = http.createServer(async (req, res) => {
   const auditStarted = performance.now();
   const auditId = randomUUID();
+  let requestId = randomUUID();
   let auditSql = '';
   let requestUser = req.headers['x-minisql-user'] ?? 'admin';
   const requestPassword = req.headers['x-minisql-password'];
@@ -620,6 +627,16 @@ const server = http.createServer(async (req, res) => {
   let auditObjects = [];
   let streamOutput = null;
   const send = (status, data) => {
+    const payload = data && typeof data === 'object' && !Array.isArray(data)
+      ? {
+          protocolVersion: 1,
+          requestId,
+          success: data.success !== false && !data.error,
+          stages: data.stages ?? {},
+          diagnostics: data.diagnostics ?? [],
+          ...data,
+        }
+      : data;
     if (!res.destroyed && !res.writableEnded) {
       appendAudit({
         id: auditId,
@@ -631,11 +648,11 @@ const server = http.createServer(async (req, res) => {
         sql: auditSql,
         object: auditObjects.length ? auditObjects.join(',') : undefined,
         status,
-        success: data?.success !== false,
+        success: payload?.success !== false,
         durationMs: performance.now() - auditStarted,
-        affectedRows: data?.affectedRows ?? 0,
-        errorCode: data?.error?.code,
-        transactionState: data?.transactionState,
+        affectedRows: payload?.affectedRows ?? 0,
+        errorCode: payload?.error?.code,
+        transactionState: payload?.transactionState,
         quarantined,
       });
     }
@@ -645,7 +662,7 @@ const server = http.createServer(async (req, res) => {
     headers['Access-Control-Allow-Headers'] = 'Content-Type, X-MiniSQL-User, X-MiniSQL-Password';
     headers['Access-Control-Allow-Methods'] = 'GET, POST, DELETE, OPTIONS';
     res.writeHead(status, headers);
-    res.end(JSON.stringify(data));
+    res.end(JSON.stringify(payload));
   };
   const beginStream = (status = 200) => {
     if (res.destroyed || res.writableEnded) return;
@@ -664,7 +681,7 @@ const server = http.createServer(async (req, res) => {
       const onDrain = () => finish();
       const onError = error => finish(error);
       res.once('error', onError);
-      if (res.write(JSON.stringify(value) + '\n')) finish();
+      if (res.write(JSON.stringify({ protocolVersion: 1, requestId, ...value }) + '\n')) finish();
       else res.once('drain', onDrain);
     });
     return { write, end() { if (!res.destroyed && !res.writableEnded) res.end(); } };
@@ -1033,8 +1050,11 @@ const server = http.createServer(async (req, res) => {
   }
   const cancelRoute = req.url?.match(/^\/api\/sessions\/([a-zA-Z0-9-]+)\/cancel$/);
   if (cancelRoute) {
-    req.resume();
     if (req.method !== 'POST') { send(405, { success: false, error: { code: 405, message: 'Cancellation requires POST' } }); return; }
+    try {
+      const body = await readJson();
+      if (typeof body.requestId === 'string' && body.requestId.length > 0 && body.requestId.length <= 128) requestId = body.requestId;
+    } catch { /* Cancellation remains valid without a JSON body. */ }
     const session = sessions.get(cancelRoute[1]);
     if (!session) { send(404, { success: false, error: { code: 404, message: 'Session not found or expired' } }); return; }
     if (session.user !== requestUser) { send(403, { success: false, error: { code: 7001, message: 'Permission denied' } }); return; }
@@ -1104,6 +1124,7 @@ const server = http.createServer(async (req, res) => {
       try {
         const body = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks)));
         if (typeof body.sql !== 'string') throw new Error();
+        if (typeof body.requestId === 'string' && body.requestId.length > 0 && body.requestId.length <= 128) requestId = body.requestId;
         sql = body.sql;
         auditSql = sql.slice(0, 4096);
         auditObjects = tableReferences(sql, firstKeyword(sql));
@@ -1183,6 +1204,6 @@ const server = http.createServer(async (req, res) => {
 // 不依赖引擎的管理端点保持可用（供管理员恢复）。
 try { await callDatabase('catalog'); }
 catch { quarantined = true; }
-server.listen(Number(process.env.PORT ?? 8081), '127.0.0.1', () => {
+server.listen(bridgePort, '127.0.0.1', () => {
   console.log(`MiniSQL database API http://127.0.0.1:${server.address().port}/api`);
 });

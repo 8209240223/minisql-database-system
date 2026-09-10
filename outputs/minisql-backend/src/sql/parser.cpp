@@ -51,20 +51,22 @@ private:
 
     bool at(const std::string& s){return i<t.size() && t[i].lexeme==s;}
     bool keyword(const std::string& s){if(i>=t.size())return false; auto v=t[i].lexeme; std::transform(v.begin(),v.end(),v.begin(),[](unsigned char c){return static_cast<char>(std::toupper(c));}); return v==s;}
+    std::string actualToken() const { return i<t.size() && t[i].type!="END" ? t[i].lexeme : std::string{}; }
 
     // Central error outlet. In strict mode it throws MiniSqlError exactly as
     // the classic parser did. In recovery mode it records the diagnostic and
     // throws Recovered{} to unwind to the nearest sync point.
-    [[noreturn]] void fail(ErrorCode code, const std::string& message, const SourceLocation& loc, const SourceLocation& end = {}){
+    [[noreturn]] void fail(ErrorCode code, const std::string& message, const SourceLocation& loc, const SourceLocation& end = {},
+                           std::string actual = {}, std::vector<std::string> expected = {}){
         if (recover_ && errors_) {
             const SourceLocation span = (end.line || end.column)
                 ? SourceLocation{loc.line, loc.column, end.line, end.column}
                 : loc;
-            errors_->emplace_back(code, message, span);
+            errors_->emplace_back(code, message, span, std::string{}, std::move(actual), std::move(expected));
             inError_ = true;
             throw Recovered{};
         }
-        throw MiniSqlError(code, message, loc);
+        throw MiniSqlError(code, message, loc, std::string{}, std::move(actual), std::move(expected));
     }
 
     const Token& take(){
@@ -73,13 +75,13 @@ private:
     }
     void expect(const std::string& s){
         if(!keyword(s)&&!at(s)){
-            fail(ErrorCode::Syntax, "Expected '"+s+"'", i<t.size()?t[i].location:SourceLocation{});
+            fail(ErrorCode::Syntax, "Expected '"+s+"'", i<t.size()?t[i].location:SourceLocation{}, {}, actualToken(), {s});
         }
         ++i;
     }
     std::string identifier(){
         const auto& x=take();
-        if(x.type!="IDENTIFIER") fail(ErrorCode::Syntax, "Expected identifier", x.location);
+        if(x.type!="IDENTIFIER") fail(ErrorCode::Syntax, "Expected identifier", x.location, x.endLocation, x.lexeme, {"IDENTIFIER"});
         return x.lexeme;
     }
     std::string literal(){
@@ -87,13 +89,16 @@ private:
         if(keyword("NULL")||keyword("TRUE")||keyword("FALSE"))return take().lexeme;
         std::string sign;if(at("-")||at("+"))sign=take().lexeme;
         const auto& x=take();
-        if(x.type!="INTEGER"&&x.type!="DECIMAL"&&x.type!="FLOAT"&&(x.type!="STRING"||!sign.empty())) fail(ErrorCode::Syntax, "Expected literal", x.location);
+        if(x.type!="INTEGER"&&x.type!="DECIMAL"&&x.type!="FLOAT"&&(x.type!="STRING"||!sign.empty()))
+            fail(ErrorCode::Syntax, "Expected literal", x.location, x.endLocation, x.lexeme,
+                 {"INTEGER", "DECIMAL", "FLOAT", "STRING", "NULL", "TRUE", "FALSE", "DATE"});
         return sign+x.lexeme;
     }
     std::string typeName() {
         if(keyword("INT")||keyword("BIGINT")||keyword("FLOAT")||keyword("BOOL")||keyword("DATE"))return take().lexeme;
         const bool varchar=keyword("VARCHAR");
-        if(!varchar && !keyword("DECIMAL")) fail(ErrorCode::Syntax, "Expected INT, BIGINT, FLOAT, VARCHAR(n), BOOL, DATE or DECIMAL(p,s) type", t[i].location);
+        if(!varchar && !keyword("DECIMAL")) fail(ErrorCode::Syntax, "Expected data type", t[i].location, {}, actualToken(),
+            {"INT", "BIGINT", "FLOAT", "VARCHAR", "BOOL", "DATE", "DECIMAL"});
         ++i;if(varchar && !at("("))return "varchar";expect("(");
         const auto parameter=[&](){
             const auto token=take();unsigned value{};
@@ -107,8 +112,8 @@ private:
         expect(",");const auto scale=parameter();expect(")");
         return "decimal("+std::to_string(precision)+","+std::to_string(scale)+")";
     }
-    void semicolon(){if(at(";"))++i;else fail(ErrorCode::Syntax, "Expected ';'", i<t.size()?t[i].location:SourceLocation{});}
-    Statement statement(){auto loc=t[i].location;Statement s;if(keyword("BEGIN")||keyword("COMMIT")||keyword("ROLLBACK")||keyword("SAVEPOINT")||keyword("RELEASE"))s=transaction();else if(keyword("CREATE"))s=create();else if(keyword("INSERT"))s=insert();else if(keyword("SELECT"))s=select();else if(keyword("DELETE"))s=remove();else if(keyword("UPDATE"))s=update();else if(keyword("CHECKPOINT"))s=checkpointStatement();else if(keyword("DROP"))s=dropIndex();else fail(ErrorCode::Syntax, "Expected SQL statement or transaction command", loc);s.location=loc;return s;}
+    void semicolon(){if(at(";"))++i;else fail(ErrorCode::Syntax, "Expected ';'", i<t.size()?t[i].location:SourceLocation{}, {}, actualToken(), {";"});}
+    Statement statement(){auto loc=t[i].location;Statement s;if(keyword("BEGIN")||keyword("COMMIT")||keyword("ROLLBACK")||keyword("SAVEPOINT")||keyword("RELEASE"))s=transaction();else if(keyword("CREATE"))s=create();else if(keyword("INSERT"))s=insert();else if(keyword("SELECT"))s=select();else if(keyword("DELETE"))s=remove();else if(keyword("UPDATE"))s=update();else if(keyword("CHECKPOINT"))s=checkpointStatement();else if(keyword("DROP"))s=dropIndex();else fail(ErrorCode::Syntax, "Expected SQL statement or transaction command", loc, {}, actualToken(), {"BEGIN", "COMMIT", "ROLLBACK", "SAVEPOINT", "RELEASE", "CREATE", "INSERT", "SELECT", "DELETE", "UPDATE", "CHECKPOINT", "DROP"});s.location=loc;return s;}
     Statement dropIndex(){Statement s{"DropIndex"};expect("DROP");expect("INDEX");s.indexName=identifier();if(keyword("ON")){++i;s.table=identifier();}semicolon();return s;}
     Statement checkpointStatement(){Statement s{"Checkpoint"};expect("CHECKPOINT");semicolon();return s;}
     Statement transaction() {
@@ -365,7 +370,7 @@ private:
     }
     std::uint64_t unsignedCount(){
         const auto& token=take();std::uint64_t value=0;
-        if(token.type!="INTEGER") fail(ErrorCode::Syntax, "Expected non-negative integer count", token.location);
+        if(token.type!="INTEGER") fail(ErrorCode::Syntax, "Expected non-negative integer count", token.location, token.endLocation, token.lexeme, {"INTEGER"});
         const auto parsed=std::from_chars(token.lexeme.data(),token.lexeme.data()+token.lexeme.size(),value);
         if(parsed.ec!=std::errc{}||parsed.ptr!=token.lexeme.data()+token.lexeme.size()) fail(ErrorCode::Syntax, "Pagination count exceeds UINT64 range", token.location);
         return value;
@@ -464,7 +469,7 @@ private:
                 return node;
             }
         }
-        if(at("(")){if(++depth>256) fail(ErrorCode::Syntax, "Expression depth exceeded", t[i].location);++i;auto e=expression();expect(")");--depth;return e;}auto loc=t[i].location;if(at("-")||at("+"))return std::make_shared<Expr>(Expr{"Literal",literal(),{},{},loc});const auto& x=take();if(x.type=="IDENTIFIER"){auto name=x.lexeme;if(at(".")){++i;name+="."+identifier();}return std::make_shared<Expr>(Expr{"Identifier",name,{},{},x.location});}if(x.type=="INTEGER"||x.type=="DECIMAL"||x.type=="FLOAT"||x.type=="STRING")return std::make_shared<Expr>(Expr{"Literal",x.lexeme,{},{},x.location}); fail(ErrorCode::Syntax, "Expected identifier, literal or '('", x.location, x.endLocation);
+        if(at("(")){if(++depth>256) fail(ErrorCode::Syntax, "Expression depth exceeded", t[i].location);++i;auto e=expression();expect(")");--depth;return e;}auto loc=t[i].location;if(at("-")||at("+"))return std::make_shared<Expr>(Expr{"Literal",literal(),{},{},loc});const auto& x=take();if(x.type=="IDENTIFIER"){auto name=x.lexeme;if(at(".")){++i;name+="."+identifier();}return std::make_shared<Expr>(Expr{"Identifier",name,{},{},x.location});}if(x.type=="INTEGER"||x.type=="DECIMAL"||x.type=="FLOAT"||x.type=="STRING")return std::make_shared<Expr>(Expr{"Literal",x.lexeme,{},{},x.location}); fail(ErrorCode::Syntax, "Expected identifier, literal or '('", x.location, x.endLocation, x.lexeme, {"IDENTIFIER", "CONST", "("});
     }
 };
 }

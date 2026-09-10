@@ -2113,7 +2113,8 @@ nlohmann::json Database::diagnostics(const std::string& source) const {
         }
         items.push_back({{"success", false}, {"stage", stageFor(error.code())},
             {"code", static_cast<int>(error.code())}, {"message", error.what()},
-            {"suggestion", std::move(suggestion)},
+            {"suggestion", std::move(suggestion)}, {"actual", error.actual()},
+            {"expected", error.expected()},
             {"line", loc.line}, {"column", loc.column},
             {"endLine", loc.endLine ? loc.endLine : loc.line},
             {"endColumn", loc.endColumn ? loc.endColumn : loc.column},
