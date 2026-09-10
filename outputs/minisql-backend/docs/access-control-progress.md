@@ -17,7 +17,7 @@
 - capabilities 暴露 `permissionsModel`、`objectPermissions`、`roleInheritance`、`sessionIdentity`、`passwordHashing`、`auditFiltering`。
 - **C++ 引擎入口鉴权（2026-09-10 补）**：新增 `src/security/access_catalog.cpp` 页式目录读取器，真实 `minisql_database.exe` 的 session 和直连 `execute/compile/diagnostics/statistics/catalog` 均在执行前校验用户、密码和对象权限；session 在每个请求前按 `permissionVersion` 热重载权限页，避免权限修改后继续使用旧快照。bridge 关闭共享 worker 时携带最后一次已验证的会话身份。
 - **PersistentCatalog 统一（2026-09-10 补）**：权限快照同步写入现有 PageFile 的保留系统堆表 `AccessCatalogStore`，按 `permissionVersion` 和分片序号保存；新快照完整写入后才清理旧快照，重启时选择最高版本的完整快照。旁路 `access.catalog.pages` 继续作为 HTTP bridge 的跨进程变更源，系统表作为引擎重启后的恢复源。
-- **Catalog 绑定（2026-09-10 补）**：C++ 入口新增只读 `Database::resolveAccessObjects`，对当前支持语法使用真实 Catalog 规范化物理表名，再把基础表集合传入 `AccessCatalog::authorize`；别名、派生表别名不会产生额外授权对象，嵌套子查询会递归绑定。
+- **Catalog 绑定（2026-09-10 补）**：C++ 入口新增只读 `Database::resolveAccessObjects`，对当前支持语法使用真实 Catalog 规范化物理表名；解析失败的 CTE/扩展 SQL 使用跳过注释和字符串的词法对象提取后继续通过真实 Catalog 规范化，再把基础表集合传入 `AccessCatalog::authorize`；别名、派生表别名不会产生额外授权对象，嵌套子查询会递归绑定。
 - **索引检查调用链（2026-09-10 补）**：bridge 将 `table`/`index` 转发到 C++ session，权限 HTTP 回归同步覆盖真实索引检查响应。
 
 ## 验证
@@ -42,7 +42,7 @@
 
 ## 限制
 
-- 当前访问目录由版本化页文件（`access.catalog.pages`）和 `PersistentCatalog` 保留系统堆表共同维护：页文件供 HTTP bridge 原子更新，C++ 引擎在打开数据库或检测到更高权限版本时同步到系统表，重启时可以仅依赖系统表恢复。旧版 `access.catalog.json` 仅用于迁移读取。C++ 入口对当前支持的语句先解析结构化 AST 并递归收集基础表对象，解析失败时才使用保守扫描；复杂 SQL 的完整名称绑定、未限定相关作用域和未支持语法的统一 AST 绑定仍未闭合。
+- 当前访问目录由版本化页文件（`access.catalog.pages`）和 `PersistentCatalog` 保留系统堆表共同维护：页文件供 HTTP bridge 原子更新，C++ 引擎在打开数据库或检测到更高权限版本时同步到系统表，重启时可以仅依赖系统表恢复。旧版 `access.catalog.json` 仅用于迁移读取。C++ 入口对当前支持的语句先解析结构化 AST 并递归收集基础表对象，解析失败时使用 Catalog 绑定的保守扫描；复杂 SQL 的完整名称绑定、未限定相关作用域和更广 SQL 的统一语义绑定仍未闭合。
 - 权限感知 CLI（`scripts/minisql-cli.mjs`）通过 HTTP bridge 强制携带身份；直接调用 `minisql_database.exe` 也已支持 `MINISQL_USER` / `MINISQL_PASSWORD` 身份校验，但这组环境变量只适合作为受控本地入口，不替代后续正式登录协议。
-- HTTP/CLI 层的对象识别已从正则升级为跳过注释/字符串、识别嵌套 FROM/JOIN/INTO/UPDATE/REFERENCES、排除 CTE 别名和派生表的轻量词法扫描；C++ 层对 MiniSQL 当前支持的派生表、子查询、JOIN、外键和索引使用真实 Catalog + 结构化 AST 绑定对象。未支持 SQL、未限定相关作用域和完整 CTE 绑定仍未闭合，DELETE 中的子查询也可能被保守地要求主表的 DELETE 权限。
+- HTTP/CLI 层的对象识别已从正则升级为跳过注释/字符串、识别嵌套 FROM/JOIN/INTO/UPDATE/REFERENCES、排除 CTE 别名和派生表的轻量词法扫描；C++ 层对 MiniSQL 当前支持的派生表、子查询、JOIN、外键和索引使用真实 Catalog + 结构化 AST 绑定对象，对解析失败的 CTE/扩展 SQL 使用 Catalog 绑定的保守对象提取。未限定相关作用域和完整语义绑定仍未闭合，DELETE 中的子查询也可能被保守地要求主表的 DELETE 权限。
 - 工作台权限/审计面板已接入（`AccessControl.tsx`），请求会携带当前连接的用户和密码；多会话面板已列出会话、锁等待和持锁状态，并提供活动请求取消。`c2-resilience-dom.cjs` 已纳入基础浏览器 DOM、移动端无溢出、客户端超时、活动请求取消、备份替换、迁移校验成功/失败、损坏备份失败隔离和恢复后查询验收。
