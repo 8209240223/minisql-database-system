@@ -188,4 +188,13 @@ void HeapStore::scan(std::uint64_t table, const RowSchema& schema, const std::fu
         }
     }
 }
+
+std::vector<RowRef> HeapStore::refsFor(std::uint64_t table) {
+    std::vector<RowRef> refs;
+    for (const auto ref : file_->pagesFor(table)) {
+        const auto page = buffer_.get(ref);
+        for (const auto slot : page.page().liveSlots()) refs.push_back({ref, slot});
+    }
+    return refs;
+}
 }

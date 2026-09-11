@@ -16,7 +16,7 @@ assert.equal(result.results[0].executed, false);
 assert.equal(result.results[0].affectedRows, 0);
 assert.deepEqual(result.results[2].rows, [[1]]);
 assert.ok(result.results[1].plan.length > 0);
-assert.ok(result.results[1].rows.every(row => row.length === 5 && Number.isFinite(row[2]) && Number.isFinite(row[3]) && row[4] === 'stats-v1'));
+assert.ok(result.results[1].rows.every(row => row.length === 6 && Number.isFinite(row[2]) && Number.isFinite(row[3]) && row[4] === 'stats-v1' && row[5] === 'table-column-statistics-or-default'));
 assert.equal(run('EXPLAIN CREATE TABLE absent(id INT);').success, true);
 assert.equal(run('SELECT * FROM absent;').success, false);
 assert.equal(run('EXPLAIN ANALYZE INSERT INTO t VALUES(3);').success, false);

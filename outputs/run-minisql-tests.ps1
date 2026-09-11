@@ -23,7 +23,7 @@ function Invoke-NodeTests([string[]]$Files) {
 function Invoke-FrontendTests {
     Push-Location $frontend
     try {
-        foreach ($script in @('test:safety', 'test:history', 'test:csv', 'build')) {
+        foreach ($script in @('test:safety', 'test:history', 'test:csv', 'test:format', 'test:virtual', 'test:demo', 'build')) {
             Write-Host "`n>>> npm.cmd run $script" -ForegroundColor Cyan
             npm.cmd run $script
             if ($LASTEXITCODE -ne 0) { throw "Frontend step failed: $script" }
@@ -48,8 +48,9 @@ $groups = @{
         'tests/subquery-smoke.mjs',
         'tests/explain-smoke.mjs',
         'tests/statistics-smoke.mjs',
-        'tests/statistics-compile-estimate-smoke.mjs',
-        'tests/statistics-index-estimate-smoke.mjs'
+        'tests/analyze-stats-smoke.mjs',
+        'tests/correlated-aggregate-smoke.mjs',
+        'tests/decorrelate-apply-smoke.mjs'
     )
     execution = @(
         'tests/database-process.mjs',
@@ -62,6 +63,8 @@ $groups = @{
         'tests/decimal-arithmetic-process.mjs',
         'tests/float-process.mjs',
         'tests/transaction-process.mjs'
+        'tests/transaction-savepoint.mjs'
+        'tests/transaction-overflow.mjs'
     )
     storage = @(
         'tests/checkpoint-smoke.mjs',
@@ -69,6 +72,7 @@ $groups = @{
         'tests/x22-fault-injection.mjs',
         'tests/journal-process.mjs',
         'tests/index-smoke.mjs',
+        'tests/index-performance-curve.mjs',
         'tests/backup-smoke.mjs',
         'tests/external-sort-smoke.mjs',
         'tests/external-aggregate-smoke.mjs'
@@ -82,6 +86,7 @@ $groups = @{
         'tests/cancel-smoke.mjs',
         'tests/result-budget-smoke.mjs',
         'tests/x25-stream-http.mjs'
+        'tests/session-stream-process.mjs'
     )
 }
 

@@ -11,16 +11,6 @@ namespace {
 // the statement-level handler can synchronize and continue.
 struct Recovered {};
 
-// Maximum expression nesting depth. The recursive-descent expression chain
-// (expression -> conjunction -> negation -> comparison -> addition ->
-// multiplication -> unary -> primary) costs roughly eight stack frames per
-// nesting level, so this guard must fire well before the default 1 MiB thread
-// stack is exhausted -- otherwise the process dies with a stack overflow
-// (0xC00000FD) instead of reporting a syntax error. A limit of 256 overflowed
-// at about 190 levels of `CAST(`/`(`/`SUM(` nesting; 128 keeps a comfortable
-// margin while staying far above any realistic SQL expression.
-constexpr std::size_t kMaxExpressionDepth = 128;
-
 class Parser {
 public:
     explicit Parser(const std::vector<Token>& tokens): t(tokens) {}
@@ -39,10 +29,6 @@ public:
     std::vector<Statement> allRecoverable(){
         std::vector<Statement> out;
         while(i<t.size() && t[i].type!="END"){
-            // A recovered statement unwinds through Recovered{}, which skips the
-            // matching `--depth` of any guard it passed, so reset the counter per
-            // statement to avoid an inflated depth falsely rejecting later ones.
-            depth = 0;
             try {
                 auto st = statement();
                 if (inError_) st.invalid = true;
@@ -65,43 +51,37 @@ private:
 
     bool at(const std::string& s){return i<t.size() && t[i].lexeme==s;}
     bool keyword(const std::string& s){if(i>=t.size())return false; auto v=t[i].lexeme; std::transform(v.begin(),v.end(),v.begin(),[](unsigned char c){return static_cast<char>(std::toupper(c));}); return v==s;}
-    // 耗尽 token 流时的「输入末尾」位置。诊断路径不会把 END token 入队（见
-    // database.cpp diagnostics()），若此处回落 SourceLocation{} 会得到 0:0，
-    // 前端便无法定位；改用最后一个 token 的 endLocation（即其右边界=EOL/EOF）。
-    SourceLocation eofLocation() const {
-        if(t.empty())return SourceLocation{};
-        const auto& last=t.back();
-        return (last.endLocation.line||last.endLocation.column)?last.endLocation:last.location;
-    }
+    std::string actualToken() const { return i<t.size() && t[i].type!="END" ? t[i].lexeme : std::string{}; }
 
     // Central error outlet. In strict mode it throws MiniSqlError exactly as
     // the classic parser did. In recovery mode it records the diagnostic and
     // throws Recovered{} to unwind to the nearest sync point.
-    [[noreturn]] void fail(ErrorCode code, const std::string& message, const SourceLocation& loc, const SourceLocation& end = {}){
+    [[noreturn]] void fail(ErrorCode code, const std::string& message, const SourceLocation& loc, const SourceLocation& end = {},
+                           std::string actual = {}, std::vector<std::string> expected = {}){
         if (recover_ && errors_) {
             const SourceLocation span = (end.line || end.column)
                 ? SourceLocation{loc.line, loc.column, end.line, end.column}
                 : loc;
-            errors_->emplace_back(code, message, span);
+            errors_->emplace_back(code, message, span, std::string{}, std::move(actual), std::move(expected));
             inError_ = true;
             throw Recovered{};
         }
-        throw MiniSqlError(code, message, loc);
+        throw MiniSqlError(code, message, loc, std::string{}, std::move(actual), std::move(expected));
     }
 
     const Token& take(){
-        if(i>=t.size()) { fail(ErrorCode::Syntax, "Unexpected end of input", eofLocation()); }
+        if(i>=t.size()) { fail(ErrorCode::Syntax, "Unexpected end of input", SourceLocation{}); }
         return t[i++];
     }
     void expect(const std::string& s){
         if(!keyword(s)&&!at(s)){
-            fail(ErrorCode::Syntax, "Expected '"+s+"'", i<t.size()?t[i].location:eofLocation());
+            fail(ErrorCode::Syntax, "Expected '"+s+"'", i<t.size()?t[i].location:SourceLocation{}, {}, actualToken(), {s});
         }
         ++i;
     }
     std::string identifier(){
         const auto& x=take();
-        if(x.type!="IDENTIFIER") fail(ErrorCode::Syntax, "Expected identifier", x.location);
+        if(x.type!="IDENTIFIER") fail(ErrorCode::Syntax, "Expected identifier", x.location, x.endLocation, x.lexeme, {"IDENTIFIER"});
         return x.lexeme;
     }
     std::string literal(){
@@ -109,13 +89,16 @@ private:
         if(keyword("NULL")||keyword("TRUE")||keyword("FALSE"))return take().lexeme;
         std::string sign;if(at("-")||at("+"))sign=take().lexeme;
         const auto& x=take();
-        if(x.type!="INTEGER"&&x.type!="DECIMAL"&&x.type!="FLOAT"&&(x.type!="STRING"||!sign.empty())) fail(ErrorCode::Syntax, "Expected literal", x.location);
+        if(x.type!="INTEGER"&&x.type!="DECIMAL"&&x.type!="FLOAT"&&(x.type!="STRING"||!sign.empty()))
+            fail(ErrorCode::Syntax, "Expected literal", x.location, x.endLocation, x.lexeme,
+                 {"INTEGER", "DECIMAL", "FLOAT", "STRING", "NULL", "TRUE", "FALSE", "DATE"});
         return sign+x.lexeme;
     }
     std::string typeName() {
         if(keyword("INT")||keyword("BIGINT")||keyword("FLOAT")||keyword("BOOL")||keyword("DATE"))return take().lexeme;
         const bool varchar=keyword("VARCHAR");
-        if(!varchar && !keyword("DECIMAL")) fail(ErrorCode::Syntax, "Expected INT, BIGINT, FLOAT, VARCHAR(n), BOOL, DATE or DECIMAL(p,s) type", t[i].location);
+        if(!varchar && !keyword("DECIMAL")) fail(ErrorCode::Syntax, "Expected data type", t[i].location, {}, actualToken(),
+            {"INT", "BIGINT", "FLOAT", "VARCHAR", "BOOL", "DATE", "DECIMAL"});
         ++i;if(varchar && !at("("))return "varchar";expect("(");
         const auto parameter=[&](){
             const auto token=take();unsigned value{};
@@ -129,12 +112,25 @@ private:
         expect(",");const auto scale=parameter();expect(")");
         return "decimal("+std::to_string(precision)+","+std::to_string(scale)+")";
     }
-    void semicolon(){if(at(";"))++i;else fail(ErrorCode::Syntax, "Expected ';'", i<t.size()?t[i].location:eofLocation());}
-    Statement statement(){auto loc=t[i].location;Statement s;if(keyword("BEGIN")||keyword("COMMIT")||keyword("ROLLBACK"))s=transaction();else if(keyword("CREATE"))s=create();else if(keyword("INSERT"))s=insert();else if(keyword("SELECT"))s=select();else if(keyword("DELETE"))s=remove();else if(keyword("UPDATE"))s=update();else if(keyword("CHECKPOINT"))s=checkpointStatement();else if(keyword("DROP"))s=dropIndex();else fail(ErrorCode::Syntax, "Expected SQL statement or transaction command", loc);s.location=loc;return s;}
+    void semicolon(){if(at(";"))++i;else fail(ErrorCode::Syntax, "Expected ';'", i<t.size()?t[i].location:SourceLocation{}, {}, actualToken(), {";"});}
+    Statement statement(){auto loc=t[i].location;Statement s;if(keyword("BEGIN")||keyword("COMMIT")||keyword("ROLLBACK")||keyword("SAVEPOINT")||keyword("RELEASE"))s=transaction();else if(keyword("CREATE"))s=create();else if(keyword("INSERT"))s=insert();else if(keyword("SELECT"))s=select();else if(keyword("DELETE"))s=remove();else if(keyword("UPDATE"))s=update();else if(keyword("CHECKPOINT"))s=checkpointStatement();else if(keyword("DROP"))s=dropIndex();else fail(ErrorCode::Syntax, "Expected SQL statement or transaction command", loc, {}, actualToken(), {"BEGIN", "COMMIT", "ROLLBACK", "SAVEPOINT", "RELEASE", "CREATE", "INSERT", "SELECT", "DELETE", "UPDATE", "CHECKPOINT", "DROP"});s.location=loc;return s;}
     Statement dropIndex(){Statement s{"DropIndex"};expect("DROP");expect("INDEX");s.indexName=identifier();if(keyword("ON")){++i;s.table=identifier();}semicolon();return s;}
     Statement checkpointStatement(){Statement s{"Checkpoint"};expect("CHECKPOINT");semicolon();return s;}
     Statement transaction() {
-        Statement s{keyword("BEGIN") ? "Begin" : keyword("COMMIT") ? "Commit" : "Rollback"};
+        if (keyword("SAVEPOINT")) {
+            Statement s{"Savepoint"};++i;s.savepointName=identifier();semicolon();return s;
+        }
+        if (keyword("RELEASE")) {
+            Statement s{"ReleaseSavepoint"};++i;
+            if(keyword("SAVEPOINT"))++i;
+            s.savepointName=identifier();semicolon();return s;
+        }
+        if (keyword("ROLLBACK")) {
+            ++i;
+            if (keyword("TO")) { ++i;if(keyword("SAVEPOINT"))++i;Statement s{"RollbackTo"};s.savepointName=identifier();semicolon();return s; }
+            if(keyword("TRANSACTION"))++i;semicolon();return Statement{"Rollback"};
+        }
+        Statement s{keyword("BEGIN") ? "Begin" : "Commit"};
         ++i;if(keyword("TRANSACTION"))++i;
         semicolon();return s;
     }
@@ -374,7 +370,7 @@ private:
     }
     std::uint64_t unsignedCount(){
         const auto& token=take();std::uint64_t value=0;
-        if(token.type!="INTEGER") fail(ErrorCode::Syntax, "Expected non-negative integer count", token.location);
+        if(token.type!="INTEGER") fail(ErrorCode::Syntax, "Expected non-negative integer count", token.location, token.endLocation, token.lexeme, {"INTEGER"});
         const auto parsed=std::from_chars(token.lexeme.data(),token.lexeme.data()+token.lexeme.size(),value);
         if(parsed.ec!=std::errc{}||parsed.ptr!=token.lexeme.data()+token.lexeme.size()) fail(ErrorCode::Syntax, "Pagination count exceeds UINT64 range", token.location);
         return value;
@@ -383,13 +379,13 @@ private:
     std::shared_ptr<Expr> expression(){auto left=conjunction();while(keyword("OR")){++i;left=std::make_shared<Expr>(Expr{"Binary","OR",left,conjunction()});}return left;}
     std::shared_ptr<Expr> conjunction(){auto left=negation();while(keyword("AND")){++i;left=std::make_shared<Expr>(Expr{"Binary","AND",left,negation()});}return left;}
     std::size_t depth=0;
-    std::shared_ptr<Expr> negation(){if(keyword("NOT")){if(++depth>kMaxExpressionDepth) fail(ErrorCode::Syntax, "Expression depth exceeded", t[i].location);++i;auto child=negation();--depth;return std::make_shared<Expr>(Expr{"Unary","NOT",child,{}});}return comparison();}
+    std::shared_ptr<Expr> negation(){if(keyword("NOT")){if(++depth>256) fail(ErrorCode::Syntax, "Expression depth exceeded", t[i].location);++i;auto child=negation();--depth;return std::make_shared<Expr>(Expr{"Unary","NOT",child,{}});}return comparison();}
     std::shared_ptr<Expr> comparison(){
         auto left=addition();
         if(keyword("IN")||keyword("NOT")){
             const bool negate=keyword("NOT");const auto op=take();
             if(negate)expect("IN");
-            if(++depth>kMaxExpressionDepth) fail(ErrorCode::Syntax, "Expression depth exceeded", op.location);
+            if(++depth>256) fail(ErrorCode::Syntax, "Expression depth exceeded", op.location);
             expect("(");
             if(keyword("SELECT")){
                 const auto start=i;
@@ -435,7 +431,7 @@ private:
            (keyword("COUNT")||keyword("SUM")||keyword("AVG")||keyword("MIN")||keyword("MAX"))){
             const auto token=take();auto name=token.lexeme;
             std::transform(name.begin(),name.end(),name.begin(),[](unsigned char c){return static_cast<char>(std::toupper(c));});
-            if(++depth>kMaxExpressionDepth) fail(ErrorCode::Syntax, "Expression depth exceeded", token.location);
+            if(++depth>256) fail(ErrorCode::Syntax, "Expression depth exceeded", token.location);
             expect("(");std::shared_ptr<Expr> argument;
             if(at("*")){
                 const auto star=take();
@@ -447,7 +443,7 @@ private:
         }
         if(keyword("CAST")){
             const auto token=take();
-            if(++depth>kMaxExpressionDepth) fail(ErrorCode::Syntax, "Expression depth exceeded", token.location);
+            if(++depth>256) fail(ErrorCode::Syntax, "Expression depth exceeded", token.location);
             expect("(");auto child=expression();expect("AS");
             auto target=typeName();expect(")");--depth;
             return std::make_shared<Expr>(Expr{"Cast",target,child,{},token.location});
@@ -457,7 +453,7 @@ private:
         if(at("+")||at("-")){
             if(i+1<t.size()&&(t[i+1].type=="INTEGER"||t[i+1].type=="DECIMAL"||t[i+1].type=="FLOAT")){auto loc=t[i].location;return std::make_shared<Expr>(Expr{"Literal",literal(),{},{},loc});}
             auto op=take();
-            if(++depth>kMaxExpressionDepth) fail(ErrorCode::Syntax, "Expression depth exceeded", op.location);
+            if(++depth>256) fail(ErrorCode::Syntax, "Expression depth exceeded", op.location);
             auto child=unary();--depth;
             return std::make_shared<Expr>(Expr{"Unary",op.lexeme,child,{},op.location});
         }
@@ -473,7 +469,7 @@ private:
                 return node;
             }
         }
-        if(at("(")){if(++depth>kMaxExpressionDepth) fail(ErrorCode::Syntax, "Expression depth exceeded", t[i].location);++i;auto e=expression();expect(")");--depth;return e;}auto loc=t[i].location;if(at("-")||at("+"))return std::make_shared<Expr>(Expr{"Literal",literal(),{},{},loc});const auto& x=take();if(x.type=="IDENTIFIER"){auto name=x.lexeme;if(at(".")){++i;name+="."+identifier();}return std::make_shared<Expr>(Expr{"Identifier",name,{},{},x.location});}if(x.type=="INTEGER"||x.type=="DECIMAL"||x.type=="FLOAT"||x.type=="STRING")return std::make_shared<Expr>(Expr{"Literal",x.lexeme,{},{},x.location}); fail(ErrorCode::Syntax, "Expected identifier, literal or '('", x.location, x.endLocation);
+        if(at("(")){if(++depth>256) fail(ErrorCode::Syntax, "Expression depth exceeded", t[i].location);++i;auto e=expression();expect(")");--depth;return e;}auto loc=t[i].location;if(at("-")||at("+"))return std::make_shared<Expr>(Expr{"Literal",literal(),{},{},loc});const auto& x=take();if(x.type=="IDENTIFIER"){auto name=x.lexeme;if(at(".")){++i;name+="."+identifier();}return std::make_shared<Expr>(Expr{"Identifier",name,{},{},x.location});}if(x.type=="INTEGER"||x.type=="DECIMAL"||x.type=="FLOAT"||x.type=="STRING")return std::make_shared<Expr>(Expr{"Literal",x.lexeme,{},{},x.location}); fail(ErrorCode::Syntax, "Expected identifier, literal or '('", x.location, x.endLocation, x.lexeme, {"IDENTIFIER", "CONST", "("});
     }
 };
 }

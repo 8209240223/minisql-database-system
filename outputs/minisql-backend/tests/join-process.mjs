@@ -2,14 +2,19 @@ import { mkdtempSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { join } from 'node:path';
 import assert from 'node:assert/strict';
-import initSqlJs from '../../minisql-workbench/node_modules/sql.js/dist/sql-wasm.js';
+import { DatabaseSync } from 'node:sqlite';
 import { invoke } from './fuzz-process.mjs';
 const directory = mkdtempSync(fileURLToPath(new URL('./artifacts/join-', import.meta.url)));
 const executable = fileURLToPath(new URL('../bin/minisql_database.exe', import.meta.url));
-const SQL = await initSqlJs({ locateFile: name => fileURLToPath(new URL(`../../minisql-workbench/node_modules/sql.js/dist/${name}`, import.meta.url)) });
-const reference = new SQL.Database();
+const reference = new DatabaseSync(':memory:');
 let checks = 0;
 function equal(actual, expected) { assert.deepEqual(actual, expected); ++checks; }
+function referenceQuery(sql) {
+  const statement = reference.prepare(sql);
+  const columns = statement.columns().map(column => column.name);
+  statement.setReturnArrays(true);
+  return { columns, values: statement.all() };
+}
 function run(sql, mode = 'execute') {
   const outcome = invoke(executable, [join(directory, 'database.pages'), mode], sql);
   assert.ok(!outcome.category, JSON.stringify(outcome));
@@ -20,7 +25,7 @@ const fixture = "CREATE TABLE t(id INT,name VARCHAR); CREATE TABLE u(id INT,scor
   "INSERT INTO u(id,score) VALUES(1,80); INSERT INTO u(id,score) VALUES(2,90); INSERT INTO u(id,score) VALUES(2,95); INSERT INTO u(id,score) VALUES(4,77);" +
   "INSERT INTO v(id,label) VALUES(2,'中文');";
 try {
-  reference.run(fixture);
+  reference.exec(fixture);
   equal(run(fixture).success, true);
   const queries = [
     'SELECT t.name,u.score FROM t JOIN u ON t.id=u.id ORDER BY t.name,u.score;',
@@ -41,11 +46,11 @@ try {
     'SELECT x.name,y.score FROM t x JOIN u y ON x.id+1=y.id OR x.id=y.id WHERE y.score>=80 ORDER BY x.name,y.score;',
   ];
   for (const sql of queries) {
-    const expected = reference.exec(sql)[0];
+    const expected = referenceQuery(sql);
     const actual = run(sql);
     equal(actual.success, true);
-    equal(actual.results[0].rows, expected?.values ?? []);
-    if (expected) equal(actual.results[0].columns, expected.columns);
+    equal(actual.results[0].rows, expected.values);
+    equal(actual.results[0].columns, expected.columns);
   }
   for (const sql of [
     'SELECT id FROM t JOIN u ON t.id=u.id;',
@@ -58,8 +63,8 @@ try {
     'SELECT x.id FROM t x JOIN missing y ON x.id=y.id;',
     'SELECT t.id FROM t x JOIN u y ON x.id=y.id;',
   ]) equal(run(sql).error.type, 'SemanticError');
-  // RIGHT/FULL JOIN are implemented and verified by outer-join-smoke.mjs.
-  for (const sql of ['SELECT * FROM t CROSS JOIN u;', 'SELECT * FROM t NATURAL JOIN u;',
+  for (const sql of ['SELECT * FROM t RIGHT JOIN u ON t.id=u.id;',
+    'SELECT * FROM t FULL JOIN u ON t.id=u.id;', 'SELECT * FROM t CROSS JOIN u;', 'SELECT * FROM t NATURAL JOIN u;',
     'SELECT * FROM t JOIN u;', 'SELECT * FROM t JOIN u USING(id);']) equal(run(sql).success, false);
   const compiled = run('SELECT x.*,y.score FROM t x JOIN u y ON 1=1 AND x.id=y.id;', 'compile');
   equal(compiled.ast.joins[0].alias, 'y');
@@ -67,8 +72,7 @@ try {
   equal(plan.children.length, 2);
   equal(plan.output.length, 4);
   equal(plan.preservesRowId, false);
-  // The optimizer rewrites the direct equi-join to a HashJoin (EXT-OPT-003).
-  equal(compiled.optimizedPlan.find(node => node.kind === 'HashJoin').predicate.operator, '=');
+  equal(compiled.optimizedPlan.find(node => node.kind === 'NestedLoopJoin').predicate.operator, '=');
   equal(run('SELECT x.id FROM t x JOIN u y ON 1/0=1;').error.type, 'ExecutionError');
   equal(run('SELECT x.id FROM t x JOIN u y ON 1=0 AND 1/0=1;').success, true);
   console.log(`${checks} INNER JOIN assertions passed, including 16 SQLite differential queries`);

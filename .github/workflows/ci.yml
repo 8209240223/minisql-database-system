@@ -1,0 +1,160 @@
+# MiniSQL 可重复回归 CI（成员 C：X27 Fuzz 固定种子语料 + 工作台单元回归）
+#
+# 说明：
+#   - 本工作流只运行「不依赖 C++ 引擎构建」的成员 C 回归，保证在普通 CI runner 上可复跑。
+#   - Windows job 会先用 MSVC + vcpkg 构建真实 minisql_database.exe，再执行 HTTP、状态机、重放
+#     和工作台 Edge 浏览器回归；Ubuntu job 保持无需 C++ 的契约回归。
+name: MiniSQL CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  backend-node:
+    name: 后端成员C纯 Node 回归（X24/X27）
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: outputs/minisql-backend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: 权限页式 Catalog 契约（X24）
+        run: node tests/access-store-contract.mjs
+      - name: 权限原子接口契约（X24）
+        run: node tests/access-catalog-atomic-contract.mjs
+      - name: 权限原子 HTTP 端点（X24）
+        run: node tests/access-atomic-http.mjs
+      - name: SQL 对象引用扫描契约（X24）
+        run: node tests/sql-object-references-contract.mjs
+      - name: Fuzz 生成器/缩减器契约（X27）
+        run: node tests/fuzz-model-contract.mjs
+      - name: 固定种子状态机语料（X27）
+        run: node tests/fuzz/generate-corpus.mjs
+      - name: 语料复现一致性
+        run: node tests/fuzz/reproducibility-contract.mjs
+
+  workbench:
+    name: 工作台单元回归与类型检查（C2）
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: outputs/minisql-workbench
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: 安装依赖
+        run: npm ci || npm install
+      - name: 变更安全（整表变异提示）
+        run: npm run test:safety
+      - name: 查询历史
+        run: npm run test:history
+      - name: CSV 导出
+        run: npm run test:csv
+      - name: 类型与构建
+        run: npm run build
+
+  engine-regression:
+    name: Windows C++ 引擎与 X24/X27 回归
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: 构建 C++ 引擎
+        shell: pwsh
+        working-directory: outputs/minisql-backend
+        run: |
+          cmake --preset windows -DBUILD_TESTING=OFF
+          if ($LASTEXITCODE -ne 0) { throw 'CMake configuration failed.' }
+          cmake --build --preset windows-release --parallel
+          if ($LASTEXITCODE -ne 0) { throw 'CMake Release build failed.' }
+      - name: 安装工作台浏览器回归依赖
+        run: npm ci
+        working-directory: outputs/minisql-workbench
+      - name: 启动 bridge 与工作台
+        shell: pwsh
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File ./outputs/start-minisql-workbench.ps1
+      - name: 工作台真实浏览器回归（C2）
+        run: npm run test:browser
+        working-directory: outputs/minisql-workbench
+      - name: HTTP 访问控制闭环
+        run: node tests/access-control-http.mjs
+        working-directory: outputs/minisql-backend
+      - name: C++ 入口访问控制闭环
+        run: node tests/access-control-process.mjs
+        working-directory: outputs/minisql-backend
+      - name: 权限感知 CLI 与原子 HTTP 回归
+        run: |
+          node tests/access-atomic-http.mjs
+        working-directory: outputs/minisql-backend
+      - name: HTTP 数据库回归
+        run: node tests/database-http.mjs
+        working-directory: outputs/minisql-backend
+      - name: Parser/子查询/诊断回归
+        run: |
+          node tests/derived-smoke.mjs
+          node tests/diagnostics-smoke.mjs
+          node tests/parser-regression.mjs
+        working-directory: outputs/minisql-backend
+      - name: 索引与 WAL/检查点回归
+        run: |
+          node tests/index-smoke.mjs
+          node tests/journal-process.mjs
+          node tests/auto-checkpoint-smoke.mjs
+          node tests/x22-fault-injection.mjs
+        working-directory: outputs/minisql-backend
+      - name: 索引规模回归（1000 行）
+        env:
+          INDEX_SCALE_ROWS: 1000
+        run: node tests/index-scale-smoke.mjs
+        working-directory: outputs/minisql-backend
+      - name: 索引性能曲线（1000/5000/10000 行）
+        run: node tests/index-performance-curve.mjs
+        working-directory: outputs/minisql-backend
+      - name: 会话/取消/流式/备份回归
+        run: |
+          node tests/session-process.mjs
+          node tests/session-http.mjs
+          node tests/multi-session-http.mjs
+          node tests/transaction-savepoint.mjs
+          node tests/transaction-overflow.mjs
+          node tests/cancel-smoke.mjs
+          node tests/x25-stream-http.mjs
+          node tests/session-stream-process.mjs
+          node tests/backup-smoke.mjs
+          node tests/backup-online-smoke.mjs
+          node tests/x25-row-stream-contract.mjs
+        working-directory: outputs/minisql-backend
+      - name: SELECT 差分回归
+        run: node tests/fuzz-differential.mjs
+        working-directory: outputs/minisql-backend
+      - name: DDL/DML 状态机差分回归
+        run: node tests/fuzz-state-machine-differential.mjs
+        working-directory: outputs/minisql-backend
+      - name: DATE/BOOL 字面量规划回归
+        run: node tests/date-literal-process.mjs
+        working-directory: outputs/minisql-backend
+      - name: DDL/DML 状态机长跑回归
+        run: node tests/fuzz-state-machine-long-run.mjs
+        working-directory: outputs/minisql-backend
+      - name: DDL/DML 状态机重复长跑 smoke
+        run: node tests/fuzz-state-machine-soak.mjs
+        working-directory: outputs/minisql-backend
+      - name: 状态机崩溃恢复组合回归
+        run: node tests/fuzz-state-machine-crash-recovery.mjs
+        working-directory: outputs/minisql-backend
+      - name: DDL/DML 状态机高压资源回归
+        run: node tests/fuzz-state-machine-pressure.mjs
+        working-directory: outputs/minisql-backend
+      - name: 状态机样本重放契约
+        run: node tests/fuzz-state-machine-replay-contract.mjs
+        working-directory: outputs/minisql-backend

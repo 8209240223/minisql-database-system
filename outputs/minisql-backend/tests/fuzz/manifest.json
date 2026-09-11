@@ -1,0 +1,47 @@
+{
+  "generatedAt": "2026-09-09T11:59:44.863Z",
+  "seeds": [
+    20260908,
+    42,
+    7
+  ],
+  "selectCount": 100,
+  "stateSteps": 96,
+  "fixtureSha256": "248d0391f0e22a8621c3e805d4fbe3563e720ade8920129b07c253e86d686836",
+  "generatorSha256": {
+    "select": "fda8b948635092135275bb2162d628ed37b8d88273e238b9de86781effb7deb5",
+    "state": "9250e5ca05d9eecb86bf506624dd2e1b7602fc8ccf92d053cb240181cf2ca02c"
+  },
+  "samples": [
+    {
+      "seed": 20260908,
+      "selectCount": 100,
+      "selectSqlBytes": 14686,
+      "selectSha256": "1487bf24d633a37336f0ed789e5b58b604287c2a736f51ac339623d3f1f1cc52",
+      "stateSteps": 96,
+      "stateSqlBytes": 5747,
+      "stateSha256": "64dc6dbf361a140ac358e7ceaf288bdb3a2e1ca253066ea6cd456e020141c869",
+      "validated": true
+    },
+    {
+      "seed": 42,
+      "selectCount": 100,
+      "selectSqlBytes": 14787,
+      "selectSha256": "40a40c9d84b614b3af02724a46ae682b2a23fe0763a4d13e8566a82093f68eb7",
+      "stateSteps": 96,
+      "stateSqlBytes": 7369,
+      "stateSha256": "7634e5a885d5b3484a3ad4b68f67d521b719a5bae476c3dde7c1229213d92f73",
+      "validated": true
+    },
+    {
+      "seed": 7,
+      "selectCount": 100,
+      "selectSqlBytes": 14449,
+      "selectSha256": "a9f5dfa5da93b8c8ad6e9ad9706076b9580b7accfde56ed6164938e3232307d6",
+      "stateSteps": 96,
+      "stateSqlBytes": 5753,
+      "stateSha256": "dd975d82dd01bf8df73abb12476c77f4dd9819ed17f4a1c8db633ccbeb7c8886",
+      "validated": true
+    }
+  ]
+}

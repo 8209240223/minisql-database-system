@@ -3,21 +3,21 @@ import { mkdtempSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { invoke } from './fuzz-process.mjs';
-import initSqlJs from '../../minisql-workbench/node_modules/sql.js/dist/sql-wasm.js';
+import { DatabaseSync } from 'node:sqlite';
 
 const directory = mkdtempSync(fileURLToPath(new URL('./artifacts/aggregate-',import.meta.url)));
 const executable = fileURLToPath(new URL('../bin/minisql_database.exe',import.meta.url));
 const file = join(directory,'database.pages');
-const SQL = await initSqlJs({locateFile:name=>fileURLToPath(new URL(`../../minisql-workbench/node_modules/sql.js/dist/${name}`,import.meta.url))});
-const reference = new SQL.Database();
+const reference = new DatabaseSync(':memory:');
 let checks=0;
 function equal(actual,expected){assert.deepEqual(actual,expected);++checks;}
+function referenceQuery(sql){const statement=reference.prepare(sql);const columns=statement.columns().map(column=>column.name);statement.setReturnArrays(true);return {columns,values:statement.all()};}
 function run(source){const result=invoke(executable,[file,'execute'],source);assert.ok(!result.category,JSON.stringify(result));return result.data;}
 function query(source){const result=run(source);assert.equal(result.success,true,JSON.stringify(result));++checks;return result.results.at(-1).rows;}
 const fixture="CREATE TABLE t(id INT,v INT,g VARCHAR); CREATE TABLE r(id INT,v INT); CREATE TABLE empty_t(id INT,v INT,g VARCHAR);"+
  "INSERT INTO t VALUES(1,10,'a'),(2,NULL,'a'),(3,20,'b'),(4,-5,'b'),(5,NULL,NULL),(6,NULL,NULL);"+
  'INSERT INTO r VALUES(1,2),(1,3),(3,NULL);';
-equal(run(fixture).success,true);reference.run(fixture);
+equal(run(fixture).success,true);reference.exec(fixture);
 const queries=[
  'SELECT COUNT(*),COUNT(v),SUM(v),MIN(v),MAX(v) FROM t;',
  'SELECT g,COUNT(*),COUNT(v),SUM(v),MIN(v),MAX(v) FROM t GROUP BY g ORDER BY g NULLS LAST;',
@@ -43,7 +43,7 @@ const queries=[
  'SELECT DISTINCT COUNT(*) FROM t GROUP BY g ORDER BY COUNT(*);',
  'SELECT COUNT(*),SUM(v) FROM t WHERE id>0 HAVING SUM(v)>0;',
 ];
-for(const source of queries){const expected=reference.exec(source);equal(query(source),expected.length?expected[0].values:[]);}
+for(const source of queries){const expected=referenceQuery(source);equal(query(source),expected.values);}
 equal(query('SELECT v>0,COUNT(*) FROM t GROUP BY v>0 ORDER BY v>0;'),[[false,1],[true,2],[null,3]]);
 equal(query('SELECT MIN(v>0),MAX(v>0),COUNT(v>0) FROM t;'),[[false,true,3]]);
 equal(query("SELECT MIN(g),MAX(g) FROM t;"),[['a','b']]);

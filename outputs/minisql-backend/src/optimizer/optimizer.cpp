@@ -22,7 +22,7 @@ void record(json& changes, const char* rule, std::size_t statement, const json& 
 json rewrite(json expression, const Options& options, json& changes, std::size_t statement, std::size_t depth = 0) {
     if (depth > 256) throw MiniSqlError(ErrorCode::Internal, "Optimizer expression depth exceeded");
     const auto kind = expression.value("kind", "");
-    if (kind == "Literal" || kind == "Identifier" || kind == "Parameter" || kind == "Exists" || kind == "ScalarSubquery") return expression;
+    if (kind == "Literal" || kind == "Identifier" || kind == "Exists" || kind == "ScalarSubquery") return expression;
     if (kind == "InSubquery") {
         expression["left"] = rewrite(expression.at("left"), options, changes, statement, depth + 1);
         return expression;
@@ -263,42 +263,6 @@ bool pushPredicateIntoJoin(sql::LogicalPlan& filter, json& changes, std::size_t 
     record(changes, "predicate-pushdown", statement, before, sql::serializePlans({filter}));
     return true;
 }
-// X18 4.2: 优化器侧确定性成本估算。仅依据计划结构 + 可选的表行数回调，
-// 同输入恒得同结果，用于候选执行策略的成本比较与固定决胜。
-constexpr double kOptimizerDefaultRows = 1000.0;
-constexpr double kOptimizerDefaultFilterSelectivity = 0.25;
-double optimizerRows(const sql::LogicalPlan& plan, const Options& options) {
-    if (plan.kind == "SeqScan")
-        return options.tableRows ? options.tableRows(plan.table).value_or(kOptimizerDefaultRows) : kOptimizerDefaultRows;
-    if (plan.children.empty()) {
-        if (plan.kind == "Insert") return static_cast<double>(std::max(plan.values.size(), plan.insertRows.size()));
-        return 1.0;
-    }
-    const auto rows = optimizerRows(plan.children.front(), options);
-    if (plan.kind == "Filter")
-        return rows * (options.selectivity ? options.selectivity(plan.predicate, plan.table) : kOptimizerDefaultFilterSelectivity);
-    if (plan.kind == "Limit") return plan.limit ? std::min(rows, static_cast<double>(*plan.limit)) : rows;
-    if (plan.kind == "Distinct") return rows * 0.5;
-    if (plan.kind == "Aggregate") return plan.groupKeys.empty() ? 1.0 : std::min(rows * 0.1, kOptimizerDefaultRows);
-    if (plan.kind == "NestedLoopJoin" || plan.kind == "HashJoin" || plan.kind == "LeftJoin" || plan.kind == "RightJoin" || plan.kind == "FullJoin") {
-        if (plan.children.size() != 2) return rows;
-        return rows * optimizerRows(plan.children[1], options) * 0.1;
-    }
-    // X09 4.x: 相关子查询去相关节点的行数估计（供 EEXPLAIN/成本展示；非相等 join 子输入）。
-    if (plan.kind == "SemiJoin" || plan.kind == "AntiSemiJoin" || plan.kind == "Apply") {
-        if (plan.children.size() != 2) return rows;
-        const auto rightRows = optimizerRows(plan.children[1], options);
-        if (plan.kind == "Apply") return rows * std::max(1.0, rightRows);
-        if (plan.kind == "SemiJoin") {
-            const double sel = plan.predicate.is_object()
-                ? (options.selectivity ? options.selectivity(plan.predicate, plan.table) : kOptimizerDefaultFilterSelectivity)
-                : 0.5;
-            return rows * std::clamp(sel, 0.0, 1.0);
-        }
-        return rows * 0.5;
-    }
-    return rows;  // Project / Sort 行数不变
-}
 void rewritePlan(sql::LogicalPlan& plan, const Options& options, json& changes, std::size_t statement, std::size_t depth = 0, bool selectQuery = false) {
     if (depth > 256) throw MiniSqlError(ErrorCode::Internal, "Optimizer plan depth exceeded");
     const bool childSelectQuery = selectQuery || plan.kind == "Project";
@@ -311,46 +275,23 @@ void rewritePlan(sql::LogicalPlan& plan, const Options& options, json& changes, 
     for (auto& row : plan.insertRows)
         for (auto& expression : row.at("expressions")) expression = rewrite(expression, options, changes, statement);
     if (plan.kind == "Project" && options.pruneColumns && pruneProjectColumns(plan, changes, statement)) return;
-    if (plan.kind != "Filter" && plan.kind != "NestedLoopJoin" && plan.kind != "LeftJoin" && plan.kind != "HashJoin") return;
+    if (plan.kind != "Filter" && plan.kind != "SemiJoin" && plan.kind != "AntiJoin" && plan.kind != "Apply" &&
+        plan.kind != "NestedLoopJoin" && plan.kind != "LeftJoin" && plan.kind != "HashJoin") return;
     plan.predicate = rewrite(plan.predicate, options, changes, statement);
+    if (options.decorrelateSubquery && plan.kind == "Filter" && !plan.subqueryJoinKind.empty()) {
+        record(changes, "decorrelate-subquery", statement, {{"kind", "Filter"}, {"subqueryJoinKind", plan.subqueryJoinKind}},
+            {{"kind", plan.subqueryJoinKind}, {"execution", "grouped-parameter-instances"}});
+        plan.kind = plan.subqueryJoinKind;
+    }
     if (plan.kind == "NestedLoopJoin" && options.hashJoin && plan.children.size() == 2) {
         std::size_t leftKey{}, rightKey{};
         if (hashJoinKeys(plan.predicate, plan.children[0].output.size(), leftKey, rightKey)) {
-            // X18 4.2: 成本驱动候选选择 + 固定决胜——Hash 成本 L+M，NestedLoop 成本 L*M；
-            // 相等时不依赖容器序、固定偏好 HashJoin（确定性）。
-            const auto leftRows = optimizerRows(plan.children[0], options);
-            const auto rightRows = optimizerRows(plan.children[1], options);
-            if (leftRows + rightRows <= leftRows * rightRows) {
-                record(changes, "hash-join", statement, {{"kind", "NestedLoopJoin"}}, {{"kind", "HashJoin"}});
-                plan.kind = "HashJoin";
-            }
+            record(changes, "hash-join", statement, {{"kind", "NestedLoopJoin"}}, {{"kind", "HashJoin"}});
+            plan.kind = "HashJoin";
         }
     }
     if (plan.kind != "Filter") return;
-    if (options.predicatePushdown && pushPredicateIntoJoin(plan, changes, statement)) {
-        // X18 4.2-iv: 旁路下推后 plan 已「原地」成为 Join（Filter 之上被压平）。子节点此前
-        // 在未带 Filter 时已按原始行数判过 Hash/NL（可能已改写为 HashJoin）；此刻 Filter
-        // 已下推到 join 子输入，按带过滤的真实子输入（列级直方图选择率）双向重判 Hash/NL。
-        if ((plan.kind == "NestedLoopJoin" || plan.kind == "HashJoin") && options.hashJoin && plan.children.size() == 2) {
-            std::size_t leftKey{}, rightKey{};
-            if (hashJoinKeys(plan.predicate, plan.children[0].output.size(), leftKey, rightKey)) {
-                const auto leftRows = optimizerRows(plan.children[0], options);
-                const auto rightRows = optimizerRows(plan.children[1], options);
-                if (leftRows + rightRows <= leftRows * rightRows) {
-                    if (plan.kind != "HashJoin") {
-                        record(changes, "hash-join", statement, {{"kind", "NestedLoopJoin"}}, {{"kind", "HashJoin"}});
-                        plan.kind = "HashJoin";
-                    }
-                } else if (plan.kind != "NestedLoopJoin") {
-                    // 过滤后单侧大幅收窄，Hash(11) > NL(10) → 由先前判定（原始行数）的
-                    // HashJoin 撤销为 NestedLoopJoin（确定性、成本驱动）。
-                    record(changes, "hash-join", statement, {{"kind", "HashJoin"}}, {{"kind", "NestedLoopJoin"}});
-                    plan.kind = "NestedLoopJoin";
-                }
-            }
-        }
-        return;
-    }
+    if (options.predicatePushdown && pushPredicateIntoJoin(plan, changes, statement)) return;
     if (options.removeTrueFilter && boolean(plan.predicate) && plan.predicate.at("value").get<bool>() && plan.children.size() == 1) {
         const auto& input = plan.children.front();
         if (plan.table != input.table || plan.preservesRowId != input.preservesRowId || plan.output.size() != input.output.size()) return;
@@ -428,6 +369,7 @@ nlohmann::json ruleDescriptors() {
         {{"ruleId", "predicate-pushdown"}, {"scope", "plan"}, {"precondition", "INNER join Filter with side-local, side-effect-free comparison/boolean predicates"}, {"postcondition", "Same rows, NULL results and error timing for safe predicates"}},
         {{"ruleId", "hash-join"}, {"scope", "plan"}, {"precondition", "INNER NestedLoopJoin with direct left/right column equality"}, {"postcondition", "Same inner-join rows, duplicates and NULL non-matching semantics"}},
         {{"ruleId", "prune-columns"}, {"scope", "plan"}, {"precondition", "Project over SeqScan with optional single Filter; projections are explicit"}, {"postcondition", "Scan output metadata contains exactly referenced columns; row values and errors unchanged"}}
+        ,{{"ruleId", "decorrelate-subquery"}, {"scope", "plan"}, {"precondition", "Filter carries SemiJoin/AntiJoin/Apply subquery classification"}, {"postcondition", "Promote to typed subquery node while preserving grouped-parameter execution semantics"}}
     });
 }
 Result optimize(const std::vector<sql::LogicalPlan>& plans, Options options) {
@@ -442,6 +384,7 @@ Result optimize(const std::vector<sql::LogicalPlan>& plans, Options options) {
         else if (id == "predicate-pushdown") options.predicatePushdown = false;
         else if (id == "hash-join") options.hashJoin = false;
         else if (id == "prune-columns") options.pruneColumns = false;
+        else if (id == "decorrelate-subquery") options.decorrelateSubquery = false;
         else throw MiniSqlError(ErrorCode::InvalidArgument, "Unknown optimizer rule: " + id);
     }
     checkBudget(plans, options.maxNodes);

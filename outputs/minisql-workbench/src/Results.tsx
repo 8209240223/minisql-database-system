@@ -1,7 +1,8 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { Copy, Download, Table2 } from 'lucide-react';
 import type { QueryResult } from './types';
 import { resultCsv, resultTsv } from './result-csv';
+import { calculateVirtualRange } from './virtual-window';
 
 type Position = { row: number; column: number };
 
@@ -12,7 +13,21 @@ export function Results({ result, rowLimit }: { result: QueryResult | null; rowL
   const [exportError, setExportError] = useState('');
   const [selection, setSelection] = useState<{ source: QueryResult; anchor: Position; focus: Position } | null>(null);
   const [copied, setCopied] = useState(false);
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const [scrollTop, setScrollTop] = useState(0);
+  const [viewportHeight, setViewportHeight] = useState(360);
   useEffect(() => { setSelection(null); setExportError(''); setCopied(false); }, [result]);
+  useEffect(() => {
+    const element = scrollRef.current;
+    if (!element) return;
+    const measure = () => setViewportHeight(Math.max(0, element.clientHeight - 34));
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, [result]);
+  const visibleRows = useMemo(() => result?.rows.slice(0, rowLimit) ?? [], [result, rowLimit]);
+  const virtualRange = calculateVirtualRange({ rowCount: visibleRows.length, rowHeight: 30, viewportHeight, scrollTop });
   const current = selection?.source === result ? selection : null;
   const bounds = current ? { top: Math.min(current.anchor.row,current.focus.row), bottom: Math.max(current.anchor.row,current.focus.row), left: Math.min(current.anchor.column,current.focus.column), right: Math.max(current.anchor.column,current.focus.column) } : null;
   function select(position: Position, extend: boolean) {
@@ -63,6 +78,6 @@ export function Results({ result, rowLimit }: { result: QueryResult | null; rowL
       {copied && <span role="status">已复制</span>}
     </div>
     {exportError && <div className="result-warning" role="alert">{exportError}</div>}
-    <div className="table-scroll"><table role="grid" aria-label="查询结果"><thead><tr><th className="index-col">#</th>{result.columns.map((column,index) => <th key={index}>{column}</th>)}</tr></thead><tbody>{result.rows.slice(0,rowLimit).map((row,i) => <tr key={i}><td className="index-col">{i+1}</td>{row.map((cell,j) => <td key={j} role="gridcell" data-row={i} data-column={j} tabIndex={current ? current.focus.row===i && current.focus.column===j ? 0 : -1 : i===0 && j===0 ? 0 : -1} aria-selected={!!bounds && i>=bounds.top && i<=bounds.bottom && j>=bounds.left && j<=bounds.right} onMouseDown={event=>{event.preventDefault();select({row:i,column:j},event.shiftKey);}} onClick={event=>event.currentTarget.focus()} onKeyDown={event=>cellKeys(event,{row:i,column:j})} className={cell === null ? 'null-cell' : ''}>{cell === null ? 'NULL' : String(cell)}</td>)}</tr>)}</tbody></table>{result.rows.length>rowLimit && <div className="result-warning">仅显示前 {rowLimit} 行，导出仍使用全部已加载结果。</div>}{result.warning && <div className="result-warning">{result.warning}</div>}</div>
+    <div className="table-scroll" ref={scrollRef} onScroll={event => setScrollTop(event.currentTarget.scrollTop)}><table role="grid" aria-label="查询结果"><thead><tr><th className="index-col">#</th>{result.columns.map((column,index) => <th key={index}>{column}</th>)}</tr></thead><tbody>{virtualRange.start > 0 && <tr className="virtual-spacer" aria-hidden="true"><td colSpan={result.columns.length + 1} style={{ height: virtualRange.start * 30 }}/></tr>}{visibleRows.slice(virtualRange.start, virtualRange.end).map((row,offset) => { const i = virtualRange.start + offset; return <tr key={i}><td className="index-col">{i+1}</td>{row.map((cell,j) => <td key={j} role="gridcell" data-row={i} data-column={j} tabIndex={current ? current.focus.row===i && current.focus.column===j ? 0 : -1 : i===0 && j===0 ? 0 : -1} aria-selected={!!bounds && i>=bounds.top && i<=bounds.bottom && j>=bounds.left && j<=bounds.right} onMouseDown={event=>{event.preventDefault();select({row:i,column:j},event.shiftKey);}} onClick={event=>event.currentTarget.focus()} onKeyDown={event=>cellKeys(event,{row:i,column:j})} className={cell === null ? 'null-cell' : ''}>{cell === null ? 'NULL' : String(cell)}</td>)}</tr>; })}{virtualRange.end < visibleRows.length && <tr className="virtual-spacer" aria-hidden="true"><td colSpan={result.columns.length + 1} style={{ height: (visibleRows.length - virtualRange.end) * 30 }}/></tr>}</tbody></table>{result.rows.length>rowLimit && <div className="result-warning">仅显示前 {rowLimit} 行，导出仍使用全部已加载结果。</div>}{result.warning && <div className="result-warning">{result.warning}</div>}</div>
   </div>;
 }

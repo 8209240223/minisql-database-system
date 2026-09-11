@@ -1,21 +1,50 @@
 import http from 'node:http';
 import { spawn } from 'node:child_process';
-import { appendFileSync, closeSync, copyFileSync, existsSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { appendFileSync, closeSync, copyFileSync, existsSync, ftruncateSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync, writeSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createHash, randomUUID } from 'node:crypto';
 import { openSession } from './session-process.mjs';
-import { can, canConnect, hashPassword, loadAccess, normalizeAccess, publicAccess, saveAccess } from './access-catalog.mjs';
+import { firstKeyword, tableReferences } from './sql-object-references.mjs';
+import { can, canConnect, defaultAccess, normalizeAccess, publicAccess,
+  createUser, dropUser, createRole, dropRole, setPassword, addRole, removeRole, grant, revoke } from './access-catalog.mjs';
+import { openStore, readHeader, writeStore } from './access-store.mjs';
 
+function cliOption(name) {
+  const index = process.argv.indexOf(name);
+  return index >= 0 && index + 1 < process.argv.length ? process.argv[index + 1] : undefined;
+}
+const bridgePort = Number(cliOption('--port') ?? process.env.PORT ?? 8081);
+if (!Number.isInteger(bridgePort) || bridgePort < 0 || bridgePort > 65535) throw new Error('Invalid bridge port');
 const releaseExecutable = fileURLToPath(new URL('../build/windows/Release/minisql_database.exe', import.meta.url));
 const executable = process.env.MINISQL_DATABASE_EXE ?? (existsSync(releaseExecutable) ? releaseExecutable : fileURLToPath(new URL('../bin/minisql_database.exe', import.meta.url)));
-const database = resolve(process.env.MINISQL_DB ?? fileURLToPath(new URL('../data/workbench.pages', import.meta.url)));
+const database = resolve(cliOption('--database') ?? process.env.MINISQL_DB ?? fileURLToPath(new URL('../data/workbench.pages', import.meta.url)));
 mkdirSync(dirname(database), { recursive: true });
-const accessPath = resolve(process.env.MINISQL_ACCESS_FILE ?? resolve(dirname(database), 'access.catalog.json'));
-let access = loadAccess(accessPath);
+const accessPath = resolve(cliOption('--access-file') ?? process.env.MINISQL_ACCESS_FILE ?? resolve(dirname(database), 'access.catalog.json'));
+const openedAccess = openStore(accessPath, { defaults: defaultAccess, normalize: normalizeAccess });
+const accessPagesFile = openedAccess.pagesFile;
+let access = openedAccess.catalog;
+let permissionVersion = openedAccess.permissionVersion;
+let accessCatalogVersion = openedAccess.catalogVersion;
+function reloadAccessIfStale() {
+  try {
+    const header = readHeader(accessPagesFile);
+    if (header.permissionVersion === permissionVersion) return;
+    const reopened = openStore(accessPath, { defaults: defaultAccess, normalize: normalizeAccess });
+    access = reopened.catalog;
+    permissionVersion = reopened.permissionVersion;
+    accessCatalogVersion = reopened.catalogVersion;
+  } catch { /* Corrupt storage is rejected by the operation that needs it. */ }
+}
+function persistAccess() {
+  const nextVersion = permissionVersion + 1;
+  if (nextVersion > 0xffffffff) throw new Error('Permission version space exhausted');
+  writeStore(accessPagesFile, access, { permissionVersion: nextVersion, catalogVersion: accessCatalogVersion });
+  permissionVersion = nextVersion;
+}
 if (process.env.MINISQL_ADMIN_PASSWORD && !access.users.admin?.hash) {
   access = normalizeAccess({ ...access, users: { ...access.users, admin: { ...access.users.admin, password: process.env.MINISQL_ADMIN_PASSWORD } } }, access);
-  saveAccess(accessPath, access);
+  persistAccess();
 }
 const allowedOrigins = new Set((process.env.MINISQL_ORIGINS ?? 'http://127.0.0.1:4173,http://localhost:4173').split(','));
 let queue = Promise.resolve();
@@ -29,33 +58,6 @@ let turnOwner;
 let activeOperation;
 const transactionWaiters = [];
 const turnWaiters = [];
-function firstKeyword(sql) {
-  return String(sql ?? '').replace(/^\s+|\s+$/g, '').match(/^(?:\/\*[\s\S]*?\*\/\s*|--[^\r\n]*\r?\n\s*)*([a-zA-Z]+)/)?.[1]?.toUpperCase() ?? '';
-}
-function tableReferences(sql, keyword) {
-  const stripped = String(sql ?? '').replace(/^EXPLAIN(?:\s+ANALYZE)?/i, '');
-  const tables = [];
-  const add = pattern => {
-    const expression = new RegExp(pattern, 'gi');
-    let match;
-    while ((match = expression.exec(stripped))) {
-      const name = match[1]?.toLowerCase();
-      if (name && !tables.includes(name)) tables.push(name);
-    }
-  };
-  if (keyword === 'SELECT') {
-    add('\\b(?:FROM|JOIN)\\s+([A-Za-z_][A-Za-z0-9_]*)');
-    add('\\bUPDATE\\s+([A-Za-z_][A-Za-z0-9_]*)');
-  } else if (keyword === 'INSERT') add('\\bINTO\\s+([A-Za-z_][A-Za-z0-9_]*)');
-  else if (keyword === 'UPDATE') add('\\bUPDATE\\s+([A-Za-z_][A-Za-z0-9_]*)');
-  else if (keyword === 'DELETE') add('\\bFROM\\s+([A-Za-z_][A-Za-z0-9_]*)');
-  else if (keyword === 'DROP') add('\\bTABLE\\s+([A-Za-z_][A-Za-z0-9_]*)');
-  else if (keyword === 'CREATE') {
-    add('\\bTABLE\\s+([A-Za-z_][A-Za-z0-9_]*)');
-    add('\\bON\\s+([A-Za-z_][A-Za-z0-9_]*)');
-  }
-  return tables;
-}
 function sqlPermissionChecks(mode, sql) {
   if (mode === 'catalog' || mode === 'statistics' || mode === 'buffer') return [{ permission: 'READ', object: '*' }];
   if (mode === 'health' || mode === 'audit' || mode === 'capabilities') return [{ permission: 'READ', object: '*' }];
@@ -137,14 +139,19 @@ function deltaBackupFile(raw) {
 }
 function normalizeFullManifest(metadata, file, manifest) {
   if (metadata.sha256 !== sha256(file)) throw httpError(422, 'Backup checksum mismatch');
+  if (metadata.pageChecksum !== undefined && metadata.pageChecksum !== sha256(file)) throw httpError(422, 'Backup page checksum mismatch');
   const detectedPageVersion = pageFormatVersion(file);
   if (metadata.version === 1) {
     const migrated = { ...metadata, version: 2, pageFormatVersion: detectedPageVersion, walBytes: 0 };
     writeFileSync(manifest, JSON.stringify(migrated), 'utf8');
     return migrated;
   }
-  if (metadata.version !== 2 || metadata.pageFormatVersion !== detectedPageVersion || metadata.walBytes !== 0)
+  if (metadata.version !== 2 && metadata.version !== 4)
     throw httpError(422, 'Backup manifest version or page format mismatch');
+  if (metadata.pageFormatVersion !== detectedPageVersion) throw httpError(422, 'Backup page format mismatch');
+  if (metadata.version === 2 && metadata.walBytes !== 0) throw httpError(422, 'Backup WAL prefix is not supported');
+  if (metadata.version === 4 && (metadata.walCutoffBytes === undefined || metadata.committedSequence === undefined))
+    throw httpError(422, 'Snapshot manifest is incomplete');
   return metadata;
 }
 function deltaHeader(basePages, finalPages, records) {
@@ -183,7 +190,10 @@ async function reconstructBackup(name, depth = 0) {
   if (!artifact) throw httpError(404, 'Backup not found');
   if (artifact.kind === 'full') {
     const metadata = normalizeFullManifest(JSON.parse(readFileSync(artifact.manifest, 'utf8')), artifact.file, artifact.manifest);
-    return { buffer: readFileSync(artifact.file), pages: Math.floor(statSync(artifact.file).size / backupPageSize), manifest: metadata };
+    const walBuffer = metadata.version === 4 && existsSync(artifact.file + '.wal') ? readFileSync(artifact.file + '.wal') : Buffer.alloc(0);
+    const ckptBuffer = metadata.version === 4 && existsSync(artifact.file + '.ckpt') ? readFileSync(artifact.file + '.ckpt') : Buffer.alloc(0);
+    return { buffer: readFileSync(artifact.file), pages: Math.floor(statSync(artifact.file).size / backupPageSize),
+      manifest: metadata, walBuffer, ckptBuffer };
   }
   if (depth > 8) throw httpError(422, 'Backup chain too deep');
   const delta = readFileSync(artifact.file);
@@ -207,12 +217,101 @@ async function reconstructBackup(name, depth = 0) {
   }
   if (offset !== delta.length) throw httpError(422, 'Incremental backup trailing data');
   if (header.basePages !== base.pages) throw httpError(422, 'Incremental base page count mismatch');
-  return { buffer, pages: header.finalPages, manifest: metadata };
+  return { buffer, pages: header.finalPages, manifest: metadata,
+    walBuffer: base.walBuffer ?? Buffer.alloc(0), ckptBuffer: base.ckptBuffer ?? Buffer.alloc(0) };
 }
-function writeDatabaseAtomically(buffer) {
+
+async function materializeBackup(name, target, depth = 0) {
+  const artifact = backupArtifactFile(name);
+  if (!artifact) throw httpError(404, 'Backup not found');
+  if (artifact.kind === 'full') {
+    const metadata = normalizeFullManifest(JSON.parse(readFileSync(artifact.manifest, 'utf8')), artifact.file, artifact.manifest);
+    copyFileSync(artifact.file, target);
+    for (const suffix of ['.wal', '.ckpt']) {
+      const source = artifact.file + suffix;
+      const destination = target + suffix;
+      if (metadata.version === 4 && existsSync(source)) copyFileSync(source, destination);
+      else if (existsSync(destination)) unlinkSync(destination);
+    }
+    return { pages: Math.floor(statSync(target).size / backupPageSize), manifest: metadata };
+  }
+  if (depth > 8) throw httpError(422, 'Backup chain too deep');
+  const delta = readFileSync(artifact.file);
+  const metadata = JSON.parse(readFileSync(artifact.manifest, 'utf8'));
+  if (metadata.sha256 !== sha256(artifact.file) || metadata.version !== 3 || metadata.kind !== 'incremental')
+    throw httpError(422, 'Incremental backup checksum or version mismatch');
+  const header = parseDeltaHeader(delta);
+  if (metadata.pageFormatVersion === undefined || metadata.base === undefined) throw httpError(422, 'Incremental manifest incomplete');
+  const base = await materializeBackup(metadata.base, target, depth + 1);
+  if (header.basePages !== base.pages) throw httpError(422, 'Incremental base page count mismatch');
+  const descriptor = openSync(target, 'r+');
+  try {
+    let offset = 64;
+    for (let index = 0; index < header.records; ++index) {
+      if (offset + 8 > delta.length) throw httpError(422, 'Incremental backup truncated');
+      const id = Number(delta.readBigUInt64LE(offset));
+      offset += 8;
+      if (id >= header.finalPages || offset + backupPageSize > delta.length) throw httpError(422, 'Incremental backup page out of range');
+      writeSync(descriptor, delta, offset, backupPageSize, id * backupPageSize);
+      offset += backupPageSize;
+    }
+    if (offset !== delta.length) throw httpError(422, 'Incremental backup trailing data');
+    ftruncateSync(descriptor, header.finalPages * backupPageSize);
+  } finally { closeSync(descriptor); }
+  return { pages: header.finalPages, manifest: metadata };
+}
+
+function backupChainDepth(name, seen = new Set()) {
+  const artifact = backupArtifactFile(name);
+  if (!artifact || artifact.kind === 'full') return 1;
+  if (seen.has(artifact.name)) throw httpError(422, 'Backup chain cycle detected');
+  seen.add(artifact.name);
+  const metadata = JSON.parse(readFileSync(artifact.manifest, 'utf8'));
+  if (!metadata.base) return 1;
+  return 1 + backupChainDepth(metadata.base, seen);
+}
+
+function safeChainDepth(name) {
+  try { return backupChainDepth(name); } catch { return 1; }
+}
+function writeDatabaseAtomically(buffer, walBuffer, ckptBuffer) {
   const temporary = database + '.restore.tmp';
   writeFileSync(temporary, buffer);
   renameSync(temporary, database);
+  if (walBuffer && walBuffer.length) {
+    const walTemporary = database + '.wal.restore.tmp';
+    writeFileSync(walTemporary, walBuffer);
+    renameSync(walTemporary, database + '.wal');
+  } else if (existsSync(database + '.wal')) unlinkSync(database + '.wal');
+  if (ckptBuffer && ckptBuffer.length) {
+    const ckptTemporary = database + '.ckpt.restore.tmp';
+    writeFileSync(ckptTemporary, ckptBuffer);
+    renameSync(ckptTemporary, database + '.ckpt');
+  } else if (existsSync(database + '.ckpt')) unlinkSync(database + '.ckpt');
+}
+
+function createRestoreRollback() {
+  const rollbackDirectory = resolve(backupDirectory, 'rollback');
+  mkdirSync(rollbackDirectory, { recursive: true });
+  const rollbackPath = resolve(rollbackDirectory, `restore-${Date.now()}`);
+  mkdirSync(rollbackPath, { recursive: true });
+  copyFileSync(database, resolve(rollbackPath, 'db.pages'));
+  for (const suffix of ['.wal', '.ckpt']) {
+    if (existsSync(database + suffix)) copyFileSync(database + suffix, resolve(rollbackPath, 'db.pages' + suffix));
+  }
+  return rollbackPath;
+}
+
+function restoreRollbackDirectory(rollbackPath) {
+  const pages = resolve(rollbackPath, 'db.pages');
+  if (!existsSync(pages)) return false;
+  copyFileSync(pages, database);
+  for (const suffix of ['.wal', '.ckpt']) {
+    const source = resolve(rollbackPath, 'db.pages' + suffix);
+    if (existsSync(source)) copyFileSync(source, database + suffix);
+    else if (existsSync(database + suffix)) unlinkSync(database + suffix);
+  }
+  return true;
 }
 const auditPath = process.env.MINISQL_AUDIT_LOG ?? resolve(dirname(database), 'audit.log');
 const auditLimitBytes = 16 * 1024 * 1024;
@@ -240,8 +339,10 @@ const sessionIdleMs = Number(process.env.MINISQL_SESSION_IDLE_MS ?? 300000);
 if (!Number.isInteger(sessionIdleMs) || sessionIdleMs < 100 || sessionIdleMs > 3600000) throw new Error('Invalid session idle timeout');
 const maxSessions = Number(process.env.MINISQL_MAX_SESSIONS ?? 16);
 const transactionLockTimeoutMs = Number(process.env.MINISQL_TRANSACTION_LOCK_TIMEOUT_MS ?? 30000);
+const engineRequestTimeoutMs = Number(process.env.MINISQL_ENGINE_REQUEST_TIMEOUT_MS ?? 30000);
 if (!Number.isInteger(maxSessions) || maxSessions < 1 || maxSessions > 128) throw new Error('Invalid maximum session count');
 if (!Number.isInteger(transactionLockTimeoutMs) || transactionLockTimeoutMs < 100 || transactionLockTimeoutMs > 3600000) throw new Error('Invalid transaction lock timeout');
+if (!Number.isInteger(engineRequestTimeoutMs) || engineRequestTimeoutMs < 1000 || engineRequestTimeoutMs > 3600000) throw new Error('Invalid engine request timeout');
 const httpError = (status, message) => Object.assign(new Error(message), { status });
 function notifyWaiters(waiters) {
   const current = waiters.splice(0);
@@ -254,9 +355,9 @@ function removeWaiter(waiters, waiter) {
   const index = waiters.indexOf(waiter);
   if (index >= 0) waiters.splice(index, 1);
 }
-function waitForTurn(waiters) {
+function waitForTurn(waiters, session) {
   return new Promise((resolve, reject) => {
-    const waiter = { resolve, timer: undefined };
+    const waiter = { resolve, timer: undefined, session };
     waiter.timer = setTimeout(() => {
       removeWaiter(waiters, waiter);
       reject(httpError(409, `Session lock wait exceeded ${transactionLockTimeoutMs}ms`));
@@ -266,18 +367,22 @@ function waitForTurn(waiters) {
 }
 async function acquireTurn(session) {
   for (;;) {
+    if (session.cancelRequested) {
+      session.cancelRequested = false;
+      throw Object.assign(new Error('Cancellation requested'), { status: 409, code: 5002 });
+    }
     if (quarantined) throw httpError(503, 'Database requires inspection after an uncertain failure');
     if (transactionOwner && transactionOwner !== session.id) {
       session.waiting = true;
-      await waitForTurn(transactionWaiters);
+      await waitForTurn(transactionWaiters, session);
       session.waiting = false;
     } else if (turnOwner && turnOwner !== session.id) {
       session.waiting = true;
-      await waitForTurn(turnWaiters);
+      await waitForTurn(turnWaiters, session);
       session.waiting = false;
     } else if (session.activeRequest) {
       session.waiting = true;
-      await waitForTurn(turnWaiters);
+      await waitForTurn(turnWaiters, session);
       session.waiting = false;
     } else {
       session.waiting = false;
@@ -318,7 +423,7 @@ async function startEngine() {
   if (engineOpening) return engineOpening;
   const cancelFile = sessionCancelFile('engine');
   clearCancelFile(cancelFile);
-  engineOpening = openSession(executable, database, { env: { MINISQL_SESSION_ID: 'bridge', MINISQL_CANCEL_FILE: cancelFile } })
+  engineOpening = openSession(executable, database, { timeoutMs: engineRequestTimeoutMs, env: { MINISQL_SESSION_ID: 'bridge', MINISQL_CANCEL_FILE: cancelFile } })
     .then(worker => {
       const value = { worker, cancelFile, closing: false };
       engine = value;
@@ -343,11 +448,11 @@ async function ensureEngine() {
   if (quarantined) throw httpError(503, 'Database requires inspection after an uncertain failure');
   return startEngine();
 }
-async function closeEngineIfIdle() {
+async function closeEngineIfIdle(context = {}) {
   if (!engine || engine.closing || sessions.size) return;
   const current = engine;
   current.closing = true;
-  try { return await current.worker.close(); }
+  try { return await current.worker.close(context); }
   finally {
     if (engine === current) engine = undefined;
     clearCancelFile(current.cancelFile);
@@ -368,7 +473,7 @@ async function closeSession(session) {
     return { success: true, transactionState: 'IDLE', transactionRolledBack: rolledBack };
   } finally {
     clearCancelFile(session.cancelFile);
-    await closeEngineIfIdle();
+    await closeEngineIfIdle({ user: session.user, password: session.password });
   }
 }
 function touchSession(session) {
@@ -377,17 +482,23 @@ function touchSession(session) {
   const epoch = Symbol();
   session.epoch = epoch;
   session.timer = setTimeout(() => {
+    if (session.epoch !== epoch || !sessions.has(session.id) || session.closing) return;
+    // 长请求、锁等待和当前轮次都不能被空闲回收中断；事务持有者则由 closeSession 回滚后回收。
+    if (session.activeRequest || session.waiting || turnOwner === session.id) {
+      touchSession(session);
+      return;
+    }
     closeSession(session).catch(() => { quarantined = true; });
   }, sessionIdleMs);
 }
 
 function callDatabase(mode, sql = '', extraEnv = {}) {
   return new Promise((resolveResult, reject) => {
-    const child = spawn(executable, [database, mode], { windowsHide: true, env: { ...process.env, ...extraEnv } });
+    const child = spawn(executable, [database, mode], { windowsHide: true, env: { ...process.env, ...extraEnv, MINISQL_AUTH_BYPASS: '1' } });
     const output = [];
     let length = 0, stopped = false;
     const stop = () => { stopped = true; child.kill(); };
-    const timer = setTimeout(stop, 30000);
+    const timer = setTimeout(stop, engineRequestTimeoutMs);
     child.stdin.on('error', () => {});
     child.stderr.resume();
     child.stdout.on('data', chunk => {
@@ -425,7 +536,7 @@ function enqueue(operation, allowQuarantined = false) {
   return result;
 }
 
-async function runSessionOperation(session, mode, sql, res) {
+async function runSessionOperation(session, mode, sql, res, context = {}) {
   await acquireTurn(session);
   try {
     const result = await enqueue(async () => {
@@ -445,7 +556,14 @@ async function runSessionOperation(session, mode, sql, res) {
       };
       res?.once('close', disconnected);
       try {
-        const value = await currentEngine.worker.request(mode, sql, { sessionId: session.id, cancelFile: session.cancelFile });
+        const { stream: streamRequested, onFrame, ...sessionContext } = context;
+        const value = streamRequested
+          ? await currentEngine.worker.requestStream('executeStream', sql, {
+              sessionId: session.id, cancelFile: session.cancelFile, user: session.user, password: session.password, ...sessionContext,
+            }, onFrame)
+          : await currentEngine.worker.request(mode, sql, {
+              sessionId: session.id, cancelFile: session.cancelFile, user: session.user, password: session.password, ...sessionContext,
+            });
         if (value.error?.code === 5002) value.cancelled = true;
         if (value.commitState === 'unknown' || value.error?.code === 4001 || value.error?.code === 9999) quarantined = true;
         return value;
@@ -467,6 +585,19 @@ async function runSessionOperation(session, mode, sql, res) {
   }
 }
 
+async function runSnapshotOperation(session, target) {
+  return enqueue(async () => {
+    const currentEngine = await ensureEngine();
+    clearCancelFile(session.cancelFile);
+    const value = await currentEngine.worker.request('snapshot', '', {
+      sessionId: session.id, cancelFile: session.cancelFile, user: session.user, password: session.password, target,
+    });
+    if (value.error?.code === 5002) value.cancelled = true;
+    if (value.commitState === 'unknown' || value.error?.code === 4001 || value.error?.code === 9999) quarantined = true;
+    return value;
+  });
+}
+
 function queryResult(data, durationMs) {
   const results = data.results ?? [];
   const last = results.at(-1);
@@ -480,19 +611,32 @@ function queryResult(data, durationMs) {
     optimizedPlan: data.optimizedPlan ?? last?.optimizedPlan,
     optimizationRules: data.optimizationRules ?? last?.optimizationRules,
     executionStats: data.executionStats ?? last?.executionStats,
+    resourceUsage: last?.resourceUsage ?? data.resourceUsage,
   };
 }
 
 const server = http.createServer(async (req, res) => {
   const auditStarted = performance.now();
   const auditId = randomUUID();
+  let requestId = randomUUID();
   let auditSql = '';
   let requestUser = req.headers['x-minisql-user'] ?? 'admin';
   const requestPassword = req.headers['x-minisql-password'];
   let auditSessionId = req.url?.match(/^\/api\/sessions\/([a-zA-Z0-9-]+)/)?.[1] ?? '';
   const origin = req.headers.origin;
   let auditObjects = [];
+  let streamOutput = null;
   const send = (status, data) => {
+    const payload = data && typeof data === 'object' && !Array.isArray(data)
+      ? {
+          protocolVersion: 1,
+          requestId,
+          success: data.success !== false && !data.error,
+          stages: data.stages ?? {},
+          diagnostics: data.diagnostics ?? [],
+          ...data,
+        }
+      : data;
     if (!res.destroyed && !res.writableEnded) {
       appendAudit({
         id: auditId,
@@ -504,11 +648,11 @@ const server = http.createServer(async (req, res) => {
         sql: auditSql,
         object: auditObjects.length ? auditObjects.join(',') : undefined,
         status,
-        success: data?.success !== false,
+        success: payload?.success !== false,
         durationMs: performance.now() - auditStarted,
-        affectedRows: data?.affectedRows ?? 0,
-        errorCode: data?.error?.code,
-        transactionState: data?.transactionState,
+        affectedRows: payload?.affectedRows ?? 0,
+        errorCode: payload?.error?.code,
+        transactionState: payload?.transactionState,
         quarantined,
       });
     }
@@ -516,16 +660,16 @@ const server = http.createServer(async (req, res) => {
     const headers = { 'Content-Type': 'application/json; charset=utf-8', 'Vary': 'Origin' };
     if (origin && allowedOrigins.has(origin)) headers['Access-Control-Allow-Origin'] = origin;
     headers['Access-Control-Allow-Headers'] = 'Content-Type, X-MiniSQL-User, X-MiniSQL-Password';
-    headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS';
+    headers['Access-Control-Allow-Methods'] = 'GET, POST, DELETE, OPTIONS';
     res.writeHead(status, headers);
-    res.end(JSON.stringify(data));
+    res.end(JSON.stringify(payload));
   };
-  const sendStream = async (status, data) => {
+  const beginStream = (status = 200) => {
     if (res.destroyed || res.writableEnded) return;
     const headers = { 'Content-Type': 'application/x-ndjson; charset=utf-8', 'Cache-Control': 'no-store', 'Vary': 'Origin' };
     if (origin && allowedOrigins.has(origin)) headers['Access-Control-Allow-Origin'] = origin;
     headers['Access-Control-Allow-Headers'] = 'Content-Type, X-MiniSQL-User, X-MiniSQL-Password';
-    headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS';
+    headers['Access-Control-Allow-Methods'] = 'GET, POST, DELETE, OPTIONS';
     res.writeHead(status, headers);
     const write = value => new Promise((resolve, reject) => {
       if (res.destroyed || res.writableEnded) { reject(httpError(499, 'Stream client disconnected')); return; }
@@ -537,9 +681,15 @@ const server = http.createServer(async (req, res) => {
       const onDrain = () => finish();
       const onError = error => finish(error);
       res.once('error', onError);
-      if (res.write(JSON.stringify(value) + '\n')) finish();
+      if (res.write(JSON.stringify({ protocolVersion: 1, requestId, ...value }) + '\n')) finish();
       else res.once('drain', onDrain);
     });
+    return { write, end() { if (!res.destroyed && !res.writableEnded) res.end(); } };
+  };
+  const sendStream = async (status, data) => {
+    const output = beginStream(status);
+    if (!output) return;
+    const { write } = output;
     const rows = Array.isArray(data.rows) ? data.rows : [];
     if (data.success === false) {
       await write({ type: 'error', success: false, error: data.error, commitState: data.commitState, transactionState: data.transactionState });
@@ -551,10 +701,11 @@ const server = http.createServer(async (req, res) => {
       await write({ type: 'complete', success: true, rowCount: rows.length, affectedRows: data.affectedRows,
         statements: data.statements, transactionState: data.transactionState, durationMs: data.durationMs });
     }
-    if (!res.destroyed && !res.writableEnded) res.end();
+    output.end();
   };
   if (origin && !allowedOrigins.has(origin)) { send(403, { error: { message: 'Origin not allowed' } }); return; }
   if (req.method === 'OPTIONS') { send(204, {}); return; }
+  reloadAccessIfStale();
   if (!canConnect(access, requestUser, requestPassword ?? null)) { send(403, { success: false, error: { code: 7001, message: 'Permission denied' } }); return; }
   if (req.method === 'GET' && req.url === '/api/users') {
     if (!can(access, requestUser, 'GRANT') && !can(access, requestUser, 'READ')) { send(403, { success: false, error: { code: 7001, message: 'Permission denied' } }); return; }
@@ -574,11 +725,73 @@ const server = http.createServer(async (req, res) => {
       for await (const chunk of req) chunks.push(chunk);
       const body = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks)));
       access = normalizeAccess(body.access ?? body, access);
-      saveAccess(accessPath, access);
+      persistAccess();
       send(200, { success: true, access: publicAccess(access) });
     } catch (error) { send(400, { success: false, error: { message: error instanceof Error ? error.message : String(error) } }); }
     return;
   }
+
+  // X24 原子权限资源接口：每个端点对应一次原子变更，失败不产生部分状态。
+  const readJson = async () => {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    return JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks)));
+  };
+  const requireGrant = () => { if (!can(access, requestUser, 'GRANT')) throw httpError(403, 'Permission denied'); };
+  const commitAccess = () => { persistAccess(); send(200, { success: true, access: publicAccess(access) }); };
+  const badRequest = error => send(error?.status ?? 400, { success: false, error: { message: error instanceof Error ? error.message : String(error) } });
+
+  if (req.method === 'POST' && req.url === '/api/users') {
+    try { requireGrant(); access = createUser(access, await readJson()); commitAccess(); }
+    catch (error) { badRequest(error); }
+    return;
+  }
+  const userDelete = req.url?.match(/^\/api\/users\/([^/]+)$/);
+  if (req.method === 'DELETE' && userDelete) {
+    try { requireGrant(); access = dropUser(access, decodeURIComponent(userDelete[1])); commitAccess(); }
+    catch (error) { badRequest(error); }
+    return;
+  }
+  const passwordRoute = req.url?.match(/^\/api\/users\/([^/]+)\/password$/);
+  if (req.method === 'POST' && passwordRoute) {
+    try { requireGrant(); const body = await readJson(); access = setPassword(access, decodeURIComponent(passwordRoute[1]), body.password); commitAccess(); }
+    catch (error) { badRequest(error); }
+    return;
+  }
+  const addRoleRoute = req.url?.match(/^\/api\/users\/([^/]+)\/roles$/);
+  if (req.method === 'POST' && addRoleRoute) {
+    try { requireGrant(); const body = await readJson(); access = addRole(access, decodeURIComponent(addRoleRoute[1]), body.role); commitAccess(); }
+    catch (error) { badRequest(error); }
+    return;
+  }
+  const removeRoleRoute = req.url?.match(/^\/api\/users\/([^/]+)\/roles\/([^/]+)$/);
+  if (req.method === 'DELETE' && removeRoleRoute) {
+    try { requireGrant(); access = removeRole(access, decodeURIComponent(removeRoleRoute[1]), decodeURIComponent(removeRoleRoute[2])); commitAccess(); }
+    catch (error) { badRequest(error); }
+    return;
+  }
+  if (req.method === 'POST' && req.url === '/api/roles') {
+    try { requireGrant(); access = createRole(access, await readJson()); commitAccess(); }
+    catch (error) { badRequest(error); }
+    return;
+  }
+  const roleDelete = req.url?.match(/^\/api\/roles\/([^/]+)$/);
+  if (req.method === 'DELETE' && roleDelete) {
+    try { requireGrant(); access = dropRole(access, decodeURIComponent(roleDelete[1])); commitAccess(); }
+    catch (error) { badRequest(error); }
+    return;
+  }
+  if (req.method === 'POST' && req.url === '/api/grants') {
+    try { requireGrant(); access = grant(access, await readJson()); commitAccess(); }
+    catch (error) { badRequest(error); }
+    return;
+  }
+  if (req.method === 'POST' && req.url === '/api/revokes') {
+    try { requireGrant(); access = revoke(access, await readJson()); commitAccess(); }
+    catch (error) { badRequest(error); }
+    return;
+  }
+
   if (req.method === 'GET' && req.url?.startsWith('/api/audit')) {
     if (!can(access, requestUser, 'AUDIT')) { send(403, { success: false, error: { code: 7001, message: 'Permission denied' } }); return; }
     const query = new URL(req.url, 'http://127.0.0.1');
@@ -602,7 +815,7 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'GET' && req.url === '/api/capabilities') {
     send(200, { engine: 'minisql-cpp', execution: true, persistence: true, serializedRequests: true,
       quarantined, transactions: true, sessionTransactions: true, multiSession: true, sessionRegistry: true,
-      maxSessions, sessionIdleMs, concurrencyModel: 'serialized-two-phase-database-lock',
+      maxSessions, sessionIdleMs, engineRequestTimeoutMs, concurrencyModel: 'serialized-two-phase-database-lock',
       transactionLock: 'exclusive-database', transactionLockTimeoutMs,
       scriptTransactions: true, statementAtomicity: true, cancellation: true, cancellationMode: 'cancel-file', cancellationScope: 'request-and-session', cancelledErrorCode: 5002, autoCheckpoint: true,
       autoCheckpointWrites: Number(process.env.MINISQL_AUTO_CHECKPOINT_WRITES ?? 0), autoCheckpointWalBytes: Number(process.env.MINISQL_AUTO_CHECKPOINT_WAL_BYTES ?? 0),
@@ -619,7 +832,10 @@ const server = http.createServer(async (req, res) => {
       castTargets: ['int', 'bigint', 'float', 'varchar', 'varchar(n)', 'decimal(p,s)', 'bool', 'date'],
       audit: true, permissions: true, backupRestore: true, backupManifestVersion: 2, backupManifestVersions: [2, 3],
       backupIncremental: true, backupChain: true, backupMigration: 'v1-to-v2',
-      permissionsModel: 'catalog-access', accessCatalogVersion: 1, objectPermissions: true, roleInheritance: true,
+      permissionsModel: 'catalog-access', accessCatalogVersion: 1, accessCatalogStore: 'paged-access-catalog', engineAccessCatalogStore: 'persistent-catalog-system-table', accessCatalogPermissionVersion: permissionVersion,
+      engineAuthorization: true, directBinaryAuth: true, accessCatalogHotReload: true,
+      objectPermissions: true, roleInheritance: true,
+      atomicPermissionEndpoints: true, permissionEndpoints: ['POST /users', 'DELETE /users/:name', 'POST /users/:name/password', 'POST /users/:name/roles', 'DELETE /users/:name/roles/:role', 'POST /roles', 'DELETE /roles/:name', 'POST /grants', 'POST /revokes'],
       passwordHashing: 'sha256-salted', auditFiltering: true, sessionIdentity: true,
       indexPageStorage: true,
       capabilities: ['backupRestore', 'backupIncremental', 'backupChain', 'backupMigration', 'permissions', 'audit', 'create', 'insert', 'multiRowInsert', 'select', 'delete', 'update', 'arithmetic', 'projection', 'tableAlias', 'innerJoin', 'leftJoin', 'null', 'notNull', 'bigint', 'float', 'default', 'primaryKey', 'unique', 'compositeKey', 'distinct', 'orderBy', 'limit', 'groupBy', 'having', 'count', 'sum', 'min', 'max', 'avg', 'compile', 'diagnostics', 'inSubquery', 'existsSubquery', 'scalarSubquery', 'correlatedSubquery', 'astRoundTrip', 'planRoundTrip', 'hashJoin', 'predicatePushdown', 'pruneColumns', 'statistics', 'createIndex', 'indexScan', 'uniqueIndex', 'indexPersistence', 'indexSnapshots', 'indexPageStorage', 'checkpoint', 'nodeStatistics', 'optimizer', 'storageStats', 'externalSort', 'sortSpill', 'externalAggregate', 'aggregateSpill', 'cancellation', 'streamingResults', 'autoCheckpoint', 'multiSession', 'sessionRegistry', 'health'] });
@@ -643,8 +859,8 @@ const server = http.createServer(async (req, res) => {
       clearCancelFile(cancelFile);
       const session = {
         id, cancelFile, closing: false, timer: undefined, epoch: undefined,
-        transactionState: 'IDLE', activeRequest: false, waiting: false,
-        lastActiveAt: new Date().toISOString(), user: requestUser,
+        transactionState: 'IDLE', activeRequest: false, waiting: false, cancelRequested: false,
+        lastActiveAt: new Date().toISOString(), user: requestUser, password: requestPassword ?? '',
       };
       sessions.set(id, session);
       touchSession(session);
@@ -683,10 +899,41 @@ const server = http.createServer(async (req, res) => {
           manifestVersion: metadata.version,
           pageFormatVersion: metadata.pageFormatVersion,
           walBytes: metadata.walBytes,
+          snapshotLsn: metadata.committedSequence,
+          chainDepth: metadata.kind === 'incremental' ? (metadata.chainDepth ?? safeChainDepth(name)) : 1,
+          pageChecksum: metadata.pageChecksum,
+          migrationState: metadata.version === 1 ? 'pending' : metadata.version >= 2 && metadata.version <= 4 ? 'ready' : 'unknown',
         };
       });
       send(200, { success: true, entries });
     } catch (error) { send(503, { success: false, error: { message: error.message } }); }
+    return;
+  }
+  if (req.method === 'POST' && req.url === '/api/backup/validate') {
+    try {
+      const chunks = [];
+      for await (const chunk of req) chunks.push(chunk);
+      const body = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks)));
+      if (sessions.size) throw httpError(409, 'Database reserved by active sessions');
+      const result = await enqueue(async () => {
+        const artifact = backupArtifactFile(body?.name);
+        if (!artifact) throw httpError(404, 'Backup not found');
+        const before = JSON.parse(readFileSync(artifact.manifest, 'utf8'));
+        const reconstructed = await reconstructBackup(body.name);
+        return {
+          name: artifact.name,
+          kind: artifact.kind,
+          migrated: before.version === 1 && reconstructed.manifest.version === 2,
+          manifestVersion: reconstructed.manifest.version,
+          pageFormatVersion: reconstructed.manifest.pageFormatVersion,
+          pages: reconstructed.pages,
+        };
+      });
+      send(200, { success: true, operation: 'backup-migration', phase: 'migration', validation: result });
+    } catch (error) {
+      send(error.status ?? 422, { success: false, operation: 'backup-migration', phase: 'migration',
+        error: { code: 'BACKUP_MIGRATION_FAILED', message: error instanceof Error ? error.message : String(error) } });
+    }
     return;
   }
   if ((req.method === 'POST' && req.url === '/api/backup') || (req.method === 'POST' && req.url === '/api/restore')) {
@@ -694,12 +941,45 @@ const server = http.createServer(async (req, res) => {
       const chunks = [];
       for await (const chunk of req) chunks.push(chunk);
       const body = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks)));
-      if (sessions.size) throw httpError(409, 'Database reserved by active sessions');
+      const online = req.url === '/api/backup' && (body.mode === 'online' || body.kind === 'online');
+      if (sessions.size && !online) throw httpError(409, 'Database reserved by active sessions');
       if (req.url === '/api/backup') {
+        const requestedName = typeof body?.name === 'string' && body.name.trim() ? body.name : `backup-${Date.now()}`;
+        if (online) {
+          if (!can(access, requestUser, 'CHECKPOINT')) throw httpError(403, 'Permission denied');
+          const { name, file } = backupFile(requestedName);
+          const cancelFile = sessionCancelFile(`backup-${auditId}`);
+          clearCancelFile(cancelFile);
+          const ephemeral = {
+            id: `backup-${auditId}`, cancelFile, closing: false, timer: undefined, epoch: undefined,
+            transactionState: 'IDLE', activeRequest: false, waiting: false, cancelRequested: false,
+            user: requestUser, password: requestPassword ?? '',
+          };
+          auditSql = `SNAPSHOT ${name}`;
+          const result = await runSnapshotOperation(ephemeral, file);
+          clearCancelFile(cancelFile);
+          await closeEngineIfIdle({ user: requestUser, password: requestPassword ?? '' });
+          if (result.success === false) {
+            send(quarantined ? 503 : 422, result);
+            return;
+          }
+          const metadata = {
+            version: 4, kind: 'snapshot', name, createdAt: new Date().toISOString(),
+            bytes: statSync(file).size, sha256: sha256(file), pageFormatVersion: pageFormatVersion(file),
+            walBytes: Number(result.walBytes ?? 0), walCutoffBytes: Number(result.walCutoffBytes ?? 0),
+            committedSequence: Number(result.committedSequence ?? 0), catalogVersion: Number(result.catalogVersion ?? 0),
+            indexVersion: Number(result.indexVersion ?? 0),
+            pageChecksum: sha256(file),
+          };
+          writeFileSync(file + '.json', JSON.stringify(metadata), 'utf8');
+          send(200, { success: true, backup: name, kind: 'snapshot', bytes: metadata.bytes,
+            sha256: metadata.sha256, walBytes: metadata.walBytes, committedSequence: metadata.committedSequence });
+          return;
+        }
         const incremental = body.kind === 'incremental' || Boolean(body.base);
         if (incremental) {
           if (!backupArtifactFile(body.base)) throw httpError(404, 'Base backup not found');
-          const target = deltaBackupFile(body.name);
+          const target = deltaBackupFile(requestedName);
           await enqueue(async () => {
             await callDatabase('execute', 'CHECKPOINT;');
             const current = readFileSync(database);
@@ -726,43 +1006,98 @@ const server = http.createServer(async (req, res) => {
               sha256: sha256(target.file),
               pageFormatVersion: baseReconstructed.manifest.pageFormatVersion,
               walBytes: 0,
+              chainDepth: safeChainDepth(body.base) + 1,
             }), 'utf8');
           });
           send(200, { success: true, backup: target.name, kind: 'incremental', base: backupArtifactFile(body.base).name, bytes: statSync(target.file).size, sha256: sha256(target.file) });
         } else {
-          const { name, file } = backupFile(body.name);
+          const { name, file } = backupFile(requestedName);
           await enqueue(async () => {
             await callDatabase('execute', 'CHECKPOINT;');
             copyFileSync(database, file);
-            writeFileSync(file + '.json', JSON.stringify({ version: 2, name, createdAt: new Date().toISOString(), bytes: statSync(file).size, sha256: sha256(file), pageFormatVersion: pageFormatVersion(file), walBytes: 0 }), 'utf8');
+          writeFileSync(file + '.json', JSON.stringify({ version: 2, name, createdAt: new Date().toISOString(), bytes: statSync(file).size, sha256: sha256(file), pageFormatVersion: pageFormatVersion(file), walBytes: 0, pageChecksum: sha256(file) }), 'utf8');
           });
           send(200, { success: true, backup: name, bytes: statSync(file).size, sha256: sha256(file) });
         }
       } else {
+        let rollbackUsed;
         await enqueue(async () => {
-          const reconstructed = await reconstructBackup(body.name);
-          writeDatabaseAtomically(reconstructed.buffer);
-          const wal = database + '.wal';
-          if (existsSync(wal)) unlinkSync(wal);
-          await callDatabase('catalog');
+          try {
+            const temporaryPages = database + '.restore.tmp';
+            if (existsSync(temporaryPages)) unlinkSync(temporaryPages);
+            await materializeBackup(body.name, temporaryPages);
+            const rollbackPath = createRestoreRollback();
+            rollbackUsed = rollbackPath;
+            renameSync(temporaryPages, database);
+            for (const suffix of ['.wal', '.ckpt']) {
+              const source = temporaryPages + suffix;
+              if (existsSync(source)) renameSync(source, database + suffix);
+              else if (existsSync(database + suffix)) unlinkSync(database + suffix);
+            }
+            await callDatabase('catalog');
+          } catch (error) {
+            if (rollbackUsed && restoreRollbackDirectory(rollbackUsed)) {
+              await callDatabase('catalog');
+              throw Object.assign(new Error(`Restore failed and original database was restored: ${error.message}`), { status: 422 });
+            }
+            throw error;
+          }
         });
-        send(200, { success: true, restored: body.name, bytes: statSync(database).size });
+        send(200, { success: true, restored: body.name, bytes: statSync(database).size, rollback: rollbackUsed });
       }
     } catch (error) { send(error.status ?? 503, { success: false, error: { message: error.message } }); }
     return;
   }
   const cancelRoute = req.url?.match(/^\/api\/sessions\/([a-zA-Z0-9-]+)\/cancel$/);
   if (cancelRoute) {
-    req.resume();
     if (req.method !== 'POST') { send(405, { success: false, error: { code: 405, message: 'Cancellation requires POST' } }); return; }
+    try {
+      const body = await readJson();
+      if (typeof body.requestId === 'string' && body.requestId.length > 0 && body.requestId.length <= 128) requestId = body.requestId;
+    } catch { /* Cancellation remains valid without a JSON body. */ }
     const session = sessions.get(cancelRoute[1]);
     if (!session) { send(404, { success: false, error: { code: 404, message: 'Session not found or expired' } }); return; }
     if (session.user !== requestUser) { send(403, { success: false, error: { code: 7001, message: 'Permission denied' } }); return; }
-    if (activeOperation?.sessionId !== session.id) { send(409, { success: false, error: { code: 409, message: 'No query is running' } }); return; }
     try {
-      writeFileSync(activeOperation.cancelFile, 'cancel\n', 'utf8');
-      send(202, { success: false, cancelled: true, commitState: 'unknown', error: { code: 5002, message: 'Cancellation requested' } });
+      if (activeOperation?.sessionId === session.id) {
+        writeFileSync(activeOperation.cancelFile, 'cancel\n', 'utf8');
+        send(202, { success: false, cancelled: true, commitState: 'unknown', error: { code: 5002, message: 'Cancellation requested' } });
+        return;
+      }
+      if (session.waiting) {
+        session.cancelRequested = true;
+        for (const waiters of [transactionWaiters, turnWaiters]) {
+          const index = waiters.findIndex(waiter => waiter.session?.id === session.id);
+          if (index < 0) continue;
+          const [waiter] = waiters.splice(index, 1);
+          clearTimeout(waiter.timer);
+          waiter.resolve();
+        }
+        send(202, { success: false, cancelled: true, error: { code: 5002, message: 'Cancellation requested' } });
+        return;
+      }
+      send(409, { success: false, error: { code: 409, message: 'No query is running' } });
     } catch (error) { send(503, { success: false, error: { message: error instanceof Error ? error.message : String(error) } }); }
+    return;
+  }
+  const inspectRoute = req.url?.match(/^\/api\/sessions\/([a-zA-Z0-9-]+)\/index-inspect$/);
+  if (inspectRoute) {
+    req.resume();
+    if (req.method !== 'POST') { send(405, { success: false, error: { code: 405, message: 'Index inspection requires POST' } }); return; }
+    const session = sessions.get(inspectRoute[1]);
+    if (!session) { send(404, { success: false, error: { code: 404, message: 'Session not found or expired' } }); return; }
+    if (session.user !== requestUser) { send(403, { success: false, error: { code: 7001, message: 'Permission denied' } }); return; }
+    try {
+      const chunks = [];
+      for await (const chunk of req) chunks.push(chunk);
+      const body = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks)));
+      if (typeof body.table !== 'string' || typeof body.index !== 'string') throw httpError(400, 'Expected table and index strings');
+      if (!can(access, requestUser, 'READ', body.table)) throw httpError(403, 'Permission denied');
+      auditSql = `INDEX INSPECT ${body.table}.${body.index}`;
+      auditObjects = [body.table.toLowerCase()];
+      const data = await runSessionOperation(session, 'indexInspect', '', res, { table: body.table, index: body.index });
+      send(data.success === false ? (quarantined ? 503 : 422) : 200, data);
+    } catch (error) { send(error.status ?? 400, { success: false, error: { message: error instanceof Error ? error.message : String(error) } }); }
     return;
   }
   const sessionRoute = req.url?.match(/^\/api\/sessions\/([a-zA-Z0-9-]+)\/(execute|compile|diagnostics|statistics|catalog|close|buffer)(\/stream)?$/);
@@ -789,6 +1124,7 @@ const server = http.createServer(async (req, res) => {
       try {
         const body = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks)));
         if (typeof body.sql !== 'string') throw new Error();
+        if (typeof body.requestId === 'string' && body.requestId.length > 0 && body.requestId.length <= 128) requestId = body.requestId;
         sql = body.sql;
         auditSql = sql.slice(0, 4096);
         auditObjects = tableReferences(sql, firstKeyword(sql));
@@ -822,9 +1158,22 @@ const server = http.createServer(async (req, res) => {
       const session = sessions.get(sessionRoute[1]);
       if (!session) throw httpError(404, 'Session not found or expired');
       if (session.user !== requestUser) throw httpError(403, 'Permission denied');
+      session.password = requestPassword ?? '';
       if (res.destroyed && mode !== 'close') throw httpError(499, 'Request disconnected before execution');
       if (mode === 'close') return closeSession(session);
-      return runSessionOperation(session, mode, sql, res);
+      const streamSession = streamed && mode === 'execute';
+      return runSessionOperation(session, mode, sql, res, streamSession ? {
+        stream: true,
+        onFrame: async frame => {
+          streamOutput ??= beginStream(200);
+          if (frame.type === 'meta') await streamOutput.write({ type: 'meta', success: true, ...frame.meta });
+          else if (frame.type === 'row') await streamOutput.write({ type: 'row', success: true, values: frame.row });
+          else if (frame.type === 'complete') await streamOutput.write({ type: 'complete', success: true,
+            rowCount: frame.rows, resourceUsage: frame.resourceUsage, transactionState: session.transactionState });
+          else if (frame.type === 'error') await streamOutput.write({ type: 'error', success: false,
+            error: frame.error, commitState: frame.commitState, transactionState: session.transactionState });
+        },
+      } : {});
     })();
     if ((mode === 'catalog' || mode === 'statistics') && data && Array.isArray(data.tables)) {
       data.tables = data.tables.filter(table => can(access, requestUser, 'SELECT', table.name));
@@ -838,14 +1187,23 @@ const server = http.createServer(async (req, res) => {
         rolledBack ? `事务内 ${rolledBack} 条已执行语句已回滚。` : ''].filter(Boolean).join('');
       response.error = { ...data.error, message: `${data.error.message}${suffix ? '；' + suffix : ''}` };
     }
-    if (streamed) await sendStream(status, response); else send(status, response);
+    if (streamOutput) streamOutput.end();
+    else if (streamed) await sendStream(status, response); else send(status, response);
   } catch (error) {
-    send(error.status ?? 503, { success: false, commitState: !error.status && mode === 'execute' ? 'unknown' : undefined,
+    const failure = { success: false, commitState: !error.status && mode === 'execute' ? 'unknown' : undefined,
       transactionState: sessionRoute ? sessions.get(sessionRoute[1])?.transactionState : undefined,
-      error: { message: error.message, suggestion: 'Do not automatically retry writes; inspect database state.' } });
+      error: { message: error.message, suggestion: 'Do not automatically retry writes; inspect database state.' } };
+    if (streamOutput) {
+      await streamOutput.write({ type: 'error', ...failure });
+      streamOutput.end();
+    } else send(error.status ?? 503, failure);
   }
 });
-await callDatabase('catalog');
-server.listen(Number(process.env.PORT ?? 8081), '127.0.0.1', () => {
+// 启动预热：尝试加载一次引擎 Catalog。若引擎二进制缺失或损坏，服务器仍进入降级
+// 模式（健康检查报 degraded、引擎路由返回 503），使 access/audit/capabilities 等
+// 不依赖引擎的管理端点保持可用（供管理员恢复）。
+try { await callDatabase('catalog'); }
+catch { quarantined = true; }
+server.listen(bridgePort, '127.0.0.1', () => {
   console.log(`MiniSQL database API http://127.0.0.1:${server.address().port}/api`);
 });

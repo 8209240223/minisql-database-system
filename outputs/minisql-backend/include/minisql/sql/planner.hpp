@@ -12,6 +12,7 @@ struct PlanColumn {
     bool primaryKey = false;
     bool unique = false;
     std::optional<std::pair<std::string,std::string>> references{};
+    std::string identity{};
 };
 
 struct LogicalPlan {
@@ -37,22 +38,17 @@ struct LogicalPlan {
     nlohmann::json groupKeys = nlohmann::json::array();
     nlohmann::json aggregates = nlohmann::json::array();
     std::string indexName{};
+    std::string savepointName{};
+    std::string subqueryJoinKind{};
     bool uniqueIndex = false;
     std::vector<std::string> indexColumns{};
     nlohmann::json indexValues = nlohmann::json::array();
     std::string indexRangeOperator{};
     nlohmann::json indexRangeValue = nullptr;
-    // X09 4.x: Apply/SemiJoin/AntiSemiJoin 去相关节点把外层列的 columnId 绑定为
-    // 右子计划中的参量 paramId。paramBinding 为数组 {paramId, columnId, type}。
-    nlohmann::json paramBinding = nlohmann::json::array();
 };
 
 std::vector<LogicalPlan> compilePlans(const std::vector<Statement>& statements,
                                       const catalog::Catalog& catalog);
 nlohmann::json serializePlans(const std::vector<LogicalPlan>& plans);
-// X13: wrap a plan batch as a versioned plan document (schemaVersion + schemaMinor
-// + planVersion + producerVersion + planKind) so readers can reject an unknown
-// major and read an older minor leniently. Round-trips with deserializePlans.
-nlohmann::json serializePlanDocument(const std::vector<LogicalPlan>& plans);
 std::vector<LogicalPlan> deserializePlans(const nlohmann::json& document);
 }

@@ -13,9 +13,20 @@
 ## 验证
 
 - `node tests/x25-stream-http.mjs`：12 项检查通过。
-- 覆盖 NDJSON 元数据/行/完成帧、结果顺序、写语句前置拒绝、响应断开后的后续查询和背压写入路径。
+- `node tests/x25-stream-http.mjs`：18 项检查通过，覆盖普通 HTTP 流式帧、会话级 C++ 多帧流式、结果顺序、写语句前置拒绝、响应断开后的后续查询和背压写入路径。
+- `node tests/session-stream-process.mjs`：9 项通过，直接用 session 进程验证 `meta/row/complete/error` 帧和 LIMIT 提前停止。
 
 ## 未完成
 
 - 当前 C++ 执行器仍先把查询结果收集到内存，再由 bridge 分帧发送；尚未实现执行器级迭代器、逐行跨进程协议和客户端真正的生产者-消费者背压。
 - 尚未实现磁盘空间不足模拟、超大单分组、流式 HashJoin/HashAggregate 和完整 X25 资源预算验收。
+
+## 执行器接口增量
+
+- 新增 `include/minisql/execution/executor.hpp` 中的 `RowStream` 抽象接口，定义 `next`、`cancel`、`close` 和 `resourceUsage`。
+- 新增 `ScanRowStream`，用于扫描层的资源计量和取消点；当前作为接口层落地，尚未把所有算子整体迁移到逐行流。
+- 新增 `FilterRowStream`、`ProjectRowStream`、`LimitRowStream`，并提供 `Database::openRowStream` 打开简单 `SeqScan -> Filter -> Project -> Limit` 链。
+- HTTP 层 `queryResult` 现在回传最后一个执行节点的 `resourceUsage`，`x25-row-stream-contract.mjs` 15 项通过。
+- `Limit` 在子计划支持 `RowStream` 时直接按 offset/limit 读取并提前停止；普通单表 `Project` 也会优先通过 `openRowStream` 执行。
+- 新增 `MaterializedRowStream`，`Sort`、`Aggregate`、`Distinct` 结果可以通过统一 `RowStream` 接口逐行消费；它们仍先物化结果，但后续 HTTP 逐行输出可以直接复用该接口。
+- 新增 C++ `Database::executeStreaming` 和会话操作 `executeStream`：会话进程按行发送 `meta/row/complete` 帧，bridge 的 session `/execute/stream` 现在直接转发这些帧，不再先等待完整 JSON 结果。

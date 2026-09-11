@@ -2,14 +2,18 @@
 #include <cstdint>
 #include <chrono>
 #include <memory>
-#include <optional>
-#include <map>
 #include <string>
+#include <mutex>
+#include <thread>
+#include <atomic>
+#include <condition_variable>
+#include <functional>
 #include <unordered_map>
 #include <vector>
 #include "minisql/catalog/persistent_catalog.hpp"
 #include "minisql/sql/planner.hpp"
 #include "minisql/storage/bplus_tree.hpp"
+#include "minisql/execution/executor.hpp"
 
 namespace minisql::execution {
 class Database {
@@ -18,26 +22,41 @@ public:
                       storage::PageFile::CommitObserver observer = {});
     nlohmann::json execute(const std::string& sql, bool optimize = true);
     nlohmann::json executeScript(const std::string& sql, bool optimize = true);
+    nlohmann::json executeStreaming(const std::string& sql,
+                                    const std::function<void(const nlohmann::json&)>& emitMeta,
+                                    const std::function<bool(const nlohmann::json&)>& emitRow);
     const char* transactionState() const;
     nlohmann::json compile(const std::string& sql) const;
+    // 解析并通过当前 Catalog 规范化 SQL 实际访问的基础表对象。
+    // 该结果供入口层权限校验使用，别名和派生表作用域不会被当成持久化对象。
+    std::vector<std::string> resolveAccessObjects(const std::string& sql) const;
     nlohmann::json diagnostics(const std::string& sql) const;
     nlohmann::json catalog();
     nlohmann::json statistics();
     nlohmann::json checkpoint();
+    nlohmann::json createSnapshot(const std::filesystem::path& target);
+    nlohmann::json indexInspect(const std::string& table, const std::string& index);   // 页级索引结构校验（页类型/height/keyCount/兄弟指针/叶链/根可达）
+    // 将已由入口层校验的权限快照同步到 PersistentCatalog 的保留系统表。
+    void synchronizeAccessCatalog(const nlohmann::json& document, std::uint32_t permissionVersion);
+    const std::optional<catalog::AccessCatalogRecord>& accessCatalogRecord() const { return catalog_.accessCatalogRecord(); }
     ~Database();
     void setSessionContext(const std::string& sessionId, const std::filesystem::path& cancelFile);
     nlohmann::json configureBuffer(const std::string& action);
     nlohmann::json runCorrelatedSubquery(const nlohmann::json& expression, const nlohmann::json& row);
-    // X09 4.x: 相关子查询去相关后，右子计划以 Parameter 节点引用外层列；Apply/SemiJoin
-    // 执行器在运行右子计划前把外层行按 paramBinding 写入该参数环境，evaluate() 的
-    // Parameter 分支读取之。仅在语句执行期内有效（每次 runStatement 复位）。
-    nlohmann::json correlationParam(std::size_t paramId) const;
 private:
-    std::vector<nlohmann::json> correlationParams_;
     nlohmann::json bufferStatus() const;
+    // X18: 实时单遍扫描的表/列/索引统计；ANALYZE 用它生成快照，statistics() 无快照时回退到它。
+    nlohmann::json liveTableStatistics();
+    // ANALYZE 快照旁路文件（<db>.analyze.json）：读、写路径与失效删除。
+    std::filesystem::path analyzeMetadataPath() const;
+    std::optional<nlohmann::json> loadAnalyzeMetadata() const;
+    void invalidateAnalyzeSnapshot() const;
+    void evaluateAutoCheckpoint(std::size_t committedWriteStatements, std::size_t committedDirtyPages);
+    void evaluateBackgroundCheckpoint();
+    void backgroundSchedulerLoop();
     std::shared_ptr<storage::PageFile> file_;
     storage::BufferPool buffer_;
-    mutable storage::HeapStore heap_;
+    storage::HeapStore heap_;
     catalog::PersistentCatalog catalog_;
     bool unavailable_ = false;
     enum class TransactionState { Idle, Active, Aborted };
@@ -49,39 +68,17 @@ private:
     nlohmann::json runStatement(const sql::LogicalPlan& plan);
     nlohmann::json run(const sql::LogicalPlan& plan);
     nlohmann::json runNode(const sql::LogicalPlan& plan);
+    std::unique_ptr<RowStream> scanRowStream(const sql::LogicalPlan& plan);
+    std::unique_ptr<RowStream> openRowStream(const sql::LogicalPlan& plan);
     // X09 3.5: 相关子查询按 subquerySql 缓存已解析 AST，执行时以 by-value 参数
     // 绑定替换外层列（不再逐行文本重解析）。值会在 run 时以当前 catalog 重新编译。
     std::unordered_map<std::string, std::vector<sql::Statement>> correlatedAstCache_;
     // X09 3.4: 相关子查询「保守执行优化」——等值/确定性相关的 EXISTS/IN/标量按绑定
     // 参数分组，对每个不同参数物化子查询一次（collection 语义半连接），避免重复执行。
-    // 以 (subquerySql|scope) 为形缓存外层列引用：仅依赖 AST 形状，跨语句持久。
+    // 以 (subquerySql|scope) 为形缓存外层列引用，以 (shape|绑定值) 缓存结果行；
+    // 缓存生命周期仅在单条语句内（runStatement/EXPLAIN ANALYZE 入口清空）。
     std::unordered_map<std::string, std::vector<std::size_t>> correlatedColumnsCache_;
-    // X09 §6.17 后续 ②：绑定级 memo 跨语句复用。结果行缓存不再每语句清空，改为在
-    // 「数据/目录版本」变化时整体失效，使长驻 session 进程内相同 (shape|绑定值) 的物化
-    // 结果得以复用（EXPLAIN ANALYZE 实际执行前仍保守清空一次）。
-    // dataVersion_ 在任何写语句分派处自增（保守：先失效、后执行）；版本不等即整表清空。
     std::unordered_map<std::string, nlohmann::json> correlatedRowsCache_;
-    std::uint64_t dataVersion_ = 0;
-    std::uint64_t correlatedRowsCacheVersion_ = 0;
-    std::uint64_t correlatedMemoHits_ = 0;
-    std::uint64_t correlatedMemoMisses_ = 0;
-    // X18 4.2: 供优化器成本估算的表行数统计（真实扫描计数，缺表返回空）。
-    // const：可为 `compile()`（const）等只读路径提供估算；扫描仅唤醒缓存、不改逻辑状态，
-    // 故 heap_ 标为 mutable。
-    std::optional<double> estimatedTableRows(const std::string& tableName) const;
-    // X18 4.2-iv: const 的按表列统计扫描（含直方图）。statistics() 复用其输出；
-    // compile()/execute() 的优化器列级选择率惰性注入取用该项目。
-    std::map<std::string, nlohmann::json> tableStats() const;
-    // X18: 显式 ANALYZE 的刷新记录路径（`<db>.analyze.json`）。ANALYZE 写入刷新时间 +
-    // 统计版本 + 表快照；任何写语句成功后删除该文件即失效。statistics() 跨进程读它并
-    // 报告 source=analyze，缺失/被删时回退实时 on-demand-scan。
-    std::filesystem::path analyzeMetadataPath() const;
-    std::optional<nlohmann::json> loadAnalyzeMetadata() const;
-    // X18 4.3: 把成本/估计元数据（estimatedRows/estimatedCost/statsSource）落到
-    // compile() 顶层 plan / optimizedPlan 的每个节点上，并入 HTTP 契约供工作台展示。
-    // 沿用优化器同源的 estimatedTableRows + columnSelectivity；惰性扫描列统计仅在有 Filter 时触发。
-    nlohmann::json annotatePlanEstimates(const nlohmann::json& serialized, const std::vector<sql::LogicalPlan>& plans) const;
-    void evaluateAutoCheckpoint(std::size_t committedWriteStatements, std::size_t committedDirtyPages);
     std::vector<nlohmann::json>* nodeStats_ = nullptr;
     std::size_t sortMemoryRows_ = 10000;
     std::size_t aggregateMemoryRows_ = 10000;
@@ -95,10 +92,26 @@ private:
     std::uint64_t pendingAutoCheckpointWalBytes_ = 0;
     std::size_t checkpointCount_ = 0;
     std::size_t transactionWriteStatements_ = 0;
+    struct SavepointState {
+        storage::PageFileSavepoint file;
+        catalog::PersistentCatalog::Snapshot catalog;
+    };
+    std::unordered_map<std::string, SavepointState> savepoints_;
     std::chrono::steady_clock::time_point lastCheckpointAt_;
     std::uint64_t lastCheckpointAtMs_ = 0;
     std::uint64_t lastAutoCheckpointAtMs_ = 0;
     std::vector<std::string> lastAutoCheckpointReasons_;
+    std::uint64_t catalogVersion_ = 1;   // 目录版本（写入持久化检查点记录）
+    std::uint64_t indexVersion_ = 1;     // 索引版本（写入持久化检查点记录）
+    mutable std::recursive_mutex mu_;    // 串行化公共入口与后台检查点，避免与语句执行竞争
+    std::thread scheduler_;
+    std::size_t backgroundCheckpointMs_ = 0;
+    std::atomic<bool> schedulerStop_{false};
+    std::mutex schedulerMutex_;
+    std::condition_variable schedulerCv_;
+    std::uint64_t schedulerLastEvaluateMs_ = 0;
+    std::uint64_t schedulerLastRunMs_ = 0;
+    std::vector<std::string> schedulerDeferredReasons_;
     std::filesystem::path sortTempDirectory_;
     std::filesystem::path cancelFile_;
     std::string sessionId_ = "local";
@@ -107,6 +120,7 @@ private:
     std::uint64_t sortSequence_ = 0;
     std::uint64_t aggregateSequence_ = 0;
     struct RuntimeIndex;
+    bool pageFileIndexes_ = true;   // 索引主路径引擎：true=页级 PageBPlusTree，false=内存 BPlusTree（MINISQL_INDEX_ENGINE=memory 时关闭）
     std::vector<std::unique_ptr<RuntimeIndex>> indexes_;
     void rebuildIndexes(std::uint64_t tableId);
     std::string tableFingerprint(std::uint64_t tableId);

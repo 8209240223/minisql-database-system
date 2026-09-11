@@ -58,6 +58,24 @@ try {
   assert.equal(frames.at(-1).type, 'complete'); ++checks;
   assert.equal(frames.at(-1).rowCount, 160); ++checks;
 
+  const opened = await fetch(url + '/sessions', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+  const session = await opened.json();
+  assert.equal(opened.status, 201, JSON.stringify(session)); ++checks;
+  const sessionStreamed = await fetch(url + '/sessions/' + session.sessionId + '/execute/stream', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ sql: 'SELECT id FROM stream_rows ORDER BY id LIMIT 2;' }),
+  });
+  assert.equal(sessionStreamed.status, 200); ++checks;
+  const sessionChunks = [];
+  for await (const chunk of sessionStreamed.body) sessionChunks.push(chunk);
+  const sessionFrames = Buffer.concat(sessionChunks).toString('utf8').trim().split('\n').map(line => JSON.parse(line));
+  assert.equal(sessionFrames[0].type, 'meta'); ++checks;
+  assert.deepEqual(sessionFrames.filter(frame => frame.type === 'row').map(frame => frame.values), [[0], [1]]); ++checks;
+  assert.equal(sessionFrames.at(-1).type, 'complete'); ++checks;
+  assert.equal(sessionFrames.at(-1).rowCount, 2); ++checks;
+  await fetch(url + '/sessions/' + session.sessionId + '/close', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+
   const writeAttempt = await fetch(url + '/execute/stream', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },

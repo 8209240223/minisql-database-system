@@ -28,6 +28,9 @@ try {
     server.once('exit', () => reject(new Error(errors || 'Server exited before readiness')));
   });
   equal((await request('/execute', { sql: 'CREATE TABLE t(id INT); INSERT INTO t VALUES(1),(2);' })).status, 200);
+  const generated = await request('/backup', {});
+  equal(generated.status, 200);
+  assert.match(generated.data.backup, /^backup-\d+\.pages$/); ++checks;
   const backup = await request('/backup', { name: 'snap1' });
   equal(backup.status, 200);
   assert.equal(backup.data.backup, 'snap1.pages'); ++checks;
@@ -39,8 +42,15 @@ try {
   assert.ok(manifest.pageFormatVersion === 1 || manifest.pageFormatVersion === 2); ++checks;
   equal(manifest.walBytes, 0);
   writeFileSync(manifestPath, JSON.stringify({ ...manifest, version: 99 }), 'utf8');
+  const unsupported = await request('/backup/validate', { name: 'snap1' });
+  equal(unsupported.status, 422);
+  equal(unsupported.data.operation, 'backup-migration');
   equal((await request('/restore', { name: 'snap1' })).status, 422);
   writeFileSync(manifestPath, JSON.stringify({ version: 1, name: manifest.name, createdAt: manifest.createdAt, bytes: manifest.bytes, sha256: manifest.sha256 }), 'utf8');
+  const migration = await request('/backup/validate', { name: 'snap1' });
+  equal(migration.status, 200);
+  equal(migration.data.validation.migrated, true);
+  equal(migration.data.validation.manifestVersion, 2);
   equal((await request('/restore', { name: 'snap1' })).status, 200);
   equal(JSON.parse(readFileSync(manifestPath, 'utf8')).version, 2);
   equal((await request('/execute', { sql: 'INSERT INTO t VALUES(3);' })).status, 200);
@@ -52,6 +62,7 @@ try {
   const listed = list.data.entries.find(entry => entry.name === 'snap1.pages');
   assert.ok(listed); ++checks;
   equal(listed.manifestVersion, 2);
+  equal(listed.migrationState, 'ready');
   assert.ok(listed.pageFormatVersion === 1 || listed.pageFormatVersion === 2); ++checks;
   equal(listed.walBytes, 0);
 
@@ -66,6 +77,7 @@ try {
   equal(inc1Manifest.version, 3);
   equal(inc1Manifest.kind, 'incremental');
   equal(inc1Manifest.base, 'base1.pages');
+  equal(inc1Manifest.chainDepth, 2);
 
   equal((await request('/execute', { sql: 'INSERT INTO t VALUES(4);' })).status, 200);
   equal((await request('/restore', { name: 'inc1.delta' })).status, 200);
@@ -82,6 +94,13 @@ try {
   equal(listedIncremental.kind, 'incremental');
   equal(listedIncremental.manifestVersion, 3);
   equal(listedIncremental.base, 'base1.pages');
+  equal(listedIncremental.chainDepth, 2);
+  const listedSecond = chainedList.data.entries.find(entry => entry.name === 'inc2.delta');
+  assert.ok(listedSecond); ++checks;
+  equal(listedSecond.chainDepth, 3);
+  const listedBase = chainedList.data.entries.find(entry => entry.name === 'base1.pages');
+  assert.ok(listedBase); ++checks;
+  equal(listedBase.chainDepth, 1);
   writeFileSync(join(root, 'backups', 'inc1.delta.json'), JSON.stringify({ ...inc1Manifest, version: 99 }), 'utf8');
   equal((await request('/restore', { name: 'inc2.delta' })).status, 422);
 

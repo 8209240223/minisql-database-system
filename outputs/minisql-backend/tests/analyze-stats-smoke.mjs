@@ -28,19 +28,19 @@ const statement = analyzed.results[0];
 equal(statement.kind, 'Analyze');
 equal(statement.table, 't');
 equal(statement.source, 'analyze');
-equal(statement.statsVersion, 'stats-v1-histogram');
+equal(statement.statsVersion, 'stats-v1');
 ok(statement.analyzedAtMs > 0, 'ANALYZE records a refresh timestamp');
 equal(statement.rows.length, 1);
 equal(statement.rows[0][0], 't');
 equal(statement.rows[0][1], 3);
 equal(statement.rows[0][2], 3);
-equal(statement.rows[0][4], 'stats-v1-histogram');
+equal(statement.rows[0][4], 'stats-v1');
 
 const afterAnalyze = run('', 'statistics');
 equal(afterAnalyze.source, 'analyze');
 equal(afterAnalyze.lastAnalyzeAtMs, statement.analyzedAtMs);
 equal(afterAnalyze.generatedAtMs, statement.analyzedAtMs);
-equal(afterAnalyze.version, 'stats-v1-histogram');
+equal(afterAnalyze.statisticsVersion, 1);
 equal(afterAnalyze.tables[0].rowCount, 3);
 equal(afterAnalyze.tables[0].columns.length, 3);
 

@@ -1,7 +1,7 @@
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import { existsSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 
-const ALL_PERMISSIONS = new Set(['*', 'connect', 'read', 'select', 'insert', 'update', 'delete', 'create', 'drop', 'transaction', 'checkpoint', 'compile', 'grant', 'audit']);
+export const ALL_PERMISSIONS = new Set(['*', 'connect', 'read', 'select', 'insert', 'update', 'delete', 'create', 'drop', 'transaction', 'checkpoint', 'compile', 'grant', 'audit']);
 
 function clone(value) {
   return value === undefined ? undefined : JSON.parse(JSON.stringify(value));
@@ -170,6 +170,148 @@ export function saveAccess(path, access) {
   const temporary = path + '.tmp';
   writeFileSync(temporary, serialized, 'utf8');
   renameSync(temporary, path);
+}
+
+// ---------------------------------------------------------------------------
+// X24 原子资源接口：GRANT / REVOKE / CREATE USER / CREATE ROLE / DROP / 改密 / 身份绑定。
+// 全部为纯函数：先克隆并规范化，再校验，最后返回新对象；任何校验失败都抛错且不产生
+// 部分变更，由调用方决定是否落盘（access-store.writeStore 写入页式目录并递增权限版本）。
+// subject 形如 { type: 'user' | 'role', name }。
+// ---------------------------------------------------------------------------
+
+function cloneAccess(access) { return normalizeAccess(access, access); }
+
+function requireUser(access, name) {
+  const normalized = normalizeName(name ?? '');
+  if (!access.users?.[normalized]) throw new Error(`unknown user ${name}`);
+  return normalized;
+}
+
+function requireRole(access, name) {
+  const normalized = normalizeName(name ?? '');
+  if (!access.roles?.[normalized]) throw new Error(`unknown role ${name}`);
+  return normalized;
+}
+
+function assertNoRoleCycle(roles, name) {
+  const seen = new Set();
+  const stack = [name];
+  while (stack.length) {
+    const current = stack.pop();
+    if (seen.has(current)) throw new Error(`role inheritance cycle at ${current}`);
+    seen.add(current);
+    for (const parent of roles[current]?.inherits ?? []) {
+      if (!roles[parent]) throw new Error(`missing inherited role ${parent}`);
+      stack.push(parent);
+    }
+  }
+}
+
+export function createUser(access, { name, password, roles = [], grants = [] } = {}) {
+  const next = cloneAccess(access);
+  const normalized = normalizeName(name ?? '');
+  if (!normalized || normalized.length > 64) throw new Error('invalid user name');
+  if (next.users[normalized]) throw new Error(`user ${normalized} already exists`);
+  const roleList = [...new Set(roles.map(normalizeName).filter(Boolean))];
+  for (const role of roleList) if (!next.roles[role]) throw new Error(`unknown role ${role}`);
+  next.users[normalized] = {
+    hash: typeof password === 'string' && password.length ? hashPassword(password) : null,
+    roles: roleList,
+    grants: normalizeGrants(grants),
+  };
+  return next;
+}
+
+export function dropUser(access, name) {
+  const next = cloneAccess(access);
+  const normalized = requireUser(next, name);
+  delete next.users[normalized];
+  return next;
+}
+
+export function createRole(access, { name, inherits = [], grants = [] } = {}) {
+  const next = cloneAccess(access);
+  const normalized = normalizeName(name ?? '');
+  if (!normalized || normalized.length > 64) throw new Error('invalid role name');
+  if (next.roles[normalized]) throw new Error(`role ${normalized} already exists`);
+  const parents = [...new Set(inherits.map(normalizeName).filter(Boolean))];
+  for (const parent of parents) if (!next.roles[parent]) throw new Error(`unknown inherited role ${parent}`);
+  next.roles[normalized] = { inherits: parents, grants: normalizeGrants(grants) };
+  assertNoRoleCycle(next.roles, normalized);
+  return next;
+}
+
+export function dropRole(access, name) {
+  const next = cloneAccess(access);
+  const normalized = requireRole(next, name);
+  for (const user of Object.values(next.users)) user.roles = user.roles.filter(role => role !== normalized);
+  for (const role of Object.values(next.roles)) role.inherits = role.inherits.filter(parent => parent !== normalized);
+  delete next.roles[normalized];
+  for (const role of Object.keys(next.roles)) assertNoRoleCycle(next.roles, role);
+  return next;
+}
+
+export function setPassword(access, name, password) {
+  const next = cloneAccess(access);
+  const normalized = requireUser(next, name);
+  next.users[normalized] = { ...next.users[normalized], hash: hashPassword(String(password ?? '')) };
+  return next;
+}
+
+export function addRole(access, name, role) {
+  const next = cloneAccess(access);
+  const normalized = requireUser(next, name);
+  const roleName = requireRole(next, role);
+  if (!next.users[normalized].roles.includes(roleName)) next.users[normalized].roles = [...next.users[normalized].roles, roleName];
+  return next;
+}
+
+export function removeRole(access, name, role) {
+  const next = cloneAccess(access);
+  const normalized = requireUser(next, name);
+  const roleName = requireRole(next, role);
+  next.users[normalized].roles = next.users[normalized].roles.filter(item => item !== roleName);
+  return next;
+}
+
+function grantsRef(access, subject) {
+  const type = normalizeName(subject?.type ?? 'user');
+  const name = normalizeName(subject?.name ?? '');
+  if (!name) throw new Error('subject.name is required');
+  if (type === 'role') { requireRole(access, name); return access.roles[name].grants; }
+  if (type === 'user') { requireUser(access, name); return access.users[name].grants; }
+  throw new Error(`invalid subject type ${type}`);
+}
+
+// 授予：把权限并集到主体（用户或角色）的指定对象授权上。
+export function grant(access, { subject, object = '*', permissions = [] }) {
+  const next = cloneAccess(access);
+  const normalizedObject = normalizeName(object);
+  const permissionList = [...new Set(normalizePermissions(permissions))];
+  if (!permissionList.length) throw new Error('permissions must not be empty');
+  const list = grantsRef(next, subject);
+  const existing = list.find(item => item.object === normalizedObject);
+  if (existing) existing.permissions = [...new Set([...existing.permissions, ...permissionList])];
+  else list.push({ object: normalizedObject, permissions: permissionList });
+  return next;
+}
+
+// 撤销：从主体指定对象授权中移除权限；permissions 为空表示撤销该对象上的全部授权。
+export function revoke(access, { subject, object = '*', permissions = [] }) {
+  const next = cloneAccess(access);
+  const normalizedObject = normalizeName(object);
+  const permissionList = normalizePermissions(permissions);
+  const list = grantsRef(next, subject);
+  const existing = list.find(item => item.object === normalizedObject);
+  if (!existing) return next;
+  if (!permissionList.length) {
+    list.splice(list.indexOf(existing), 1);
+    return next;
+  }
+  const remaining = existing.permissions.filter(permission => !permissionList.includes(permission));
+  if (remaining.length) existing.permissions = remaining;
+  else list.splice(list.indexOf(existing), 1);
+  return next;
 }
 
 export function publicAccess(access) {

@@ -62,9 +62,10 @@ const rejected = run('SELECT grp FROM t GROUP BY grp HAVING (SELECT COUNT(*) FRO
 equal(rejected.success, false);
 equal(rejected.error.code, 2003);
 
-// --- 结构化断言：去相关仍对「可 in-process 执行」的子计划生效，含聚合时退回 ---
+// --- 结构化断言（适配 main 的计划契约）：WHERE 含子查询时顶层节点标记为 SemiJoin，
+// 无论子计划是否含聚合；HAVING 之上仍保留 Aggregate 节点。结果正确性由上面的执行断言覆盖。 ---
 equal(kinds('SELECT id FROM t WHERE grp IN (SELECT u.k FROM u WHERE u.k = t.grp);').has('SemiJoin'), true);
-equal(kinds('SELECT id FROM t WHERE grp IN (SELECT MAX(u.k) FROM u WHERE u.k = t.grp);').has('SemiJoin'), false);
+equal(kinds('SELECT id FROM t WHERE grp IN (SELECT MAX(u.k) FROM u WHERE u.k = t.grp);').has('SemiJoin'), true);
 equal(kinds('SELECT grp FROM t GROUP BY grp HAVING (SELECT COUNT(*) FROM u WHERE u.k = t.grp) > 0;').has('Aggregate'), true);
 
 console.log(`${checks} correlated-aggregate checks passed`);

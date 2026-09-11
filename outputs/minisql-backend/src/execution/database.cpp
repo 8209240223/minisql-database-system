@@ -5,13 +5,17 @@
 #include "minisql/common/decimal.hpp"
 #include "minisql/common/float.hpp"
 #include "minisql/storage/bplus_tree.hpp"
+#include "minisql/storage/page_bplus_tree.hpp"
+#include "minisql/storage/heap.hpp"
 #include "minisql/execution/external_sort.hpp"
 #include "minisql/sql/serialization.hpp"
+#include <filesystem>
 #include <algorithm>
 #include <cctype>
 #include <set>
 #include <map>
 #include <unordered_map>
+#include <unordered_set>
 #include <type_traits>
 #include <chrono>
 #include <cmath>
@@ -33,6 +37,77 @@ struct ActiveDatabaseScope {
 std::string key(std::string value) {
     std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
     return value;
+}
+bool sqlIdentifier(const std::string& value) {
+    if (value.empty() || !(std::isalpha(static_cast<unsigned char>(value.front())) || value.front() == '_')) return false;
+    return std::all_of(value.begin() + 1, value.end(), [](unsigned char c) {
+        return std::isalnum(c) || c == '_';
+    });
+}
+std::vector<std::string> lexicalAccessObjects(const std::vector<sql::Token>& tokens) {
+    std::vector<std::string> words;
+    words.reserve(tokens.size());
+    for (const auto& token : tokens) {
+        if (token.type == "END") break;
+        if (token.type == "STRING") continue;
+        words.push_back(key(token.lexeme));
+    }
+    std::unordered_set<std::string> ctes;
+    if (!words.empty() && words.front() == "with") {
+        std::size_t cursor = words.size() > 1 && words[1] == "recursive" ? 2 : 1;
+        for (;;) {
+            if (cursor >= words.size() || !sqlIdentifier(words[cursor])) break;
+            ctes.insert(words[cursor++]);
+            if (cursor < words.size() && words[cursor] == "(") {
+                std::size_t columnDepth = 1;
+                ++cursor;
+                while (cursor < words.size() && columnDepth > 0) {
+                    if (words[cursor] == "(") ++columnDepth;
+                    else if (words[cursor] == ")") --columnDepth;
+                    ++cursor;
+                }
+            }
+            if (cursor + 1 >= words.size() || words[cursor] != "as" || words[cursor + 1] != "(") break;
+            cursor += 2;
+            std::size_t depth = 1;
+            while (cursor < words.size() && depth > 0) {
+                if (words[cursor] == "(") ++depth;
+                else if (words[cursor] == ")") --depth;
+                ++cursor;
+            }
+            if (cursor >= words.size() || words[cursor] != ",") break;
+            ++cursor;
+        }
+    }
+    std::string command;
+    if (!words.empty()) {
+        command = words.front();
+        if (command == "explain") {
+            const auto found = std::find_if(words.begin(), words.end(), [](const std::string& value) {
+                return value == "select" || value == "insert" || value == "update" || value == "delete";
+            });
+            if (found != words.end()) command = *found;
+        }
+    }
+    std::vector<std::string> result;
+    const auto add = [&](const std::string& value) {
+        if (sqlIdentifier(value) && !ctes.contains(value) &&
+            std::find(result.begin(), result.end(), value) == result.end()) result.push_back(value);
+    };
+    const auto addAfter = [&](std::size_t index, bool allowParenthesized) {
+        auto cursor = index + 1;
+        if (allowParenthesized && cursor < words.size() && words[cursor] == "(") return;
+        if (cursor < words.size() && words[cursor] == "lateral") ++cursor;
+        if (cursor < words.size()) add(words[cursor]);
+    };
+    for (std::size_t index = 0; index < words.size(); ++index) {
+        const auto& word = words[index];
+        if (word == "from" || word == "join" || word == "into" || word == "update" || word == "references")
+            addAfter(index, true);
+        if (command == "drop" && (word == "table" || word == "on")) addAfter(index, false);
+        if (command == "create" && (word == "table" || word == "on")) addAfter(index, false);
+    }
+    return result;
 }
 json cell(const storage::Value& value) {
     return std::visit([](const auto& v) -> json {
@@ -60,127 +135,6 @@ json rowJson(const Row& row) {
     json result = json::array();
     for (const auto& value : row) result.push_back(cell(value));
     return result;
-}
-// X18 4.2-iv: 列级选择率（直方图驱动）。复用 EXPLAIN 原有估算逻辑，抽成共享自由函数，
-// 供 EXPLAIN estimate() 与优化器 Options.selectivity 同源使用（AND/OR/NOT 连乘与交、
-// IS NULL 用 nullRatio、数值范围谓词用等宽直方图桶、等值越界归零、无直方图回退默认）。
-double columnSelectivity(const std::map<std::string, json>& byTable, const json& predicate, const std::string& table) {
-    const auto columnStat = [&](const std::string& tbl, std::size_t columnId) -> const json* {
-        const auto found = byTable.find(key(tbl));
-        if (found == byTable.end()) return nullptr;
-        for (const auto& column : found->second.at("columns"))
-            if (column.at("columnId").get<std::size_t>() == columnId) return &column;
-        return nullptr;
-    };
-    std::function<double(const json&, const std::string&)> sel;
-    sel = [&](const json& predicate, const std::string& table) -> double {
-        if (!predicate.is_object()) return 1.0;
-        if (predicate.value("kind", "") == "Literal") {
-            const auto& value = predicate.at("value");
-            if (value.is_null() || value == false) return 0.0;
-            if (value == true) return 1.0;
-            return 0.25;
-        }
-        const auto op = predicate.value("operator", "");
-        if (op == "AND") return sel(predicate.at("left"), table) * sel(predicate.at("right"), table);
-        if (op == "OR") {
-            const auto left = sel(predicate.at("left"), table), right = sel(predicate.at("right"), table);
-            return std::min(1.0, left + right - left * right);
-        }
-        if (op == "NOT") return 1.0 - sel(predicate.at("left"), table);
-        if ((op == "IS NULL" || op == "IS NOT NULL") && predicate.contains("left")) {
-            const auto& operand = predicate.at("left");
-            if (operand.value("kind", "") == "Identifier") {
-                const auto* stat = columnStat(table, operand.at("columnId").get<std::size_t>());
-                if (stat) {
-                    const auto ratio = stat->value("nullRatio", 0.0);
-                    return op == "IS NULL" ? ratio : 1.0 - ratio;
-                }
-            }
-        }
-        if (predicate.contains("left") && predicate.contains("right")) {
-            const auto& left = predicate.at("left");
-            const auto& right = predicate.at("right");
-            const json* id = left.value("kind", "") == "Identifier" ? &left : right.value("kind", "") == "Identifier" ? &right : nullptr;
-            const json* literal = left.value("kind", "") == "Literal" ? &left : right.value("kind", "") == "Literal" ? &right : nullptr;
-            if (id && literal && id->contains("columnId")) {
-                const auto* stat = columnStat(table, id->at("columnId").get<std::size_t>());
-                if (stat) {
-                    if (stat->contains("histogram") && op[0] != '=' && literal->at("value").is_number()) {
-                        const auto& h = stat->at("histogram");
-                        const auto buckets = h.at("buckets");
-                        double total = 0;
-                        for (const auto& bucket : buckets) total += bucket.get<std::size_t>();
-                        if (total > 0) {
-                            const auto bucketCount = h.at("bucketCount").get<std::size_t>();
-                            const auto span = h.at("max").get<double>() - h.at("min").get<double>();
-                            const auto value = literal->at("value").get<double>();
-                            double position = span == 0.0 ? 0.0 : (value - h.at("min").get<double>()) / span;
-                            if (position < 0.0) position = 0.0;
-                            else if (position > 1.0) position = 1.0;
-                            const auto slot = position == 1.0 ? bucketCount - 1 : static_cast<std::size_t>(position * bucketCount);
-                            double le = 0, lt = 0;
-                            for (std::size_t i = 0; i < buckets.size(); ++i) {
-                                if (i <= slot) le += buckets[i].get<std::size_t>();
-                                if (i < slot) lt += buckets[i].get<std::size_t>();
-                            }
-                            const double fracLe = le / total, fracLt = lt / total;
-                            if (op == "<") return fracLt;
-                            if (op == "<=") return fracLe;
-                            if (op == ">") return 1.0 - fracLe;
-                            if (op == ">=") return 1.0 - fracLt;
-                        }
-                    }
-                    if (op == "=") {
-                        const auto distinct = stat->value("distinctCount", std::size_t{0});
-                        if (distinct > 0 && stat->contains("min")) {
-                            const auto value = literal->at("value");
-                            if (value.is_number()) {
-                                const auto lo = stat->at("min").get<double>();
-                                const auto hi = stat->at("max").get<double>();
-                                const auto v = value.get<double>();
-                                if (v < lo || v > hi) return 0.0;
-                            }
-                        }
-                        if (distinct > 0) return 1.0 / static_cast<double>(distinct);
-                    }
-                }
-            }
-        }
-        if (op == "=" || op == "!=" || op == "<" || op == "<=" || op == ">" || op == ">=") return 0.33;
-        return 0.25;
-    };
-    return sel(predicate, table);
-}
-// X18 4.3-iv: 按索引列统计估算 IndexScan 选择率——等值前缀逐列 `1/distinct`（越界归零）、
-// 范围列走直方图。合成与 columnSelectivity 同构的列谓词（含 columnId）逐列连乘，保证口径与
-// Filter 完全一致、源码单点复用。无该列统计时回退默认选择率 0.25。
-double indexScanSelectivity(const std::map<std::string, json>& byTable, const std::string& table,
-                            const std::vector<std::string>& indexColumns, const json& indexValues,
-                            const std::string& rangeOperator, const json& rangeValue) {
-    std::map<std::string, std::size_t> columnIds;
-    const auto found = byTable.find(key(table));
-    if (found != byTable.end())
-        for (const auto& column : found->second.at("columns"))
-            columnIds[key(column.at("name").get<std::string>())] = column.at("columnId").get<std::size_t>();
-    std::function<double(const std::string&, const std::string&, const json&)> columnSel =
-        [&](const std::string& column, const std::string& op, const json& value) -> double {
-        const auto it = columnIds.find(key(column));
-        if (it == columnIds.end()) return 0.25;
-        return columnSelectivity(byTable,
-            {{"kind", "Binary"}, {"operator", op},
-             {"left", {{"kind", "Identifier"}, {"columnId", it->second}, {"name", column}}},
-             {"right", value}},
-            table);
-    };
-    double selectivity = 1.0;
-    const auto equalities = static_cast<std::size_t>(std::min<std::size_t>(indexValues.size(), indexColumns.size()));
-    for (std::size_t i = 0; i < equalities; ++i)
-        if (indexValues[i].is_object() && indexValues[i].value("kind", "") == "Literal")
-            selectivity *= columnSel(indexColumns[i], "=", indexValues[i]);
-    if (!rangeOperator.empty() && indexValues.size() < indexColumns.size() && rangeValue.is_object())
-        selectivity *= columnSel(indexColumns[indexValues.size()], rangeOperator, rangeValue);
-    return selectivity;
 }
 ExactDecimal decimalValue(const json& value, const std::string& type) {
     const auto decimal = decimalType(type);
@@ -290,10 +244,6 @@ template <typename Row>
 json evaluate(const json& expression, const Row& row) {
     const auto kind = expression.at("kind").get<std::string>();
     if (kind == "Literal") return expression.at("value");
-    if (kind == "Parameter") {
-        if (!activeDatabase) fail("Parameter evaluated outside a database context");
-        return activeDatabase->correlationParam(expression.at("paramId").get<std::size_t>());
-    }
     if (kind == "Identifier") {
         const auto index = expression.at("columnId").get<std::size_t>();
         if (index >= row.size()) fail("Plan column outside row");
@@ -418,13 +368,27 @@ storage::RowSchema rowSchema(const sql::Statement& definition) {
 }
 }
 struct Database::RuntimeIndex {
-    RuntimeIndex(std::string indexName, std::string tableName, std::vector<std::size_t> columnIndices, bool isUnique)
-        : name(std::move(indexName)), table(std::move(tableName)), columns(std::move(columnIndices)), unique(isUnique), tree(64, isUnique) {}
+    RuntimeIndex(std::string indexName, std::string tableName, std::vector<std::size_t> columnIndices, bool isUnique, bool usePage)
+        : name(std::move(indexName)), table(std::move(tableName)), columns(std::move(columnIndices)), unique(isUnique),
+          pageFile(usePage), tree(64, isUnique) {}
     std::string name;
     std::string table;
     std::vector<std::size_t> columns;
     bool unique;
-    storage::BPlusTree tree;
+    bool pageFile;
+    storage::BPlusTree tree;                                        // memory 引擎
+    std::unique_ptr<storage::PageBPlusTree> pageTree{nullptr};      // page-file 引擎
+    std::vector<storage::RowRef> search(const storage::IndexKey& key) const {
+        return pageFile ? pageTree->search(key) : tree.search(key);
+    }
+    std::vector<storage::RowRef> range(const std::optional<storage::IndexKey>& lower, bool lowerInclusive,
+                                       const std::optional<storage::IndexKey>& upper, bool upperInclusive) const {
+        return pageFile ? pageTree->range(lower, lowerInclusive, upper, upperInclusive)
+                        : tree.range(lower, lowerInclusive, upper, upperInclusive);
+    }
+    std::size_t height() const { return pageFile ? pageTree->height() : tree.height(); }
+    std::size_t size() const { return pageFile ? pageTree->size() : tree.size(); }
+    bool validate() const { return pageFile ? pageTree->validate() : tree.validate(); }
 };
 Database::Database(const std::filesystem::path& path, std::size_t frames, storage::PageFile::CommitObserver observer)
     : file_(std::make_shared<storage::PageFile>(path, std::move(observer))), buffer_(file_, frames, storage::ReplacementPolicy::LRU),
@@ -432,6 +396,7 @@ Database::Database(const std::filesystem::path& path, std::size_t frames, storag
     lastCheckpointAt_ = std::chrono::steady_clock::now();
     lastCheckpointAtMs_ = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count());
+    if (const char* engine = std::getenv("MINISQL_INDEX_ENGINE"); engine && std::string(engine) == "memory") pageFileIndexes_ = false;
     if (const char* configured = std::getenv("MINISQL_SORT_MEMORY_ROWS")) {
         char* end = nullptr;const auto parsed = std::strtoull(configured, &end, 10);
         if (end && *end == '\0' && parsed > 0 && parsed <= 1000000) sortMemoryRows_ = static_cast<std::size_t>(parsed);
@@ -467,9 +432,49 @@ Database::Database(const std::filesystem::path& path, std::size_t frames, storag
     sortTempDirectory_ = std::getenv("MINISQL_TEMP_DIR") ? std::filesystem::path(std::getenv("MINISQL_TEMP_DIR")) : path.parent_path() / ".minisql-sort";
     if (const char* configured = std::getenv("MINISQL_SESSION_ID"); configured && *configured) sessionId_ = configured;
     if (const char* configured = std::getenv("MINISQL_CANCEL_FILE"); configured && *configured) cancelFile_ = configured;
+    if (const char* configured = std::getenv("MINISQL_BACKGROUND_CHECKPOINT_MS")) {
+        char* end = nullptr;const auto parsed = std::strtoull(configured, &end, 10);
+        if (end && *end == '\0' && parsed > 0 && parsed <= 3600000) backgroundCheckpointMs_ = static_cast<std::size_t>(parsed);
+    }
     for (const auto& table : catalog_.tables()) rebuildIndexes(table.id);
+    if (backgroundCheckpointMs_ > 0) {
+        scheduler_ = std::thread([this] { backgroundSchedulerLoop(); });
+    }
 }
-Database::~Database() = default;
+Database::~Database() {
+    if (backgroundCheckpointMs_ > 0) {
+        {
+            std::lock_guard<std::mutex> lock(schedulerMutex_);
+            schedulerStop_.store(true);
+        }
+        schedulerCv_.notify_all();
+        if (scheduler_.joinable()) scheduler_.join();
+    }
+}
+
+void Database::synchronizeAccessCatalog(const nlohmann::json& document, std::uint32_t permissionVersion) {
+    std::lock_guard<std::recursive_mutex> guard(mu_);
+    requireAvailable();
+    if (transaction_ != TransactionState::Idle)
+        throw MiniSqlError(ErrorCode::Transaction, "Cannot synchronize access catalog during an active transaction");
+    const auto payload = document.dump();
+    const auto existing = catalog_.accessCatalogRecord();
+    if (existing && existing->permissionVersion >= permissionVersion) {
+        if (existing->permissionVersion == permissionVersion && existing->payload != payload)
+            throw MiniSqlError(ErrorCode::Catalog, "Access catalog version conflict");
+        return;
+    }
+    buffer_.beginWriteBatch();
+    try {
+        catalog_.storeAccessCatalog(permissionVersion, payload);
+        buffer_.commitWriteBatch();
+        catalog_.reload();
+    } catch (...) {
+        if (file_->writeBatchActive()) buffer_.rollbackWriteBatch();
+        throw;
+    }
+    ++catalogVersion_;
+}
 
 void Database::setSessionContext(const std::string& sessionId, const std::filesystem::path& cancelFile) {
     sessionId_ = sessionId;
@@ -487,87 +492,95 @@ void Database::checkCancelled() const {
     if (cancelled) throw MiniSqlError(ErrorCode::Cancelled, "Query cancelled");
 }
 nlohmann::json Database::compile(const std::string& source) const {
+    std::lock_guard<std::recursive_mutex> guard(mu_);
     requireAvailable();
     if (transaction_ == TransactionState::Aborted) throw MiniSqlError(ErrorCode::Transaction, "Transaction aborted; ROLLBACK required");
     const auto tokens = sql::tokenize(source);
     const auto ast = sql::parse(tokens);
     const auto plans = sql::compilePlans(ast, catalog_.view());
-    optimizer::Options optimizerOptions;
-    optimizerOptions.tableRows = [this](const std::string& name) { return estimatedTableRows(name); };
-    // X18 4.2-iv: 惰性列级选择率——仅当优化器真的需要对 Filter 估算时才扫一次列统计。
-    std::optional<std::map<std::string, json>> byTable;
-    optimizerOptions.selectivity = [this, &byTable](const json& predicate, const std::string& table) -> double {
-        if (!byTable) byTable = tableStats();
-        return columnSelectivity(*byTable, predicate, table);
-    };
-    const auto optimized = optimizer::optimize(plans, optimizerOptions);
-    // X18 4.3: 顶层 plan/optimizedPlan 每个节点附上 estimatedRows/estimatedCost/statsSource，
-    // 与 EXPLAIN 展示路径同源的统计口径（estimatedTableRows + columnSelectivity）。
-    const auto annotatedRaw = annotatePlanEstimates(sql::serializePlans(plans), plans);
-    const auto annotatedOpt = annotatePlanEstimates(sql::serializePlans(optimized.plans), optimized.plans);
-    return {{"success", true}, {"plan", annotatedRaw}, {"optimizedPlan", annotatedOpt},
+    const auto optimized = optimizer::optimize(plans);
+    return {{"success", true}, {"plan", sql::serializePlans(plans)}, {"optimizedPlan", sql::serializePlans(optimized.plans)},
             {"optimizationRules", optimized.changes}, {"statements", ast.size()},
             {"optimizer", {{"iterations", optimized.iterations}, {"converged", optimized.converged},
                            {"diagnostics", optimized.diagnostics}, {"rules", optimizer::ruleDescriptors()}}},
             {"tokens", sql::serializeTokens(tokens)}, {"ast", sql::serializeAst(ast)},
             {"schemaVersion", 1}, {"planKind", "logical"},
-            {"estimateModel", "stats-v1"}, {"estimatedRowsAvailable", true},
             {"stages", {{"lexer", "passed"}, {"parser", "passed"}, {"semantic", "passed"},
                         {"planner", "passed"}, {"optimizer", "passed"}, {"executor", "notRun"}}}};
 }
-// X18 4.3: 为序列化计划节点附加成本/估计元数据。节点 DFS 顺序与 serializePlans 的 id 一致
-// （id 即 nodes 下标）。行数用 optimizedTableRows（与优化器同源），过滤选择率用惰性
-// columnSelectivity（仅当存在 Filter 时扫一次列统计）。
-nlohmann::json Database::annotatePlanEstimates(const nlohmann::json& serialized, const std::vector<sql::LogicalPlan>& plans) const {
-    std::vector<const sql::LogicalPlan*> nodes;
-    std::function<void(const sql::LogicalPlan&)> visit = [&](const sql::LogicalPlan& plan) {
-        nodes.push_back(&plan);
-        for (const auto& child : plan.children) visit(child);
-    };
-    for (const auto& plan : plans) visit(plan);
-    std::optional<std::map<std::string, json>> byTable;
-    const auto selectivity = [&](const json& predicate, const std::string& table) -> double {
-        if (!byTable) byTable = tableStats();
-        return columnSelectivity(*byTable, predicate, table);
-    };
-    const auto tableRows = [&](const std::string& name) -> double { return estimatedTableRows(name).value_or(0.0); };
-    std::function<std::pair<double, double>(const sql::LogicalPlan&)> estimate;
-    estimate = [&](const sql::LogicalPlan& plan) -> std::pair<double, double> {
-        if (plan.kind == "SeqScan") { const auto rows = tableRows(plan.table); return {rows, rows + rows * 0.1}; }
-        if (plan.kind == "IndexScan") {
-            if (!byTable) byTable = tableStats();
-            const auto rows = tableRows(plan.table) * indexScanSelectivity(*byTable, plan.table, plan.indexColumns, plan.indexValues, plan.indexRangeOperator, plan.indexRangeValue);
-            return {rows, rows + rows * 0.05};
+
+std::vector<std::string> Database::resolveAccessObjects(const std::string& source) const {
+    std::lock_guard<std::recursive_mutex> guard(mu_);
+    requireAvailable();
+    try {
+        auto tokens = sql::tokenize(source);
+        if (!tokens.empty() && key(tokens.front().lexeme) == "explain") {
+            tokens.erase(tokens.begin());
+            if (!tokens.empty() && key(tokens.front().lexeme) == "analyze") tokens.erase(tokens.begin());
         }
-        if (plan.children.empty()) return {0.0, 1.0};
-        auto child = estimate(plan.children.front());
-        if (plan.kind == "Filter") { const auto rows = child.first * selectivity(plan.predicate, plan.table); return {rows, child.second + rows}; }
-        if (plan.kind == "Sort") { const auto rows = child.first; return {rows, child.second + rows * std::log2(std::max(1.0, rows))}; }
-        if (plan.kind == "Limit") return {plan.limit ? std::min(child.first, static_cast<double>(*plan.limit)) : child.first, child.second};
-        if (plan.kind == "Distinct") return {child.first * 0.5, child.second + child.first * 0.5};
-        if (plan.kind == "Aggregate") return {plan.groupKeys.empty() ? 1.0 : std::min(child.first * 0.1, 1000.0), child.second + child.first};
-        if (plan.kind == "NestedLoopJoin" || plan.kind == "LeftJoin" || plan.kind == "RightJoin" || plan.kind == "FullJoin" || plan.kind == "HashJoin") {
-            if (plan.children.size() != 2) return {0.0, child.second};
-            const auto right = estimate(plan.children[1]);
-            const auto joined = child.first * right.first;
-            const auto cost = child.second + right.second + (plan.kind == "HashJoin" ? child.first + right.first : joined * 0.1);
-            return {joined * (plan.kind == "HashJoin" ? 1.0 : 0.1), cost};
+        const auto statements = sql::parse(tokens);
+        std::vector<std::string> result;
+        std::unordered_set<std::string> seen;
+        const auto add = [&](const std::string& name) {
+            if (name.empty()) return;
+            const auto* bound = catalog_.view().find(name);
+            const auto resolved = key(bound ? bound->name : name);
+            if (seen.insert(resolved).second) result.push_back(resolved);
+        };
+        std::function<void(const sql::Statement&)> visitStatement;
+        std::function<void(const std::shared_ptr<sql::Expr>&)> visitExpression;
+        visitExpression = [&](const std::shared_ptr<sql::Expr>& expression) {
+            if (!expression) return;
+            visitExpression(expression->left);
+            visitExpression(expression->right);
+            if (expression->subquery) visitStatement(*expression->subquery);
+            else if (!expression->subquerySql.empty()) {
+                try {
+                    auto nestedSql = expression->subquerySql;
+                    const auto last = nestedSql.find_last_not_of(" \t\r\n");
+                    if (last == std::string::npos || nestedSql[last] != ';') nestedSql += ';';
+                    for (const auto& nested : sql::parse(sql::tokenize(nestedSql))) visitStatement(nested);
+                } catch (const MiniSqlError&) {
+                    // 不完整子查询由入口层保留现有保守对象扫描结果。
+                }
+            }
+        };
+        visitStatement = [&](const sql::Statement& statement) {
+            if (!statement.fromSubquery && !statement.table.empty()) add(statement.table);
+            for (const auto& join : statement.joins) add(join.table);
+            for (const auto& foreignKey : statement.foreignKeys) add(foreignKey.table);
+            for (const auto& column : statement.columns)
+                if (column.references) add(column.references->first);
+            if (statement.fromSubquery) visitStatement(*statement.fromSubquery);
+            visitExpression(statement.where);
+            visitExpression(statement.having);
+            for (const auto& item : statement.selectItems) visitExpression(item.expression);
+            for (const auto& item : statement.orderBy) visitExpression(item.expression);
+            for (const auto& item : statement.assignments) visitExpression(item.expression);
+            for (const auto& item : statement.groupBy) visitExpression(item);
+            for (const auto& item : statement.checks) visitExpression(item);
+            for (const auto& item : statement.valueExpressions) visitExpression(item);
+            for (const auto& row : statement.valueRows)
+                for (const auto& item : row) visitExpression(item);
+            for (const auto& join : statement.joins) visitExpression(join.on);
+        };
+        for (const auto& statement : statements) visitStatement(statement);
+        return result;
+    } catch (const MiniSqlError&) {
+        std::vector<MiniSqlError> lexicalErrors;
+        const auto tokens = sql::tokenizeRecoverable(source, lexicalErrors);
+        std::vector<std::string> result;
+        std::unordered_set<std::string> seen;
+        for (const auto& object : lexicalAccessObjects(tokens)) {
+            const auto* bound = catalog_.view().find(object);
+            const auto resolved = key(bound ? bound->name : object);
+            if (seen.insert(resolved).second) result.push_back(resolved);
         }
-        return {child.first, child.second + child.first};
-    };
-    json output = serialized;
-    for (auto& node : output) {
-        if (!node.is_object() || !node.contains("id") || !node.at("id").is_number_unsigned()) continue;
-        const auto index = node.at("id").get<std::size_t>();
-        if (index >= nodes.size()) continue;
-        const auto estimated = estimate(*nodes[index]);
-        node["estimatedRows"] = estimated.first;
-        node["estimatedCost"] = estimated.second;
-        node["statsSource"] = "stats-v1";
+        return result;
     }
-    return output;
 }
 nlohmann::json Database::catalog() {
+    std::lock_guard<std::recursive_mutex> guard(mu_);
     requireAvailable();
     json tables = json::array();
     for (const auto& table : catalog_.tables()) {
@@ -585,7 +598,7 @@ nlohmann::json Database::catalog() {
                 for (const auto& runtime : indexes_)
                     if (key(runtime->table) == key(table.definition.table) && key(runtime->name) == key(index.name)) {
                         entry["pageCount"] = file_->pagesFor(indexOwnerId(runtime->table, runtime->name)).size();
-                        entry["height"] = runtime->tree.height();
+                        entry["height"] = runtime->height();
                     }
                 indexes.push_back(std::move(entry));
             }
@@ -598,16 +611,175 @@ nlohmann::json Database::catalog() {
     return {{"tables", tables}, {"buffer", bufferStatus()}, {"schemaVersion", catalog_.catalogSchemaVersion()}};
 }
 nlohmann::json Database::checkpoint() {
+    std::lock_guard<std::recursive_mutex> guard(mu_);
     requireAvailable();
     if (transaction_ != TransactionState::Idle) throw MiniSqlError(ErrorCode::Transaction, "CHECKPOINT requires an idle transaction");
     buffer_.flushAll();
-    file_->checkpoint();
+    file_->checkpoint({catalogVersion_, indexVersion_});
     pendingAutoCheckpointWrites_ = 0;
     pendingAutoCheckpointWalBytes_ = 0;
     lastCheckpointAt_ = std::chrono::steady_clock::now();
     lastCheckpointAtMs_ = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count());
     return {{"success", true}, {"kind", "Checkpoint"}, {"wal", "truncated"}};
+}
+
+class ScanRowStream : public RowStream {
+public:
+    ScanRowStream(storage::HeapStore& heap, std::uint64_t tableId, storage::RowSchema schema)
+        : heap_(heap), tableId_(tableId), schema_(std::move(schema)) {
+        refs_ = heap_.refsFor(tableId_);
+    }
+    bool next(nlohmann::json& row) override {
+        if (cancelled_) throw MiniSqlError(ErrorCode::Cancelled, "Query cancelled");
+        if (cursor_ >= refs_.size()) return false;
+        row = rowJson(heap_.read(tableId_, schema_, refs_[cursor_]));
+        ++cursor_;
+        ++rows_;
+        return true;
+    }
+    void cancel() override { cancelled_ = true; }
+    void close() override { closed_ = true; }
+    nlohmann::json resourceUsage() const override {
+        return {{"kind", "ScanRowStream"}, {"rows", rows_}, {"pending", refs_.size() > cursor_ ? refs_.size() - cursor_ : 0}, {"closed", closed_}};
+    }
+private:
+    storage::HeapStore& heap_;
+    std::uint64_t tableId_;
+    storage::RowSchema schema_;
+    std::vector<storage::RowRef> refs_;
+    std::size_t cursor_ = 0;
+    std::size_t rows_ = 0;
+    bool cancelled_ = false;
+    bool closed_ = false;
+};
+
+class FilterRowStream : public RowStream {
+public:
+    FilterRowStream(std::unique_ptr<RowStream> child, std::function<bool(const nlohmann::json&)> predicate)
+        : child_(std::move(child)), predicate_(std::move(predicate)) {}
+    bool next(nlohmann::json& row) override {
+        while (child_->next(row)) if (predicate_(row)) return true;
+        return false;
+    }
+    void cancel() override { cancelled_ = true; child_->cancel(); }
+    void close() override { child_->close(); }
+    nlohmann::json resourceUsage() const override {
+        return {{"kind", "FilterRowStream"}, {"rows", rows_}, {"pending", pending_}, {"cancelled", cancelled_}};
+    }
+private:
+    std::unique_ptr<RowStream> child_;
+    std::function<bool(const nlohmann::json&)> predicate_;
+    std::size_t rows_ = 0;
+    bool pending_ = false;
+    bool cancelled_ = false;
+};
+
+class ProjectRowStream : public RowStream {
+public:
+    ProjectRowStream(std::unique_ptr<RowStream> child, std::function<nlohmann::json(const nlohmann::json&)> project)
+        : child_(std::move(child)), project_(std::move(project)) {}
+    bool next(nlohmann::json& row) override {
+        nlohmann::json input;
+        if (!child_->next(input)) return false;
+        row = project_(input);
+        ++rows_;
+        return true;
+    }
+    void cancel() override { child_->cancel(); }
+    void close() override { child_->close(); }
+    nlohmann::json resourceUsage() const override {
+        return {{"kind", "ProjectRowStream"}, {"rows", rows_}};
+    }
+private:
+    std::unique_ptr<RowStream> child_;
+    std::function<nlohmann::json(const nlohmann::json&)> project_;
+    std::size_t rows_ = 0;
+};
+
+class LimitRowStream : public RowStream {
+public:
+    LimitRowStream(std::unique_ptr<RowStream> child, std::uint64_t offset, std::optional<std::uint64_t> limit)
+        : child_(std::move(child)), offset_(offset), limit_(limit) {}
+    bool next(nlohmann::json& row) override {
+        if (limit_ && emitted_ >= *limit_) return false;
+        while (skipped_ < offset_) {
+            nlohmann::json discarded;
+            if (!child_->next(discarded)) return false;
+            ++skipped_;
+        }
+        if (!child_->next(row)) return false;
+        ++emitted_;
+        return true;
+    }
+    void cancel() override { child_->cancel(); }
+    void close() override { child_->close(); }
+    nlohmann::json resourceUsage() const override {
+        return {{"kind", "LimitRowStream"}, {"rows", emitted_}, {"skipped", skipped_}};
+    }
+private:
+    std::unique_ptr<RowStream> child_;
+    std::uint64_t offset_ = 0;
+    std::optional<std::uint64_t> limit_;
+    std::uint64_t skipped_ = 0;
+    std::uint64_t emitted_ = 0;
+};
+
+class MaterializedRowStream : public RowStream {
+public:
+    explicit MaterializedRowStream(nlohmann::json rows) : rows_(std::move(rows)) {}
+    bool next(nlohmann::json& row) override {
+        if (cursor_ >= rows_.size()) return false;
+        row = rows_.at(cursor_++);
+        return true;
+    }
+    void cancel() override { cancelled_ = true; }
+    void close() override { closed_ = true; }
+    nlohmann::json resourceUsage() const override {
+        return {{"kind", "MaterializedRowStream"}, {"rows", rows_.size()}, {"emitted", cursor_}, {"closed", closed_}, {"cancelled", cancelled_}};
+    }
+private:
+    nlohmann::json rows_ = nlohmann::json::array();
+    std::size_t cursor_ = 0;
+    bool cancelled_ = false;
+    bool closed_ = false;
+};
+
+nlohmann::json Database::createSnapshot(const std::filesystem::path& target) {
+    std::lock_guard<std::recursive_mutex> guard(mu_);
+    requireAvailable();
+    file_->copyTo(target);
+    const auto& record = file_->checkpointRecord();
+    return {{"success", true}, {"kind", "Snapshot"}, {"target", target.string()},
+        {"walBytes", file_->walBytes()}, {"walCutoffBytes", record.walCutoffBytes},
+        {"committedSequence", record.committedSequence}, {"catalogVersion", record.catalogVersion},
+        {"indexVersion", record.indexVersion}};
+}
+nlohmann::json Database::indexInspect(const std::string& table, const std::string& index) {
+    std::lock_guard<std::recursive_mutex> guard(mu_);
+    requireAvailable();
+    const RuntimeIndex* found = nullptr;
+    for (const auto& candidate : indexes_)
+        if (key(candidate->table) == key(table) && key(candidate->name) == key(index)) { found = candidate.get(); break; }
+    if (!found) throw MiniSqlError(ErrorCode::Catalog, "Index not found: " + index);
+    if (!found->pageFile)
+        return {{"kind", "IndexInspect"}, {"table", found->table}, {"index", found->name}, {"present", false},
+                {"storage", "memory"}, {"message", "page-level structure only available on the page-file engine"}};
+    const auto state = found->pageTree->inspect();
+    std::vector<nlohmann::json> pages;
+    pages.reserve(state.pages.size());
+    const auto refJson = [](const storage::PageRef& ref) { return nlohmann::json{{"id", ref.id}, {"generation", ref.generation}}; };
+    for (const auto& info : state.pages)
+        pages.push_back({{"page", refJson(info.page)}, {"leaf", info.leaf}, {"height", info.height}, {"keyCount", info.keyCount},
+                         {"parent", refJson(info.parent)}, {"left", refJson(info.left)}, {"right", refJson(info.right)}});
+    nlohmann::json problems = nlohmann::json::array();
+    for (const auto& problem : state.problems) problems.push_back(problem);
+    return {{"kind", "IndexInspect"}, {"table", found->table}, {"index", found->name},
+            {"present", state.present}, {"root", refJson(state.root)}, {"height", state.height},
+            {"nodeCount", state.nodeCount}, {"leafCount", state.leafCount}, {"rowCount", state.rowCount},
+            {"leafChainLength", state.leafChainLength}, {"rootReachable", state.rootReachable},
+            {"leafChainLinked", state.leafChainLinked}, {"parentLinksValid", state.parentLinksValid},
+            {"storage", "page-file"}, {"problems", std::move(problems)}, {"pages", std::move(pages)}};
 }
 void Database::evaluateAutoCheckpoint(std::size_t committedWriteStatements, std::size_t committedDirtyPages) {
     if (committedWriteStatements == 0) return;
@@ -630,7 +802,7 @@ void Database::evaluateAutoCheckpoint(std::size_t committedWriteStatements, std:
     if (autoCheckpointIntervalMs_ > 0 && elapsedMs >= autoCheckpointIntervalMs_) reasons.push_back("interval");
     if (reasons.empty()) return;
     buffer_.flushAll();
-    file_->checkpoint();
+    file_->checkpoint({catalogVersion_, indexVersion_});
     ++checkpointCount_;
     pendingAutoCheckpointWrites_ = 0;
     pendingAutoCheckpointWalBytes_ = 0;
@@ -640,9 +812,49 @@ void Database::evaluateAutoCheckpoint(std::size_t committedWriteStatements, std:
         std::chrono::system_clock::now().time_since_epoch()).count());
     lastAutoCheckpointAtMs_ = lastCheckpointAtMs_;
 }
+void Database::evaluateBackgroundCheckpoint() {
+    if (unavailable_) return;
+    std::vector<std::string> reasons;
+    const auto dirtyPages = buffer_.dirtyPages();
+    const auto dirtyRatio = buffer_.capacity() == 0 ? 0.0 : std::min(1.0, static_cast<double>(dirtyPages) / static_cast<double>(buffer_.capacity()));
+    const auto now = std::chrono::steady_clock::now();
+    const auto elapsedMs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(now - lastCheckpointAt_).count());
+    if (autoCheckpointWrites_ > 0 && pendingAutoCheckpointWrites_ >= autoCheckpointWrites_) reasons.push_back("writes");
+    if (autoCheckpointWalBytes_ > 0 && pendingAutoCheckpointWalBytes_ >= autoCheckpointWalBytes_) reasons.push_back("wal-bytes");
+    if (autoCheckpointDirtyPages_ > 0 && dirtyPages >= autoCheckpointDirtyPages_) reasons.push_back("dirty-pages");
+    if (autoCheckpointDirtyRatio_ > 0.0 && dirtyRatio >= autoCheckpointDirtyRatio_) reasons.push_back("dirty-ratio");
+    if (autoCheckpointIntervalMs_ > 0 && elapsedMs >= autoCheckpointIntervalMs_) reasons.push_back("interval");
+    schedulerLastEvaluateMs_ = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count());
+    if (reasons.empty()) return;
+    // 后台线程仅在空闲且事务空闲时执行检查点，绝不在活动事务提交点之前截断未提交日志。
+    if (transaction_ != TransactionState::Idle) { schedulerDeferredReasons_ = std::move(reasons); return; }
+    buffer_.flushAll();
+    file_->checkpoint({catalogVersion_, indexVersion_});
+    ++checkpointCount_;
+    pendingAutoCheckpointWrites_ = 0;
+    pendingAutoCheckpointWalBytes_ = 0;
+    lastAutoCheckpointReasons_ = std::move(reasons);
+    lastCheckpointAt_ = now;
+    lastCheckpointAtMs_ = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count());
+    lastAutoCheckpointAtMs_ = lastCheckpointAtMs_;
+    schedulerLastRunMs_ = lastCheckpointAtMs_;
+    schedulerDeferredReasons_.clear();
+}
+void Database::backgroundSchedulerLoop() {
+    std::unique_lock<std::mutex> lock(schedulerMutex_);
+    while (true) {
+        schedulerCv_.wait_for(lock, std::chrono::milliseconds(backgroundCheckpointMs_),
+            [&] { return schedulerStop_.load(); });
+        if (schedulerStop_.load()) break;
+        std::lock_guard<std::recursive_mutex> dbLock(mu_);
+        evaluateBackgroundCheckpoint();
+    }
+}
 std::string Database::tableFingerprint(std::uint64_t tableId) {
     const catalog::StoredTable* stored = nullptr;
-    for (const auto& table : catalog_.tables()) if (table.id == tableId) { stored = &table; break; }
+    for (const auto& table : catalog_.tables()) if (static_cast<std::uint64_t>(table.id) == tableId) { stored = &table; break; }
     if (!stored) throw MiniSqlError(ErrorCode::Catalog, "Index table identity not found");
     std::uint64_t hash = 1469598103934665603ULL;
     const auto mix = [&](const std::uint8_t* bytes, std::size_t size) {
@@ -722,7 +934,7 @@ bool Database::loadIndexPages(storage::BPlusTree& tree, std::uint64_t owner, con
 }
 void Database::rebuildIndexes(std::uint64_t tableId) {
     const catalog::StoredTable* stored = nullptr;
-    for (const auto& table : catalog_.tables()) if (table.id == tableId) { stored = &table; break; }
+    for (const auto& table : catalog_.tables()) if (static_cast<std::uint64_t>(table.id) == tableId) { stored = &table; break; }
     if (!stored) throw MiniSqlError(ErrorCode::Catalog, "Index table identity not found");
     const auto* definition = catalog_.view().find(stored->definition.table);
     if (!definition) throw MiniSqlError(ErrorCode::Catalog, "Index table definition not found");
@@ -732,8 +944,21 @@ void Database::rebuildIndexes(std::uint64_t tableId) {
     for (const auto& index : definition->indexes) {
         std::vector<std::size_t> columns;
         for (const auto& name : index.columns) columns.push_back(catalog::resolveColumnIndex(*definition, name));
-        auto runtime = std::make_unique<RuntimeIndex>(index.name, stored->definition.table, columns, index.unique);
+        auto runtime = std::make_unique<RuntimeIndex>(index.name, stored->definition.table, columns, index.unique, pageFileIndexes_);
         const auto owner = indexOwnerId(stored->definition.table, index.name);
+        if (pageFileIndexes_) {
+            // 页级引擎主路径：每次重建清旧页后从堆全量建树，索引页与堆页同属一个
+            // PageFile/WAL，随写批次原子落盘/回滚，因而总是与堆一致（无需指纹复用来判断陈旧）。
+            clearIndexPages(owner);
+            runtime->pageTree = std::make_unique<storage::PageBPlusTree>(file_, buffer_, owner, 64, index.unique);
+            if (!runtime->pageTree->create()) throw MiniSqlError(ErrorCode::Catalog, "Failed to create page index: " + index.name);
+            heap_.scan(tableId, schema, [&](storage::RowRef ref, const storage::Row& row) {
+                storage::IndexKey key;
+                for (const auto column : columns) key.values.push_back(row[column]);
+                if (!runtime->pageTree->insert(std::move(key), ref)) throw MiniSqlError(ErrorCode::Execution, "UNIQUE index violation: " + index.name);
+            });
+            indexes_.push_back(std::move(runtime));continue;
+        }
         if (!std::getenv("MINISQL_REBUILD_INDEXES") && loadIndexPages(runtime->tree, owner, fingerprint)) {
             indexes_.push_back(std::move(runtime));continue;
         }
@@ -748,13 +973,13 @@ void Database::rebuildIndexes(std::uint64_t tableId) {
 }
 void Database::validateUniqueIndexes(std::uint64_t tableId, const storage::Row& row, const std::optional<storage::RowRef>& ignored) {
     const catalog::StoredTable* stored = nullptr;
-    for (const auto& table : catalog_.tables()) if (table.id == tableId) { stored = &table; break; }
+    for (const auto& table : catalog_.tables()) if (static_cast<std::uint64_t>(table.id) == tableId) { stored = &table; break; }
     if (!stored) throw MiniSqlError(ErrorCode::Catalog, "Index table identity not found");
     for (const auto& index : indexes_) {
         if (key(index->table) != key(stored->definition.table) || !index->unique) continue;
         storage::IndexKey key;
         for (const auto column : index->columns) key.values.push_back(row[column]);
-        const auto matches = index->tree.search(key);
+        const auto matches = index->search(key);
         for (const auto& match : matches) {
             if (ignored && match.page.id == ignored->page.id && match.page.generation == ignored->page.generation &&
                 match.slot.slot == ignored->slot.slot && match.slot.generation == ignored->slot.generation) continue;
@@ -762,71 +987,88 @@ void Database::validateUniqueIndexes(std::uint64_t tableId, const storage::Row& 
         }
     }
 }
-std::optional<double> Database::estimatedTableRows(const std::string& tableName) const {
-    for (const auto& table : catalog_.tables())
-        if (key(table.definition.table) == key(tableName)) {
-            double rows = 0;
-            heap_.scan(table.id, rowSchema(table.definition), [&](storage::RowRef, const storage::Row&) { ++rows; });
-            return rows;
-        }
-    return std::nullopt;
-}
-
-// X18 4.2-iv: const 的值扫描列统计——单遍扫描构造各表 JSON（含数值列等宽直方图、
-// min/max、基数、NULL 计数与比例）。statistics() 复用其构造输出，compile/execute 的
-// 优化器列级选择率（Options.selectivity）也在其中惰性构建取用。
-std::map<std::string, nlohmann::json> Database::tableStats() const {
-    std::map<std::string, json> byTable;
+// X18: 实时单遍扫描构造各表统计（表/列/索引）。ANALYZE 用它生成快照，
+// statistics() 在无快照时也回退到它。
+nlohmann::json Database::liveTableStatistics() {
+    json tables = json::array();
     for (const auto& table : catalog_.tables()) {
         const auto schema = rowSchema(table.definition);
         std::vector<std::set<json>> distinct(schema.size());
         std::vector<std::uint64_t> nulls(schema.size(), 0);
+        std::vector<std::optional<json>> minimum(schema.size());
+        std::vector<std::optional<json>> maximum(schema.size());
+        std::vector<std::map<std::string, std::pair<json, std::uint64_t>>> frequencies(schema.size());
         std::uint64_t rowCount = 0;
         heap_.scan(table.id, schema, [&](storage::RowRef, const storage::Row& row) {
             ++rowCount;
             for (std::size_t index = 0; index < row.size(); ++index) {
                 if (std::holds_alternative<std::monostate>(row[index])) ++nulls[index];
-                else distinct[index].insert(cell(row[index]));
+                else {
+                    auto value = cell(row[index]);
+                    distinct[index].insert(value);
+                    if (!minimum[index] || value < *minimum[index]) minimum[index] = value;
+                    if (!maximum[index] || *maximum[index] < value) maximum[index] = value;
+                    auto& bucket = frequencies[index][value.dump()];
+                    bucket.first = std::move(value);
+                    ++bucket.second;
+                }
             }
         });
         json columns = json::array();
         for (std::size_t index = 0; index < table.definition.columns.size(); ++index) {
-            const auto type = key(table.definition.columns[index].type);
-            json column = {{"name", table.definition.columns[index].name},
-                {"columnId", index}, {"type", type},
-                {"distinctCount", distinct[index].size()},
-                {"nullCount", nulls[index]},
-                {"nullRatio", rowCount == 0 ? 0.0 : static_cast<double>(nulls[index]) / static_cast<double>(rowCount)}};
+            std::vector<std::pair<std::string, std::pair<json, std::uint64_t>>> ranked(frequencies[index].begin(), frequencies[index].end());
+            std::sort(ranked.begin(), ranked.end(), [](const auto& left, const auto& right) {
+                if (left.second.second != right.second.second) return left.second.second > right.second.second;
+                return left.first < right.first;
+            });
+            if (ranked.size() > 8) ranked.resize(8);
+            json histogram = json::array();
+            json valueHistogram = json::array();
+            for (const auto& [keyValue, entry] : ranked) {
+                (void)keyValue;
+                histogram.push_back({{"value", entry.first}, {"count", entry.second}});
+            }
             if (!distinct[index].empty()) {
-                column["min"] = *distinct[index].begin();
-                column["max"] = *distinct[index].rbegin();
-                if (type == "int" || type == "bigint" || type == "float") {
-                    // X18: 单遍扫描的 distinct 值等宽直方图（数值列）。
-                    const auto span = distinct[index].rbegin()->get<double>() - distinct[index].begin()->get<double>();
-                    auto lower = distinct[index].begin()->get<double>();
-                    auto upper = distinct[index].rbegin()->get<double>();
-                    if (lower > upper) std::swap(lower, upper);
-                    const std::size_t buckets = std::min<std::size_t>(16, distinct[index].size());
-                    std::vector<std::size_t> counts(buckets, 0);
-                    const double width = upper - lower;
-                    for (const auto& value : distinct[index]) {
-                        double position = width == 0.0 ? 0.0 : (value.get<double>() - lower) / width;
-                        if (position < 0.0) position = 0.0;
-                        else if (position > 1.0) position = 1.0;
-                        const auto slot = position == 1.0 ? buckets - 1 : static_cast<std::size_t>(position * buckets);
-                        ++counts[slot];
+                const std::vector<json> ordered(distinct[index].begin(), distinct[index].end());
+                const auto bucketCount = std::min<std::size_t>(8, ordered.size());
+                for (std::size_t bucket = 0; bucket < bucketCount; ++bucket) {
+                    const auto begin = bucket * ordered.size() / bucketCount;
+                    const auto end = (bucket + 1) * ordered.size() / bucketCount;
+                    if (begin >= end) continue;
+                    const auto& lower = ordered[begin];
+                    const auto& upper = ordered[end - 1];
+                    std::uint64_t count = 0;
+                    for (const auto& [keyValue, entry] : frequencies[index]) {
+                        (void)keyValue;
+                        if (!(entry.first < lower) && !(upper < entry.first)) count += entry.second;
                     }
-                    column["histogram"] = {{"bucketCount", buckets}, {"min", lower}, {"max", upper},
-                        {"span", span}, {"buckets", counts}};
+                    valueHistogram.push_back({{"lower", lower}, {"upper", upper}, {"count", count}});
                 }
             }
-            columns.push_back(std::move(column));
+            columns.push_back({{"name", table.definition.columns[index].name},
+                {"columnId", index}, {"type", key(table.definition.columns[index].type)},
+                {"distinctCount", distinct[index].size()},
+                {"nullCount", nulls[index]},
+                {"nullRatio", rowCount == 0 ? 0.0 : static_cast<double>(nulls[index]) / static_cast<double>(rowCount)},
+                {"minValue", minimum[index] ? *minimum[index] : json(nullptr)},
+                {"maxValue", maximum[index] ? *maximum[index] : json(nullptr)},
+                {"histogram", std::move(histogram)}, {"valueHistogram", std::move(valueHistogram)}});
         }
-        byTable[key(table.definition.table)] = {{"name", table.definition.table}, {"tableId", table.id},
-            {"rowCount", rowCount}, {"allocatedPages", file_->pagesFor(table.id).size()}, {"columns", columns}};
+        json indexes = json::array();
+        for (const auto& definition : table.definition.indexes) {
+            const RuntimeIndex* runtime = nullptr;
+            for (const auto& candidate : indexes_) if (key(candidate->table) == key(table.definition.table) && key(candidate->name) == key(definition.name)) { runtime = candidate.get(); break; }
+            indexes.push_back({{"name", definition.name}, {"columns", definition.columns}, {"unique", definition.unique},
+                {"entries", runtime ? runtime->size() : 0}, {"height", runtime ? runtime->height() : 1},
+                {"pageCount", runtime && runtime->pageFile ? file_->pagesFor(indexOwnerId(table.definition.table, definition.name)).size() : 0},
+                {"statsSource", runtime ? (runtime->pageFile ? "page-bplus-tree" : "memory-bplus-tree") : "missing"}});
+        }
+        tables.push_back({{"name", table.definition.table}, {"tableId", table.id}, {"rowCount", rowCount},
+            {"allocatedPages", file_->pagesFor(table.id).size()}, {"columns", columns}, {"indexes", std::move(indexes)}});
     }
-    return byTable;
+    return tables;
 }
+// ANALYZE 快照的旁路路径：<db>.analyze.json。写语句成功后删除即失效。
 std::filesystem::path Database::analyzeMetadataPath() const {
     auto path = file_->path();
     path += ".analyze.json";
@@ -845,37 +1087,41 @@ std::optional<nlohmann::json> Database::loadAnalyzeMetadata() const {
         return document;
     } catch (const std::exception&) { return std::nullopt; }
 }
+void Database::invalidateAnalyzeSnapshot() const {
+    std::error_code ignored;
+    std::filesystem::remove(analyzeMetadataPath(), ignored);
+}
 nlohmann::json Database::statistics() {
+    std::lock_guard<std::recursive_mutex> guard(mu_);
     requireAvailable();
     // X18: 显式 ANALYZE 的持久快照优先（跨进程有效）；缺失或已被写语句删除时回退实时扫描。
     const auto analyzed = loadAnalyzeMetadata();
-    json tables = json::array();
-    if (analyzed) tables = analyzed->at("tables");
-    else {
-        // 复用 const 的 tableStats() 单遍扫描构造各表统计（供本输出与优化器列级选择率同源）。
-        const auto byTable = tableStats();
-        for (const auto& table : catalog_.tables())
-            tables.push_back(byTable.at(key(table.definition.table)));
-    }
+    const auto tables = analyzed ? analyzed->at("tables") : liveTableStatistics();
     const auto dirtyPages = buffer_.dirtyPages();
     const auto dirtyRatio = buffer_.capacity() == 0 ? 0.0 : static_cast<double>(dirtyPages) / static_cast<double>(buffer_.capacity());
+    const auto& record = file_->checkpointRecord();
     const auto analyzedAtMs = analyzed ? analyzed->value("analyzedAtMs", std::uint64_t{0}) : std::uint64_t{0};
-    const auto generatedAtMs = analyzed ? analyzedAtMs : static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+    const auto refreshedAt = analyzed ? analyzedAtMs : static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count());
-    return {{"success", true}, {"tables", tables}, {"scope", "table-and-column"},
+    return {{"success", true}, {"tables", tables}, {"scope", "table-column-index"},
         {"source", analyzed ? "analyze" : "on-demand-scan"},
-        {"version", "stats-v1-histogram"}, {"generatedAtMs", generatedAtMs}, {"lastAnalyzeAtMs", analyzedAtMs},
+        {"statisticsVersion", 1}, {"refreshedAt", refreshedAt}, {"histogramBuckets", 8},
+        {"generatedAtMs", refreshedAt}, {"lastAnalyzeAtMs", analyzedAtMs},
         {"checkpointCount", checkpointCount_}, {"autoCheckpointWrites", autoCheckpointWrites_},
         {"autoCheckpointWalBytes", autoCheckpointWalBytes_}, {"autoCheckpointDirtyPages", autoCheckpointDirtyPages_},
         {"autoCheckpointDirtyRatio", autoCheckpointDirtyRatio_}, {"autoCheckpointIntervalMs", autoCheckpointIntervalMs_},
         {"pendingAutoCheckpointWrites", pendingAutoCheckpointWrites_}, {"pendingAutoCheckpointWalBytes", pendingAutoCheckpointWalBytes_},
         {"walBytes", file_->walBytes()}, {"dirtyPages", dirtyPages}, {"dirtyPageRatio", dirtyRatio},
+        {"committedSequence", file_->committedSequence()}, {"dirtyWatermark", file_->dirtyWatermark()},
+        {"checkpointRecord", {{"present", record.present}, {"walCutoffBytes", record.walCutoffBytes},
+            {"dirtyWatermark", record.dirtyWatermark}, {"catalogVersion", record.catalogVersion},
+            {"indexVersion", record.indexVersion}, {"committedSequence", record.committedSequence},
+            {"timestampMs", record.timestampMs}}},
         {"lastCheckpointAtMs", lastCheckpointAtMs_}, {"lastAutoCheckpointAtMs", lastAutoCheckpointAtMs_},
         {"lastAutoCheckpointReasons", lastAutoCheckpointReasons_},
-        // X09 §6.17 后续 ②：绑定级 memo 的可观测计数（命中/未命中/驻留条目/数据版本）。
-        {"correlatedMemo", {{"hits", correlatedMemoHits_}, {"misses", correlatedMemoMisses_},
-            {"entries", correlatedRowsCache_.size()}, {"dataVersion", dataVersion_},
-            {"cacheVersion", correlatedRowsCacheVersion_}}}};
+        {"backgroundScheduler", {{"enabled", backgroundCheckpointMs_ > 0 && scheduler_.joinable()},
+            {"intervalMs", backgroundCheckpointMs_}, {"lastEvaluateMs", schedulerLastEvaluateMs_},
+            {"lastRunMs", schedulerLastRunMs_}, {"deferredReasons", schedulerDeferredReasons_}}}};
 }
 nlohmann::json Database::bufferStatus() const {
     const auto& stats = buffer_.stats();
@@ -898,6 +1144,7 @@ nlohmann::json Database::bufferStatus() const {
         {"stagedPageWrites", stats.stagedPageWrites}, {"evictions", evictions}};
 }
  nlohmann::json Database::configureBuffer(const std::string& action) {
+    std::lock_guard<std::recursive_mutex> guard(mu_);
     requireAvailable();
     if (transaction_ != TransactionState::Idle)
         throw MiniSqlError(ErrorCode::Transaction, "Buffer configuration requires an idle transaction");
@@ -910,86 +1157,7 @@ nlohmann::json Database::bufferStatus() const {
 std::vector<storage::Row> Database::joinRows(const sql::LogicalPlan& plan) {
     checkCancelled();
     std::vector<storage::Row> rows;
-    // 把左行按 paramBinding 绑定进运行参数环境（apply/semi 每次左行重设）。
-    const auto bindCorrelation = [&](const storage::Row& a) {
-        correlationParams_.clear();
-        correlationParams_.resize(plan.paramBinding.size());
-        for (const auto& entry : plan.paramBinding) {
-            const auto pid = entry.at("paramId").get<std::size_t>();
-            const auto col = entry.at("columnId").get<std::size_t>();
-            if (pid >= correlationParams_.size()) fail("Correlated paramId outside range");
-            if (col >= a.size()) fail("Correlated outer column outside row");
-            correlationParams_[pid] = cell(a[col]);
-        }
-    };
-    // X09 4.x: 相关子查询去相关节点 —— 右子计划为 compiled-once 结构化子计划，其
-    // 外层引用以 Parameter 节点表示；按 paramBinding 从每左行取值写入参数环境后
-    // in-process 运行右子计划（不再逐绑定值重新 compile/run 独立语句）。
-    if (plan.kind == "SemiJoin" || plan.kind == "AntiSemiJoin" || plan.kind == "Apply") {
-        if (plan.children.size() != 2) fail("Apply/SemiJoin requires two children");
-        const auto left = joinRows(plan.children[0]);
-        if (plan.kind == "SemiJoin" || plan.kind == "AntiSemiJoin") {
-            // X09 4.x: 半连接 —— 按 paramBinding 逐左行绑定后 in-process 运行右子计划。
-            // NOT EXISTS（无残差）以“右非空”判命中；IN/NOT IN（有残差）以右行等值成立判命中，
-            // 且 NOT IN 额外把“右值列 NULL”视为命中（SQL：子查询含 NULL 时 NOT IN 为 NULL→排除）。
-            const bool anti = plan.kind == "AntiSemiJoin";
-            const bool hasResidual = plan.predicate.is_object();
-            // 右子计划为单列（IN/NOT IN/buildRight inSubquery 已保证 output.size()==1），
-            // 其 NULL 值位于右行索引 0 处。
-            for (const auto& a : left) {
-                checkCancelled();
-                bindCorrelation(a);
-                const auto right = joinRows(plan.children[1]);
-                bool matched = false;
-                if (!hasResidual) {
-                    matched = !right.empty();
-                } else {
-                    for (const auto& b : right) {
-                        if (anti && !b.empty() && std::holds_alternative<std::monostate>(b[0])) { matched = true; break; }
-                        auto combined = a;
-                        combined.insert(combined.end(), b.begin(), b.end());
-                        if (accepted(evaluate(plan.predicate, combined))) { matched = true; break; }
-                    }
-                }
-                if (anti ? !matched : matched) rows.push_back(a);
-            }
-            return rows;
-        }
-        // Apply：左行拼接右子计划每行（标量语义：右 >1 行报错、=0 行补 NULL；可选残差过滤）。
-        const bool scalar = plan.values.is_object() && plan.values.value("scalar", false);
-        for (const auto& a : left) {
-            checkCancelled();
-            bindCorrelation(a);
-            const auto right = joinRows(plan.children[1]);
-            if (scalar) {
-                if (right.size() > 1) fail("Correlated scalar subquery returned more than one row");
-                auto combined = a;
-                if (right.empty()) combined.resize(a.size() + plan.children[1].output.size(), std::monostate{});
-                else combined.insert(combined.end(), right.front().begin(), right.front().end());
-                if (plan.predicate.is_object() && !accepted(evaluate(plan.predicate, combined))) continue;
-                rows.push_back(std::move(combined));
-            } else {
-                for (const auto& b : right) {
-                    auto combined = a;
-                    combined.insert(combined.end(), b.begin(), b.end());
-                    rows.push_back(std::move(combined));
-                }
-            }
-        }
-        return rows;
-    }
-    if (plan.kind == "Project") {
-        if (plan.children.size() != 1) fail("Project requires one child");
-        for (const auto& row : joinRows(plan.children.front())) {
-            checkCancelled();
-            storage::Row projected;
-            projected.reserve(plan.output.size());
-            for (const auto& expression : plan.projections) projected.push_back(indexValue(evaluate(expression, row), plan.output[projected.size()].type));
-            rows.push_back(std::move(projected));
-        }
-        return rows;
-    }
-    if (plan.kind == "Filter") {
+    if (plan.kind == "Filter" || plan.kind == "SemiJoin" || plan.kind == "AntiJoin" || plan.kind == "Apply") {
         if (plan.children.size() != 1) fail("Join filter requires one child");
         rows = joinRows(plan.children.front());
         for (auto iterator = rows.begin(); iterator != rows.end();) {
@@ -1079,7 +1247,7 @@ json Database::aggregateRows(const sql::LogicalPlan& plan) {
     if (plan.children.size() != 1) fail("Aggregate requires one child");
     const auto* input = &plan.children.front();
     const json* predicate = nullptr;
-    if (input->kind == "Filter") {
+    if (input->kind == "Filter" || input->kind == "SemiJoin" || input->kind == "AntiJoin" || input->kind == "Apply") {
         if (input->children.size() != 1) fail("Aggregate filter requires one child");
         predicate = &input->predicate;
         input = &input->children.front();
@@ -1228,6 +1396,54 @@ json Database::aggregateRows(const sql::LogicalPlan& plan) {
     if (active) emit();
     return rows;
 }
+std::unique_ptr<RowStream> Database::scanRowStream(const sql::LogicalPlan& plan) {
+    const catalog::StoredTable* table = nullptr;
+    for (const auto& candidate : catalog_.tables()) if (key(candidate.definition.table) == key(plan.table)) table = &candidate;
+    if (!table) throw MiniSqlError(ErrorCode::Catalog, "Plan references missing table");
+    return std::make_unique<ScanRowStream>(heap_, table->id, rowSchema(table->definition));
+}
+
+std::unique_ptr<RowStream> Database::openRowStream(const sql::LogicalPlan& plan) {
+    checkCancelled();
+    if (plan.kind == "SeqScan") return scanRowStream(plan);
+    if (plan.kind == "Filter" || plan.kind == "SemiJoin" || plan.kind == "AntiJoin" || plan.kind == "Apply") {
+        if (plan.children.size() != 1) fail("Filter requires one child");
+        auto child = openRowStream(plan.children.front());
+        const auto predicate = plan.predicate;
+        return std::make_unique<FilterRowStream>(std::move(child), [this, predicate](const json& row) {
+            return accepted(evaluate(predicate, row));
+        });
+    }
+    if (plan.kind == "Project") {
+        if (plan.children.size() != 1) fail("Project requires one child");
+        auto child = openRowStream(plan.children.front());
+        const auto projections = plan.projections;
+        const auto output = plan.output;
+        return std::make_unique<ProjectRowStream>(std::move(child), [this, projections, output](const json& row) {
+            json projected = json::array();
+            if (!projections.empty()) {
+                for (const auto& expression : projections) projected.push_back(evaluate(expression, row));
+            } else {
+                for (const auto& column : output) {
+                    if (column.columnId >= row.size()) fail("Projection outside row");
+                    projected.push_back(cell(row.at(column.columnId)));
+                }
+            }
+            return projected;
+        });
+    }
+    if (plan.kind == "Limit") {
+        if (plan.children.size() != 1) fail("Limit requires one child");
+        auto child = openRowStream(plan.children.front());
+        return std::make_unique<LimitRowStream>(std::move(child), plan.offset, plan.limit);
+    }
+    if (plan.kind == "Sort" || plan.kind == "Aggregate" || plan.kind == "Distinct") {
+        auto result = runNode(plan);
+        return std::make_unique<MaterializedRowStream>(result.at("rows"));
+    }
+    throw MiniSqlError(ErrorCode::InvalidArgument, "RowStream does not support plan kind " + plan.kind);
+}
+
 nlohmann::json Database::runNode(const sql::LogicalPlan& plan) {
     checkCancelled();
     if (plan.kind == "Sort") {
@@ -1260,6 +1476,8 @@ nlohmann::json Database::runNode(const sql::LogicalPlan& plan) {
         result["columns"] = json::array();
         for (const auto& column : plan.output) result["columns"].push_back(column.name);
         result["kind"] = "Sort";
+        result["resourceUsage"] = {{"kind", "Sort"}, {"rows", rows.size()},
+            {"external", rows.size() > sortMemoryRows_}, {"memoryRows", sortMemoryRows_}};
         return result;
     }
     if (plan.kind == "Limit") {
@@ -1269,6 +1487,27 @@ nlohmann::json Database::runNode(const sql::LogicalPlan& plan) {
             for (const auto& column : plan.output) columns.push_back(column.name);
             return {{"kind", "Limit"}, {"columns", columns}, {"rows", json::array()}, {"affectedRows", 0}};
         }
+        try {
+            auto stream = openRowStream(plan.children.front());
+            json rows = json::array();
+            json row;
+            for (std::uint64_t skipped = 0; skipped < plan.offset; ++skipped) {
+                if (!stream->next(row)) break;
+            }
+            std::uint64_t emitted = 0;
+            while (!plan.limit || emitted < *plan.limit) {
+                if (!stream->next(row)) break;
+                rows.push_back(std::move(row));
+                ++emitted;
+            }
+            stream->close();
+            json columns = json::array();
+            for (const auto& column : plan.output) columns.push_back(column.name);
+            return {{"kind", "Limit"}, {"columns", std::move(columns)}, {"rows", std::move(rows)},
+                {"affectedRows", 0}, {"resourceUsage", {{"kind", "LimitRowStream"}, {"rows", emitted}}}};
+        } catch (const MiniSqlError& error) {
+            if (error.code() != ErrorCode::InvalidArgument) throw;
+        }
         auto result = run(plan.children.front());
         const auto size = result.at("rows").size();
         const auto begin = std::min<std::uint64_t>(plan.offset, size);
@@ -1277,6 +1516,7 @@ nlohmann::json Database::runNode(const sql::LogicalPlan& plan) {
         for (std::uint64_t i = 0; i < count; ++i) rows.push_back(std::move(result["rows"][begin + i]));
         result["rows"] = std::move(rows);
         result["kind"] = "Limit";
+        result["resourceUsage"] = {{"kind", "Limit"}, {"rows", rows.size()}};
         return result;
     }
     if (plan.kind == "Distinct") {
@@ -1292,13 +1532,17 @@ nlohmann::json Database::runNode(const sql::LogicalPlan& plan) {
     json result = {{"kind", plan.kind}, {"columns", json::array()}, {"rows", json::array()}, {"affectedRows", 0}};
     if (plan.kind == "Aggregate") {
         for (const auto& column : plan.output) result["columns"].push_back(column.name);
-        result["rows"] = aggregateRows(plan);return result;
+        result["rows"] = aggregateRows(plan);
+        result["resourceUsage"] = {{"kind", "Aggregate"}, {"rows", result.at("rows").size()},
+            {"groups", result.at("rows").size()}, {"external", false}};
+        return result;
     }
-    if (plan.kind == "Filter") {
+    if (plan.kind == "Filter" || plan.kind == "SemiJoin" || plan.kind == "AntiJoin" || plan.kind == "Apply") {
         if (plan.children.size() != 1) fail("Filter requires one child");
         auto input = run(plan.children.front());
         for (const auto& column : plan.output) result["columns"].push_back(column.name);
         for (auto& row : input["rows"]) if (accepted(evaluate(plan.predicate, row))) result["rows"].push_back(std::move(row));
+        result["resourceUsage"] = {{"kind", "Filter"}, {"rows", result.at("rows").size()}};
         return result;
     }
     if (plan.kind == "Project" && plan.children.size() == 1 &&
@@ -1311,6 +1555,9 @@ nlohmann::json Database::runNode(const sql::LogicalPlan& plan) {
             for (const auto& expression : plan.projections) projected.push_back(evaluate(expression, row));
             result["rows"].push_back(std::move(projected));
         }
+        json projectUsage = {{"kind", "Project"}, {"rows", result.at("rows").size()}};
+        if (input.contains("resourceUsage")) projectUsage["child"] = input.at("resourceUsage");
+        result["resourceUsage"] = std::move(projectUsage);
         return result;
     }
     if (plan.kind == "Project" && plan.children.size() == 1 && plan.children.front().kind == "Limit" &&
@@ -1336,6 +1583,9 @@ nlohmann::json Database::runNode(const sql::LogicalPlan& plan) {
                 for (const auto& expression : plan.projections) projected.push_back(evaluate(expression, row));
                 result["rows"].push_back(std::move(projected));
             }
+            json projectUsage = {{"kind", "Project"}, {"rows", result.at("rows").size()}};
+            if (sub.contains("resourceUsage")) projectUsage["child"] = sub.at("resourceUsage");
+            result["resourceUsage"] = std::move(projectUsage);
             return result;
         }
     }
@@ -1406,15 +1656,15 @@ nlohmann::json Database::runNode(const sql::LogicalPlan& plan) {
                 key.values.push_back(indexValue(value.at("value"), value.at("type").get<std::string>()));
             key.values.push_back(indexValue(plan.indexRangeValue.at("value"), plan.indexRangeValue.at("type").get<std::string>()));
             const auto& op = plan.indexRangeOperator;
-            if (op == ">") refs = index->tree.range(key, false, std::nullopt, true);
-            else if (op == ">=") refs = index->tree.range(key, true, std::nullopt, true);
-            else if (op == "<") refs = index->tree.range(std::nullopt, true, key, false);
-            else refs = index->tree.range(std::nullopt, true, key, true);
+            if (op == ">") refs = index->range(key, false, std::nullopt, true);
+            else if (op == ">=") refs = index->range(key, true, std::nullopt, true);
+            else if (op == "<") refs = index->range(std::nullopt, true, key, false);
+            else refs = index->range(std::nullopt, true, key, true);
         } else if (!plan.indexValues.empty()) {
             storage::IndexKey key;
             for (const auto& value : plan.indexValues)
                 key.values.push_back(indexValue(value.at("value"), value.at("type").get<std::string>()));
-            refs = index->tree.search(key);
+            refs = index->search(key);
         } else {
         const auto& predicate = plan.predicate;
         if (!predicate.is_object()) fail("IndexScan requires a predicate");
@@ -1423,11 +1673,11 @@ nlohmann::json Database::runNode(const sql::LogicalPlan& plan) {
         const auto& right = predicate.at("right");
         if (!right.is_object() || right.value("kind", "") != "Literal") fail("IndexScan requires a literal key");
         const auto key = storage::IndexKey{{indexValue(right.at("value"), right.at("type").get<std::string>())}};
-        if (op == "=") refs = index->tree.search(key);
-        else if (op == ">") refs = index->tree.range(key, false, std::nullopt, true);
-        else if (op == ">=") refs = index->tree.range(key, true, std::nullopt, true);
-        else if (op == "<") refs = index->tree.range(std::nullopt, true, key, false);
-        else refs = index->tree.range(std::nullopt, true, key, true);
+        if (op == "=") refs = index->search(key);
+        else if (op == ">") refs = index->range(key, false, std::nullopt, true);
+        else if (op == ">=") refs = index->range(key, true, std::nullopt, true);
+        else if (op == "<") refs = index->range(std::nullopt, true, key, false);
+        else refs = index->range(std::nullopt, true, key, true);
         }
         for (const auto ref : refs) result["rows"].push_back(rowJson(heap_.read(table->id, schema, ref)));
         for (const auto& column : plan.output) result["columns"].push_back(column.name);
@@ -1608,15 +1858,29 @@ nlohmann::json Database::runNode(const sql::LogicalPlan& plan) {
     }
     if (plan.kind != "Project" && plan.kind != "Delete" && plan.kind != "Update") fail("Unsupported root plan");
     if (plan.children.size() != 1) fail("Root plan requires one child");
+    if (plan.kind == "Project") {
+        try {
+            auto stream = openRowStream(plan);
+            json rows = json::array();
+            json row;
+            while (stream->next(row)) rows.push_back(std::move(row));
+            stream->close();
+            json columns = json::array();
+            for (const auto& column : plan.output) columns.push_back(column.name);
+            return {{"kind", "Project"}, {"columns", std::move(columns)}, {"rows", std::move(rows)},
+                {"affectedRows", 0}, {"resourceUsage", stream->resourceUsage()}};
+        } catch (const MiniSqlError& error) {
+            if (error.code() != ErrorCode::InvalidArgument) throw;
+        }
+    }
     const auto* input = &plan.children.front();
     const json* predicate = nullptr;
-    if (input->kind == "Filter") {
+    if (input->kind == "Filter" || input->kind == "SemiJoin" || input->kind == "AntiJoin" || input->kind == "Apply") {
         predicate = &input->predicate;
         if (input->children.size() != 1) fail("Filter requires one child");
         input = &input->children.front();
     }
-    const bool joined = (input->kind == "NestedLoopJoin" || input->kind == "HashJoin" || input->kind == "LeftJoin" || input->kind == "RightJoin" || input->kind == "FullJoin" ||
-                          input->kind == "SemiJoin" || input->kind == "AntiSemiJoin" || input->kind == "Apply") && (plan.kind == "Project" || plan.kind == "Update" || plan.kind == "Delete");
+    const bool joined = (input->kind == "NestedLoopJoin" || input->kind == "HashJoin" || input->kind == "LeftJoin" || input->kind == "RightJoin" || input->kind == "FullJoin") && plan.kind == "Project";
     if (!joined && ((input->kind != "SeqScan" && input->kind != "IndexScan") || key(input->table) != key(plan.table))) fail("Unsupported scan plan");
     for (const auto& column : plan.output) result["columns"].push_back(column.name);
     if (input->kind == "IndexScan" && plan.kind == "Project") {
@@ -1700,6 +1964,7 @@ nlohmann::json Database::runNode(const sql::LogicalPlan& plan) {
     if (!indexes_.empty() && (!deletion.empty() || !updates.empty())) rebuildIndexes(table->id);
     if (plan.kind == "Update") { heap_.flush(); result["affectedRows"] = updates.size(); }
     if (plan.kind == "Delete") { heap_.flush(); result["affectedRows"] = deletion.size(); }
+    if (plan.kind == "Project") result["resourceUsage"] = {{"kind", "Project"}, {"rows", result.at("rows").size()}};
     return result;
 }
 const char* Database::transactionState() const {
@@ -1710,6 +1975,7 @@ void Database::rollbackBatch() {
     try {
         if (file_->writeBatchActive()) buffer_.rollbackWriteBatch();
         catalog_.reload();
+        savepoints_.clear();
         for (const auto& table : catalog_.tables()) rebuildIndexes(table.id);
     } catch (...) {
         unavailable_ = true;
@@ -1727,13 +1993,12 @@ nlohmann::json Database::run(const sql::LogicalPlan& plan) {
     return result;
 }
 nlohmann::json Database::runStatement(const sql::LogicalPlan& plan) {
-    // X09 §6.17 后续 ②：结果行缓存不再每语句清空——改由 dataVersion_ 版本闸门控制
-    // （见 runCorrelatedSubquery）。仅参数环境仍按语句复位。
-    correlationParams_.clear();
+    correlatedRowsCache_.clear();
+    if (plan.kind == "IndexInspect") return indexInspect(plan.table, plan.indexName);
     if (plan.kind == "Checkpoint") {
         if (transaction_ != TransactionState::Idle) throw MiniSqlError(ErrorCode::Transaction, "CHECKPOINT requires an idle transaction");
         buffer_.flushAll();
-        file_->checkpoint();
+        file_->checkpoint({catalogVersion_, indexVersion_});
         ++checkpointCount_;
         pendingAutoCheckpointWrites_ = 0;
         pendingAutoCheckpointWalBytes_ = 0;
@@ -1749,31 +2014,41 @@ nlohmann::json Database::runStatement(const sql::LogicalPlan& plan) {
         return {{"kind", plan.kind}, {"columns", json::array()}, {"rows", json::array()}, {"affectedRows", 0}, {"commitState", "rolledBack"}};
     }
     if (transaction_ == TransactionState::Aborted) throw MiniSqlError(ErrorCode::Transaction, "Transaction aborted; ROLLBACK required");
+    if (plan.kind == "Savepoint") {
+        if (transaction_ != TransactionState::Active) throw MiniSqlError(ErrorCode::Transaction, "SAVEPOINT requires an active transaction");
+        if (plan.savepointName.empty()) throw MiniSqlError(ErrorCode::Transaction, "Savepoint name is required");
+        savepoints_[key(plan.savepointName)] = SavepointState{file_->savepoint(), catalog_.snapshot()};
+        return {{"kind", plan.kind}, {"columns", json::array()}, {"rows", json::array()}, {"affectedRows", 0}, {"commitState", "pending"}};
+    }
+    if (plan.kind == "ReleaseSavepoint") {
+        if (transaction_ != TransactionState::Active || !savepoints_.erase(key(plan.savepointName)))
+            throw MiniSqlError(ErrorCode::Transaction, "Savepoint does not exist: " + plan.savepointName);
+        return {{"kind", plan.kind}, {"columns", json::array()}, {"rows", json::array()}, {"affectedRows", 0}, {"commitState", "pending"}};
+    }
+    if (plan.kind == "RollbackTo") {
+        if (transaction_ != TransactionState::Active) throw MiniSqlError(ErrorCode::Transaction, "ROLLBACK TO requires an active transaction");
+        const auto found = savepoints_.find(key(plan.savepointName));
+        if (found == savepoints_.end()) throw MiniSqlError(ErrorCode::Transaction, "Savepoint does not exist: " + plan.savepointName);
+        file_->restoreSavepoint(found->second.file);
+        catalog_.restore(found->second.catalog);
+        for (const auto& table : catalog_.tables()) rebuildIndexes(table.id);
+        return {{"kind", plan.kind}, {"columns", json::array()}, {"rows", json::array()}, {"affectedRows", 0}, {"commitState", "pending"}};
+    }
     if (plan.kind == "Begin") {
         if (transaction_ != TransactionState::Idle) throw MiniSqlError(ErrorCode::Transaction, "Nested transactions are not supported");
-        buffer_.beginWriteBatch();transaction_ = TransactionState::Active;transactionWriteStatements_ = 0;
+        buffer_.beginWriteBatch();transaction_ = TransactionState::Active;transactionWriteStatements_ = 0;savepoints_.clear();
         return {{"kind", plan.kind}, {"columns", json::array()}, {"rows", json::array()}, {"affectedRows", 0}, {"commitState", "pending"}};
     }
     if (plan.kind == "Commit") {
         if (transaction_ != TransactionState::Active) throw MiniSqlError(ErrorCode::Transaction, "No active transaction");
         const auto committedWriteStatements = transactionWriteStatements_;
         const auto committedDirtyPages = file_->stagedPageCount();
-        buffer_.commitWriteBatch();transaction_ = TransactionState::Idle;transactionWriteStatements_ = 0;
+        buffer_.commitWriteBatch();transaction_ = TransactionState::Idle;transactionWriteStatements_ = 0;savepoints_.clear();
         evaluateAutoCheckpoint(committedWriteStatements, committedDirtyPages);
         return {{"kind", plan.kind}, {"columns", json::array()}, {"rows", json::array()}, {"affectedRows", 0}, {"commitState", "committed"}};
     }
     const bool writes = plan.kind == "CreateTable" || plan.kind == "CreateIndex" || plan.kind == "DropIndex" || plan.kind == "Insert" ||
                         plan.kind == "Update" || plan.kind == "Delete";
-    // X18: 任何写语句都使显式 ANALYZE 快照失效——但必须「成功后」才删除（任务书 §6.21-c）。
-    // 若在执行期失败（如唯一键冲突），数据未变、快照仍然有效，不应被误删；故删除动作
-    // 下移到下方两处「写语句成功回收点」，而非此处的分派点。
-    // X09 §6.17 后续 ②：绑定级 memo 则相反，先失效、后执行（失败也不影响正确性）。
-    if (writes) ++dataVersion_;
-    const auto invalidateAnalyzeSnapshot = [&]() {
-        if (!writes) return;
-        std::error_code ignored;
-        std::filesystem::remove(analyzeMetadataPath(), ignored);
-    };
     if (transaction_ == TransactionState::Active) {
         auto result = run(plan);
         if (writes) { ++transactionWriteStatements_; invalidateAnalyzeSnapshot(); }
@@ -1794,6 +2069,7 @@ nlohmann::json Database::runStatement(const sql::LogicalPlan& plan) {
     }
 }
 nlohmann::json Database::diagnostics(const std::string& source) const {
+    std::lock_guard<std::recursive_mutex> guard(mu_);
     requireAvailable();
     json items = json::array();
     const auto stageFor = [](ErrorCode code) {
@@ -1804,13 +2080,81 @@ nlohmann::json Database::diagnostics(const std::string& source) const {
         return "internal";
     };
     std::size_t statementIndex = 0;
+    const auto sourceLine = [&](std::size_t line) {
+        if (line == 0) return std::string{};
+        std::size_t current = 1, begin = 0;
+        while (begin <= source.size() && current < line) {
+            const auto end = source.find('\n', begin);
+            if (end == std::string::npos) return std::string{};
+            begin = end + 1;
+            ++current;
+        }
+        const auto end = source.find('\n', begin);
+        return source.substr(begin, end == std::string::npos ? std::string::npos : end - begin);
+    };
+    const auto closestName = [](const std::string& target, const std::vector<std::string>& candidates) {
+        if (target.empty()) return std::string{};
+        const auto lower = [](std::string value) {
+            std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            return value;
+        };
+        const auto normalizedTarget = lower(target);
+        std::string best;
+        std::size_t bestDistance = std::numeric_limits<std::size_t>::max();
+        for (const auto& candidate : candidates) {
+            const auto normalizedCandidate = lower(candidate);
+            std::vector<std::size_t> previous(normalizedCandidate.size() + 1), current(normalizedCandidate.size() + 1);
+            for (std::size_t i = 0; i <= normalizedCandidate.size(); ++i) previous[i] = i;
+            for (std::size_t i = 1; i <= normalizedTarget.size(); ++i) {
+                current[0] = i;
+                for (std::size_t j = 1; j <= normalizedCandidate.size(); ++j)
+                    current[j] = std::min({previous[j] + 1, current[j - 1] + 1,
+                        previous[j - 1] + (normalizedTarget[i - 1] == normalizedCandidate[j - 1] ? 0 : 1)});
+                std::swap(previous, current);
+            }
+            const auto distance = previous.back();
+            if (distance < bestDistance || (distance == bestDistance && normalizedCandidate < lower(best))) {
+                bestDistance = distance;
+                best = candidate;
+            }
+        }
+        const auto limit = std::max<std::size_t>(1, std::min<std::size_t>(3, normalizedTarget.size() / 2 + 1));
+        return bestDistance <= limit ? best : std::string{};
+    };
     const auto append = [&](const MiniSqlError& error) {
         const auto& loc = error.location();
+        std::string suggestion = error.suggestion();
+        if (suggestion.empty()) {
+            const std::string message = error.what();
+            if (message.find("Table does not exist") != std::string::npos || message.find("missing table") != std::string::npos)
+            {
+                const auto separator = message.find(':');
+                const auto target = message.substr(separator == std::string::npos ? 0 : separator + 1);
+                std::vector<std::string> candidates;
+                for (const auto& table : catalog_.tables()) candidates.push_back(table.definition.table);
+                const auto matched = closestName(target, candidates);
+                suggestion = matched.empty() ? "Check the table name and confirm the table was created." : "Did you mean: " + matched + "?";
+            }
+            else if (message.find("Column does not exist") != std::string::npos || message.find("Unknown column") != std::string::npos)
+            {
+                const auto separator = message.find(':');
+                const auto target = message.substr(separator == std::string::npos ? 0 : separator + 1);
+                std::vector<std::string> candidates;
+                for (const auto& table : catalog_.tables()) for (const auto& column : table.definition.columns) candidates.push_back(column.name);
+                const auto matched = closestName(target, candidates);
+                suggestion = matched.empty() ? "Check the column name and table alias." : "Did you mean: " + matched + "?";
+            }
+            else if (message.find("Expected FROM") != std::string::npos)
+                suggestion = "Add FROM before the table name.";
+        }
         items.push_back({{"success", false}, {"stage", stageFor(error.code())},
             {"code", static_cast<int>(error.code())}, {"message", error.what()},
+            {"suggestion", std::move(suggestion)}, {"actual", error.actual()},
+            {"expected", error.expected()},
             {"line", loc.line}, {"column", loc.column},
             {"endLine", loc.endLine ? loc.endLine : loc.line},
             {"endColumn", loc.endColumn ? loc.endColumn : loc.column},
+            {"source", sourceLine(loc.line)},
             {"recoverable", true}, {"statementIndex", statementIndex}});
     };
     // Tokenize in recovery mode so every lexical error is reported, not only
@@ -1840,6 +2184,7 @@ nlohmann::json Database::diagnostics(const std::string& source) const {
                 {"line", item.location.line}, {"column", item.location.column},
                 {"endLine", item.location.endLine ? item.location.endLine : item.location.line},
                 {"endColumn", item.location.endColumn ? item.location.endColumn : item.location.column},
+                {"source", sourceLine(item.location.line)},
                 {"statementIndex", statementIndex}});
         }
         ++statementIndex;
@@ -1853,11 +2198,8 @@ nlohmann::json Database::diagnostics(const std::string& source) const {
     const bool success = std::all_of(items.begin(), items.end(), [](const json& item) { return item.value("success", false); });
     return {{"success", success}, {"diagnostics", items}, {"count", items.size()}};
 }
-nlohmann::json Database::correlationParam(std::size_t paramId) const {
-    if (paramId >= correlationParams_.size()) fail("Parameter outside correlation range");
-    return correlationParams_[paramId];
-}
 nlohmann::json Database::runCorrelatedSubquery(const json& expression, const json& row) {
+    std::lock_guard<std::recursive_mutex> guard(mu_);
     const auto sql = expression.at("subquerySql").get<std::string>();
     const auto& scope = expression.at("outerColumns");
     OuterBinding outer;
@@ -1889,17 +2231,8 @@ nlohmann::json Database::runCorrelatedSubquery(const json& expression, const jso
         tuple.push_back(row.at(id));
     }
     const std::string fullKey = prepKey + "\x1f" + tuple.dump();
-    // X09 §6.17 后续 ②：绑定级 memo 的版本闸门——仅当数据/目录版本变化（任何写语句）时
-    // 整体失效；否则跨语句复用同一 (shape|绑定值) 的物化结果。
-    if (correlatedRowsCacheVersion_ != dataVersion_) {
-        correlatedRowsCache_.clear();
-        correlatedRowsCacheVersion_ = dataVersion_;
-    }
-    if (const auto cached = correlatedRowsCache_.find(fullKey); cached != correlatedRowsCache_.end()) {
-        ++correlatedMemoHits_;
-        return cached->second;
-    }
-    ++correlatedMemoMisses_;
+    const auto cached = correlatedRowsCache_.find(fullKey);
+    if (cached != correlatedRowsCache_.end()) return cached->second;
 
     sql::Statement bound = bindOuterStatement(ast.front(), outer, row);
     const auto subplans = sql::compilePlans({std::move(bound)}, catalog_.view());
@@ -1988,6 +2321,7 @@ void Database::materializeSubqueries(std::vector<sql::LogicalPlan>& plans) {
     for (auto& plan : plans) visit(plan);
 }
 nlohmann::json Database::execute(const std::string& source, bool optimize) {
+    std::lock_guard<std::recursive_mutex> guard(mu_);
     json results = json::array();
     currentQueryId_ = ++querySequence_;
     try {
@@ -2019,19 +2353,9 @@ nlohmann::json Database::execute(const std::string& source, bool optimize) {
                 const auto rawPlans = sql::compilePlans(target, catalog_.view());
                 if (analyze && target.front().kind != "Select")
                     throw MiniSqlError(ErrorCode::Semantic, "EXPLAIN ANALYZE permits only SELECT", location);
-                // X18 4.2-iv: 列级选择率与 EXPLAIN estimate() 同源——单遍 statistics() 建
-                // byTable，注入优化器 Options.selectivity 使过滤选择率进入 join 的成本选择。
-                const auto statsDocument = statistics();
-                std::map<std::string, json> byTable;
-                for (const auto& table : statsDocument.at("tables")) byTable[key(table.at("name").get<std::string>())] = table;
-                optimizer::Options optimizerOptions;
-                optimizerOptions.tableRows = [this](const std::string& name) { return estimatedTableRows(name); };
-                optimizerOptions.selectivity = [&byTable](const json& predicate, const std::string& table) -> double {
-                    return columnSelectivity(byTable, predicate, table);
-                };
-                const auto optimized = optimizer::optimize(rawPlans, optimizerOptions);
-                json raw = sql::serializePlans(rawPlans);
-                json optimizedJson = sql::serializePlans(optimized.plans);
+                const auto optimized = optimizer::optimize(rawPlans);
+                const auto raw = sql::serializePlans(rawPlans);
+                const auto optimizedJson = sql::serializePlans(optimized.plans);
                 const auto tableEstimate = [&](const std::string& name) -> std::pair<double, double> {
                     for (const auto& table : catalog_.tables()) if (key(table.definition.table) == key(name)) {
                         double rows = 0;
@@ -2040,9 +2364,57 @@ nlohmann::json Database::execute(const std::string& source, bool optimize) {
                     }
                     return {0, 0};
                 };
-                // X18 4.2-iv: estimate() 与优化器 Options.selectivity 共用同一 byTable + columnSelectivity。
-                const auto selectivity = [&](const json& predicate, const std::string& table) -> double {
-                    return columnSelectivity(byTable, predicate, table);
+                const auto statsDocument = statistics();
+                std::map<std::string, const json*> statsByTable;
+                for (const auto& table : statsDocument.at("tables")) statsByTable[key(table.at("name").get<std::string>())] = &table;
+                const auto columnStat = [&](const std::string& table, std::size_t columnId) -> const json* {
+                    const auto found = statsByTable.find(key(table));
+                    if (found == statsByTable.end()) return nullptr;
+                    for (const auto& column : found->second->at("columns"))
+                        if (column.at("columnId").get<std::size_t>() == columnId) return &column;
+                    return nullptr;
+                };
+                std::function<double(const json&, const std::string&)> selectivity;
+                selectivity = [&](const json& predicate, const std::string& table) -> double {
+                    if (!predicate.is_object()) return 1.0;
+                    if (predicate.value("kind", "") == "Literal") {
+                        const auto& value = predicate.at("value");
+                        if (value.is_null() || value == false) return 0.0;
+                        if (value == true) return 1.0;
+                        return 0.25;
+                    }
+                    const auto op = predicate.value("operator", "");
+                    if (op == "AND") return selectivity(predicate.at("left"), table) * selectivity(predicate.at("right"), table);
+                    if (op == "OR") {
+                        const auto left = selectivity(predicate.at("left"), table), right = selectivity(predicate.at("right"), table);
+                        return std::min(1.0, left + right - left * right);
+                    }
+                    if (op == "NOT") return 1.0 - selectivity(predicate.at("left"), table);
+                    if ((op == "IS NULL" || op == "IS NOT NULL") && predicate.contains("left")) {
+                        const auto& operand = predicate.at("left");
+                        if (operand.value("kind", "") == "Identifier") {
+                            const auto* stat = columnStat(table, operand.at("columnId").get<std::size_t>());
+                            if (stat) {
+                                const auto ratio = stat->value("nullRatio", 0.0);
+                                return op == "IS NULL" ? ratio : 1.0 - ratio;
+                            }
+                        }
+                    }
+                    if (predicate.contains("left") && predicate.contains("right")) {
+                        const auto& left = predicate.at("left");
+                        const auto& right = predicate.at("right");
+                        const json* id = left.value("kind", "") == "Identifier" ? &left : right.value("kind", "") == "Identifier" ? &right : nullptr;
+                        const json* literal = left.value("kind", "") == "Literal" ? &left : right.value("kind", "") == "Literal" ? &right : nullptr;
+                        if (id && literal && id->contains("columnId")) {
+                            const auto* stat = columnStat(table, id->at("columnId").get<std::size_t>());
+                            if (stat && op == "=") {
+                                const auto distinct = stat->value("distinctCount", std::size_t{0});
+                                if (distinct > 0) return 1.0 / static_cast<double>(distinct);
+                            }
+                        }
+                    }
+                    if (op == "=" || op == "!=" || op == "<" || op == "<=" || op == ">" || op == ">=") return 0.33;
+                    return 0.25;
                 };
                 std::function<std::pair<double, double>(const sql::LogicalPlan&)> estimate;
                 estimate = [&](const sql::LogicalPlan& plan) -> std::pair<double, double> {
@@ -2050,17 +2422,12 @@ nlohmann::json Database::execute(const std::string& source, bool optimize) {
                         const auto [rows, pages] = tableEstimate(plan.table);
                         return {rows, rows + pages};
                     }
-                    if (plan.kind == "IndexScan") {
-                        const auto [tableRows, pages] = tableEstimate(plan.table);
-                        const auto rows = tableRows * indexScanSelectivity(byTable, plan.table, plan.indexColumns, plan.indexValues, plan.indexRangeOperator, plan.indexRangeValue);
-                        return {rows, rows + pages * 0.5};
-                    }
                     if (plan.children.empty()) {
                         if (plan.kind == "Insert") return {static_cast<double>(std::max(plan.values.size(), plan.insertRows.size())), 1.0};
                         return {0.0, 1.0};
                     }
                     auto child = estimate(plan.children.front());
-                    if (plan.kind == "Filter") {
+                    if (plan.kind == "Filter" || plan.kind == "SemiJoin" || plan.kind == "AntiJoin" || plan.kind == "Apply") {
                         const auto rows = child.first * selectivity(plan.predicate, plan.table);
                         return {rows, child.second + rows};
                     }
@@ -2078,41 +2445,39 @@ nlohmann::json Database::execute(const std::string& source, bool optimize) {
                     }
                     return {child.first, child.second + child.first};
                 };
-                std::vector<const sql::LogicalPlan*> rawNodes, optNodes;
-                std::function<void(const std::vector<sql::LogicalPlan>&, std::vector<const sql::LogicalPlan*>&)> collectPlans;
-                collectPlans = [&](const std::vector<sql::LogicalPlan>& plans, std::vector<const sql::LogicalPlan*>& nodes) {
-                    std::function<void(const sql::LogicalPlan&)> visitNode;
-                    visitNode = [&](const sql::LogicalPlan& plan) {
-                        nodes.push_back(&plan);
-                        for (const auto& child : plan.children) visitNode(child);
-                    };
-                    for (const auto& plan : plans) visitNode(plan);
+                std::vector<const sql::LogicalPlan*> planNodes;
+                std::function<void(const sql::LogicalPlan&)> collect;
+                collect = [&](const sql::LogicalPlan& plan) {
+                    planNodes.push_back(&plan);
+                    for (const auto& child : plan.children) collect(child);
                 };
-                collectPlans(rawPlans, rawNodes);
-                collectPlans(optimized.plans, optNodes);
-                // X18 4.3: 把估计元数据落到 EXPLAIN 的 plan JSON 节点上（仅 EXPLAIN 展示路径，
-                // 不改 serializePlans / compile() 冻结契约）；比 estimateSource 列更细粒度、可被工作台消费。
-                const auto annotate = [&](json& array, const std::vector<const sql::LogicalPlan*>& nodes) {
-                    for (auto& node : array) {
-                        if (!node.is_object() || !node.contains("id") || !node.at("id").is_number_unsigned()) continue;
-                        const auto planIndex = node.at("id").get<std::size_t>();
-                        if (planIndex >= nodes.size()) fail("EXPLAIN plan node index is invalid");
-                        const auto estimated = estimate(*nodes[planIndex]);
-                        node["estimatedRows"] = estimated.first;
-                        node["estimatedCost"] = estimated.second;
-                        node["statsSource"] = "stats-v1";
-                    }
-                };
-                annotate(raw, rawNodes);
-                annotate(optimizedJson, optNodes);
-                // 展示行与 plan JSON 同源，保证 estimatedRows/estimatedCost 一致。
+                for (const auto& plan : (optimize ? optimized.plans : rawPlans)) collect(plan);
                 json rows = json::array();
-                for (const auto& node : (optimize ? optimizedJson : raw))
-                    rows.push_back({node.at("kind"), node.at("detail"), node.at("estimatedRows"), node.at("estimatedCost"), "stats-v1"});
-                json explanation = {{"kind", "Explain"}, {"columns", {"node", "detail", "estimatedRows", "estimatedCost", "estimateSource"}},
-                    {"columnTypes", {"varchar", "varchar", "bigint", "float", "varchar"}}, {"rows", rows}, {"affectedRows", 0},
+                for (const auto& node : (optimize ? optimizedJson : raw)) {
+                    const auto planIndex = node.at("id").get<std::size_t>();
+                    if (planIndex >= planNodes.size()) fail("EXPLAIN plan node index is invalid");
+                    const auto estimated = estimate(*planNodes[planIndex]);
+                    rows.push_back({node.at("kind"), node.at("detail"), estimated.first, estimated.second, "stats-v1", "table-column-statistics-or-default"});
+                }
+                json accessCandidates = json::array();
+                double bestCost = std::numeric_limits<double>::infinity();
+                std::string chosenAccess;
+                for (const auto* node : planNodes) {
+                    if (node->kind != "SeqScan" && node->kind != "IndexScan") continue;
+                    const auto candidate = estimate(*node);
+                    accessCandidates.push_back({{"kind", node->kind}, {"table", node->table},
+                        {"estimatedRows", candidate.first}, {"estimatedCost", candidate.second}});
+                    if (candidate.second < bestCost || (candidate.second == bestCost && (chosenAccess.empty() || node->kind < chosenAccess))) {
+                        bestCost = candidate.second;
+                        chosenAccess = node->kind;
+                    }
+                }
+                json explanation = {{"kind", "Explain"}, {"columns", {"node", "detail", "estimatedRows", "estimatedCost", "estimateSource", "statsSource"}},
+                    {"columnTypes", {"varchar", "varchar", "bigint", "float", "varchar", "varchar"}}, {"rows", rows}, {"affectedRows", 0},
                     {"plan", raw}, {"optimizedPlan", optimizedJson}, {"optimizationRules", optimized.changes},
-                    {"estimatedRowsAvailable", true}, {"costModel", "stats-v1"}, {"executed", false},
+                    {"estimatedRowsAvailable", true}, {"costModel", "stats-v1"}, {"costModelVersion", 1},
+                    {"deterministicTieBreak", "estimated-cost-then-plan-kind"}, {"candidateAccessPaths", accessCandidates},
+                    {"chosenAccessPath", chosenAccess.empty() ? nullptr : json(chosenAccess)}, {"executed", false},
                     {"commitState", "notApplicable"}};
                 if (analyze) {
                     const auto before = buffer_.stats();
@@ -2145,6 +2510,9 @@ nlohmann::json Database::execute(const std::string& source, bool optimize) {
                 statement.clear();
                 return;
             }
+            // X18: `ANALYZE [TABLE] <name>;` 在入口层特判，不进入 AST/计划契约。
+            // 它按需重新扫描一次全库统计，并把刷新时间 + 统计版本 + 表快照持久化到旁路文件，
+            // 供 statistics() 跨进程报告 source=analyze（任何写语句成功后删除该文件即失效）。
             if (key(statement.front().lexeme) == "analyze") {
                 const auto location = statement.front().location;
                 if (transaction_ == TransactionState::Aborted)
@@ -2153,32 +2521,28 @@ nlohmann::json Database::execute(const std::string& source, bool optimize) {
                 std::size_t end = statement.size();
                 if (end > begin && statement.back().type == "DELIMITER") --end;
                 if (begin < end && key(statement.at(begin).lexeme) == "table") ++begin;
-                if (begin + 1 != end || statement.at(begin).type != "IDENTIFIER")
+                if (end <= begin || begin + 1 != end || statement.at(begin).type != "IDENTIFIER")
                     throw MiniSqlError(ErrorCode::Syntax, "ANALYZE expects a single table name", location);
                 const auto tableName = statement.at(begin).lexeme;
                 if (catalog_.view().find(tableName) == nullptr)
                     throw MiniSqlError(ErrorCode::Catalog, "Unknown table in ANALYZE: " + tableName, location);
-                // X18: 单遍扫描刷新全库表统计，并把刷新时间 + 统计版本 + 表快照持久化到旁路文件，
-                // 供 statistics() 跨进程报告 source=analyze（写语句成功后删除该文件即失效）。
-                const auto byTable = tableStats();
-                json tables = json::array();
-                for (const auto& table : catalog_.tables()) tables.push_back(byTable.at(key(table.definition.table)));
+                const auto tables = liveTableStatistics();
                 const auto analyzedAtMs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
                     std::chrono::system_clock::now().time_since_epoch()).count());
                 const json document = {{"table", tableName}, {"analyzedAtMs", analyzedAtMs},
-                    {"version", "stats-v1-histogram"}, {"tables", tables}};
+                    {"version", "stats-v1"}, {"tables", tables}};
                 std::ofstream stream(analyzeMetadataPath(), std::ios::binary | std::ios::trunc);
                 if (!stream) throw MiniSqlError(ErrorCode::Storage, "Unable to persist ANALYZE statistics", location);
                 stream << document.dump();
                 json rows = json::array();
                 for (const auto& table : tables)
                     if (key(table.at("name").get<std::string>()) == key(tableName))
-                        rows.push_back({table.at("name"), table.at("rowCount"), table.at("columns").size(), analyzedAtMs, "stats-v1-histogram"});
+                        rows.push_back({table.at("name"), table.at("rowCount"), table.at("columns").size(), analyzedAtMs, "stats-v1"});
                 results.push_back({{"kind", "Analyze"}, {"table", tableName},
                     {"columns", {"table", "rowCount", "columnCount", "analyzedAtMs", "statsVersion"}},
                     {"columnTypes", {"varchar", "bigint", "bigint", "bigint", "varchar"}},
                     {"rows", rows}, {"affectedRows", 0}, {"commitState", "committed"},
-                    {"source", "analyze"}, {"statsVersion", "stats-v1-histogram"}, {"analyzedAtMs", analyzedAtMs}});
+                    {"source", "analyze"}, {"statsVersion", "stats-v1"}, {"analyzedAtMs", analyzedAtMs}});
                 statement.clear();
                 return;
             }
@@ -2186,16 +2550,7 @@ nlohmann::json Database::execute(const std::string& source, bool optimize) {
             if (transaction_ == TransactionState::Aborted && ast.front().kind != "Rollback")
                 throw MiniSqlError(ErrorCode::Transaction, "Transaction aborted; ROLLBACK required");
             auto plans = sql::compilePlans(ast, catalog_.view());
-            if (optimize) {
-                optimizer::Options optimizerOptions;
-                optimizerOptions.tableRows = [this](const std::string& name) { return estimatedTableRows(name); };
-                std::optional<std::map<std::string, json>> byTable;
-                optimizerOptions.selectivity = [this, &byTable](const json& predicate, const std::string& table) -> double {
-                    if (!byTable) byTable = tableStats();
-                    return columnSelectivity(*byTable, predicate, table);
-                };
-                plans = optimizer::optimize(plans, optimizerOptions).plans;
-            }
+            if (optimize) plans = optimizer::optimize(plans).plans;
             materializeSubqueries(plans);
             for (const auto& plan : plans) {
                 auto result = runStatement(plan);
@@ -2235,7 +2590,52 @@ nlohmann::json Database::executionFailure(const MiniSqlError& error, json result
     if (unavailable_ || error.code() == ErrorCode::Storage) response["commitState"] = "unknown";
     return response;
 }
+nlohmann::json Database::executeStreaming(const std::string& source,
+                                          const std::function<void(const nlohmann::json&)>& emitMeta,
+                                          const std::function<bool(const nlohmann::json&)>& emitRow) {
+    std::lock_guard<std::recursive_mutex> guard(mu_);
+    requireAvailable();
+    checkCancelled();
+    ActiveDatabaseScope active(this);
+    if (transaction_ == TransactionState::Aborted) throw MiniSqlError(ErrorCode::Transaction, "Transaction aborted; ROLLBACK required");
+    const auto statements = sql::parse(sql::tokenize(source));
+    if (statements.size() != 1 || (statements.front().kind != "Select" && statements.front().kind != "Explain"))
+        throw MiniSqlError(ErrorCode::InvalidArgument, "Streaming execution accepts one SELECT or EXPLAIN statement");
+    auto plans = sql::compilePlans(statements, catalog_.view());
+    materializeSubqueries(plans);
+    correlatedRowsCache_.clear();
+    const auto& plan = plans.front();
+    json columns = json::array(), columnTypes = json::array();
+    for (const auto& column : plan.output) {
+        columns.push_back(column.name);
+        columnTypes.push_back(column.type);
+    }
+    if (emitMeta) emitMeta({{"columns", std::move(columns)}, {"columnTypes", std::move(columnTypes)}, {"kind", plan.kind}});
+    std::size_t emitted = 0;
+    try {
+        auto stream = openRowStream(plan);
+        json row;
+        while (stream->next(row)) {
+            checkCancelled();
+            if (emitRow && !emitRow(row)) throw MiniSqlError(ErrorCode::Cancelled, "Streaming client disconnected");
+            ++emitted;
+        }
+        const auto usage = stream->resourceUsage();
+        stream->close();
+        return {{"success", true}, {"rows", emitted}, {"resourceUsage", usage}};
+    } catch (const MiniSqlError& error) {
+        if (error.code() != ErrorCode::InvalidArgument) throw;
+    }
+    auto result = run(plan);
+    for (auto& row : result.at("rows")) {
+        checkCancelled();
+        if (emitRow && !emitRow(row)) throw MiniSqlError(ErrorCode::Cancelled, "Streaming client disconnected");
+        ++emitted;
+    }
+    return {{"success", true}, {"rows", emitted}, {"resourceUsage", result.value("resourceUsage", json::object())}};
+}
 nlohmann::json Database::executeScript(const std::string& source, bool optimize) {
+    std::lock_guard<std::recursive_mutex> guard(mu_);
     auto response = execute(source, optimize);
     if (transaction_ != TransactionState::Idle && !unavailable_) {
         rollbackBatch();transaction_ = TransactionState::Idle;

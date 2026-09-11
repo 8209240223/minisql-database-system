@@ -6,7 +6,17 @@
 using namespace minisql;
 int checks = 0;
 void require(bool value, const char* message) { if (!value) throw std::runtime_error(message); ++checks; }
+nlohmann::json semanticResult(nlohmann::json value) {
+    if (value.is_object()) {
+        value.erase("resourceUsage");
+        for (auto& item : value.items()) item.value() = semanticResult(std::move(item.value()));
+    } else if (value.is_array()) {
+        for (auto& item : value) item = semanticResult(std::move(item));
+    }
+    return value;
+}
 int main() {
+try {
     catalog::Catalog catalog;
     auto parse = [](const std::string& source) { return sql::parse(sql::tokenize(source)); };
     catalog::validate(parse("CREATE TABLE t(id INT,name VARCHAR);"), catalog);
@@ -44,13 +54,13 @@ int main() {
         try { (void)optimizer::optimize(original, options); } catch (const MiniSqlError& e) { invalidOption = e.code() == ErrorCode::InvalidArgument; }
         require(invalidOption, "invalid iteration budget rejected");
     }
-    require(optimizer::ruleDescriptors().size() == 8, "built-in rule metadata exposed");
+    require(optimizer::ruleDescriptors().size() == 9, "built-in rule metadata exposed");
     auto incompatible = sql::compilePlans(parse("SELECT id FROM t WHERE 1=1;"), catalog);
     incompatible[0].children[0].output[0].name = "renamed";
     require(optimizer::optimize(incompatible).plans[0].children[0].kind == "Filter", "filter with different output contract not eliminated");
     require(sql::serializePlans(second.plans) == sql::serializePlans(optimized.plans), "second pass stable");
     optimizer::Options allDisabled;
-    allDisabled.disabledRules = {"constant-arithmetic", "constant-comparison", "boolean-simplification", "remove-true-filter", "remove-false-filter", "predicate-pushdown", "hash-join", "prune-columns"};
+    allDisabled.disabledRules = {"constant-arithmetic", "constant-comparison", "boolean-simplification", "remove-true-filter", "remove-false-filter", "predicate-pushdown", "hash-join", "prune-columns", "decorrelate-subquery"};
     auto disabled = optimizer::optimize(original, allDisabled);
     require(disabled.changes.empty() && sql::serializePlans(disabled.plans) == before, "all rules disabled");
     auto comparisonOnly = optimizer::optimize(original, {true, false, false});
@@ -122,13 +132,13 @@ int main() {
     require(database.execute("CREATE TABLE t(id INT,name VARCHAR); INSERT INTO t(id,name) VALUES(1,'a'); INSERT INTO t(id,name) VALUES(2,'b'); INSERT INTO t(id,name) VALUES(2,'b');")["success"] == true, "fixture persisted");
     const auto joinPlain = database.execute("SELECT t.id,e.id FROM t JOIN t e ON t.id=e.id ORDER BY t.id,e.id;", false);
     const auto joinFast = database.execute("SELECT t.id,e.id FROM t JOIN t e ON t.id=e.id ORDER BY t.id,e.id;", true);
-    require(joinPlain["success"] == true && joinFast == joinPlain, "hash join results equal nested loop results including duplicates");
+    require(joinPlain["success"] == true && semanticResult(joinFast) == semanticResult(joinPlain), "hash join results equal nested loop results including duplicates");
     const auto prunePlain = database.execute("SELECT name FROM t ORDER BY name;", false);
     const auto pruneFast = database.execute("SELECT name FROM t ORDER BY name;", true);
-    require(prunePlain["success"] == true && pruneFast == prunePlain, "column pruning preserves projected rows");
+    require(prunePlain["success"] == true && semanticResult(pruneFast) == semanticResult(prunePlain), "column pruning preserves projected rows");
     const auto literalPlain = database.execute("SELECT 1 FROM t;", false);
     const auto literalFast = database.execute("SELECT 1 FROM t;", true);
-    require(literalPlain["success"] == true && literalFast == literalPlain, "all-column pruning preserves literal projection cardinality");
+    require(literalPlain["success"] == true && semanticResult(literalFast) == semanticResult(literalPlain), "all-column pruning preserves literal projection cardinality");
     for (const auto& [leftText, leftValue] : truthValues) {
         for (const auto& [rightText, rightValue] : truthValues) {
             for (const auto& op : {"AND", "OR"}) {
@@ -148,7 +158,9 @@ int main() {
     }
     for (const auto& source : {"SELECT COUNT(*),SUM(id) FROM t WHERE NULL=1;", "SELECT COUNT(*) FROM t HAVING NOT NULL;", "SELECT 1/0 FROM t WHERE NULL AND FALSE;", "SELECT id FROM t WHERE NULL OR TRUE;", "BEGIN; UPDATE t SET id=1/0 WHERE NULL=NULL; DELETE FROM t WHERE NOT NULL; ROLLBACK;"}) {
         const auto plain = database.execute(source, false);
-        require(plain.at("success") == true && database.execute(source, true) == plain, "NULL folding preserves aggregate empty input and DML no-op behavior");
+        const auto fast = database.execute(source, true);
+        require(plain.at("success") == true && semanticResult(fast) == semanticResult(plain),
+                "NULL folding preserves aggregate empty input and DML no-op behavior");
     }
     for (const auto& predicate : {"1=1 AND id>1", "1=0 OR id=1", "NOT 1!=1", "id=1 AND 1=1", "id=1 OR 1=0",
                                  "1=0 AND id=1", "1=1 OR id=1", "'a'<'b' AND id=2", "NOT (1=1 AND 2=2)",
@@ -156,7 +168,7 @@ int main() {
         const auto source = std::string("SELECT name,id,name FROM t WHERE ") + predicate + ";";
         const auto plain = database.execute(source, false);
         const auto fast = database.execute(source, true);
-        require(plain["success"] == true && fast == plain, "optimized results equal including duplicates");
+        require(plain["success"] == true && semanticResult(fast) == semanticResult(plain), "optimized results equal including duplicates");
     }
     auto compiled = database.compile("SELECT id FROM t WHERE 1=1;");
     require(compiled["plan"].size() == 3 && compiled["optimizedPlan"].size() == 2, "compile exposes both plans");
@@ -168,14 +180,14 @@ int main() {
         const auto source = std::string("SELECT id FROM t WHERE ") + predicate + ";";
         const auto plain = database.execute(source, false);
         const auto optimizedResult = database.execute(source, true);
-        require(plain["success"] == true && optimizedResult == plain, "arithmetic precedence and short circuit equivalence");
+        require(plain["success"] == true && semanticResult(optimizedResult) == semanticResult(plain), "arithmetic precedence and short circuit equivalence");
     }
     for (const auto& predicate : {"1/0=1", "2147483647+1=0", "-2147483648/-1=0", "-(-2147483648)=0",
                                  "50000*50000=0", "1/0=1 AND 1=0", "1/0=1 OR 1=1"}) {
         const auto source = std::string("SELECT id FROM t WHERE ") + predicate + ";";
         const auto plain = database.execute(source, false);
         const auto optimizedResult = database.execute(source, true);
-        require(plain["success"] == false && plain["error"]["code"] == 5001 && optimizedResult == plain, "arithmetic runtime error preserved");
+        require(plain["success"] == false && plain["error"]["code"] == 5001 && semanticResult(optimizedResult) == semanticResult(plain), "arithmetic runtime error preserved");
         require(database.compile(source)["success"] == true, "constant runtime failure not raised at compile time");
     }
     auto arithmeticPlan = database.compile("SELECT id FROM t WHERE id>10+8;");
@@ -192,7 +204,7 @@ int main() {
     require(database.execute("SELECT missing+1 AS x FROM t;")["error"]["code"] == 2003, "missing expression column rejected");
     require(database.execute("SELECT name+1 FROM t;")["error"]["code"] == 2003, "invalid expression type rejected");
     for (const auto& source : {"SELECT 1+2*3 AS result FROM t;", "SELECT 1/0 AS error FROM t;", "SELECT 1/0 FROM t WHERE 1=0;"}) {
-        require(database.execute(source, false) == database.execute(source, true), "projection optimization preserves values and errors");
+        require(semanticResult(database.execute(source, false)) == semanticResult(database.execute(source, true)), "projection optimization preserves values and errors");
     }
     require(database.execute("INSERT INTO t(id,name) VALUES(2,'c'); INSERT INTO t(id,name) VALUES(3,'b');")["success"] == true, "distinct fixture");
     auto distinct = database.execute("SELECT DISTINCT id,name FROM t;");
@@ -201,7 +213,7 @@ int main() {
     require(distinct["results"][0]["rows"].size() == 2, "distinct uses projected columns");
     distinct = database.execute("SELECT DISTINCT 1+1 AS fixed,name AS label FROM t;");
     require(distinct["results"][0]["rows"].size() == 2, "distinct expression results");
-    require(distinct == database.execute("SELECT DISTINCT 1+1 AS fixed,name AS label FROM t;", false), "distinct optimization equivalence");
+    require(semanticResult(distinct) == semanticResult(database.execute("SELECT DISTINCT 1+1 AS fixed,name AS label FROM t;", false)), "distinct optimization equivalence");
     distinct = database.execute("SELECT DISTINCT name,name FROM t;");
     require(distinct["results"][0]["columns"] == nlohmann::json::array({"name","name"}) && distinct["results"][0]["rows"].size() == 2, "distinct duplicate output columns");
     distinct = database.execute("SELECT DISTINCT * FROM t WHERE 1=0;");
@@ -238,38 +250,38 @@ int main() {
     require(database.execute("SELECT id+1 AS id FROM t ORDER BY id;")["error"]["code"] == 2003, "source alias conflict rejected");
     require(database.execute("SELECT name FROM t ORDER BY missing;")["error"]["code"] == 2003, "unknown order column rejected");
     const auto sortSql = "SELECT name FROM t WHERE 1=1 ORDER BY id+2 DESC,name LIMIT 2;";
-    require(database.execute(sortSql, true) == database.execute(sortSql, false), "sort optimizer equivalence");
+    require(semanticResult(database.execute(sortSql, true)) == semanticResult(database.execute(sortSql, false)), "sort optimizer equivalence");
     require(database.execute("SELECT * FROM t WHERE 1=0 ORDER BY id;")["results"][0]["rows"].empty(), "empty sorted output");
     const auto sortedPlan = database.compile("SELECT DISTINCT id FROM t ORDER BY id LIMIT 1;")["plan"];
     require(sortedPlan[0]["kind"] == "Limit" && sortedPlan[1]["kind"] == "Sort" && sortedPlan[2]["kind"] == "Distinct", "explicit sort plan order");
     for (const auto& predicate : {"a.id=b.id", "1=1 AND a.id=b.id", "1=0 OR a.id=b.id", "1=0 AND 1/0=1", "1/0=1 AND a.id=b.id", "a.id+1=b.id+1"}) {
         const auto source = std::string("SELECT a.id,b.id FROM t a JOIN t b ON ") + predicate + " ORDER BY a.id,b.id;";
-        require(database.execute(source, true) == database.execute(source, false), "join optimizer preserves rows and runtime errors");
+        require(semanticResult(database.execute(source, true)) == semanticResult(database.execute(source, false)), "join optimizer preserves rows and runtime errors");
     }
     for (const auto& expression : {"NULL=NULL", "NULL!=1", "NOT NULL", "TRUE AND NULL", "NULL AND TRUE", "FALSE OR NULL", "NULL OR FALSE", "NULL AND FALSE", "NULL OR TRUE", "NULL+1", "NULL IS NULL", "NULL IS NOT NULL", "NULL AND 1/0=1", "FALSE AND 1/0=1"}) {
         const auto source = std::string("SELECT ") + expression + " FROM t;";
-        require(database.execute(source, true) == database.execute(source, false), "NULL optimization preserves truth values and errors");
+        require(semanticResult(database.execute(source, true)) == semanticResult(database.execute(source, false)), "NULL optimization preserves truth values and errors");
     }
     for (const auto& expression : {"CAST(1+2 AS BIGINT)", "CAST('9223372036854775807' AS BIGINT)",
              "CAST(NULL AS INT)", "CAST('bad' AS INT)", "FALSE AND CAST('bad' AS INT)=1",
              "TRUE OR CAST('bad' AS INT)=1", "CAST('bad' AS INT)=1 AND FALSE",
              "CAST(2147483648 AS INT)", "CAST(CAST(id AS VARCHAR) AS BIGINT)"}) {
         const auto source = std::string("SELECT ") + expression + " FROM t;";
-        require(database.execute(source, true) == database.execute(source, false), "CAST optimization preserves values and evaluation errors");
+        require(semanticResult(database.execute(source, true)) == semanticResult(database.execute(source, false)), "CAST optimization preserves values and evaluation errors");
     }
     for (const auto& values : {"CAST('42' AS INT),CAST(1+2 AS VARCHAR)", "1/0,'bad'",
              "CAST('bad' AS INT),'bad'", "CAST(2147483648 AS INT),'bad'", "NULL,CAST(NULL AS VARCHAR)"}) {
         const auto source = std::string("INSERT INTO t(id,name) VALUES(") + values + ");";
-        require(database.execute(source, true) == database.execute(source, false), "INSERT expressions preserve result and error with optimization");
+        require(semanticResult(database.execute(source, true)) == semanticResult(database.execute(source, false)), "INSERT expressions preserve result and error with optimization");
     }
     for (const auto& values : {"(1+2,'a'),(3*4,'b')", "(5,'a'),(1/0,'b')",
              "(5,'a'),(CAST('bad' AS INT),'b')", "(NULL,NULL),(7,CAST(8 AS VARCHAR))"}) {
         require(database.execute("DELETE FROM t;")["success"] == true, "clear optimized multirow fixture");
         const auto source = std::string("INSERT INTO t(id,name) VALUES") + values + ";";
-        const auto optimized = database.execute(source, true);
+        const auto multirowOptimized = database.execute(source, true);
         const auto optimizedRows = database.execute("SELECT * FROM t ORDER BY id;");
         require(database.execute("DELETE FROM t;")["success"] == true, "clear plain multirow fixture");
-        require(optimized == database.execute(source, false), "multirow optimization preserves errors and counts");
+        require(semanticResult(multirowOptimized) == semanticResult(database.execute(source, false)), "multirow optimization preserves errors and counts");
         require(optimizedRows == database.execute("SELECT * FROM t ORDER BY id;"), "multirow optimization preserves persisted rows");
     }
     auto aggregatePlans = sql::compilePlans(parse("SELECT SUM(1+2),COUNT(*) FROM t GROUP BY id+1 HAVING TRUE;"), catalog);
@@ -306,7 +318,7 @@ int main() {
         "SELECT COUNT(*) FROM t HAVING COUNT(*)/0>0;",
         "SELECT MIN(id>0),MAX(id>0) FROM t;",
         "SELECT SUM(CAST(name AS INT)) FROM t;"
-    }) require(database.execute(source, true) == database.execute(source, false), "aggregate optimizer preserves results and errors");
+    }) require(semanticResult(database.execute(source, true)) == semanticResult(database.execute(source, false)), "aggregate optimizer preserves results and errors");
     for (const auto& source : {
         "SELECT AVG(id) FROM t;", "SELECT -AVG(id),+AVG(id) FROM t;",
         "SELECT name,AVG(id) FROM t GROUP BY name HAVING AVG(id)>0 ORDER BY AVG(id);",
@@ -320,7 +332,7 @@ int main() {
         "SELECT AVG(id)*AVG(id)/AVG(id) FROM t;",
         "SELECT AVG(id)*AVG(id),AVG(id)/0 FROM t WHERE FALSE;",
         "SELECT CAST(AVG(id)*AVG(id) AS INT),CAST(AVG(id)*AVG(id) AS VARCHAR) FROM t;"
-    }) require(database.execute(source, true) == database.execute(source, false), "exact AVG optimizer preserves results and errors");
+    }) require(semanticResult(database.execute(source, true)) == semanticResult(database.execute(source, false)), "exact AVG optimizer preserves results and errors");
     for (const auto& source : {
         "SELECT 0.1+0.2,1.25*0.125,1.0/3.0 FROM t;",
         "SELECT 2.0<10.0,-10.0<-2.0,1.0=1.00,1.0=1,1.0!=2.0 FROM t;",
@@ -332,7 +344,7 @@ int main() {
         "SELECT AVG(0.00000001),SUM(0.00000001) FROM t;",
         "SELECT id+0.5,COUNT(*) FROM t GROUP BY id+00.5 ORDER BY id+0.5;",
         "SELECT DISTINCT id+0.1 FROM t ORDER BY id+0.1;"
-    }) require(database.execute(source, true) == database.execute(source, false), "decimal literals preserve results and errors under optimization");
+    }) require(semanticResult(database.execute(source, true)) == semanticResult(database.execute(source, false)), "decimal literals preserve results and errors under optimization");
     for (const auto& source : {
         "SELECT CAST(1.235 AS DECIMAL(4,2)),CAST(-1.235 AS DECIMAL(4,2)) FROM t;",
         "SELECT CAST(1 AS DECIMAL(4,2))+0.1,CAST(2 AS DECIMAL(4,2))/3 FROM t;",
@@ -342,9 +354,8 @@ int main() {
         "SELECT SUM(CAST(id AS DECIMAL(12,2))),AVG(CAST(id AS DECIMAL(12,2))) FROM t;",
         "SELECT CAST(id AS DECIMAL(12,2)) FROM t GROUP BY CAST(id AS DECIMAL(012,02)) ORDER BY CAST(id AS DECIMAL(12,2));",
         "SELECT CAST(NULL AS DECIMAL(2,1)),CAST(CAST(-2.5 AS DECIMAL(2,1)) AS INT) FROM t;"
-    }) require(database.execute(source, true) == database.execute(source, false), "DECIMAL target CAST optimizer equivalence");
+    }) require(semanticResult(database.execute(source, true)) == semanticResult(database.execute(source, false)), "DECIMAL target CAST optimizer equivalence");
     const auto varcharFixture=database.execute("CREATE TABLE varchar_values(id INT,s VARCHAR(2)); INSERT INTO varchar_values VALUES(1,'ab'),(2,''),(3,NULL);",true);
-    if(!varcharFixture.at("success").get<bool>())std::cerr << directory << '\n' << varcharFixture.dump() << '\n';
     require(varcharFixture.at("success")==true,"VARCHAR optimizer fixture");
     for(const auto* source : {
         "SELECT s FROM varchar_values WHERE s='ab' ORDER BY s;",
@@ -355,7 +366,7 @@ int main() {
         "SELECT CAST('long' AS VARCHAR(1)) FROM varchar_values;",
         "SELECT CAST(1.20 AS VARCHAR(4)),CAST(TRUE AS VARCHAR(4)) FROM varchar_values;",
         "BEGIN; UPDATE varchar_values SET s='xy'; SELECT s FROM varchar_values ORDER BY id; ROLLBACK;"
-    }) require(database.execute(source,true)==database.execute(source,false),"VARCHAR optimizer equivalence");
+    }) require(semanticResult(database.execute(source,true))==semanticResult(database.execute(source,false)),"VARCHAR optimizer equivalence");
     require(database.execute("CREATE TABLE date_values(id INT,d DATE); INSERT INTO date_values VALUES(1,DATE '1999-12-31'),(2,DATE '2000-02-29'),(3,NULL);",true).at("success") == true,"DATE optimizer fixture");
     for(const auto* source : {
         "SELECT d FROM date_values WHERE d>=DATE '2000-01-01' ORDER BY d;",
@@ -366,7 +377,7 @@ int main() {
         "SELECT CAST('bad' AS DATE) FROM date_values;",
         "SELECT CAST(CAST(d AS VARCHAR) AS DATE) FROM date_values ORDER BY id;",
         "BEGIN; UPDATE date_values SET d=DATE '2024-02-29'; SELECT * FROM date_values ORDER BY id; ROLLBACK;"
-    }) require(database.execute(source,true)==database.execute(source,false),"DATE optimizer equivalence");
+    }) require(semanticResult(database.execute(source,true))==semanticResult(database.execute(source,false)),"DATE optimizer equivalence");
     require(database.execute("CREATE TABLE bool_values(id INT,b BOOL); INSERT INTO bool_values VALUES(1,TRUE),(2,FALSE),(3,NULL);",true).at("success") == true, "persistent BOOL optimizer fixture");
     for (const auto* source : {
         "SELECT b,NOT b,b AND NULL,b OR NULL FROM bool_values ORDER BY id;",
@@ -378,9 +389,8 @@ int main() {
         "SELECT CAST('bad' AS BOOL) FROM bool_values;",
         "SELECT CAST(CAST(b AS VARCHAR) AS BOOL) FROM bool_values ORDER BY id;",
         "BEGIN; UPDATE bool_values SET b=NOT b; SELECT b FROM bool_values ORDER BY id; ROLLBACK;"
-    }) require(database.execute(source,true) == database.execute(source,false), "persistent BOOL optimizer equivalence");
+    }) require(semanticResult(database.execute(source,true)) == semanticResult(database.execute(source,false)), "persistent BOOL optimizer equivalence");
     const auto decimalFixture = database.execute("CREATE TABLE decimal_values(id INT,v DECIMAL(12,2)); INSERT INTO decimal_values VALUES(1,0.1),(2,10.0),(3,-2.5),(4,NULL);",true);
-    if (!decimalFixture.at("success").get<bool>()) std::cerr << directory << '\n' << decimalFixture.dump() << '\n';
     require(decimalFixture.at("success") == true, "persistent DECIMAL optimizer fixture");
     for (const auto& source : {
         "SELECT * FROM decimal_values ORDER BY v;",
@@ -391,6 +401,14 @@ int main() {
         "SELECT a.v,b.v FROM decimal_values a LEFT JOIN decimal_values b ON a.v=b.v ORDER BY a.id;",
         "SELECT CAST(v AS DECIMAL(5,1)) FROM decimal_values ORDER BY id;",
         "BEGIN; UPDATE decimal_values SET v=CAST(v+1 AS DECIMAL(12,2)); SELECT v FROM decimal_values ORDER BY id; ROLLBACK;"
-    }) require(database.execute(source,true) == database.execute(source,false), "persistent DECIMAL optimizer equivalence");
+    }) require(semanticResult(database.execute(source,true)) == semanticResult(database.execute(source,false)), "persistent DECIMAL optimizer equivalence");
     std::cout << checks << " optimizer checks passed\n";
+    return 0;
+} catch (const std::exception& error) {
+    std::cerr << "optimizer contract failed after " << checks << " checks: " << error.what() << '\n';
+    return 1;
+} catch (...) {
+    std::cerr << "optimizer contract failed after " << checks << " checks with an unknown exception\n";
+    return 1;
+}
 }

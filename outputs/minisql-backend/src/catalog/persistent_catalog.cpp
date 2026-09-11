@@ -15,6 +15,9 @@ std::string key(std::string value) {
 }
 const RowSchema tableSchema{ColumnType::Int, ColumnType::Varchar, ColumnType::Int};
 const RowSchema columnSchema{ColumnType::Int, ColumnType::Int, ColumnType::Varchar, ColumnType::Varchar};
+const RowSchema accessSchema{ColumnType::Bigint, ColumnType::Int, ColumnType::Varchar};
+constexpr std::size_t accessChunkBytes = 3800;
+constexpr std::size_t accessMaxChunks = 4096;
 [[noreturn]] void corrupt() { throw MiniSqlError(ErrorCode::Storage, "STORAGE_CORRUPTION: system catalog"); }
 }
 PersistentCatalog::PersistentCatalog(storage::HeapStore& heap) : heap_(heap) {
@@ -134,6 +137,38 @@ PersistentCatalog::PersistentCatalog(storage::HeapStore& heap) : heap_(heap) {
         try { view_.create(definition); for (const auto& index : definition.indexes) { sql::Statement createIndex{"CreateIndex"};createIndex.indexName=index.name;createIndex.table=definition.table;createIndex.indexColumns=index.columns;createIndex.uniqueIndex=index.unique;view_.createIndex(createIndex); } } catch (const MiniSqlError&) { corrupt(); }
         tables_.push_back({id, std::move(definition)});
     });
+    // 读取权限系统堆表时按 permissionVersion 组成候选快照，允许崩溃留下旧快照和新快照的混合尾部。
+    std::map<std::uint32_t, std::vector<std::pair<std::int32_t, std::string>>> accessChunks;
+    heap_.scan(AccessCatalogStore, accessSchema, [&](storage::RowRef, const storage::Row& row) {
+        if (row.size() != 3 || std::holds_alternative<std::monostate>(row[0]) ||
+            std::holds_alternative<std::monostate>(row[1]) || std::holds_alternative<std::monostate>(row[2])) corrupt();
+        const auto version = std::get<std::int64_t>(row[0]);
+        const auto ordinal = std::get<std::int32_t>(row[1]);
+        const auto& chunk = std::get<std::string>(row[2]);
+        if (version < 1 || version > std::numeric_limits<std::uint32_t>::max() || ordinal < 0 ||
+            static_cast<std::size_t>(ordinal) >= accessMaxChunks || chunk.empty() || chunk.size() > accessChunkBytes) corrupt();
+        accessChunks[static_cast<std::uint32_t>(version)].push_back({ordinal, chunk});
+    });
+    for (auto version = accessChunks.rbegin(); version != accessChunks.rend() && !accessCatalog_; ++version) {
+        auto& chunks = version->second;
+        std::sort(chunks.begin(), chunks.end(), [](const auto& left, const auto& right) { return left.first < right.first; });
+        bool complete = !chunks.empty() && chunks.front().first == 0;
+        std::string payload;
+        if (complete) {
+            for (std::size_t index = 0; index < chunks.size(); ++index) {
+                if (chunks[index].first != static_cast<std::int32_t>(index)) { complete = false; break; }
+                payload += chunks[index].second;
+            }
+        }
+        if (!complete || payload.empty()) continue;
+        try {
+            const auto parsed = nlohmann::json::parse(payload);
+            if (!parsed.is_object() || !parsed.contains("users") || !parsed.contains("roles") ||
+                !parsed.at("users").is_object() || !parsed.at("roles").is_object()) continue;
+        } catch (const nlohmann::json::exception&) { continue; }
+        accessCatalog_ = AccessCatalogRecord{version->first, std::move(payload)};
+    }
+    if (!accessChunks.empty() && !accessCatalog_) corrupt();
     // --- X13 migrate / stamp. Table & column rows above were read leniently, so
     // the in-memory catalog already reflects current features; migration here is
     // a version stamp and never rewrites column types / NULL / constraints /
@@ -197,6 +232,52 @@ void PersistentCatalog::reload() {
     view_ = std::move(restored.view_);
     tables_ = std::move(restored.tables_);
     nextId_ = restored.nextId_;
+    accessCatalog_ = std::move(restored.accessCatalog_);
+}
+PersistentCatalog::Snapshot PersistentCatalog::snapshot() const {
+    return {view_, tables_, nextId_, schemaVersion_, migratedFrom_, recovered_, producerVersion_, accessCatalog_};
+}
+void PersistentCatalog::restore(const Snapshot& snapshot) {
+    view_ = snapshot.view;
+    tables_ = snapshot.tables;
+    nextId_ = snapshot.nextId;
+    schemaVersion_ = snapshot.schemaVersion;
+    migratedFrom_ = snapshot.migratedFrom;
+    recovered_ = snapshot.recovered;
+    producerVersion_ = snapshot.producerVersion;
+    accessCatalog_ = snapshot.accessCatalog;
+}
+void PersistentCatalog::storeAccessCatalog(std::uint32_t permissionVersion, const std::string& payload) {
+    if (permissionVersion == 0 || payload.empty() || payload.size() > accessChunkBytes * accessMaxChunks)
+        throw MiniSqlError(ErrorCode::Catalog, "Invalid access catalog snapshot");
+    try {
+        const auto parsed = nlohmann::json::parse(payload);
+        if (!parsed.is_object() || !parsed.contains("users") || !parsed.contains("roles") ||
+            !parsed.at("users").is_object() || !parsed.at("roles").is_object())
+            throw MiniSqlError(ErrorCode::Catalog, "Invalid access catalog snapshot");
+    } catch (const nlohmann::json::exception&) {
+        throw MiniSqlError(ErrorCode::Catalog, "Invalid access catalog snapshot");
+    }
+    if (accessCatalog_ && permissionVersion < accessCatalog_->permissionVersion)
+        throw MiniSqlError(ErrorCode::Catalog, "Access catalog version would move backwards");
+    if (accessCatalog_ && permissionVersion == accessCatalog_->permissionVersion) {
+        if (accessCatalog_->payload != payload) throw MiniSqlError(ErrorCode::Catalog, "Access catalog version conflict");
+        return;
+    }
+    std::vector<storage::RowRef> oldRows;
+    heap_.scan(AccessCatalogStore, accessSchema, [&](storage::RowRef ref, const storage::Row&) { oldRows.push_back(ref); });
+    const auto chunkCount = (payload.size() + accessChunkBytes - 1) / accessChunkBytes;
+    if (chunkCount == 0 || chunkCount > accessMaxChunks) throw MiniSqlError(ErrorCode::Catalog, "Access catalog has too many chunks");
+    for (std::size_t ordinal = 0; ordinal < chunkCount; ++ordinal) {
+        const auto begin = ordinal * accessChunkBytes;
+        const auto length = std::min(accessChunkBytes, payload.size() - begin);
+        const storage::Row row{static_cast<std::int64_t>(permissionVersion), static_cast<std::int32_t>(ordinal), payload.substr(begin, length)};
+        (void)storage::encodeRow(row, accessSchema);
+        heap_.insert(AccessCatalogStore, accessSchema, row);
+    }
+    heap_.flush();
+    for (const auto ref : oldRows) heap_.erase(AccessCatalogStore, ref);
+    heap_.flush();
 }
 void PersistentCatalog::createIndex(const sql::Statement& statement) {
     view_.createIndex(statement);

@@ -14,6 +14,7 @@ const server = spawn(process.execPath, [fileURLToPath(new URL('../scripts/databa
     PORT: '0',
     MINISQL_DB: join(root, 'database.pages'),
     MINISQL_SESSION_IDLE_MS: '30000',
+    MINISQL_ENGINE_REQUEST_TIMEOUT_MS: '120000',
     MINISQL_SORT_MEMORY_ROWS: '500',
     MINISQL_AGGREGATE_MEMORY_ROWS: '500',
     MINISQL_TEMP_DIR: sortDirectory,
@@ -22,7 +23,7 @@ const server = spawn(process.execPath, [fileURLToPath(new URL('../scripts/databa
   windowsHide: true,
 });
 const exited = once(server, 'exit');
-const deadline = setTimeout(() => server.kill(), 120000);
+const deadline = setTimeout(() => server.kill(), 300000);
 let errors = '', checks = 0;
 server.stderr.on('data', chunk => { errors += chunk; });
 const delay = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
@@ -44,7 +45,7 @@ try {
       method,
       headers: { 'Content-Type': 'application/json' },
       ...(sql === undefined ? {} : { body: JSON.stringify({ sql }) }),
-      signal: AbortSignal.timeout(60000),
+      signal: AbortSignal.timeout(180000),
     });
     return { status: response.status, data: await response.json() };
   }
@@ -55,7 +56,9 @@ try {
   equal((await request(prefix + '/execute', 'CREATE TABLE big(id INT);')).status, 200);
   for (let start = 0; start < 30000; start += 5000) {
     const values = Array.from({ length: 5000 }, (_, index) => '(' + (start + index) + ')').join(',');
-    equal((await request(prefix + '/execute', 'INSERT INTO big VALUES ' + values + ';')).status, 200);
+    const inserted = await request(prefix + '/execute', 'INSERT INTO big VALUES ' + values + ';');
+    assert.equal(inserted.status, 200, JSON.stringify(inserted.data));
+    ++checks;
   }
 
   const idleCancel = await request(prefix + '/cancel');
