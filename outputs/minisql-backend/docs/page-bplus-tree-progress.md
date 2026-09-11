@@ -18,17 +18,19 @@
 - bridge 新增只读会话路由 `POST /api/sessions/:id/index-inspect`，带表级 `READ` 权限与审计；`runSessionOperation` 支持透传上下文。
 - 工作台 Web（`client.ts`/`App.tsx`/`IndexInspect.tsx`）：侧栏表展开区列出索引，点击即触发检查；新增 `Inspect` 输出面板展示树高/节点/叶链/校验标记/结构问题及页明细。
 
-## B1（X20）收尾状态（契约层结论，2026-09-10 复核）
+## 合并后验证（2026-09-10）
 
-- **契约层即 B1 的 storage 收尾结论**：`page_bplus_tree_contract` 以最小依赖桩 harness 编译，496 项全绿，且 exe 构建时间晚于源码、与当前实现同步。页级 B+ 树结构能力（分裂递归、删除借位/合并/根收缩、`inspect()` 校验、陈旧代次拒绝、同进程重开恢复）已验证，无需修复。
-- **集成层遗留，明确记入 B5 存储与恢复集成门禁**，待完整 `minisql_database.exe` 构建后执行：
-  1. UPDATE 键变化后索引与全扫一致（含复合键前缀范围完整覆盖）——`index-smoke.mjs`
-  2. 事务回滚后索引恢复——`index-smoke.mjs`/`database-http.mjs`
-  3. 跨进程重启后叶链/根页恢复——`index-smoke.mjs` 重开段
-- 全量回归阻塞原因：本仓库本地沙箱无法完成 vcpkg 依赖安装（`vcpkg install` 引导挂起、0 下载缓存），亦无 node 可编译前端 TS，故 **execution/server 及前端改动未在本环境编译/回归**。请在有 vcpkg + node 环境跑：
-  - `cmake --preset windows && cmake --build --preset windows-debug && ctest --preset windows-debug`
-  - `cd outputs\minisql-workbench && npm install && npm run build && npm run preview`（联调 bridge 端口）
-  - 及 `tests/index-smoke.mjs` 与 HTTP 会话链路。若页级默认引发回归，可设 `MINISQL_INDEX_ENGINE=memory` 回退旧内存引擎对比。
+- Windows Release 主工程构建通过：`cmake --preset windows -DBUILD_TESTING=OFF`、`cmake --build --preset windows-release --parallel`。
+- `node tests/index-smoke.mjs`：29 项索引检查、41 项索引持久化检查、44 项重启/持久化检查通过。
+- `node tests/database-http.mjs`：真实 HTTP 执行链路通过；`node tests/session-process.mjs`：51 项 session 协议检查通过。
+- 工作台 `npm.cmd run build` 与 `npm.cmd run test:browser` 通过，页级索引检查入口与现有连接、权限、设置、拖动和移动端 DOM 回归无冲突。
+- 新增 `tests/index-scale-smoke.mjs`：1000 行 15 项（height=2, pages=33）、10000 行 33 项（height=3, pages=323）通过，覆盖批量插入、CREATE INDEX、点查、范围扫描、行数和 catalog 索引元数据。
+- 新增 `tests/index-performance-curve.mjs`：1000/5000/10000 行耗时约 0.46s / 0.80s / 3.41s，树高 2/3/3，页数 33/162/323，并输出 `tests/artifacts/index-performance-curve.json`。
+
+## 尚未闭合
+
+- X20 仍保留“部分实现”：需要继续补齐页级索引与所有 SQL 扩展的全量组合验收，以及更大规模数据下的性能/资源曲线。
+- 旧 JSON 镜像格式仍保留为兼容回退路径；`MINISQL_INDEX_ENGINE=memory` 可用于对照验证，但不应把兼容路径当作页级主路径的验证替代。
 
 ## 回归命令
 
@@ -41,5 +43,5 @@ node tests\index-smoke.mjs            # 既有 44 项索引回归（确保不受
 
 ## 兼容与回滚
 
-- `PageBPlusTree` 为新增自包含模块，不改动现有 `BPlusTree`/`Database` 主路径，既有索引测试保持绿色。
+- `PageBPlusTree` 已接入 `Database` 索引主路径；原 `BPlusTree`/JSON 镜像仍保留为兼容回退实现，既有索引测试保持绿色。
 - 设计见 `docs/page-bplus-tree-design.md`。旧 JSON 快照 `loadIndexPages` 保留为兼容入口。

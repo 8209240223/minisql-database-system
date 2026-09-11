@@ -24,10 +24,26 @@ Database.executeScript 用于一次性 CLI 和现有 HTTP 桥。一个请求可�
 
 transaction-process.mjs 74 项通过：多语句提交、显式回滚、第二条语句失败、查询除零、编译错误、非法字符、缺少分号、嵌套事务、EOF 未提交、事务化 DDL、已提交语句不被后续事务失败撤销，以及只编译不持久化。
 
+`transaction-savepoint.mjs` 7 项通过：DML 回滚到保存点、DDL 回滚到保存点、RELEASE 后提交、事务外 SAVEPOINT 拒绝，以及保存点回滚后索引重建。
+
+`transaction-overflow.mjs` 5 项通过：通过 `MINISQL_MAX_BATCH_PAGES` 缩小写批页数预算，大事务超限时返回明确的 `Write batch page limit exceeded; rollback required`，自动回滚后数据库仍可查询。
+
 database_contract 81 项通过：同实例跨调用保留事务、读自己的写入、ABORTED 状态限制、ROLLBACK 恢复、目录撤销、重复提交拒绝、实例销毁后未提交记录消失，以及原生异常在日志提交点前后的状态与恢复。
 
 HTTP 全链路回归通过，包括完整事务脚本、未提交请求结束、回滚后影响行数和提示、多行插入、外键及 12 个串行处理的并发写请求。多行专项 111 项重新运行通过。本轮未运行浏览器交互测试，不把 HTTP 通过视为前端事务按钮已完成。
 
-## 四、尚未完成
+## 四、保存点实现
 
-前端事务按钮与状态同步已接入，见 workbench-transaction-progress.md。多逻辑会话、数据库级排他事务锁、锁等待超时和关闭回滚已接入，详见 concurrency-progress.md；行级隔离、死锁等待图、保存点、事务溢写和 X21/X23 全量验收尚未完成。原生数据库锁仍独占整个打开实例，不等于已经实现行锁或 MVCC。此前偶发自引用外键测试失败仍是未关闭风险。
+- `SAVEPOINT` 在活动事务内保存页写批次和 Catalog 快照。
+- `ROLLBACK TO [SAVEPOINT]` 恢复页写批次、Catalog 和索引，使 DML 与 DDL 都可回滚到保存点。
+- `RELEASE [SAVEPOINT]` 删除保存点；COMMIT、ROLLBACK 和事务开始会清理保存点集合。
+- 保存点名称按大小写不敏感匹配。
+
+## 五、事务溢写边界
+
+- `MINISQL_MAX_BATCH_PAGES` 可配置单写批次的页数上限，默认 16384。
+- 超过预算时事务返回明确错误并回滚，不产生部分修改；该入口同时用于自动化回归。
+
+## 六、尚未完成
+
+前端事务按钮与状态同步已接入，见 workbench-transaction-progress.md。多逻辑会话、数据库级排他事务锁、锁等待超时和关闭回滚已接入，详见 concurrency-progress.md；行级隔离、死锁等待图和 X21/X23 全量验收尚未完成。事务溢写目前是明确预算/回滚语义，尚未实现降级到外存继续执行。原生数据库锁仍独占整个打开实例，不等于已经实现行锁或 MVCC。此前偶发自引用外键测试失败仍是未关闭风险。

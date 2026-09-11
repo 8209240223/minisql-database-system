@@ -7,10 +7,13 @@
 #include <thread>
 #include <atomic>
 #include <condition_variable>
+#include <functional>
+#include <unordered_map>
+#include <vector>
 #include "minisql/catalog/persistent_catalog.hpp"
-#include "minisql/execution/executor.hpp"
 #include "minisql/sql/planner.hpp"
 #include "minisql/storage/bplus_tree.hpp"
+#include "minisql/execution/executor.hpp"
 
 namespace minisql::execution {
 class Database {
@@ -19,29 +22,35 @@ public:
                       storage::PageFile::CommitObserver observer = {});
     nlohmann::json execute(const std::string& sql, bool optimize = true);
     nlohmann::json executeScript(const std::string& sql, bool optimize = true);
+    nlohmann::json executeStreaming(const std::string& sql,
+                                    const std::function<void(const nlohmann::json&)>& emitMeta,
+                                    const std::function<bool(const nlohmann::json&)>& emitRow);
     const char* transactionState() const;
     nlohmann::json compile(const std::string& sql) const;
+    // 解析并通过当前 Catalog 规范化 SQL 实际访问的基础表对象。
+    // 该结果供入口层权限校验使用，别名和派生表作用域不会被当成持久化对象。
+    std::vector<std::string> resolveAccessObjects(const std::string& sql) const;
     nlohmann::json diagnostics(const std::string& sql) const;
     nlohmann::json catalog();
     nlohmann::json statistics();
     nlohmann::json checkpoint();
-    // 在线一致性快照信息（B4/X26）：空闲时 flush 全部 buffeer 并执行一次检查点，使数据库文件
-    // 落入一致状态，并返回当前提交序号、WAL 状态、脏页水位与目录/索引版本，供备份 manifest 记录。
-    nlohmann::json snapshotInfo();
+    nlohmann::json createSnapshot(const std::filesystem::path& target);
     nlohmann::json indexInspect(const std::string& table, const std::string& index);   // 页级索引结构校验（页类型/height/keyCount/兄弟指针/叶链/根可达）
+    // 将已由入口层校验的权限快照同步到 PersistentCatalog 的保留系统表。
+    void synchronizeAccessCatalog(const nlohmann::json& document, std::uint32_t permissionVersion);
+    const std::optional<catalog::AccessCatalogRecord>& accessCatalogRecord() const { return catalog_.accessCatalogRecord(); }
     ~Database();
     void setSessionContext(const std::string& sessionId, const std::filesystem::path& cancelFile);
     nlohmann::json configureBuffer(const std::string& action);
     nlohmann::json runCorrelatedSubquery(const nlohmann::json& expression, const nlohmann::json& row);
-    // 执行器级流式读执行（X25 跨进程协议入口）：解析单条 SELECT，构建 RowStream 并施加
-    // 资源预算后逐行产出。onMeta 在首行前回调（含 columns/columnTypes）；onRow 每行回调一次；
-    // waitBackpressure 在每行产出后回调（若提供），供跨进程背压/取消确认使用（内部持有 mu_）。
-    nlohmann::json streamQuery(const std::string& sql,
-                               const std::function<void(nlohmann::json&&)>& onMeta,
-                               const std::function<void(Row&&)>& onRow,
-                               const std::function<void(std::size_t rowIndex)>& waitBackpressure = {});
 private:
     nlohmann::json bufferStatus() const;
+    // X18: 实时单遍扫描的表/列/索引统计；ANALYZE 用它生成快照，statistics() 无快照时回退到它。
+    nlohmann::json liveTableStatistics();
+    // ANALYZE 快照旁路文件（<db>.analyze.json）：读、写路径与失效删除。
+    std::filesystem::path analyzeMetadataPath() const;
+    std::optional<nlohmann::json> loadAnalyzeMetadata() const;
+    void invalidateAnalyzeSnapshot() const;
     void evaluateAutoCheckpoint(std::size_t committedWriteStatements, std::size_t committedDirtyPages);
     void evaluateBackgroundCheckpoint();
     void backgroundSchedulerLoop();
@@ -59,18 +68,20 @@ private:
     nlohmann::json runStatement(const sql::LogicalPlan& plan);
     nlohmann::json run(const sql::LogicalPlan& plan);
     nlohmann::json runNode(const sql::LogicalPlan& plan);
-    // 执行器级流式读路径（X25）：SeqScan/Filter/Project/Sort/Limit/Distinct 组合成 RowStream，
-    // 并施加行数/临时文件字节/sort run 数预算，达预算立即停止。经由 MINISQL_EXECUTOR=stream 启用。
-    bool streamEligible(const sql::LogicalPlan& plan) const;
-    std::unique_ptr<RowStream> buildStream(const sql::LogicalPlan& plan);
-    nlohmann::json runStream(const sql::LogicalPlan& plan);
+    std::unique_ptr<RowStream> scanRowStream(const sql::LogicalPlan& plan);
+    std::unique_ptr<RowStream> openRowStream(const sql::LogicalPlan& plan);
+    // X09 3.5: 相关子查询按 subquerySql 缓存已解析 AST，执行时以 by-value 参数
+    // 绑定替换外层列（不再逐行文本重解析）。值会在 run 时以当前 catalog 重新编译。
+    std::unordered_map<std::string, std::vector<sql::Statement>> correlatedAstCache_;
+    // X09 3.4: 相关子查询「保守执行优化」——等值/确定性相关的 EXISTS/IN/标量按绑定
+    // 参数分组，对每个不同参数物化子查询一次（collection 语义半连接），避免重复执行。
+    // 以 (subquerySql|scope) 为形缓存外层列引用，以 (shape|绑定值) 缓存结果行；
+    // 缓存生命周期仅在单条语句内（runStatement/EXPLAIN ANALYZE 入口清空）。
+    std::unordered_map<std::string, std::vector<std::size_t>> correlatedColumnsCache_;
+    std::unordered_map<std::string, nlohmann::json> correlatedRowsCache_;
     std::vector<nlohmann::json>* nodeStats_ = nullptr;
     std::size_t sortMemoryRows_ = 10000;
     std::size_t aggregateMemoryRows_ = 10000;
-    bool streamReads_ = false;              // MINISQL_EXECUTOR=stream 时启用 RowStream 读路径
-    std::uint64_t maxTempFileBytes_ = 0;    // 临时文件字节预算（0=不限）
-    std::size_t maxSortRuns_ = 0;           // 排序 run 数预算（0=不限）
-    std::size_t maxAggregateStates_ = 0;    // 聚合状态数预算（0=不限）
     std::size_t autoCheckpointWrites_ = 0;
     std::uint64_t autoCheckpointWalBytes_ = 0;
     std::size_t autoCheckpointDirtyPages_ = 0;
@@ -81,6 +92,11 @@ private:
     std::uint64_t pendingAutoCheckpointWalBytes_ = 0;
     std::size_t checkpointCount_ = 0;
     std::size_t transactionWriteStatements_ = 0;
+    struct SavepointState {
+        storage::PageFileSavepoint file;
+        catalog::PersistentCatalog::Snapshot catalog;
+    };
+    std::unordered_map<std::string, SavepointState> savepoints_;
     std::chrono::steady_clock::time_point lastCheckpointAt_;
     std::uint64_t lastCheckpointAtMs_ = 0;
     std::uint64_t lastAutoCheckpointAtMs_ = 0;

@@ -5,6 +5,7 @@
 #include <string>
 #include <utility>
 #include <variant>
+#include <vector>
 #include <nlohmann/json_fwd.hpp>
 
 namespace minisql {
@@ -20,6 +21,8 @@ enum class ErrorCode {
 struct SourceLocation {
     std::size_t line{0};   // 1-based; 0 means location unavailable.
     std::size_t column{0};
+    std::size_t endLine{0};    // Exclusive end of the source span; 0 = fall back to line.
+    std::size_t endColumn{0};  // One past the last column of the source span; 0 = fall back to column.
 };
 
 std::string errorType(ErrorCode code);
@@ -27,15 +30,20 @@ std::string errorType(ErrorCode code);
 class MiniSqlError : public std::runtime_error {
 public:
     MiniSqlError(ErrorCode code, std::string message,
-                 SourceLocation location = {}, std::string suggestion = {});
+                 SourceLocation location = {}, std::string suggestion = {},
+                 std::string actual = {}, std::vector<std::string> expected = {});
     ErrorCode code() const noexcept { return code_; }
     SourceLocation location() const noexcept { return location_; }
     const std::string& suggestion() const noexcept { return suggestion_; }
+    const std::string& actual() const noexcept { return actual_; }
+    const std::vector<std::string>& expected() const noexcept { return expected_; }
     nlohmann::json toJson() const;
 private:
     ErrorCode code_;
     SourceLocation location_;
     std::string suggestion_;
+    std::string actual_;
+    std::vector<std::string> expected_;
 };
 
 class Status {

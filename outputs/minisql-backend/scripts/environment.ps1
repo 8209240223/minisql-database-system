@@ -32,6 +32,8 @@ if (!$env:VCPKG_BINARY_SOURCES) {
     $env:VCPKG_BINARY_SOURCES = "clear;files,$binaryCache,readwrite"
 }
 $env:VCPKG_DISABLE_METRICS = '1'
-# 不设置 VCPKG_FORCE_SYSTEM_BINARIES，让 vcpkg 按需下载 cmake/powershell-core 等工具；
-# 该变量一旦非空会导致 powershell-core 等工具无法下载（本仓库的 VS 内置 vcpkg 无内置
-# ports 目录，依赖 vcpkg-configuration.json 的 git 注册表解析 baseline）。
+# Reuse the detected CMake instead of downloading another large tool bundle.
+# Do not force system binaries: vcpkg may download a pinned PowerShell (pwsh)
+# for its toolchain bootstrap through the configured proxy when the host lacks
+# pwsh, which the old FORCE flag silently prevented and broke "vcpkg install".
+# Git and CMake still come from the system PATH.

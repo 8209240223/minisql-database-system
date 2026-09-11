@@ -1,8 +1,16 @@
-import type { AccessState, AuditEntry, Connection, QueryResult, SessionEntry, Table } from './types';
+import type { AccessState, AuditEntry, BackupEntry, BackupValidation, Capabilities, Connection, QueryResult, SessionEntry, Table } from './types';
+
+function requestHeaders(connection: Connection, initial?: HeadersInit) {
+  const headers = new Headers(initial);
+  headers.set('X-MiniSQL-User', connection.user);
+  if (connection.password) headers.set('X-MiniSQL-Password', connection.password);
+  else headers.delete('X-MiniSQL-Password');
+  return headers;
+}
 
 async function api(connection: Connection, path: string, options?: RequestInit) {
   const url = `${connection.url.replace(/\/$/, '')}${path}`;
-  const response = await fetch(url, options);
+  const response = await fetch(url, { ...options, headers: requestHeaders(connection, options?.headers) });
   const data = await response.json().catch(() => { throw new Error(`API 返回非 JSON 响应 (${response.status})`); });
   if (!response.ok || data.error) throw Object.assign(new Error(data.error?.message || data.message || `HTTP ${response.status}`), data.error, {
     completedStatements: data.completedStatements, results: data.results, commitState: data.commitState,
@@ -12,8 +20,9 @@ async function api(connection: Connection, path: string, options?: RequestInit) 
 }
 
 async function streamApi(connection: Connection, path: string, sql: string, signal: AbortSignal) {
+  const requestId = crypto.randomUUID();
   const response = await fetch(`${connection.url.replace(/\/$/, '')}${path}`, {
-    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sql }), signal,
+    method: 'POST', headers: requestHeaders(connection, { 'Content-Type': 'application/json' }), body: JSON.stringify({ sql, requestId }), signal,
   });
   const reader = response.body?.getReader();
   if (!reader) throw new Error(`API 未返回可读取的流 (${response.status})`);
@@ -61,7 +70,9 @@ export async function closeApiSession(connection: Connection) {
 }
 
 export function releaseApiSession(connection: Connection) {
-  if (connection.sessionId) void fetch(`${connection.url.replace(/\/$/, '')}${sessionPath(connection, '/close')}`, { method: 'POST', keepalive: true }).catch(() => {});
+  if (connection.sessionId) void fetch(`${connection.url.replace(/\/$/, '')}${sessionPath(connection, '/close')}`, {
+    method: 'POST', keepalive: true, headers: requestHeaders(connection),
+  }).catch(() => {});
 }
 
 export async function getCatalog(connection: Connection): Promise<Table[]> {
@@ -176,6 +187,41 @@ export async function getSessions(connection: Connection): Promise<SessionEntry[
   return data.entries;
 }
 
+export async function cancelSession(connection: Connection, sessionId: string) {
+  const requestId = crypto.randomUUID();
+  const response = await fetch(`${connection.url.replace(/\/$/, '')}/sessions/${encodeURIComponent(sessionId)}/cancel`, {
+    method: 'POST', headers: requestHeaders(connection, { 'Content-Type': 'application/json' }), body: JSON.stringify({ requestId }), signal: AbortSignal.timeout(10000),
+  });
+  const data = await response.json().catch(() => { throw new Error(`取消请求返回非 JSON 响应 (${response.status})`); });
+  if (response.status === 202 && data.cancelled) return data;
+  throw Object.assign(new Error(data.error?.message ?? `HTTP ${response.status}`), data.error ?? {}, { status: response.status, response: data });
+}
+
+export async function getCapabilities(connection: Connection): Promise<Capabilities> {
+  return api(connection, '/capabilities');
+}
+
+export async function getBackups(connection: Connection): Promise<BackupEntry[]> {
+  const data = await api(connection, '/backups');
+  if (!Array.isArray(data.entries)) throw new Error('备份响应缺少 entries 数组。');
+  return data.entries;
+}
+
+export async function createBackup(connection: Connection, body: { name?: string; kind?: 'full' | 'incremental'; base?: string } = {}) {
+  return api(connection, '/backup', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+}
+
+export async function restoreBackup(connection: Connection, name: string) {
+  return api(connection, '/restore', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name }) });
+}
+
+export async function validateBackup(connection: Connection, name: string): Promise<BackupValidation> {
+  const data = await api(connection, '/backup/validate', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name }),
+  });
+  if (!data.validation) throw new Error('备份迁移校验响应缺少 validation 字段。');
+  return data.validation;
+}
 export interface IndexPageInspect {
   page: { id: number; generation: number };
   leaf: boolean;
@@ -218,7 +264,7 @@ export async function runSql(connection: Connection, sql: string, compile: boole
     return { ...data, plan: data.plan ?? [], durationMs: data.durationMs ?? 0, affectedRows: data.affectedRows ?? 0, statements: data.statements ?? 1 };
   }
   const data = await api(connection, sessionPath(connection, compile ? '/compile' : '/execute'), {
-    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sql }), signal,
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sql, requestId: crypto.randomUUID() }), signal,
   });
   if (!Array.isArray(data.rows) || !Array.isArray(data.columns)) throw new Error('API 响应不符合 QueryResult 契约。');
   return { ...data, plan: data.plan ?? [], durationMs: data.durationMs ?? 0, affectedRows: data.affectedRows ?? 0, statements: data.statements ?? 1 };

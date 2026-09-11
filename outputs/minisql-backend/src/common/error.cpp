@@ -23,15 +23,18 @@ std::string errorType(ErrorCode code) {
 }
 
 MiniSqlError::MiniSqlError(ErrorCode code, std::string message,
-                         SourceLocation location, std::string suggestion)
+                         SourceLocation location, std::string suggestion,
+                         std::string actual, std::vector<std::string> expected)
     : std::runtime_error(std::move(message)), code_(code), location_(location),
-      suggestion_(std::move(suggestion)) {}
+      suggestion_(std::move(suggestion)), actual_(std::move(actual)),
+      expected_(std::move(expected)) {}
 
 nlohmann::json MiniSqlError::toJson() const {
     return {{"success", false}, {"error", {
         {"type", errorType(code_)}, {"code", static_cast<int>(code_)},
         {"message", what()}, {"line", location_.line},
-        {"column", location_.column}, {"suggestion", suggestion_}}}};
+        {"column", location_.column}, {"suggestion", suggestion_},
+        {"actual", actual_}, {"expected", expected_}}}};
 }
 
 Status::Status(ErrorCode code, std::string message)

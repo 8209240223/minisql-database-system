@@ -56,6 +56,7 @@ try {
   equal(adminSession.status, 201);
   const adminPrefix = '/sessions/' + adminSession.data.sessionId;
   equal((await request(adminPrefix + '/execute', 'CREATE TABLE public_records(id INT PRIMARY KEY);')).status, 200);
+  equal((await request(adminPrefix + '/execute', 'CREATE INDEX public_records_id_idx ON public_records(id);')).status, 200);
   equal((await request(adminPrefix + '/execute', 'CREATE TABLE secret_records(id INT PRIMARY KEY);')).status, 200);
 
   const initial = await request('/access', undefined, 'GET');
@@ -92,7 +93,13 @@ try {
   equal(bobSession.status, 201);
   const bobPrefix = '/sessions/' + bobSession.data.sessionId;
 
+  const inspected = await request(alicePrefix + '/index-inspect', { table: 'public_records', index: 'public_records_id_idx' }, 'POST', 'alice', 'alice-secret');
+  equal(inspected.status, 200);
+  equal(inspected.data.storage, 'page-file');
   equal((await request(alicePrefix + '/execute', 'SELECT * FROM public_records;', 'POST', 'alice', 'alice-secret')).status, 200);
+  equal((await request(alicePrefix + '/execute', 'SELECT * FROM public_records WHERE id IN (SELECT id FROM secret_records);', 'POST', 'alice', 'alice-secret')).status, 403);
+  equal((await request(alicePrefix + '/execute', 'SELECT * FROM (SELECT id FROM secret_records) AS hidden;', 'POST', 'alice', 'alice-secret')).status, 403);
+  equal((await request(alicePrefix + '/execute', "SELECT * FROM public_records WHERE 'FROM secret_records' = 'x';", 'POST', 'alice', 'alice-secret')).status, 200);
   equal((await request(alicePrefix + '/execute', 'INSERT INTO public_records VALUES(1);', 'POST', 'alice', 'alice-secret')).status, 200);
   equal((await request(alicePrefix + '/execute', 'UPDATE public_records SET id = id + 1 WHERE id = 1;', 'POST', 'alice', 'alice-secret')).status, 200);
   equal((await request(alicePrefix + '/execute', 'DELETE FROM public_records;', 'POST', 'alice', 'alice-secret')).status, 403);
@@ -154,7 +161,7 @@ try {
   equal((await request(bobPrefix + '/close', undefined, 'POST', 'bob', 'bob-secret')).status, 200);
   equal((await request(carolPrefix + '/close', undefined, 'POST', 'carol', 'carol-secret')).status, 200);
   equal((await request(adminPrefix + '/close')).status, 200);
-  console.log(`${checks} access-control HTTP checks passed: roles, object grants, revoke, identity, metadata and audit`);
+  console.log(`${checks} access-control HTTP checks passed: roles, object grants, index inspection, revoke, identity, metadata and audit`);
 } catch (error) {
   console.error('server stderr:', errors);
   throw error;

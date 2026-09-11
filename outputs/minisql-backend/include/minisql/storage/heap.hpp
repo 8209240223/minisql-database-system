@@ -31,6 +31,7 @@ public:
     void erase(std::uint64_t table, RowRef ref);
     RowRef replace(std::uint64_t table, const RowSchema& schema, RowRef ref, const Row& row);
     void scan(std::uint64_t table, const RowSchema& schema, const std::function<void(RowRef, const Row&)>& visitor);
+    std::vector<RowRef> refsFor(std::uint64_t table);
     void flush() { buffer_.flushAll(); }
 private:
     std::shared_ptr<PageFile> file_;

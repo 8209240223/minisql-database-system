@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import type { QueryResult } from './types';
+import type { QueryResult, SqlToken } from './types';
 
 export function Plan({ result }: { result: QueryResult | null }) {
   const [optimized, setOptimized] = useState(false);
@@ -36,8 +36,43 @@ export function Plan({ result }: { result: QueryResult | null }) {
     </div>}
     {visibleRows?.length ? visibleRows.map(row => <div className="plan-row" style={{ paddingLeft: 14 + Math.min(32, Math.max(0, row.depth ?? 0)) * 20 }} key={row.id}>
       <span className="plan-node">{row.kind ?? 'STEP'}</span><strong>{row.detail}</strong>
+      <details className="plan-node-details">
+        <summary>节点详情</summary>
+        <p>输入节点：{row.children?.length ? row.children.join(', ') : '无'}</p>
+        <p>输出列：{row.output?.length ? row.output.map(column => `${column.name}:${column.type}`).join(', ') : '无'}</p>
+        {row.predicate != null && <p>条件：<code>{JSON.stringify(row.predicate)}</code></p>}
+        {!!row.projections?.length && <p>投影：<code>{JSON.stringify(row.projections)}</code></p>}
+        {!!row.sortKeys?.length && <p>排序键：<code>{JSON.stringify(row.sortKeys)}</code></p>}
+        {!!row.groupKeys?.length && <p>分组键：<code>{JSON.stringify(row.groupKeys)}</code></p>}
+        {!!row.aggregates?.length && <p>聚合：<code>{JSON.stringify(row.aggregates)}</code></p>}
+        <p>估算行数：{row.estimatedRows ?? '未提供'} · 实际行数：{row.actualRows ?? '未提供'}</p>
+      </details>
     </div>) : <p className="result-warning">暂无计划</p>}
     {optimized && result?.optimizationRules && <details><summary>优化记录（{result.optimizationRules.length}）</summary><pre className="json-view">{JSON.stringify(result.optimizationRules, null, 2)}</pre></details>}
+  </div>;
+}
+
+export function TokenStream({ result, onSelect }: { result: QueryResult | null; onSelect?: (token: SqlToken) => void }) {
+  const tokens = result?.tokens ?? [];
+  if (!tokens.length) return <div className="table-scroll"><p className="result-warning">暂无 Token 数据</p></div>;
+  return <div className="token-view">
+    <div className="token-summary">
+      <strong>词法分析结果</strong>
+      <span>共 {tokens.length} 个 Token</span>
+      <span>格式：[种别码，词素值，行号，列号]</span>
+    </div>
+    <div className="table-scroll">
+      <table aria-label="Token 流">
+        <thead><tr><th>#</th><th>种别码</th><th>词素值</th><th>行号</th><th>列号</th></tr></thead>
+        <tbody>{tokens.map((token, index) => <tr className="token-row" key={`${token.line}-${token.column}-${index}`} tabIndex={0} title="点击定位到 SQL 源码" onClick={() => onSelect?.(token)} onKeyDown={event => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); onSelect?.(token); } }}>
+          <td>{index + 1}</td>
+          <td><span className={`token-type token-${token.type.toLowerCase().replace(/[^a-z0-9_-]/g, '')}`}>{token.type}</span></td>
+          <td className="token-lexeme">{token.text || '<空>'}</td>
+          <td>{token.line}</td>
+          <td>{token.column}</td>
+        </tr>)}</tbody>
+      </table>
+    </div>
   </div>;
 }
 
@@ -45,8 +80,7 @@ export function Diagnostics({ result }: { result: QueryResult | null }) {
   const labels: Record<string, string> = { passed: '已通过', skipped: '已跳过', notRun: '未运行', notImplemented: '未实现', failed: '失败' };
   return <div className="table-scroll">
     {result?.stages && <div className="diagnostics">{Object.entries(result.stages).map(([name, state]) => <div className="diag-row" key={name}><strong>{name}</strong><span>{labels[state] ?? state}</span></div>)}</div>}
-    {result?.tokens ? <table aria-label="Token 序列"><thead><tr><th>#</th><th>类型</th><th>原文</th><th>行</th><th>列</th></tr></thead><tbody>
-      {result.tokens.map((token, index) => <tr key={index}><td>{index + 1}</td><td>{token.type}</td><td style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', maxWidth: 400 }}>{token.text}</td><td>{token.line}</td><td>{token.column}</td></tr>)}
-    </tbody></table> : <p className="result-warning">暂无 Token 数据</p>}
+    {result?.diagnostics?.length ? <div className="diagnostics" aria-label="编译诊断">{result.diagnostics.map((item, index) => <div className="diag-row" key={`${item.statementIndex ?? index}-${item.line ?? 0}-${item.column ?? 0}`}><strong>{item.code ?? 'SQL'}</strong><span>第 {item.line ?? 1} 行，第 {item.column ?? 1} 列：{item.message}</span>{(item.actual || item.expected?.length) && <p>实际：{item.actual || '空'} · 期望：{item.expected?.join(' | ') || '未提供'}</p>}{item.suggestion && <p>{item.suggestion}</p>}</div>)}</div> : null}
+    {!result?.stages && !result?.diagnostics?.length && <p className="result-warning">暂无诊断数据</p>}
   </div>;
 }

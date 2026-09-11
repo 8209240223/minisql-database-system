@@ -62,7 +62,11 @@ function queryRows(db, sql) {
 }
 for (const stage of ['prepared', 'published', 'applied-page', 'data-synced']) {
   const database = join(directory, `fault-${stage}.pages`);
-  assert.equal(crashRun(database, 'CREATE TABLE t(id INT);', stage).status, 0); ++checks;
+  // 建表是准备步骤：main 把 DDL 也纳入写批次，故此处不注入故障，避免与待验证的 INSERT 混淆。
+  const setupRun = spawnSync(executable, [database, 'execute'], {
+    input: 'CREATE TABLE t(id INT);', encoding: 'utf8', windowsHide: true, timeout: 10000, env: baseEnv,
+  });
+  assert.equal(setupRun.status, 0, setupRun.stderr); ++checks;
   const interrupted = crashRun(database, 'INSERT INTO t VALUES(7);', stage);
   assert.equal(interrupted.status, 77, `${stage}: ${interrupted.stderr}`); ++checks;
   const expected = stage === 'prepared' ? [] : [[7]];

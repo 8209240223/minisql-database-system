@@ -9,7 +9,10 @@
 #include <cctype>
 #include <cstdint>
 #include <functional>
+#include <map>
+#include <string>
 #include <unordered_map>
+#include <vector>
 
 namespace minisql::sql {
 namespace {
@@ -55,6 +58,14 @@ nlohmann::json correlatedScope(const catalog::Table& table) {
     }
     return scope;
 }
+bool containsSubquery(const Expr& expression) {
+    if (expression.kind == "Exists" || expression.kind == "InSubquery" || expression.kind == "ScalarSubquery") return true;
+    return (expression.left && containsSubquery(*expression.left)) || (expression.right && containsSubquery(*expression.right));
+}
+bool containsNegatedSubquery(const Expr& expression) {
+    if (expression.kind == "Unary" && canonical(expression.value) == "not" && expression.left && containsSubquery(*expression.left)) return true;
+    return (expression.left && containsNegatedSubquery(*expression.left)) || (expression.right && containsNegatedSubquery(*expression.right));
+}
 nlohmann::json bindExpression(const Expr& expression, const catalog::Table& table, std::size_t depth = 0) {
     if (depth > 256) invalid("expression depth exceeded");
     nlohmann::json result = {{"kind", expression.kind}, {"line", expression.location.line},
@@ -70,26 +81,41 @@ nlohmann::json bindExpression(const Expr& expression, const catalog::Table& tabl
         result["type"] = result["value"].is_null() ? "null" : result["value"].is_boolean() ? "bool" : result["value"].is_string() ? "varchar" : result["value"].is_number_float() ? "float" : "int";
         if (result["value"].is_number_integer() && (result["value"].get<std::int64_t>() < INT32_MIN || result["value"].get<std::int64_t>() > INT32_MAX)) result["type"] = "bigint";
         result["nullable"] = result["value"].is_null();
-        if (dateLiteralText(expression.value)) result["type"] = "date";
-        if (expression.value.find_first_of("eE") != std::string::npos && expression.value.front() != '\'') result["type"] = "float";
-        if (expression.value.find_first_of("eE") == std::string::npos && expression.value.find('.') != std::string::npos && expression.value.front() != '\'') result["type"] = decimalLiteral(expression.value, expression.location).type.name();
+        const bool dateLiteral = dateLiteralText(expression.value).has_value();
+        const auto firstNumeric = [&]() {
+            if (expression.value.empty()) return false;
+            const std::size_t offset = expression.value.front() == '+' || expression.value.front() == '-' ? 1 : 0;
+            return offset < expression.value.size() && std::isdigit(static_cast<unsigned char>(expression.value[offset]));
+        };
+        if (dateLiteral) result["type"] = "date";
+        if (!dateLiteral && firstNumeric() && expression.value.find_first_of("eE") != std::string::npos) result["type"] = "float";
+        if (firstNumeric() && expression.value.find_first_of("eE") == std::string::npos && expression.value.find('.') != std::string::npos) result["type"] = decimalLiteral(expression.value, expression.location).type.name();
     } else if (expression.kind == "Exists") {
         if (expression.subquerySql.empty()) invalid("missing EXISTS subquery");
         result["subquerySql"] = expression.subquerySql;
-        result["outerColumns"] = correlatedScope(table);
+        const auto outer = correlatedScope(table);
+        result["outerColumns"] = outer;
+        result["planKind"] = outer.empty() ? "SemiJoin" : "Apply";
+        result["decorrelation"] = outer.empty() ? "none" : "grouped-parameter-instances";
         result["type"] = "bool";
         result["nullable"] = false;
     } else if (expression.kind == "ScalarSubquery") {
         if (expression.subquerySql.empty()) invalid("missing scalar subquery");
         result["subquerySql"] = expression.subquerySql;
-        result["outerColumns"] = correlatedScope(table);
+        const auto outer = correlatedScope(table);
+        result["outerColumns"] = outer;
+        result["planKind"] = outer.empty() ? "ScalarSubquery" : "Apply";
+        result["decorrelation"] = outer.empty() ? "none" : "grouped-parameter-instances";
         result["type"] = "null";
         result["nullable"] = true;
     } else if (expression.kind == "InSubquery") {
         if (!expression.left || expression.subquerySql.empty()) invalid("missing IN subquery operand");
         result["left"] = bindExpression(*expression.left, table, depth + 1);
         result["subquerySql"] = expression.subquerySql;
-        result["outerColumns"] = correlatedScope(table);
+        const auto outer = correlatedScope(table);
+        result["outerColumns"] = outer;
+        result["planKind"] = outer.empty() ? "SemiJoin" : "Apply";
+        result["decorrelation"] = outer.empty() ? "none" : "grouped-parameter-instances";
         result["type"] = "bool";
         result["nullable"] = true;
     } else if (expression.kind == "AggregateExpr") {
@@ -140,7 +166,9 @@ nlohmann::json bindExpression(const Expr& expression, const catalog::Table& tabl
 std::vector<PlanColumn> schema(const catalog::Table& table) {
     std::vector<PlanColumn> output;
     for (std::size_t i = 0; i < table.columns.size(); ++i) {
-        output.push_back({table.columns[i].name, table.columns[i].type, i, table.columns[i].nullable, table.columns[i].defaultValue, table.columns[i].primaryKey, table.columns[i].unique, table.columns[i].references});
+        const auto qualifier = table.columns[i].qualifier.empty() ? table.name : table.columns[i].qualifier;
+        output.push_back({table.columns[i].name, table.columns[i].type, i, table.columns[i].nullable, table.columns[i].defaultValue,
+            table.columns[i].primaryKey, table.columns[i].unique, table.columns[i].references, qualifier + "." + table.columns[i].name});
     }
     return output;
 }
@@ -204,6 +232,49 @@ void lowerAggregate(LogicalPlan& project, const Statement& statement, const cata
         project.output.at(i).columnId = expression.at("kind") == "Identifier" ? expression.at("columnId").get<std::size_t>() : static_cast<std::size_t>(-1);
     }
     auto having = statement.having ? rewrite(bindExpression(*statement.having, scope), 0) : nlohmann::json(nullptr);
+    // X09 4.x: 聚合之上（HAVING / 投影）的相关子查询 —— 其 outerColumns 携带的是基表列下标，
+    // 而此处实际求值的行是聚合输出行（分组键 + 聚合槽位）。必须把外层列下标重映射到 GROUP BY
+    // 键在 aggregate.output 中的槽位，否则执行期会越界（5001）或取自错误列。
+    // 引用未参与分组的列按 SQL 语义报 2003，与 rewrite 对普通标识符的处理一致。
+    std::unordered_map<std::size_t, std::size_t> groupSlot;
+    for (std::size_t i = 0; i < aggregate.groupKeys.size(); ++i) {
+        const auto& key = aggregate.groupKeys[i];
+        if (key.is_object() && key.value("kind", "") == "Identifier" && key.contains("columnId"))
+            groupSlot.emplace(key.at("columnId").get<std::size_t>(), i);
+    }
+    std::function<void(nlohmann::json&)> remapGroupRefs;
+    remapGroupRefs = [&](nlohmann::json& node) {
+        if (!node.is_object()) return;
+        const auto kind = node.value("kind", "");
+        if ((kind == "ScalarSubquery" || kind == "Exists" || kind == "InSubquery") &&
+            node.contains("subquerySql") && node.at("subquerySql").is_string() &&
+            node.contains("outerColumns") && node.at("outerColumns").is_object()) {
+            std::vector<std::string> referenced;
+            try {
+                const auto toks = tokenize(node.at("subquerySql").get<std::string>());
+                for (std::size_t i = 0; i + 2 < toks.size(); ++i)
+                    if (toks[i].type == "IDENTIFIER" && toks[i + 1].lexeme == "." && toks[i + 2].type == "IDENTIFIER")
+                        referenced.push_back(canonical(toks[i].lexeme + "." + toks[i + 2].lexeme));
+            } catch (...) { referenced.clear(); }
+            std::map<std::string, std::size_t> slots;
+            for (const auto& name : referenced) {
+                const auto found = node.at("outerColumns").find(name);
+                if (found == node.at("outerColumns").end() || !found->is_object() || !found->contains("columnId")) continue;
+                const auto slot = groupSlot.find(found->at("columnId").get<std::size_t>());
+                if (slot == groupSlot.end()) {
+                    const auto dot = name.find('.');
+                    throw MiniSqlError(ErrorCode::Semantic, "Column must be grouped or aggregated: " +
+                        (dot == std::string::npos ? name : name.substr(dot + 1)), statement.location);
+                }
+                slots.emplace(name, slot->second);
+            }
+            for (const auto& entry : slots) node.at("outerColumns").at(entry.first)["columnId"] = entry.second;
+        }
+        if (node.contains("left")) remapGroupRefs(node["left"]);
+        if (node.contains("right")) remapGroupRefs(node["right"]);
+    };
+    for (auto& expression : project.projections) remapGroupRefs(expression);
+    if (!having.is_null()) remapGroupRefs(having);
     aggregate.children.push_back(std::move(project.children.front()));
     project.children.clear();
     if (statement.having) {
@@ -214,20 +285,36 @@ void lowerAggregate(LogicalPlan& project, const Statement& statement, const cata
     } else project.children.push_back(std::move(aggregate));
 }
 LogicalPlan build(const Statement& statement, const catalog::Catalog& catalog) {
-    if (statement.kind == "Begin" || statement.kind == "Commit" || statement.kind == "Rollback") {
-        LogicalPlan plan;plan.kind = statement.kind;return plan;
+    if (statement.kind == "Begin" || statement.kind == "Commit" || statement.kind == "Rollback" ||
+        statement.kind == "Savepoint" || statement.kind == "ReleaseSavepoint" || statement.kind == "RollbackTo") {
+        LogicalPlan plan;plan.kind = statement.kind;plan.savepointName = statement.savepointName;return plan;
     }
     if (statement.kind == "Checkpoint") { LogicalPlan plan; plan.kind = "Checkpoint"; return plan; }
     if (statement.kind == "DropIndex") { LogicalPlan plan; plan.kind = "DropIndex"; plan.table = statement.table; plan.indexName = statement.indexName; return plan; }
     if (statement.kind == "CreateIndex") { LogicalPlan plan; plan.kind = "CreateIndex"; plan.table = statement.table; plan.indexName = statement.indexName; plan.uniqueIndex = statement.uniqueIndex; plan.indexColumns = statement.indexColumns; return plan; }
-    const auto* table = catalog.find(statement.table);
-    if (!table) invalid("missing table " + statement.table);
-    const auto scope = catalog::queryScope(statement, catalog);
-    const bool aggregated = statement.kind == "Select" && catalog::analyzeSelect(statement, scope).aggregated;
+    // X09 3.3: 派生表作为外层关系基座。内层 select 计划先构建，其实体输出
+    // （selectItems）成为外层查询的绑定作用域；未限定列名一律按该作用域解析，禁字符串替换。
+    const bool derivedBase = statement.fromSubquery != nullptr;
+    const auto* table = derivedBase ? nullptr : catalog.find(statement.table);
+    if (!table && !derivedBase) invalid("missing table " + statement.table);
     LogicalPlan plan;
-    plan.table = table->name;
-    for (const auto& check : table->checks)
-        plan.checks.push_back(bindExpression(*deserializeExpression(nlohmann::json::parse(check)), *table));
+    catalog::Table bindScope;
+    LogicalPlan derivedInput;
+    if (derivedBase) {
+        derivedInput = build(*statement.fromSubquery, catalog);
+        plan.table = statement.tableAlias.empty() ? statement.table : statement.tableAlias;
+        catalog::Table derived;
+        derived.name = plan.table;
+        for (const auto& column : derivedInput.output)
+            derived.columns.push_back({column.name, column.type, derived.name, column.nullable, column.defaultValue, column.primaryKey, column.unique, column.references});
+        bindScope = std::move(derived);
+    } else {
+        plan.table = table->name;
+        for (const auto& check : table->checks)
+            plan.checks.push_back(bindExpression(*deserializeExpression(nlohmann::json::parse(check)), *table));
+        bindScope = catalog::queryScope(statement, catalog);
+    }
+    const bool aggregated = statement.kind == "Select" && catalog::analyzeSelect(statement, bindScope).aggregated;
     if (statement.kind == "CreateTable") {
         plan.kind = "CreateTable";
         plan.checkDefinitions = serializeChecks(statement.checks);
@@ -270,6 +357,15 @@ LogicalPlan build(const Statement& statement, const catalog::Catalog& catalog) {
             }
         }
     } else if (statement.kind == "Select" || statement.kind == "Delete" || statement.kind == "Update") {
+        if (derivedBase && statement.kind != "Select")
+            throw MiniSqlError(ErrorCode::Semantic, "DELETE/UPDATE is not supported over a derived table", statement.location);
+        LogicalPlan input;
+        if (derivedBase) {
+            if (!statement.joins.empty())
+                throw MiniSqlError(ErrorCode::Semantic, "JOIN over a derived table is not supported yet", statement.location);
+            // 派生表基座：直接以内层 select 计划作为输入，外层谓词/投影按 derivedScope 绑定。
+            input = std::move(derivedInput);
+        } else {
         LogicalPlan scan;
         scan.kind = "SeqScan";
         scan.table = table->name;
@@ -312,15 +408,16 @@ LogicalPlan build(const Statement& statement, const catalog::Catalog& catalog) {
                 scan.indexName = index.name;
                 scan.indexColumns = index.columns;
                 scan.indexValues = nlohmann::json::array();
-                for (const auto& value : values) scan.indexValues.push_back(bindExpression(*value, scope));
+                for (const auto& value : values) scan.indexValues.push_back(bindExpression(*value, bindScope));
                 if (prefix < index.columns.size()) {
                     scan.indexRangeOperator = range.first;
-                    scan.indexRangeValue = bindExpression(*range.second, scope);
+                    scan.indexRangeValue = bindExpression(*range.second, bindScope);
                 }
                 break;
             }
         }
-        LogicalPlan input = std::move(scan);
+        input = std::move(scan);
+        }
         for (std::size_t i = 0; i < statement.joins.size(); ++i) {
             const auto& source = statement.joins[i];
             const auto* right = catalog.find(source.table);
@@ -337,11 +434,14 @@ LogicalPlan build(const Statement& statement, const catalog::Catalog& catalog) {
         }
         if (statement.where) {
             LogicalPlan filter;
-            filter.kind = "Filter";
-            filter.table = table->name;
+            filter.kind = containsNegatedSubquery(*statement.where) ? "AntiJoin" :
+                containsSubquery(*statement.where) ? "SemiJoin" : "Filter";
+            filter.subqueryJoinKind = containsNegatedSubquery(*statement.where) ? "AntiJoin" :
+                containsSubquery(*statement.where) ? "SemiJoin" : "";
+            filter.table = plan.table;
             filter.output = input.output;
             filter.preservesRowId = input.preservesRowId;
-            filter.predicate = bindExpression(*statement.where, scope);
+            filter.predicate = bindExpression(*statement.where, bindScope);
             filter.children.push_back(std::move(input));
             input = std::move(filter);
         }
@@ -351,8 +451,8 @@ LogicalPlan build(const Statement& statement, const catalog::Catalog& catalog) {
                 const auto index = columnIndex(*table, item.column);
                 plan.columnMapping.push_back(index);
                 if (item.expression->kind == "Default")
-                    plan.projections.push_back(bindExpression(Expr{"Literal", table->columns[index].defaultValue.value_or("NULL"), {}, {}, item.expression->location}, scope));
-                else plan.projections.push_back(bindExpression(*item.expression, scope));
+                    plan.projections.push_back(bindExpression(Expr{"Literal", table->columns[index].defaultValue.value_or("NULL"), {}, {}, item.expression->location}, bindScope));
+                else plan.projections.push_back(bindExpression(*item.expression, bindScope));
             }
         }
         if (statement.kind == "Select") {
@@ -361,23 +461,23 @@ LogicalPlan build(const Statement& statement, const catalog::Catalog& catalog) {
                     const auto& item = statement.selectItems[i];
                     if (item.expression->kind == "Wildcard") {
                         const auto dot = item.expression->value.find('.');
-                        for (const auto& column : schema(scope)) {
-                            const auto& source = scope.columns[column.columnId];
+                        for (const auto& column : schema(bindScope)) {
+                            const auto& source = bindScope.columns[column.columnId];
                             if (dot != std::string::npos && canonical(source.qualifier) != canonical(item.expression->value.substr(0, dot))) continue;
                             plan.output.push_back(column);
                             Expr reference{"Identifier", source.qualifier + "." + column.name, {}, {}, item.expression->location};
-                            plan.projections.push_back(bindExpression(reference, scope));
+                            plan.projections.push_back(bindExpression(reference, bindScope));
                         }
                         continue;
                     }
-                    auto bound = bindExpression(*item.expression, scope);
+                    auto bound = bindExpression(*item.expression, bindScope);
                     auto name = item.alias;
                     if (name.empty()) name = item.expression->kind == "Identifier" ? bound.at("name").get<std::string>() : "expr_" + std::to_string(i + 1);
                     const auto columnId = item.expression->kind == "Identifier" ? bound.at("columnId").get<std::size_t>() : static_cast<std::size_t>(-1);
                     plan.output.push_back({name, bound.at("type").get<std::string>(), columnId, bound.value("nullable", true)});
                     plan.projections.push_back(std::move(bound));
                 }
-            } else for (const auto& name : statement.selectList) {
+            } else if (!derivedBase) for (const auto& name : statement.selectList) {
                 if (name == "*") plan.output = schema(*table);
                 else {
                     auto index = columnIndex(*table, name);
@@ -392,15 +492,15 @@ LogicalPlan build(const Statement& statement, const catalog::Catalog& catalog) {
     nlohmann::json sortKeys = nlohmann::json::array();
     auto visibleOutput = plan.output;
     if (statement.kind == "Select" && !statement.orderBy.empty()) {
-        if (plan.projections.empty()) {
+        if (plan.projections.empty() && !derivedBase) {
             for (const auto& column : plan.output) {
                 Expr reference{"Identifier", column.name, {}, {}};
-                plan.projections.push_back(bindExpression(reference, *table));
+                plan.projections.push_back(bindExpression(reference, bindScope));
             }
         }
         for (const auto& item : statement.orderBy) {
-            const auto resolved = catalog::resolveOrder(statement, item, scope);
-            const auto bound = bindExpression(*resolved, scope);
+            const auto resolved = catalog::resolveOrder(statement, item, bindScope);
+            const auto bound = bindExpression(*resolved, bindScope);
             const auto identity = expressionIdentity(bound);
             std::size_t index = 0;
             while (index < plan.projections.size() && expressionIdentity(plan.projections[index]) != identity) ++index;
@@ -413,7 +513,7 @@ LogicalPlan build(const Statement& statement, const catalog::Catalog& catalog) {
         }
     }
     if (aggregated) {
-        lowerAggregate(plan, statement, scope);
+        lowerAggregate(plan, statement, bindScope);
         std::copy_n(plan.output.begin(), visibleOutput.size(), visibleOutput.begin());
     }
     if (statement.kind == "Select" && statement.distinct) {
@@ -451,11 +551,19 @@ std::vector<LogicalPlan> compilePlans(const std::vector<Statement>& statements,
                                       const catalog::Catalog& catalog) {
     auto snapshot = catalog;
     std::optional<catalog::Catalog> transactionCatalog;
+    std::map<std::string, catalog::Catalog> savepointCatalogs;
     std::vector<LogicalPlan> plans;
     for (const auto& statement : statements) {
-        if (statement.kind == "Begin") transactionCatalog = snapshot;
-        else if (statement.kind == "Rollback" && transactionCatalog) { snapshot = *transactionCatalog;transactionCatalog.reset(); }
-        else if (statement.kind == "Commit") transactionCatalog.reset();
+        if (statement.kind == "Begin") { transactionCatalog = snapshot; savepointCatalogs.clear(); }
+        else if (statement.kind == "Savepoint" && transactionCatalog) savepointCatalogs[canonical(statement.savepointName)] = snapshot;
+        else if (statement.kind == "ReleaseSavepoint") savepointCatalogs.erase(canonical(statement.savepointName));
+        else if (statement.kind == "RollbackTo" && transactionCatalog) {
+            const auto found = savepointCatalogs.find(canonical(statement.savepointName));
+            if (found == savepointCatalogs.end()) invalid("savepoint does not exist: " + statement.savepointName);
+            snapshot = found->second;
+        }
+        else if (statement.kind == "Rollback" && transactionCatalog) { snapshot = *transactionCatalog;transactionCatalog.reset();savepointCatalogs.clear(); }
+        else if (statement.kind == "Commit") { transactionCatalog.reset();savepointCatalogs.clear(); }
         snapshot = catalog::compileSnapshot({statement}, snapshot);
         plans.push_back(build(statement, snapshot));
     }
@@ -471,12 +579,12 @@ nlohmann::json serializePlans(const std::vector<LogicalPlan>& plans) {
         const auto rowIndex = rows.size();
         nlohmann::json output = nlohmann::json::array();
         for (const auto& column : plan.output) {
-            output.push_back({{"name", column.name}, {"type", column.type}, {"columnId", column.columnId}, {"nullable", column.nullable},
+            output.push_back({{"name", column.name}, {"type", column.type}, {"columnId", column.columnId}, {"identity", column.identity}, {"nullable", column.nullable},
                 {"defaultValue", column.defaultValue ? nlohmann::json(*column.defaultValue) : nlohmann::json(nullptr)}, {"primaryKey", column.primaryKey}, {"unique", column.unique}, {"references", serializeReference(column.references)}});
         }
         rows.push_back({{"id", id}, {"parent", parent}, {"depth", depth}, {"statementIndex", statementIndex},
                         {"kind", plan.kind}, {"detail", plan.kind + " " + plan.table}, {"table", plan.table},
-                        {"indexName", plan.indexName}, {"uniqueIndex", plan.uniqueIndex}, {"indexColumns", plan.indexColumns}, {"indexValues", plan.indexValues}, {"indexRangeOperator", plan.indexRangeOperator}, {"indexRangeValue", plan.indexRangeValue},
+                        {"indexName", plan.indexName}, {"savepointName", plan.savepointName}, {"subqueryJoinKind", plan.subqueryJoinKind}, {"uniqueIndex", plan.uniqueIndex}, {"indexColumns", plan.indexColumns}, {"indexValues", plan.indexValues}, {"indexRangeOperator", plan.indexRangeOperator}, {"indexRangeValue", plan.indexRangeValue},
                         {"output", output}, {"preservesRowId", plan.preservesRowId},
                         {"predicate", plan.predicate}, {"values", plan.values}, {"insertExpressions", plan.insertExpressions}, {"insertRows", plan.insertRows},
                         {"columnMapping", plan.columnMapping}, {"projections", plan.projections}, {"children", nlohmann::json::array()}});
@@ -504,7 +612,7 @@ std::vector<LogicalPlan> deserializePlans(const nlohmann::json& document) {
     const auto invalid = []() -> void { throw MiniSqlError(ErrorCode::Storage, "Invalid serialized logical plan"); };
     nlohmann::json rows;
     if (document.is_array()) rows = document;
-    else if (document.is_object() && document.value("schemaVersion", 0u) == 1u && document.value("planKind", "") == "logical" && document.contains("plans"))
+    else if (document.is_object() && document.value("schemaVersion", 0u) == PLAN_SCHEMA_VERSION && document.value("planKind", "") == "logical" && document.contains("plans"))
         rows = document.at("plans");
     else invalid();
     if (!rows.is_array() || rows.size() > 65536) invalid();
@@ -542,7 +650,9 @@ std::vector<LogicalPlan> deserializePlans(const nlohmann::json& document) {
         item.plan.kind = row.at("kind").get<std::string>();
         item.plan.table = row.at("table").get<std::string>();
         item.plan.preservesRowId = row.at("preservesRowId").get<bool>();
-        item.plan.indexName = row.value("indexName", std::string{});
+    item.plan.indexName = row.value("indexName", std::string{});
+    item.plan.savepointName = row.value("savepointName", std::string{});
+    item.plan.subqueryJoinKind = row.value("subqueryJoinKind", std::string{});
         item.plan.uniqueIndex = row.value("uniqueIndex", false);
         item.plan.indexColumns = row.value("indexColumns", std::vector<std::string>{});
         item.plan.indexValues = row.value("indexValues", nlohmann::json::array());
@@ -552,6 +662,7 @@ std::vector<LogicalPlan> deserializePlans(const nlohmann::json& document) {
             if (!column.is_object() || !column.contains("name") || !column.at("name").is_string() || !column.contains("type") || !column.at("type").is_string() ||
                 !column.contains("columnId") || !column.at("columnId").is_number_unsigned() || !column.contains("nullable") || !column.at("nullable").is_boolean()) invalid();
             PlanColumn value{column.at("name").get<std::string>(), column.at("type").get<std::string>(), column.at("columnId").get<std::size_t>(), column.at("nullable").get<bool>()};
+            value.identity = column.value("identity", std::string{});
             if (column.contains("defaultValue") && !column.at("defaultValue").is_null()) value.defaultValue = column.at("defaultValue").get<std::string>();
             value.primaryKey = column.value("primaryKey", false);
             value.unique = column.value("unique", false);

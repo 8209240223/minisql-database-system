@@ -12,6 +12,7 @@ struct PlanColumn {
     bool primaryKey = false;
     bool unique = false;
     std::optional<std::pair<std::string,std::string>> references{};
+    std::string identity{};
 };
 
 struct LogicalPlan {
@@ -37,6 +38,8 @@ struct LogicalPlan {
     nlohmann::json groupKeys = nlohmann::json::array();
     nlohmann::json aggregates = nlohmann::json::array();
     std::string indexName{};
+    std::string savepointName{};
+    std::string subqueryJoinKind{};
     bool uniqueIndex = false;
     std::vector<std::string> indexColumns{};
     nlohmann::json indexValues = nlohmann::json::array();

@@ -453,7 +453,9 @@ std::vector<std::string> insertColumns(const sql::Statement& statement, const Ta
 }
 void validate(const std::vector<sql::Statement>& statements, Catalog& catalog) {
     for (const auto& statement : statements) {
-        if (statement.kind == "Begin" || statement.kind == "Commit" || statement.kind == "Rollback" || statement.kind == "Checkpoint") continue;
+        if (statement.kind == "Begin" || statement.kind == "Commit" || statement.kind == "Rollback" ||
+            statement.kind == "Savepoint" || statement.kind == "ReleaseSavepoint" || statement.kind == "RollbackTo" ||
+            statement.kind == "Checkpoint") continue;
         if (statement.kind == "CreateIndex") { catalog.createIndex(statement); continue; }
         if (statement.kind == "DropIndex") { catalog.dropIndex(statement); continue; }
         if (statement.kind == "Insert" && !statement.valueRows.empty()) {
@@ -469,6 +471,13 @@ void validate(const std::vector<sql::Statement>& statements, Catalog& catalog) {
         }
         if (statement.kind == "CreateTable") {
             catalog.create(statement);
+            continue;
+        }
+        // X09 3.3: 派生表基座。内层 select 仍在真实 catalog 上校验；外层列绑定、
+        // 类型与 WHERE 校验交由 planner 的 Scope 链完成（catalog 未知派生别名）。
+        if (statement.fromSubquery != nullptr) {
+            if (statement.kind != "Select") fail("DELETE/UPDATE is not supported over a derived table", statement.location);
+            validate({*statement.fromSubquery}, catalog);
             continue;
         }
         auto binding = queryScope(statement, catalog);

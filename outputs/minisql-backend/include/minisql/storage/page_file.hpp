@@ -26,6 +26,14 @@ struct CheckpointOptions {
     std::uint64_t catalogVersion = 0;   // 目录版本（目录/索引版本由上层语义维护）
     std::uint64_t indexVersion = 0;
 };
+struct PageFileSavepoint {
+    std::uint64_t count = 1;
+    std::unordered_map<PageId, std::uint64_t> active;
+    std::unordered_map<PageId, std::uint64_t> owners;
+    std::vector<PageRef> free;
+    std::unordered_map<PageId, PageBytes> pages;
+    bool published = false;
+};
 class PageFile {
 public:
     using CommitObserver = std::function<void(std::string_view)>;
@@ -40,6 +48,8 @@ public:
     void beginWriteBatch();
     void rollbackWriteBatch();
     void commitWriteBatch();
+    PageFileSavepoint savepoint() const;
+    void restoreSavepoint(const PageFileSavepoint& snapshot);
     void checkpoint(const CheckpointOptions& options = {});
     void requireHealthy() const;
     bool writeBatchActive() const { return batch_ != nullptr; }
@@ -51,6 +61,7 @@ public:
     std::uint64_t committedSequence() const { return committedSequence_; }
     std::uint64_t dirtyWatermark() const { return dirtyWatermark_; }
     const CheckpointRecord& checkpointRecord() const { return checkpointRecord_; }
+    void copyTo(const std::filesystem::path& destination);
     const std::filesystem::path& path() const { return path_; }
     const PageIoStats& ioStats() const { return ioStats_; }
     void resetIoStats() { ioStats_ = {}; }
@@ -91,7 +102,7 @@ private:
     void checkpointJournal();
     void writeCheckpointRecord();
     void loadCheckpointRecord();
-    void notify(std::string_view stage);
+    void notify(std::string_view stage, bool allowCrash = true);
     void writeHeader();
     void requireActive(PageRef ref) const;
 };

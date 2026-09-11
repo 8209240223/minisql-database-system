@@ -23,10 +23,38 @@ const syntax = run('SELECT FROM t; SELECT WHERE;');
 equal(syntax.success, false);
 equal(syntax.count, 2);
 equal(syntax.diagnostics.every(item => item.stage === 'parser'), true);
+const missingOperand = run('SELECT * FROM t WHERE age > 18 AND;');
+equal(missingOperand.success, false);
+equal(missingOperand.diagnostics[0].actual, ';');
+equal(missingOperand.diagnostics[0].expected.includes('IDENTIFIER'), true);
+equal(Array.isArray(missingOperand.diagnostics[0].expected), true);
 const valid = run('CREATE TABLE a(id INT); INSERT INTO a VALUES(1); SELECT * FROM a;');
 equal(valid.success, true);
 equal(valid.count, 3);
 const lexical = run("SELECT 'unterminated");
 equal(lexical.success, false);
 equal(lexical.diagnostics[0].stage, 'lexer');
+
+// X12: recovery-mode tokenizer reports EVERY lexical error in the batch (not
+// just the first) and still parses the remaining valid statements.
+const multiLex = run('SELECT @@ @; CREATE TABLE a(id INT); INSERT INTO a VALUES(1); SELECT * FROM a;');
+equal(multiLex.count, 6);
+const lexerStages = multiLex.diagnostics.filter(d => d.stage === 'lexer');
+equal(lexerStages.length, 2); // two '@' errors are both reported
+equal(lexerStages.every(d => d.recoverable === true && d.statementIndex === 0), true);
+equal(multiLex.diagnostics.every(d => Number.isInteger(d.endLine) && Number.isInteger(d.endColumn)), true);
+equal(multiLex.diagnostics.every(d => typeof d.source === 'string'), true);
+// the valid statements after the lexical errors still succeed
+equal(multiLex.diagnostics.filter(d => d.success === true).length, 3);
+
+// X12 (clause-level): one SELECT with two broken clauses reports BOTH syntax
+// errors within the same statement, not just the first.
+const clause = run('SELECT * FROM t WHERE = GROUP BY x ORDER BY ;');
+equal(clause.count, 2);
+equal(clause.diagnostics.every(d => d.stage === 'parser' && d.statementIndex === 0), true);
+equal(clause.diagnostics.length, 2);
+equal(run('CREATE TABLE people(id INT);', 'execute').success, true);
+const typo = run('SELECT * FROM peopl;');
+assert.match(typo.diagnostics[0].suggestion ?? '', /people/); ++checks;
+
 console.log(`${checks} batch diagnostics checks passed`);

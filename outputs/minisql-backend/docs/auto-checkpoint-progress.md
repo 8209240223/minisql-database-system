@@ -1,13 +1,13 @@
 # 自动检查点实现进度
 
-日期：2026-09-09。对应 EXT-SYS-003 和 X22，当前为部分实现，不表示 X22 全量验收通过。
+日期：2026-09-10。对应 EXT-SYS-003 和 X22，当前为部分实现，不表示 X22 全量验收通过。
 
 ## 已实现
 
 - 新增 `MINISQL_AUTO_CHECKPOINT_WRITES`，按成功提交的写语句数量触发自动 CHECKPOINT。
 - 新增 `MINISQL_AUTO_CHECKPOINT_WAL_BYTES`、`MINISQL_AUTO_CHECKPOINT_DIRTY_PAGES`、`MINISQL_AUTO_CHECKPOINT_DIRTY_RATIO` 和 `MINISQL_AUTO_CHECKPOINT_INTERVAL_MS`。
 - 自动策略在成功提交后统一评估；满足多个条件时一次 CHECKPOINT，并在统计接口中记录所有触发原因。
-- WAL 阈值使用本次提交生成的已同步日志大小累计。当前提交实现会在数据页恢复完成后立即截断 `.wal`，因此 `walBytes` 是实际文件大小，`pendingAutoCheckpointWalBytes` 是自动策略的累计依据。
+- WAL 阈值使用本次提交生成的已同步日志大小累计；多提交日志保留到独立 checkpoint，`walBytes` 表示当前日志文件大小，`pendingAutoCheckpointWalBytes` 表示自动策略的累计依据。
 - 脏页阈值使用提交前写批次中的唯一暂存页数；比例以 BufferPool 容量为分母并限制在 0 到 1，用于避免 `heap.flush()` 提前清除 dirty 标志后阈值失效。
 - 显式 `CHECKPOINT`、非事务写入和事务 `COMMIT` 都会重置累计量；事务内多条成功写语句在提交时一次计数，回滚不会计入。
 - `statistics()` 返回阈值配置、实际 `walBytes`、当前 `dirtyPages`/`dirtyPageRatio`、累计量、上次检查点时间和自动触发原因。
@@ -35,8 +35,12 @@
   - 恢复逻辑不依赖这两字段（仍以 seq + 提交标记判断），故对旧 `.wal` 格式向后兼容。
 - `page_file_wal_lsn_contract.cpp` 新增扩展头字段断言：两次提交的 seq/txId/startLsn/endLsn/recoveryStart 均一一校验。隔离编译 + 运行从 23 项增至 **36 项全绿**；检查点契约 21 项、页级 B+ 树契约 496 项均无回归。
 
-### 待验证/接入
-- 新路径的跨进程故障注入与 node 全量回归（`auto-checkpoint-smoke`/`x22-fault-injection`/`journal-process`，以及后台调度线程启用路径）需在有 vcpkg + node 环境验证；`database.cpp` 改动在本隔离环境无法编译断言，需在完整构建中确认。
+### 合并后验证（2026-09-10）
+- Windows Release 主工程构建通过，`database.cpp` 的后台调度和版本透传改动已纳入真实引擎。
+- `node tests/auto-checkpoint-smoke.mjs`：62 项通过。
+- `node tests/x22-fault-injection.mjs`：30 项通过，覆盖 `prepared`、`published`、`applied-page`、`data-synced`、`checkpointed` 五个阶段；恢复路径不会把正常重启误判为当前故障注入点。
+- `node tests/journal-process.mjs`：88 项通过，覆盖提交边界、重做、重复恢复、损坏、身份、锁和旧格式迁移。
+- `node tests/fuzz-state-machine-long-run.mjs`：2 个固定种子各 512 步通过，未出现崩溃、超时或资源限制错误。
 
 ## 验证
 
@@ -45,8 +49,8 @@
 - `node tests/x22-fault-injection.mjs`：30 项检查通过；覆盖五个提交/恢复阶段，验证故障后恢复、重复恢复和提交前后数据边界。
 - Release 构建通过。
 
-## 未完成
+## 尚未闭合
 
-- 当前为提交事件驱动检查，不在后台线程中对活动事务强制执行 CHECKPOINT；在线后台调度、工作台展示和全项目 X22 组合验收仍待完成。
-- 现有 WAL 在单次提交完成后立即截断，尚未改为保留多个提交日志直到独立检查点，因此不能据此宣称已实现完整 ARIES/WAL 截止位置语义。
+- 后台调度已实现并通过核心回归，但在线备份、活动事务边界的更高压力组合和工作台端到端展示仍需独立验收。
+- 当前 WAL/检查点实现满足本项目的页级恢复和截止位置测试，不等同于完整 ARIES 实现；更复杂的并发恢复语义仍不在本轮承诺内。
 - 迁移、在线备份、外部执行资源和 X01-X27 全量验收仍按各自 progress 文档推进。

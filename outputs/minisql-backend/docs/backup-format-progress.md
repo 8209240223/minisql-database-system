@@ -23,17 +23,31 @@
 
 ## 验证
 
-- `node tests/backup-smoke.mjs`：42 项检查通过。
+- `node tests/backup-smoke.mjs`：56 项检查通过。
 - 覆盖 v2 manifest 字段、未知版本拒绝、v1 到 v2 迁移、恢复后数据一致、备份列表和活动会话拒绝。
 - 覆盖全量 base1、增量 inc1、二次链 inc2、恢复、列表 kind/base、链上 manifest 损坏拒绝。
 - Release 构建和 HTTP 回归通过。
 
-## 在线一致性快照与迁移回滚
+## 在线快照增量
 
-- 引擎新增 `snapshot` 子命令（Database::snapshotInfo）：在无活动事务且无写批时 flush 全部缓冲并执行一次检查点，返回提交序号、WAL 状态、脏页水位、目录版本与索引版本，作为一致性快照位置。
-- `/backup` 备份前调用该一致性快照替代裸 CHECKPOINT，并把 `snapshot{committedSequence, walBytes, dirtyWatermark, catalogVersion, indexVersion, checkpointedAt}` 写入 manifest（version 2/3 保留原字段，新增可选 `snapshot` 对象，不做版本号升级，避免破坏既有回归断言）。
-- `/restore` 在原子替换前把当前库复制为迁移回滚副本 `backups/<name>.rollback-<ts>.pages`；替换成功则删除回滚副本，替换失败则保留原库与回滚副本供检查，且不删除 `.wal` 以免破坏原库恢复链。
-- `/backups` 列表额外暴露 `snapshot` 快照信息与 `chainDepth`（增量链深度）、`verified`。
+- 新增在线一致性快照入口 `POST /api/backup`（`mode=online`）：
+  - 复用 C++ `Database::createSnapshot` 在数据库级锁内复制页文件、WAL 和 `.ckpt`。
+  - 备份 manifest 升级为 version 4，记录 `walBytes`、`walCutoffBytes`、`committedSequence`、`catalogVersion` 和 `indexVersion`。
+  - 会话在线时也允许快照；快照完成后 bridge 会关闭无会话共享引擎，避免旧锁阻塞后续请求。
+  - 恢复链支持 version 4 manifest 和非零 WAL 截止位置，并在重建整条链后原子替换页文件和 sidecar。
+
+## 在线快照验证
+
+- `node tests/backup-online-smoke.mjs`：22 项通过，覆盖在线快照、manifest 版本 4、WAL 侧车校验、快照后插入并恢复、活动事务未提交时快照、提交后恢复不包含未提交行、恢复回滚目录存在。
+
+## 回滚目录增量
+
+- 恢复前会创建 `backups/rollback/restore-<timestamp>` 目录，并把当前页文件、WAL、`.ckpt` 一起复制进去。
+- 恢复成功后保留该目录；若后续发现恢复结果异常，可以使用它做人工回放。
+- 恢复过程中替换或重新打开失败时，会自动从回滚目录还原原库并返回 422，不再留下半替换状态。
+- 恢复路径新增 `materializeBackup`：全量备份直接复制到临时页文件，增量链按 delta 记录逐页随机写入并截断到最终页数，不再先构造完整内存页缓冲；磁盘落位完成后再原子 rename 到数据库路径。
+- 备份列表额外暴露 `snapshotLsn`、`chainDepth` 和 `pageChecksum`。
+- `chainDepth` 按 manifest 的 `base` 链递归计算，全量=1，一级增量=2，二级增量=3；增量 manifest 写入时也会固化该值。
 
 ## 未完成
 

@@ -1,5 +1,7 @@
 #include "minisql/sql/planner.hpp"
 #include "minisql/sql/serialization.hpp"
+#include "minisql/sql/lr_generator.hpp"
+#include <algorithm>
 #include <iostream>
 #include <stdexcept>
 
@@ -71,5 +73,20 @@ int main() {
     try { (void)minisql::sql::deserializeAst(damagedAst); }
     catch (const minisql::MiniSqlError&) { badAstExpression = true; }
     require(badAstExpression);
+    const auto lr = minisql::sql::buildCanonicalLr0({
+        {"S", {"A"}},
+        {"A", {"a"}},
+    });
+    require(lr.productions.size() == 3);
+    require(lr.states.size() >= 2);
+    const auto accept = std::find_if(lr.actions.begin(), lr.actions.end(), [](const auto& entry) { return entry.second == "accept"; });
+    require(accept != lr.actions.end());
+    const auto lalr = minisql::sql::buildLalr({
+        {"S", {"A"}},
+        {"A", {"a"}},
+    });
+    require(!lalr.states.empty());
+    const auto lalrAccept = std::find_if(lalr.actions.begin(), lalr.actions.end(), [](const auto& entry) { return entry.second == "accept"; });
+    require(lalrAccept != lalr.actions.end());
     std::cout << "Catalog snapshot, plan JSON and AST JSON contract checks passed\n";
 }
