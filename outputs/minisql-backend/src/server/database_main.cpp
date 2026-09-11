@@ -13,10 +13,18 @@
 
 namespace {
 using json = nlohmann::json;
+std::string displayPath(const std::filesystem::path& path) {
+    const auto value = path.generic_u8string();
+    return {reinterpret_cast<const char*>(value.data()), value.size()};
+}
+std::filesystem::path pathFromUtf8(const std::string& value) {
+    return std::filesystem::path(std::u8string(
+        reinterpret_cast<const char8_t*>(value.data()), value.size()));
+}
 // 从 SQL 文件读取源码：显式失败优于静默空输入，并去掉 UTF-8 BOM。
 std::string readSqlFile(const std::filesystem::path& path) {
     std::ifstream stream(path, std::ios::binary);
-    if (!stream) throw minisql::MiniSqlError(minisql::ErrorCode::InvalidArgument, "Cannot open SQL file: " + path.string());
+    if (!stream) throw minisql::MiniSqlError(minisql::ErrorCode::InvalidArgument, "Cannot open SQL file: " + displayPath(path));
     std::string source{std::istreambuf_iterator<char>(stream), {}};
     if (source.size() >= 3 && static_cast<unsigned char>(source[0]) == 0xEF &&
         static_cast<unsigned char>(source[1]) == 0xBB && static_cast<unsigned char>(source[2]) == 0xBF)
@@ -127,7 +135,7 @@ int session(minisql::execution::Database& database, minisql::security::AccessCat
                 if (request.contains("cancelFile") && !request["cancelFile"].is_string())
                     throw minisql::MiniSqlError(minisql::ErrorCode::InvalidArgument, "Expected cancellation file string");
                 database.setSessionContext(request["sessionId"].get<std::string>(),
-                    request.contains("cancelFile") ? std::filesystem::path(request["cancelFile"].get<std::string>()) : std::filesystem::path{});
+                    request.contains("cancelFile") ? pathFromUtf8(request["cancelFile"].get<std::string>()) : std::filesystem::path{});
             }
             if (operation == "execute" || operation == "compile") {
                 if (!request.contains("sql") || !request["sql"].is_string())
@@ -211,11 +219,13 @@ int main(int argc, char** argv) {
         std::filesystem::path sqlFile;
         std::vector<std::string> positional;
         int databaseArgIndex = -1;
+        int sqlFileArgIndex = -1;
         for (int index = 1; index < argc; ++index) {
             const std::string argument = argv[index];
             if (argument == "--file" || argument == "-f") {
                 if (index + 1 >= argc) throw minisql::MiniSqlError(minisql::ErrorCode::InvalidArgument, "--file requires a path");
-                sqlFile = argv[++index];
+                sqlFileArgIndex = ++index;
+                sqlFile = argv[index];
                 continue;
             }
             if (databaseArgIndex < 0) databaseArgIndex = index;
@@ -235,6 +245,7 @@ int main(int argc, char** argv) {
             throw minisql::MiniSqlError(minisql::ErrorCode::InvalidArgument, "Cannot decode command line");
         }
         path = wideArgs[databaseArgIndex];
+        if (sqlFileArgIndex >= 0) sqlFile = wideArgs[sqlFileArgIndex];
         LocalFree(wideArgs);
 #else
         path = argv[1];

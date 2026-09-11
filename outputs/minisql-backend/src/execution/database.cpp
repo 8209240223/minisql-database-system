@@ -34,6 +34,14 @@ struct ActiveDatabaseScope {
     ~ActiveDatabaseScope() { activeDatabase = previous; }
     Database* previous;
 };
+struct QueryResourcesScope {
+    QueryResourcesScope(std::shared_ptr<QueryResourceManager>& slot,
+                        std::shared_ptr<QueryResourceManager> resources)
+        : slot_(slot), previous_(std::move(slot)) { slot_ = std::move(resources); }
+    ~QueryResourcesScope() { slot_ = std::move(previous_); }
+    std::shared_ptr<QueryResourceManager>& slot_;
+    std::shared_ptr<QueryResourceManager> previous_;
+};
 std::string key(std::string value) {
     std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
     return value;
@@ -46,6 +54,14 @@ std::size_t resolveBufferFrames(std::size_t frames) {
         if (end && *end == '\0' && parsed >= 1 && parsed <= 1000000) return static_cast<std::size_t>(parsed);
     }
     return frames;
+}
+std::optional<std::uint64_t> positiveEnvironmentValue(const char* name, std::uint64_t maximum) {
+    const char* configured = std::getenv(name);
+    if (!configured) return std::nullopt;
+    char* end = nullptr;
+    const auto parsed = std::strtoull(configured, &end, 10);
+    if (!end || *end != '\0' || parsed == 0 || parsed > maximum) return std::nullopt;
+    return parsed;
 }
 bool sqlIdentifier(const std::string& value) {
     if (value.empty() || !(std::isalpha(static_cast<unsigned char>(value.front())) || value.front() == '_')) return false;
@@ -414,6 +430,15 @@ Database::Database(const std::filesystem::path& path, std::size_t frames, storag
         char* end = nullptr;const auto parsed = std::strtoull(configured, &end, 10);
         if (end && *end == '\0' && parsed > 0 && parsed <= 1000000) aggregateMemoryRows_ = static_cast<std::size_t>(parsed);
     }
+    if (const auto configured = positiveEnvironmentValue("MINISQL_DISTINCT_MEMORY_ROWS", 1000000))
+        distinctMemoryRows_ = static_cast<std::size_t>(*configured);
+    else distinctMemoryRows_ = sortMemoryRows_;
+    if (const auto configured = positiveEnvironmentValue("MINISQL_JOIN_MEMORY_ROWS", 1000000))
+        joinMemoryRows_ = static_cast<std::size_t>(*configured);
+    if (const auto configured = positiveEnvironmentValue("MINISQL_QUERY_MEMORY_BYTES", 16ull * 1024ull * 1024ull * 1024ull))
+        queryMemoryBytes_ = static_cast<std::size_t>(*configured);
+    if (const auto configured = positiveEnvironmentValue("MINISQL_TEMP_DISK_BYTES", 1024ull * 1024ull * 1024ull * 1024ull))
+        tempDiskBytes_ = *configured;
     if (const char* configured = std::getenv("MINISQL_AUTO_CHECKPOINT_WRITES")) {
         char* end = nullptr;const auto parsed = std::strtoull(configured, &end, 10);
         if (end && *end == '\0' && parsed > 0 && parsed <= 1000000) autoCheckpointWrites_ = static_cast<std::size_t>(parsed);
@@ -641,6 +666,9 @@ public:
         : heap_(heap), tableId_(tableId), schema_(std::move(schema)) {
         refs_ = heap_.refsFor(tableId_);
     }
+    ScanRowStream(storage::HeapStore& heap, std::uint64_t tableId, storage::RowSchema schema,
+                  std::vector<storage::RowRef> refs)
+        : heap_(heap), tableId_(tableId), schema_(std::move(schema)), refs_(std::move(refs)) {}
     bool next(nlohmann::json& row) override {
         if (cancelled_) throw MiniSqlError(ErrorCode::Cancelled, "Query cancelled");
         if (cursor_ >= refs_.size()) return false;
@@ -670,13 +698,14 @@ public:
     FilterRowStream(std::unique_ptr<RowStream> child, std::function<bool(const nlohmann::json&)> predicate)
         : child_(std::move(child)), predicate_(std::move(predicate)) {}
     bool next(nlohmann::json& row) override {
-        while (child_->next(row)) if (predicate_(row)) return true;
+        while (child_->next(row)) if (predicate_(row)) { ++rows_; return true; }
         return false;
     }
     void cancel() override { cancelled_ = true; child_->cancel(); }
     void close() override { child_->close(); }
     nlohmann::json resourceUsage() const override {
-        return {{"kind", "FilterRowStream"}, {"rows", rows_}, {"pending", pending_}, {"cancelled", cancelled_}};
+        return {{"kind", "FilterRowStream"}, {"rows", rows_}, {"pending", pending_}, {"cancelled", cancelled_},
+            {"child", child_->resourceUsage()}};
     }
 private:
     std::unique_ptr<RowStream> child_;
@@ -700,7 +729,7 @@ public:
     void cancel() override { child_->cancel(); }
     void close() override { child_->close(); }
     nlohmann::json resourceUsage() const override {
-        return {{"kind", "ProjectRowStream"}, {"rows", rows_}};
+        return {{"kind", "ProjectRowStream"}, {"rows", rows_}, {"child", child_->resourceUsage()}};
     }
 private:
     std::unique_ptr<RowStream> child_;
@@ -726,7 +755,8 @@ public:
     void cancel() override { child_->cancel(); }
     void close() override { child_->close(); }
     nlohmann::json resourceUsage() const override {
-        return {{"kind", "LimitRowStream"}, {"rows", emitted_}, {"skipped", skipped_}};
+        return {{"kind", "LimitRowStream"}, {"rows", emitted_}, {"skipped", skipped_},
+            {"child", child_->resourceUsage()}};
     }
 private:
     std::unique_ptr<RowStream> child_;
@@ -1416,7 +1446,48 @@ std::unique_ptr<RowStream> Database::scanRowStream(const sql::LogicalPlan& plan)
 
 std::unique_ptr<RowStream> Database::openRowStream(const sql::LogicalPlan& plan) {
     checkCancelled();
+    if (!activeResources_) activeResources_ = std::make_shared<QueryResourceManager>(queryMemoryBytes_, tempDiskBytes_);
     if (plan.kind == "SeqScan") return scanRowStream(plan);
+    if (plan.kind == "IndexScan") {
+        const catalog::StoredTable* table = nullptr;
+        for (const auto& candidate : catalog_.tables()) if (key(candidate.definition.table) == key(plan.table)) table = &candidate;
+        if (!table) fail("IndexScan references missing table");
+        const RuntimeIndex* index = nullptr;
+        for (const auto& candidate : indexes_)
+            if (key(candidate->table) == key(plan.table) && key(candidate->name) == key(plan.indexName)) index = candidate.get();
+        if (!index) fail("IndexScan references missing runtime index");
+        std::vector<storage::RowRef> refs;
+        if (!plan.indexRangeOperator.empty()) {
+            storage::IndexKey searchKey;
+            for (const auto& value : plan.indexValues)
+                searchKey.values.push_back(indexValue(value.at("value"), value.at("type").get<std::string>()));
+            searchKey.values.push_back(indexValue(plan.indexRangeValue.at("value"), plan.indexRangeValue.at("type").get<std::string>()));
+            const auto& op = plan.indexRangeOperator;
+            if (op == ">") refs = index->range(searchKey, false, std::nullopt, true);
+            else if (op == ">=") refs = index->range(searchKey, true, std::nullopt, true);
+            else if (op == "<") refs = index->range(std::nullopt, true, searchKey, false);
+            else refs = index->range(std::nullopt, true, searchKey, true);
+        } else if (!plan.indexValues.empty()) {
+            storage::IndexKey searchKey;
+            for (const auto& value : plan.indexValues)
+                searchKey.values.push_back(indexValue(value.at("value"), value.at("type").get<std::string>()));
+            refs = index->search(searchKey);
+        } else {
+            const auto& predicate = plan.predicate;
+            if (!predicate.is_object()) fail("IndexScan requires a predicate");
+            const auto op = predicate.value("operator", "");
+            const auto& right = predicate.at("right");
+            if (!right.is_object() || right.value("kind", "") != "Literal") fail("IndexScan requires a literal key");
+            const auto searchKey = storage::IndexKey{{indexValue(right.at("value"), right.at("type").get<std::string>())}};
+            if (op == "=") refs = index->search(searchKey);
+            else if (op == ">") refs = index->range(searchKey, false, std::nullopt, true);
+            else if (op == ">=") refs = index->range(searchKey, true, std::nullopt, true);
+            else if (op == "<") refs = index->range(std::nullopt, true, searchKey, false);
+            else if (op == "<=") refs = index->range(std::nullopt, true, searchKey, true);
+            else fail("IndexScan requires an indexed comparison");
+        }
+        return std::make_unique<ScanRowStream>(heap_, table->id, rowSchema(table->definition), std::move(refs));
+    }
     if (plan.kind == "Filter" || plan.kind == "SemiJoin" || plan.kind == "AntiJoin" || plan.kind == "Apply") {
         if (plan.children.size() != 1) fail("Filter requires one child");
         auto child = openRowStream(plan.children.front());
@@ -1448,9 +1519,158 @@ std::unique_ptr<RowStream> Database::openRowStream(const sql::LogicalPlan& plan)
         auto child = openRowStream(plan.children.front());
         return std::make_unique<LimitRowStream>(std::move(child), plan.offset, plan.limit);
     }
-    if (plan.kind == "Sort" || plan.kind == "Aggregate" || plan.kind == "Distinct") {
-        auto result = runNode(plan);
-        return std::make_unique<MaterializedRowStream>(result.at("rows"));
+    if (plan.kind == "Sort") {
+        if (plan.children.size() != 1) fail("Sort requires one child");
+        auto child = openRowStream(plan.children.front());
+        const auto sortKeys = plan.sortKeys;
+        const auto inputSchema = plan.children.front().output;
+        const auto compareRows = [sortKeys, inputSchema](const json& left, const json& right) {
+            for (const auto& sort : sortKeys) {
+                const auto index = sort.at("index").get<std::size_t>();
+                const auto& a = left.at(index);
+                const auto& b = right.at(index);
+                if (a == b) continue;
+                if (a.is_null() || b.is_null()) return a.is_null() ? sort.at("nullsFirst").get<bool>() : !sort.at("nullsFirst").get<bool>();
+                if (index < inputSchema.size() && decimalType(inputSchema[index].type)) {
+                    const auto& type = inputSchema[index].type;
+                    const auto order = decimalValue(a, type).compare(decimalValue(b, type));
+                    if (order == 0) continue;
+                    return sort.at("descending").get<bool>() ? order > 0 : order < 0;
+                }
+                return sort.at("descending").get<bool>() ? a > b : a < b;
+            }
+            return false;
+        };
+        const auto operationId = sessionId_ + "-q" + std::to_string(currentQueryId_) + "-s" + std::to_string(++sortSequence_);
+        return std::make_unique<ExternalSortRowStream>(std::move(child), compareRows, activeResources_,
+            sortTempDirectory_, operationId, sortMemoryRows_, [this] { checkCancelled(); }, plan.output.size());
+    }
+    if (plan.kind == "Distinct") {
+        if (plan.children.size() != 1) fail("Distinct requires one child");
+        auto child = openRowStream(plan.children.front());
+        const auto operationId = sessionId_ + "-q" + std::to_string(currentQueryId_) + "-d" + std::to_string(++sortSequence_);
+        auto sorted = std::make_unique<ExternalSortRowStream>(std::move(child),
+            [](const json& left, const json& right) { return left < right; }, activeResources_,
+            sortTempDirectory_, operationId, distinctMemoryRows_, [this] { checkCancelled(); });
+        return std::make_unique<DistinctRowStream>(std::move(sorted), activeResources_);
+    }
+    if (plan.kind == "Aggregate") {
+        if (plan.children.size() != 1) fail("Aggregate requires one child");
+        auto child = openRowStream(plan.children.front());
+        const auto groupKeys = plan.groupKeys;
+        const auto aggregates = plan.aggregates;
+        json initial = json::array();
+        json emptyValues = json::array();
+        for (const auto& aggregate : aggregates) {
+            initial.push_back(aggregate.at("function") == "COUNT" ? json(std::int64_t{0}) :
+                aggregate.at("function") == "AVG" ? (aggregate.at("argument").at("type") == "float" ?
+                    json{{"sum", 0.0}, {"count", std::int64_t{0}}} : json{{"sum", "0"}, {"count", std::int64_t{0}}}) : json(nullptr));
+            emptyValues.push_back(nullptr);
+        }
+        std::optional<json> emptyRecord;
+        if (groupKeys.empty()) emptyRecord = json{{"key", json::array()}, {"values", emptyValues}};
+        auto records = std::make_unique<MappingRowStream>(std::move(child),
+            [this, groupKeys, aggregates](const json& input) {
+                json groupKey = json::array(), values = json::array();
+                for (const auto& expression : groupKeys) groupKey.push_back(evaluate(expression, input));
+                for (const auto& aggregate : aggregates) {
+                    const auto& argument = aggregate.at("argument");
+                    values.push_back(argument.is_null() ? json(true) : evaluate(argument, input));
+                }
+                return json{{"key", std::move(groupKey)}, {"values", std::move(values)}};
+            }, emptyRecord);
+        const auto operationId = sessionId_ + "-q" + std::to_string(currentQueryId_) + "-a" + std::to_string(++aggregateSequence_);
+        auto sorted = std::make_unique<ExternalSortRowStream>(std::move(records),
+            [](const json& left, const json& right) { return left.at("key") < right.at("key"); },
+            activeResources_, sortTempDirectory_, operationId, aggregateMemoryRows_, [this] { checkCancelled(); });
+        const auto combine = [aggregates](json& state, const json& values) {
+            if (!values.is_array() || values.size() != aggregates.size()) fail("Aggregate record schema mismatch");
+            for (std::size_t index = 0; index < aggregates.size(); ++index) {
+                const auto& aggregate = aggregates[index];
+                const auto& value = values[index];
+                if (value.is_null()) continue;
+                const auto function = aggregate.at("function").get<std::string>();
+                const auto& argument = aggregate.at("argument");
+                const SourceLocation location{
+                    argument.is_object() ? argument.value("line", std::size_t{0}) : 0,
+                    argument.is_object() ? argument.value("column", std::size_t{0}) : 0};
+                json next = state[index];
+                if (function == "COUNT") next = arithmetic64("+", state[index].get<std::int64_t>(), 1, location);
+                else if (function == "SUM") {
+                    if (const auto type = decimalType(argument.at("type").get<std::string>()))
+                        next = state[index].is_null() ? value : json(ExactDecimal::parse(state[index].get<std::string>(), 38, type->scale)
+                            .arithmetic("+", decimalValue(value, type->name()), location).format());
+                    else if (argument.at("type") == "float")
+                        next = state[index].is_null() ? value : json(requireFiniteFloat(state[index].get<double>() + value.get<double>(), location));
+                    else next = state[index].is_null() ? value : json(arithmetic64("+", state[index].get<std::int64_t>(), value.get<std::int64_t>(), location));
+                } else if (function == "MIN" || function == "MAX") {
+                    if (next.is_null()) next = value;
+                    else {
+                        const auto type = argument.at("type").get<std::string>();
+                        const auto order = decimalType(type) ? decimalValue(value, type).compare(decimalValue(next, type)) : value < next ? -1 : value > next ? 1 : 0;
+                        if ((function == "MIN" && order < 0) || (function == "MAX" && order > 0)) next = value;
+                    }
+                } else if (function == "AVG") {
+                    if (argument.at("type") == "float")
+                        next = {{"sum", requireFiniteFloat(state[index].at("sum").get<double>() + value.get<double>(), location)},
+                            {"count", arithmetic64("+", state[index].at("count").get<std::int64_t>(), 1, location)}};
+                    else {
+                        ExactDecimal::Integer total(state[index].at("sum").get<std::string>());
+                        if (decimalType(argument.at("type").get<std::string>())) total += decimalValue(value, argument.at("type").get<std::string>()).coefficient();
+                        else total += value.get<std::int64_t>();
+                        next = {{"sum", total.convert_to<std::string>()},
+                            {"count", arithmetic64("+", state[index].at("count").get<std::int64_t>(), 1, location)}};
+                    }
+                } else throw MiniSqlError(ErrorCode::NotImplemented, "Aggregate function evaluation is not implemented: " + function);
+                state[index] = std::move(next);
+            }
+        };
+        const auto outputSize = plan.output.size();
+        const auto finalize = [aggregates, outputSize](const json& groupKey, const json& state) {
+            json row = groupKey;
+            for (std::size_t index = 0; index < state.size(); ++index) {
+                if (aggregates[index].at("function") != "AVG") { row.push_back(state[index]); continue; }
+                const auto count = state[index].at("count").get<std::int64_t>();
+                const auto& argument = aggregates[index].at("argument");
+                const SourceLocation location{argument.value("line", std::size_t{0}), argument.value("column", std::size_t{0})};
+                if (aggregates[index].at("type") == "float") {
+                    row.push_back(count == 0 ? json(nullptr) : json(requireFiniteFloat(
+                        state[index].at("sum").get<double>() / static_cast<double>(count), location)));
+                    continue;
+                }
+                ExactDecimal::Integer denominator = count;
+                const auto argumentType = decimalType(argument.at("type").get<std::string>());
+                if (argumentType) for (unsigned digit = 0; digit < argumentType->scale; ++digit) denominator *= 10;
+                const auto outputType = decimalType(aggregates[index].at("type").get<std::string>());
+                try {
+                    row.push_back(count == 0 ? json(nullptr) : json(ExactDecimal::fromRatio(
+                        ExactDecimal::Integer(state[index].at("sum").get<std::string>()), denominator, 38, outputType->scale).format()));
+                } catch (const MiniSqlError& error) {
+                    throw MiniSqlError(error.code(), error.what(), location);
+                }
+            }
+            if (row.size() != outputSize) fail("Aggregate output schema mismatch");
+            return row;
+        };
+        return std::make_unique<GroupedAggregateRowStream>(std::move(sorted), std::move(initial), combine, finalize, activeResources_);
+    }
+    if (plan.kind == "NestedLoopJoin" || plan.kind == "HashJoin" || plan.kind == "LeftJoin") {
+        if (plan.children.size() != 2) fail("Join requires two children");
+        auto left = openRowStream(plan.children[0]);
+        auto right = openRowStream(plan.children[1]);
+        std::optional<std::pair<std::size_t, std::size_t>> keys;
+        if (plan.kind == "HashJoin") {
+            std::size_t leftKey = 0, rightKey = 0;
+            if (!hashJoinKeys(plan.predicate, plan.children[0].output.size(), leftKey, rightKey))
+                fail("HashJoin requires a direct equality key");
+            keys = std::pair{leftKey, rightKey};
+        }
+        const auto predicate = plan.predicate;
+        const auto operationId = sessionId_ + "-q" + std::to_string(currentQueryId_) + "-j" + std::to_string(++joinSequence_);
+        return std::make_unique<JoinRowStream>(std::move(left), std::move(right),
+            [this, predicate](const json& row) { return accepted(evaluate(predicate, row)); },
+            activeResources_, sortTempDirectory_, operationId, joinMemoryRows_, plan.children[1].output.size(),
+            plan.kind == "LeftJoin", keys, [this] { checkCancelled(); });
     }
     throw MiniSqlError(ErrorCode::InvalidArgument, "RowStream does not support plan kind " + plan.kind);
 }
@@ -1458,6 +1678,19 @@ std::unique_ptr<RowStream> Database::openRowStream(const sql::LogicalPlan& plan)
 nlohmann::json Database::runNode(const sql::LogicalPlan& plan) {
     checkCancelled();
     if (plan.kind == "Sort") {
+        try {
+            auto stream = openRowStream(plan);
+            json rows = json::array(), row;
+            while (stream->next(row)) rows.push_back(std::move(row));
+            stream->close();
+            auto usage = stream->resourceUsage();
+            json columns = json::array();
+            for (const auto& column : plan.output) columns.push_back(column.name);
+            return {{"kind", "Sort"}, {"columns", std::move(columns)}, {"rows", std::move(rows)},
+                {"affectedRows", 0}, {"resourceUsage", std::move(usage)}};
+        } catch (const MiniSqlError& error) {
+            if (error.code() != ErrorCode::InvalidArgument) throw;
+        }
         if (plan.children.size() != 1) fail("Sort requires one child");
         auto result = run(plan.children.front());
         auto& rows = result["rows"];
@@ -1478,17 +1711,17 @@ nlohmann::json Database::runNode(const sql::LogicalPlan& plan) {
             }
             return false;
         };
-        if (rows.size() > sortMemoryRows_) {
+        const bool external = rows.size() > sortMemoryRows_;
+        if (external) {
             const auto operationId = sessionId_ + "-q" + std::to_string(currentQueryId_) + "-s" + std::to_string(++sortSequence_);
             externalSort(rows, compareRows, sortMemoryRows_, sortTempDirectory_, operationId, [this] { checkCancelled(); });
-        }
-        else std::stable_sort(rows.begin(), rows.end(), compareRows);
+        } else std::stable_sort(rows.begin(), rows.end(), compareRows);
         for (auto& row : rows) while (row.size() > plan.output.size()) row.erase(row.end() - 1);
         result["columns"] = json::array();
         for (const auto& column : plan.output) result["columns"].push_back(column.name);
         result["kind"] = "Sort";
         result["resourceUsage"] = {{"kind", "Sort"}, {"rows", rows.size()},
-            {"external", rows.size() > sortMemoryRows_}, {"memoryRows", sortMemoryRows_}};
+            {"external", external}, {"memoryRows", sortMemoryRows_}};
         return result;
     }
     if (plan.kind == "Limit") {
@@ -1512,10 +1745,12 @@ nlohmann::json Database::runNode(const sql::LogicalPlan& plan) {
                 ++emitted;
             }
             stream->close();
+            auto childUsage = stream->resourceUsage();
             json columns = json::array();
             for (const auto& column : plan.output) columns.push_back(column.name);
             return {{"kind", "Limit"}, {"columns", std::move(columns)}, {"rows", std::move(rows)},
-                {"affectedRows", 0}, {"resourceUsage", {{"kind", "LimitRowStream"}, {"rows", emitted}}}};
+                {"affectedRows", 0}, {"resourceUsage", {{"kind", "LimitRowStream"}, {"rows", emitted},
+                    {"child", std::move(childUsage)}}}};
         } catch (const MiniSqlError& error) {
             if (error.code() != ErrorCode::InvalidArgument) throw;
         }
@@ -1531,17 +1766,42 @@ nlohmann::json Database::runNode(const sql::LogicalPlan& plan) {
         return result;
     }
     if (plan.kind == "Distinct") {
-        if (plan.children.size() != 1 || plan.children.front().kind != "Project") fail("Distinct requires a projection child");
+        try {
+            auto stream = openRowStream(plan);
+            json rows = json::array(), row;
+            while (stream->next(row)) rows.push_back(std::move(row));
+            stream->close();
+            auto usage = stream->resourceUsage();
+            json columns = json::array();
+            for (const auto& column : plan.output) columns.push_back(column.name);
+            return {{"kind", "Distinct"}, {"columns", std::move(columns)}, {"rows", std::move(rows)},
+                {"affectedRows", 0}, {"resourceUsage", std::move(usage)}};
+        } catch (const MiniSqlError& error) {
+            if (error.code() != ErrorCode::InvalidArgument) throw;
+        }
+        if (plan.children.size() != 1) fail("Distinct requires one child");
         auto result = run(plan.children.front());
         std::set<json> seen;
         json unique = json::array();
         for (auto& row : result.at("rows")) if (seen.insert(row).second) unique.push_back(std::move(row));
         result["rows"] = std::move(unique);
         result["kind"] = "Distinct";
+        result["resourceUsage"] = {{"kind", "Distinct"}, {"rows", result.at("rows").size()}, {"external", false}};
         return result;
     }
     json result = {{"kind", plan.kind}, {"columns", json::array()}, {"rows", json::array()}, {"affectedRows", 0}};
     if (plan.kind == "Aggregate") {
+        try {
+            auto stream = openRowStream(plan);
+            json row;
+            while (stream->next(row)) result["rows"].push_back(std::move(row));
+            stream->close();
+            for (const auto& column : plan.output) result["columns"].push_back(column.name);
+            result["resourceUsage"] = stream->resourceUsage();
+            return result;
+        } catch (const MiniSqlError& error) {
+            if (error.code() != ErrorCode::InvalidArgument) throw;
+        }
         for (const auto& column : plan.output) result["columns"].push_back(column.name);
         result["rows"] = aggregateRows(plan);
         result["resourceUsage"] = {{"kind", "Aggregate"}, {"rows", result.at("rows").size()},
@@ -2344,6 +2604,7 @@ nlohmann::json Database::execute(const std::string& source, bool optimize) {
     std::lock_guard<std::recursive_mutex> guard(mu_);
     json results = json::array();
     currentQueryId_ = ++querySequence_;
+    QueryResourcesScope resources(activeResources_, std::make_shared<QueryResourceManager>(queryMemoryBytes_, tempDiskBytes_));
     try {
         requireAvailable();
         checkCancelled();
@@ -2614,6 +2875,8 @@ nlohmann::json Database::executeStreaming(const std::string& source,
                                           const std::function<void(const nlohmann::json&)>& emitMeta,
                                           const std::function<bool(const nlohmann::json&)>& emitRow) {
     std::lock_guard<std::recursive_mutex> guard(mu_);
+    currentQueryId_ = ++querySequence_;
+    QueryResourcesScope resources(activeResources_, std::make_shared<QueryResourceManager>(queryMemoryBytes_, tempDiskBytes_));
     requireAvailable();
     checkCancelled();
     ActiveDatabaseScope active(this);
@@ -2640,8 +2903,8 @@ nlohmann::json Database::executeStreaming(const std::string& source,
             if (emitRow && !emitRow(row)) throw MiniSqlError(ErrorCode::Cancelled, "Streaming client disconnected");
             ++emitted;
         }
-        const auto usage = stream->resourceUsage();
         stream->close();
+        const auto usage = stream->resourceUsage();
         return {{"success", true}, {"rows", emitted}, {"resourceUsage", usage}};
     } catch (const MiniSqlError& error) {
         if (error.code() != ErrorCode::InvalidArgument) throw;

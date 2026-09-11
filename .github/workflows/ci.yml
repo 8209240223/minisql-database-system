@@ -140,6 +140,7 @@ jobs:
           node tests/cancel-smoke.mjs
           node tests/x25-stream-http.mjs
           node tests/session-stream-process.mjs
+          node tests/query-resource-process.mjs
           node tests/backup-smoke.mjs
           node tests/backup-online-smoke.mjs
           node tests/x25-row-stream-contract.mjs

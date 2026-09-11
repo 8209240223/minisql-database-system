@@ -822,7 +822,12 @@ const server = http.createServer(async (req, res) => {
       autoCheckpointDirtyPages: Number(process.env.MINISQL_AUTO_CHECKPOINT_DIRTY_PAGES ?? 0), autoCheckpointDirtyRatio: Number(process.env.MINISQL_AUTO_CHECKPOINT_DIRTY_RATIO ?? 0),
       autoCheckpointIntervalMs: Number(process.env.MINISQL_AUTO_CHECKPOINT_INTERVAL_MS ?? 0), autoCheckpointWalBasis: 'committed-journal-bytes',
       autoCheckpointEvaluation: 'after-successful-commit', streamingResults: true, streamingFormat: 'ndjson', streamingReadOnly: true,
-      maxResultRows: Number(process.env.MINISQL_MAX_RESULT_ROWS ?? 0), externalSort: true, sortSpill: true, sortSpillEncoding: 'jsonl', sortArtifactIdentity: 'session-query-sort', sortChecksum: 'fnv1a64', externalAggregate: true, aggregateSpill: true, aggregateSpillEncoding: 'jsonl',
+      maxResultRows: Number(process.env.MINISQL_MAX_RESULT_ROWS ?? 0),
+      queryMemoryBytes: Number(process.env.MINISQL_QUERY_MEMORY_BYTES ?? 64 * 1024 * 1024),
+      tempDiskBytes: Number(process.env.MINISQL_TEMP_DISK_BYTES ?? 1024 * 1024 * 1024),
+      externalSort: true, sortSpill: true, sortSpillEncoding: 'jsonl', sortArtifactIdentity: 'session-query-sort', sortChecksum: 'fnv1a64',
+      externalAggregate: true, aggregateSpill: true, aggregateSpillEncoding: 'jsonl',
+      distinctSpill: true, joinSpill: true, queryResourceManager: true,
       integerEncoding: 'safe-number-or-decimal-string',
       decimalExpressions: true, decimalColumns: true, decimalEncoding: 'fixed-scale-string',
       floatColumns: true, floatEncoding: 'json-number-finite-only',
@@ -838,7 +843,7 @@ const server = http.createServer(async (req, res) => {
       atomicPermissionEndpoints: true, permissionEndpoints: ['POST /users', 'DELETE /users/:name', 'POST /users/:name/password', 'POST /users/:name/roles', 'DELETE /users/:name/roles/:role', 'POST /roles', 'DELETE /roles/:name', 'POST /grants', 'POST /revokes'],
       passwordHashing: 'sha256-salted', auditFiltering: true, sessionIdentity: true,
       indexPageStorage: true,
-      capabilities: ['backupRestore', 'backupIncremental', 'backupChain', 'backupMigration', 'permissions', 'audit', 'create', 'insert', 'multiRowInsert', 'select', 'delete', 'update', 'arithmetic', 'projection', 'tableAlias', 'innerJoin', 'leftJoin', 'null', 'notNull', 'bigint', 'float', 'default', 'primaryKey', 'unique', 'compositeKey', 'distinct', 'orderBy', 'limit', 'groupBy', 'having', 'count', 'sum', 'min', 'max', 'avg', 'compile', 'diagnostics', 'inSubquery', 'existsSubquery', 'scalarSubquery', 'correlatedSubquery', 'astRoundTrip', 'planRoundTrip', 'hashJoin', 'predicatePushdown', 'pruneColumns', 'statistics', 'createIndex', 'indexScan', 'uniqueIndex', 'indexPersistence', 'indexSnapshots', 'indexPageStorage', 'checkpoint', 'nodeStatistics', 'optimizer', 'storageStats', 'externalSort', 'sortSpill', 'externalAggregate', 'aggregateSpill', 'cancellation', 'streamingResults', 'autoCheckpoint', 'multiSession', 'sessionRegistry', 'health'] });
+      capabilities: ['backupRestore', 'backupIncremental', 'backupChain', 'backupMigration', 'permissions', 'audit', 'create', 'insert', 'multiRowInsert', 'select', 'delete', 'update', 'arithmetic', 'projection', 'tableAlias', 'innerJoin', 'leftJoin', 'null', 'notNull', 'bigint', 'float', 'default', 'primaryKey', 'unique', 'compositeKey', 'distinct', 'orderBy', 'limit', 'groupBy', 'having', 'count', 'sum', 'min', 'max', 'avg', 'compile', 'diagnostics', 'inSubquery', 'existsSubquery', 'scalarSubquery', 'correlatedSubquery', 'astRoundTrip', 'planRoundTrip', 'hashJoin', 'predicatePushdown', 'pruneColumns', 'statistics', 'createIndex', 'indexScan', 'uniqueIndex', 'indexPersistence', 'indexSnapshots', 'indexPageStorage', 'checkpoint', 'nodeStatistics', 'optimizer', 'storageStats', 'externalSort', 'sortSpill', 'externalAggregate', 'aggregateSpill', 'distinctSpill', 'joinSpill', 'queryResourceManager', 'cancellation', 'streamingResults', 'autoCheckpoint', 'multiSession', 'sessionRegistry', 'health'] });
     return;
   }
   if (req.method === 'GET' && req.url === '/api/storage') {
@@ -1178,7 +1183,8 @@ const server = http.createServer(async (req, res) => {
     if ((mode === 'catalog' || mode === 'statistics') && data && Array.isArray(data.tables)) {
       data.tables = data.tables.filter(table => can(access, requestUser, 'SELECT', table.name));
     }
-    const status = data.success === false ? (quarantined ? 503 : 422) : 200;
+    const resourceLimited = data.error?.code === 5001 && /budget exceeded/i.test(data.error?.message ?? '');
+    const status = data.success === false ? (quarantined ? 503 : resourceLimited ? 413 : 422) : 200;
     const response = mode === 'catalog' || mode === 'buffer' || mode === 'diagnostics' || mode === 'statistics' ? data : queryResult(data, performance.now() - started);
     if (data.success === false && data.completedStatements > 0) {
       const committed = (data.results ?? []).filter(result => result.commitState === 'committed').length;

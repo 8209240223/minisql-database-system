@@ -82,6 +82,11 @@ private:
     std::vector<nlohmann::json>* nodeStats_ = nullptr;
     std::size_t sortMemoryRows_ = 10000;
     std::size_t aggregateMemoryRows_ = 10000;
+    std::size_t distinctMemoryRows_ = 10000;
+    std::size_t joinMemoryRows_ = 10000;
+    std::size_t queryMemoryBytes_ = 64 * 1024 * 1024;
+    std::uint64_t tempDiskBytes_ = 1024ull * 1024ull * 1024ull;
+    std::shared_ptr<QueryResourceManager> activeResources_;
     std::size_t autoCheckpointWrites_ = 0;
     std::uint64_t autoCheckpointWalBytes_ = 0;
     std::size_t autoCheckpointDirtyPages_ = 0;
@@ -119,6 +124,7 @@ private:
     std::uint64_t currentQueryId_ = 0;
     std::uint64_t sortSequence_ = 0;
     std::uint64_t aggregateSequence_ = 0;
+    std::uint64_t joinSequence_ = 0;
     struct RuntimeIndex;
     bool pageFileIndexes_ = true;   // 索引主路径引擎：true=页级 PageBPlusTree，false=内存 BPlusTree（MINISQL_INDEX_ENGINE=memory 时关闭）
     std::vector<std::unique_ptr<RuntimeIndex>> indexes_;
