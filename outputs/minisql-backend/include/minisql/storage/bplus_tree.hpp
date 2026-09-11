@@ -21,6 +21,7 @@ public:
     BPlusTree& operator=(const BPlusTree&) = delete;
 
     bool insert(IndexKey key, RowRef row);
+    bool erase(const IndexKey& key, RowRef row);
     std::vector<RowRef> search(const IndexKey& key) const;
     std::vector<RowRef> range(const std::optional<IndexKey>& lower, bool lowerInclusive,
                               const std::optional<IndexKey>& upper, bool upperInclusive) const;
@@ -49,6 +50,7 @@ private:
     const Node* findLeaf(const IndexKey& key) const;
     void collect(const Node& node, const std::optional<IndexKey>& lower, bool lowerInclusive,
                  const std::optional<IndexKey>& upper, bool upperInclusive, std::vector<RowRef>& rows) const;
+    void collectEntries(const Node& node, std::vector<IndexEntry>& entries) const;
     bool validateNode(const Node& node, std::size_t depth, std::size_t& leafDepth) const;
 };
 }

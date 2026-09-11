@@ -107,6 +107,7 @@ private:
     bool rebalanceChild(Node& n, std::size_t childIdx, PageRef childRef, bool nodeIsRoot);
     PageRef locateLeaf(PageRef root) const;
     PageRef liftLeaf(PageRef root, const IndexKey& key) const;
+    IndexKey minimumKey(PageRef node) const;
     std::size_t childIndex(const std::vector<IndexKey>& keys, const IndexKey& key) const;
     std::size_t lowerBound(const std::vector<IndexKey>& keys, const IndexKey& key) const;
     bool validateNode(PageRef ref, std::uint32_t expected, std::optional<const IndexKey*> left,

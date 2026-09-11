@@ -1,5 +1,6 @@
 #include "minisql/storage/page_bplus_tree.hpp"
 #include "minisql/common/error.hpp"
+#include <algorithm>
 #include <chrono>
 #include <filesystem>
 #include <iostream>
@@ -137,6 +138,24 @@ int mainImpl(int argc, char** argv) {
         require(keep.size() == 20, "kept 20 odd keys");
         require(keep.validate(), "keep tree valid");
         kbuf.flushAll();
+    }
+
+    // -- 非唯一重复键跨越多个叶页：点查和精确 RowRef 删除必须覆盖整段叶链 --
+    {
+        const auto duplicatePath = directory / "duplicates.db";
+        auto duplicateFile = std::make_shared<PageFile>(duplicatePath);
+        BufferPool duplicateBuffer(duplicateFile, 4, ReplacementPolicy::LRU);
+        PageBPlusTree duplicateTree(duplicateFile, duplicateBuffer, owner, maxKeys, false);
+        require(duplicateTree.create(), "duplicate create");
+        for (std::uint64_t id = 0; id < 40; ++id)
+            require(duplicateTree.insert(intKey(7), row(id)), "insert duplicate page key");
+        require(duplicateTree.search(intKey(7)).size() == 40, "all duplicate page keys found");
+        require(duplicateTree.erase(intKey(7), row(17)), "erase exact duplicate page row");
+        const auto remaining = duplicateTree.search(intKey(7));
+        require(remaining.size() == 39, "one duplicate page row erased");
+        require(std::none_of(remaining.begin(), remaining.end(), [](const RowRef& ref) { return ref.page.id == 17; }),
+            "requested duplicate row removed");
+        require(duplicateTree.validate(), "duplicate page tree valid after erase");
     }
     {
         std::filesystem::path keepPath2 = directory / "keep.db";

@@ -48,6 +48,7 @@ public:
     void flushAll();
     void beginWriteBatch();
     void rollbackWriteBatch();
+    void restoreSavepoint(const PageFileSavepoint& snapshot);
     void commitWriteBatch();
     void setPolicy(ReplacementPolicy policy);
     void resetStats();

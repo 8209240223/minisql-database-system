@@ -25,5 +25,20 @@ int main() {
     require(composite.insert({{std::int32_t(2), std::string("a")}}, row(3)), "composite third");
     require(composite.search({{std::int32_t(1), std::string("b")}}).front().page.id == 2, "composite search");
     require(composite.validate(), "composite tree valid");
+    require(tree.erase({{std::int32_t(42)}}, row(42)), "erase existing memory entry");
+    require(tree.search({{std::int32_t(42)}}).empty(), "erased memory entry absent");
+    require(tree.size() == 99 && tree.validate(), "memory tree valid after erase");
+    require(!tree.erase({{std::int32_t(42)}}, row(42)), "erase missing memory entry rejected");
+    BPlusTree duplicates(4, false);
+    for (std::uint64_t id = 0; id < 40; ++id)
+        require(duplicates.insert({{std::int32_t(7)}}, row(id)), "insert duplicate memory key");
+    require(duplicates.search({{std::int32_t(7)}}).size() == 40, "all duplicate memory keys found");
+    require(duplicates.erase({{std::int32_t(7)}}, row(17)), "erase exact duplicate memory row");
+    require(duplicates.search({{std::int32_t(7)}}).size() == 39, "one duplicate memory row erased");
+    require(duplicates.validate(), "duplicate memory tree valid after erase");
+    BPlusTree restoredDuplicates(4, false);
+    restoredDuplicates.restore(duplicates.dump("duplicate-v2"), "duplicate-v2");
+    require(restoredDuplicates.search({{std::int32_t(7)}}).size() == 39, "duplicate snapshot restores");
+    require(restoredDuplicates.validate(), "restored duplicate tree valid");
     std::cout << checks << " B+ tree checks passed\n";
 }

@@ -403,6 +403,24 @@ struct Database::RuntimeIndex {
     bool pageFile;
     storage::BPlusTree tree;                                        // memory 引擎
     std::unique_ptr<storage::PageBPlusTree> pageTree{nullptr};      // page-file 引擎
+    storage::IndexKey keyFor(const storage::Row& row) const {
+        storage::IndexKey result;
+        for (const auto column : columns) result.values.push_back(row.at(column));
+        return result;
+    }
+    static bool indexable(const storage::IndexKey& key) {
+        return std::none_of(key.values.begin(), key.values.end(), [](const storage::Value& value) {
+            return std::holds_alternative<std::monostate>(value);
+        });
+    }
+    bool insert(const storage::IndexKey& key, storage::RowRef row) {
+        if (!indexable(key)) return true;
+        return pageFile ? pageTree->insert(key, row) : tree.insert(key, row);
+    }
+    bool erase(const storage::IndexKey& key, storage::RowRef row) {
+        if (!indexable(key)) return true;
+        return pageFile ? pageTree->erase(key, row) : tree.erase(key, row);
+    }
     std::vector<storage::RowRef> search(const storage::IndexKey& key) const {
         return pageFile ? pageTree->search(key) : tree.search(key);
     }
@@ -472,7 +490,8 @@ Database::Database(const std::filesystem::path& path, std::size_t frames, storag
         char* end = nullptr;const auto parsed = std::strtoull(configured, &end, 10);
         if (end && *end == '\0' && parsed > 0 && parsed <= 3600000) backgroundCheckpointMs_ = static_cast<std::size_t>(parsed);
     }
-    for (const auto& table : catalog_.tables()) rebuildIndexes(table.id);
+    const bool forceIndexRebuild = std::getenv("MINISQL_REBUILD_INDEXES") != nullptr;
+    for (const auto& table : catalog_.tables()) initializeIndexes(table.id, forceIndexRebuild, true);
     if (backgroundCheckpointMs_ > 0) {
         scheduler_ = std::thread([this] { backgroundSchedulerLoop(); });
     }
@@ -901,12 +920,11 @@ std::string Database::tableFingerprint(std::uint64_t tableId) {
     const auto mix = [&](const std::uint8_t* bytes, std::size_t size) {
         for (std::size_t index = 0; index < size; ++index) { hash ^= bytes[index];hash *= 1099511628211ULL; }
     };
-    const auto schema = rowSchema(stored->definition);
-    heap_.scan(tableId, schema, [&](storage::RowRef ref, const storage::Row& row) {
-        const auto bytes = storage::encodeRow(row, schema);mix(bytes.data(), bytes.size());
-        const std::uint64_t values[] = {ref.page.id, ref.page.generation, ref.slot.slot, ref.slot.generation};
-        mix(reinterpret_cast<const std::uint8_t*>(values), sizeof(values));
-    });
+    static constexpr char format[] = "minisql-index-v2";
+    mix(reinterpret_cast<const std::uint8_t*>(format), sizeof(format) - 1);
+    mix(reinterpret_cast<const std::uint8_t*>(&tableId), sizeof(tableId));
+    const auto tableName = key(stored->definition.table);
+    mix(reinterpret_cast<const std::uint8_t*>(tableName.data()), tableName.size());
     char buffer[17]{};std::snprintf(buffer, sizeof(buffer), "%016llx", static_cast<unsigned long long>(hash));
     return buffer;
 }
@@ -936,9 +954,9 @@ void Database::persistIndexPages(storage::BPlusTree& tree, std::uint64_t owner, 
         const auto pageRef = buffer_.allocate(owner);
         auto guard = buffer_.get(pageRef);
         std::vector<std::uint8_t> record;
-        record.reserve(12 + end - begin);
+        record.reserve(32 + end - begin);
         const auto append = [&](std::uint64_t value) {
-            for (unsigned shift = 0; shift < 8; shift += 8) record.push_back(static_cast<std::uint8_t>((value >> shift) & 0xff));
+            for (unsigned shift = 0; shift < 64; shift += 8) record.push_back(static_cast<std::uint8_t>((value >> shift) & 0xff));
         };
         record.insert(record.end(), {'I', 'X', 'P', 'A', 'G', 'E', 0, 0});
         append(sequence);append(total);append(static_cast<std::uint64_t>(end - begin));
@@ -946,34 +964,51 @@ void Database::persistIndexPages(storage::BPlusTree& tree, std::uint64_t owner, 
         guard.insert(record);
     }
 }
-bool Database::loadIndexPages(storage::BPlusTree& tree, std::uint64_t owner, const std::string& fingerprint) {
+bool Database::loadIndexPages(storage::BPlusTree& tree, std::uint64_t owner, const std::string& fingerprint,
+                              std::string* failure) {
+    const auto reject = [&](const char* reason) {
+        if (failure) *failure = reason;
+        return false;
+    };
     const auto pages = file_->pagesFor(owner);
-    if (pages.empty()) return false;
+    if (pages.empty()) return reject("no snapshot pages");
     std::vector<std::string> chunks;
     for (const auto& page : pages) {
         auto guard = buffer_.get(page);
         const auto slots = guard.page().liveSlots();
-        if (slots.size() != 1) return false;
+        if (slots.size() != 1) return reject("snapshot page slot count");
         const auto record = guard.page().read(slots.front());
-        if (record.size() < 25 || record[0] != 'I' || record[1] != 'X') return false;
+        if (record.size() < 32 || record[0] != 'I' || record[1] != 'X') return reject("snapshot page header");
         const auto decode = [&](std::size_t offset) {
             std::uint64_t value = 0;
-            for (unsigned shift = 0; shift < 8; shift += 8) value |= static_cast<std::uint64_t>(record[offset + shift]) << shift;
+            for (unsigned shift = 0; shift < 64; shift += 8) value |= static_cast<std::uint64_t>(record[offset + shift / 8]) << shift;
             return value;
         };
         const auto sequence = decode(8), expectedTotal = decode(16), payloadSize = decode(24);
-        if (expectedTotal == 0 || payloadSize > 3800 || sequence >= expectedTotal || record.size() != 32 + payloadSize) return false;
+        if (expectedTotal == 0 || payloadSize > 3800 || sequence >= expectedTotal || record.size() != 32 + payloadSize) {
+            if (failure) *failure = "snapshot chunk bounds: sequence=" + std::to_string(sequence) +
+                ", total=" + std::to_string(expectedTotal) + ", payload=" + std::to_string(payloadSize) +
+                ", record=" + std::to_string(record.size());
+            return false;
+        }
         if (chunks.size() <= sequence) chunks.resize(static_cast<std::size_t>(sequence) + 1);
-        if (!chunks[static_cast<std::size_t>(sequence)].empty()) return false;
+        if (!chunks[static_cast<std::size_t>(sequence)].empty()) return reject("duplicate snapshot chunk");
         chunks[static_cast<std::size_t>(sequence)].assign(record.begin() + 32, record.end());
     }
-    if (chunks.empty() || std::any_of(chunks.begin(), chunks.end(), [](const std::string& chunk) { return chunk.empty(); })) return false;
+    if (chunks.empty() || std::any_of(chunks.begin(), chunks.end(), [](const std::string& chunk) { return chunk.empty(); }))
+        return reject("missing snapshot chunk");
     std::string bytes;
     for (auto& chunk : chunks) bytes += chunk;
     try { tree.restore(bytes, fingerprint);return true; }
-    catch (const std::exception&) { return false; }
+    catch (const std::exception& error) {
+        if (failure) *failure = error.what();
+        return false;
+    }
 }
 void Database::rebuildIndexes(std::uint64_t tableId) {
+    initializeIndexes(tableId, true, true);
+}
+void Database::initializeIndexes(std::uint64_t tableId, bool forceRebuild, bool allowRebuild) {
     const catalog::StoredTable* stored = nullptr;
     for (const auto& table : catalog_.tables()) if (static_cast<std::uint64_t>(table.id) == tableId) { stored = &table; break; }
     if (!stored) throw MiniSqlError(ErrorCode::Catalog, "Index table identity not found");
@@ -988,28 +1023,79 @@ void Database::rebuildIndexes(std::uint64_t tableId) {
         auto runtime = std::make_unique<RuntimeIndex>(index.name, stored->definition.table, columns, index.unique, pageFileIndexes_);
         const auto owner = indexOwnerId(stored->definition.table, index.name);
         if (pageFileIndexes_) {
-            // 页级引擎主路径：每次重建清旧页后从堆全量建树，索引页与堆页同属一个
-            // PageFile/WAL，随写批次原子落盘/回滚，因而总是与堆一致（无需指纹复用来判断陈旧）。
+            runtime->pageTree = std::make_unique<storage::PageBPlusTree>(file_, buffer_, owner, 64, index.unique);
+            if (!forceRebuild && runtime->pageTree->exists()) {
+                try {
+                    if (runtime->pageTree->validate()) {
+                        indexes_.push_back(std::move(runtime));
+                        continue;
+                    }
+                } catch (const MiniSqlError&) {
+                    if (!allowRebuild) throw;
+                }
+            }
+            if (!allowRebuild) throw MiniSqlError(ErrorCode::Storage, "Index pages missing after rollback: " + index.name);
             clearIndexPages(owner);
             runtime->pageTree = std::make_unique<storage::PageBPlusTree>(file_, buffer_, owner, 64, index.unique);
             if (!runtime->pageTree->create()) throw MiniSqlError(ErrorCode::Catalog, "Failed to create page index: " + index.name);
             heap_.scan(tableId, schema, [&](storage::RowRef ref, const storage::Row& row) {
-                storage::IndexKey key;
-                for (const auto column : columns) key.values.push_back(row[column]);
-                if (!runtime->pageTree->insert(std::move(key), ref)) throw MiniSqlError(ErrorCode::Execution, "UNIQUE index violation: " + index.name);
+                const auto indexKey = runtime->keyFor(row);
+                if (!runtime->insert(indexKey, ref)) throw MiniSqlError(ErrorCode::Execution, "UNIQUE index violation: " + index.name);
             });
+            ++indexFullRebuilds_;
             indexes_.push_back(std::move(runtime));continue;
         }
-        if (!std::getenv("MINISQL_REBUILD_INDEXES") && loadIndexPages(runtime->tree, owner, fingerprint)) {
+        std::string loadFailure;
+        if (!forceRebuild && loadIndexPages(runtime->tree, owner, fingerprint, &loadFailure)) {
             indexes_.push_back(std::move(runtime));continue;
         }
+        if (!allowRebuild) throw MiniSqlError(ErrorCode::Storage,
+            "Index snapshot missing after rollback: " + index.name + " (" + loadFailure + ")");
         heap_.scan(tableId, schema, [&](storage::RowRef ref, const storage::Row& row) {
-            storage::IndexKey key;
-            for (const auto column : columns) key.values.push_back(row[column]);
-            if (!runtime->tree.insert(std::move(key), ref)) throw MiniSqlError(ErrorCode::Execution, "UNIQUE index violation: " + index.name);
+            const auto indexKey = runtime->keyFor(row);
+            if (!runtime->insert(indexKey, ref)) throw MiniSqlError(ErrorCode::Execution, "UNIQUE index violation: " + index.name);
         });
         persistIndexPages(runtime->tree, owner, fingerprint);
+        ++indexFullRebuilds_;
         indexes_.push_back(std::move(runtime));
+    }
+}
+void Database::reloadIndexRuntimes() {
+    indexes_.clear();
+    for (const auto& table : catalog_.tables()) initializeIndexes(table.id, false, false);
+    ++indexRuntimeReloads_;
+}
+void Database::insertIndexEntries(std::uint64_t tableId, const storage::Row& row, storage::RowRef ref) {
+    const catalog::StoredTable* stored = nullptr;
+    for (const auto& table : catalog_.tables()) if (static_cast<std::uint64_t>(table.id) == tableId) { stored = &table; break; }
+    if (!stored) throw MiniSqlError(ErrorCode::Catalog, "Index table identity not found");
+    for (auto& index : indexes_) {
+        if (key(index->table) != key(stored->definition.table)) continue;
+        const auto indexKey = index->keyFor(row);
+        if (!index->insert(indexKey, ref)) throw MiniSqlError(ErrorCode::Execution, "UNIQUE index violation: " + index->name);
+        if (RuntimeIndex::indexable(indexKey)) ++indexEntriesInserted_;
+    }
+}
+void Database::eraseIndexEntries(std::uint64_t tableId, const storage::Row& row, storage::RowRef ref) {
+    const catalog::StoredTable* stored = nullptr;
+    for (const auto& table : catalog_.tables()) if (static_cast<std::uint64_t>(table.id) == tableId) { stored = &table; break; }
+    if (!stored) throw MiniSqlError(ErrorCode::Catalog, "Index table identity not found");
+    for (auto& index : indexes_) {
+        if (key(index->table) != key(stored->definition.table)) continue;
+        const auto indexKey = index->keyFor(row);
+        if (!index->erase(indexKey, ref)) throw MiniSqlError(ErrorCode::Storage, "Index entry missing during DML: " + index->name);
+        if (RuntimeIndex::indexable(indexKey)) ++indexEntriesErased_;
+    }
+}
+void Database::persistMemoryIndexes(std::uint64_t tableId) {
+    if (pageFileIndexes_) return;
+    const catalog::StoredTable* stored = nullptr;
+    for (const auto& table : catalog_.tables()) if (static_cast<std::uint64_t>(table.id) == tableId) { stored = &table; break; }
+    if (!stored) throw MiniSqlError(ErrorCode::Catalog, "Index table identity not found");
+    const auto fingerprint = tableFingerprint(tableId);
+    for (auto& index : indexes_) {
+        if (key(index->table) == key(stored->definition.table))
+            persistIndexPages(index->tree, indexOwnerId(index->table, index->name), fingerprint);
     }
 }
 void Database::validateUniqueIndexes(std::uint64_t tableId, const storage::Row& row, const std::optional<storage::RowRef>& ignored) {
@@ -1020,6 +1106,7 @@ void Database::validateUniqueIndexes(std::uint64_t tableId, const storage::Row& 
         if (key(index->table) != key(stored->definition.table) || !index->unique) continue;
         storage::IndexKey key;
         for (const auto column : index->columns) key.values.push_back(row[column]);
+        if (!RuntimeIndex::indexable(key)) continue;
         const auto matches = index->search(key);
         for (const auto& match : matches) {
             if (ignored && match.page.id == ignored->page.id && match.page.generation == ignored->page.generation &&
@@ -1160,6 +1247,9 @@ nlohmann::json Database::statistics() {
             {"timestampMs", record.timestampMs}}},
         {"lastCheckpointAtMs", lastCheckpointAtMs_}, {"lastAutoCheckpointAtMs", lastAutoCheckpointAtMs_},
         {"lastAutoCheckpointReasons", lastAutoCheckpointReasons_},
+        {"indexMaintenance", {{"engine", pageFileIndexes_ ? "page-file" : "memory"},
+            {"fullRebuilds", indexFullRebuilds_}, {"runtimeReloads", indexRuntimeReloads_},
+            {"entriesInserted", indexEntriesInserted_}, {"entriesErased", indexEntriesErased_}}},
         {"backgroundScheduler", {{"enabled", backgroundCheckpointMs_ > 0 && scheduler_.joinable()},
             {"intervalMs", backgroundCheckpointMs_}, {"lastEvaluateMs", schedulerLastEvaluateMs_},
             {"lastRunMs", schedulerLastRunMs_}, {"deferredReasons", schedulerDeferredReasons_}}}};
@@ -2121,8 +2211,12 @@ nlohmann::json Database::runNode(const sql::LogicalPlan& plan) {
             checkSelfReferences(finalRows);
         }
         for (const auto& row : candidates) validateUniqueIndexes(table->id, row);
-        for (const auto& row : candidates) heap_.insert(table->id, schema, row);
-        if (!indexes_.empty()) rebuildIndexes(table->id);
+        for (const auto& row : candidates) {
+            const auto ref = heap_.insert(table->id, schema, row);
+            insertIndexEntries(table->id, row, ref);
+        }
+        persistMemoryIndexes(table->id);
+        if (!candidates.empty()) ++indexVersion_;
         heap_.flush();
         result["affectedRows"] = candidates.size();
         return result;
@@ -2165,8 +2259,13 @@ nlohmann::json Database::runNode(const sql::LogicalPlan& plan) {
         }
         return result;
     }
-    std::vector<storage::RowRef> deletion;
-    std::vector<std::pair<storage::RowRef, storage::Row>> updates;
+    std::vector<std::pair<storage::RowRef, storage::Row>> deletion;
+    struct PendingUpdate {
+        storage::RowRef ref;
+        storage::Row original;
+        storage::Row replacement;
+    };
+    std::vector<PendingUpdate> updates;
     const bool inspectSelfReferences = hasSelfReferences && (plan.kind == "Update" || plan.kind == "Delete");
     std::vector<storage::Row> finalRows;
     const auto consume = [&](storage::RowRef ref, const storage::Row& row) {
@@ -2176,7 +2275,7 @@ nlohmann::json Database::runNode(const sql::LogicalPlan& plan) {
             if (inspectSelfReferences) finalRows.push_back(row);
             return;
         }
-        if (plan.kind == "Delete") { restrictParent(ref, row, nullptr); deletion.push_back(ref); return; }
+        if (plan.kind == "Delete") { restrictParent(ref, row, nullptr); deletion.emplace_back(ref, row); return; }
         if (plan.kind == "Update") {
             if (plan.columnMapping.size() != plan.projections.size()) fail("UPDATE assignment mapping mismatch");
             auto replacement = row;
@@ -2212,7 +2311,7 @@ nlohmann::json Database::runNode(const sql::LogicalPlan& plan) {
             checkForeignKeys(replacement);
             restrictParent(ref, row, &replacement);
             if (inspectSelfReferences) finalRows.push_back(replacement);
-            updates.emplace_back(ref, std::move(replacement));
+            updates.push_back({ref, row, std::move(replacement)});
             return;
         }
         json projected = json::array();
@@ -2228,11 +2327,21 @@ nlohmann::json Database::runNode(const sql::LogicalPlan& plan) {
         for (const auto& row : joinRows(*input)) consume({}, row);
     } else heap_.scan(table->id, schema, consume);
     if (inspectSelfReferences) checkSelfReferences(finalRows);
-    for (auto ref : deletion) heap_.erase(table->id, ref);
     // 扫描及全部表达式检查完成后再写入，避免除零或行长错误造成前半批修改。
-    for (const auto& [ref, replacement] : updates) validateUniqueIndexes(table->id, replacement, ref);
-    for (const auto& [ref, replacement] : updates) (void)heap_.replace(table->id, schema, ref, replacement);
-    if (!indexes_.empty() && (!deletion.empty() || !updates.empty())) rebuildIndexes(table->id);
+    for (const auto& update : updates) validateUniqueIndexes(table->id, update.replacement, update.ref);
+    for (const auto& [ref, row] : deletion) {
+        eraseIndexEntries(table->id, row, ref);
+        heap_.erase(table->id, ref);
+    }
+    for (const auto& update : updates) {
+        eraseIndexEntries(table->id, update.original, update.ref);
+        const auto replacementRef = heap_.replace(table->id, schema, update.ref, update.replacement);
+        insertIndexEntries(table->id, update.replacement, replacementRef);
+    }
+    if (!deletion.empty() || !updates.empty()) {
+        persistMemoryIndexes(table->id);
+        ++indexVersion_;
+    }
     if (plan.kind == "Update") { heap_.flush(); result["affectedRows"] = updates.size(); }
     if (plan.kind == "Delete") { heap_.flush(); result["affectedRows"] = deletion.size(); }
     if (plan.kind == "Project") result["resourceUsage"] = {{"kind", "Project"}, {"rows", result.at("rows").size()}};
@@ -2247,10 +2356,10 @@ void Database::rollbackBatch() {
         if (file_->writeBatchActive()) buffer_.rollbackWriteBatch();
         catalog_.reload();
         savepoints_.clear();
-        for (const auto& table : catalog_.tables()) rebuildIndexes(table.id);
-    } catch (...) {
+        reloadIndexRuntimes();
+    } catch (const std::exception& error) {
         unavailable_ = true;
-        throw MiniSqlError(ErrorCode::Storage, "Commit state unknown; reopen for recovery");
+        throw MiniSqlError(ErrorCode::Storage, std::string("Commit state unknown; reopen for recovery: ") + error.what());
     }
 }
 nlohmann::json Database::run(const sql::LogicalPlan& plan) {
@@ -2301,9 +2410,9 @@ nlohmann::json Database::runStatement(const sql::LogicalPlan& plan) {
         if (transaction_ != TransactionState::Active) throw MiniSqlError(ErrorCode::Transaction, "ROLLBACK TO requires an active transaction");
         const auto found = savepoints_.find(key(plan.savepointName));
         if (found == savepoints_.end()) throw MiniSqlError(ErrorCode::Transaction, "Savepoint does not exist: " + plan.savepointName);
-        file_->restoreSavepoint(found->second.file);
+        buffer_.restoreSavepoint(found->second.file);
         catalog_.restore(found->second.catalog);
-        for (const auto& table : catalog_.tables()) rebuildIndexes(table.id);
+        reloadIndexRuntimes();
         return {{"kind", plan.kind}, {"columns", json::array()}, {"rows", json::array()}, {"affectedRows", 0}, {"commitState", "pending"}};
     }
     if (plan.kind == "Begin") {

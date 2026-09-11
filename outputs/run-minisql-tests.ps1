@@ -84,6 +84,7 @@ $groups = @{
         'tests/cli-input-and-buffer-log.mjs',
         'tests/journal-process.mjs',
         'tests/index-smoke.mjs',
+        'tests/incremental-index-process.mjs',
         'tests/index-performance-curve.mjs',
         'tests/backup-smoke.mjs',
         'tests/external-sort-smoke.mjs',

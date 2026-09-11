@@ -162,6 +162,11 @@ void BufferPool::rollbackWriteBatch() {
     // 回滚后不能把仍在缓存中的候选页再次写回。
     frames_.clear();
 }
+void BufferPool::restoreSavepoint(const PageFileSavepoint& snapshot) {
+    requireUnpinned();
+    file_->restoreSavepoint(snapshot);
+    frames_.clear();
+}
 void BufferPool::commitWriteBatch() {
     if (!file_->writeBatchActive()) throw MiniSqlError(ErrorCode::Transaction, "No active write batch");
     flushAll();

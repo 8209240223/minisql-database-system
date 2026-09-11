@@ -85,6 +85,27 @@ bool BPlusTree::insert(IndexKey key, RowRef row) {
     root_ = std::move(root);
     return true;
 }
+bool BPlusTree::erase(const IndexKey& key, RowRef row) {
+    std::vector<IndexEntry> entries;
+    entries.reserve(size_);
+    collectEntries(*root_, entries);
+    const auto sameRow = [&](const RowRef& candidate) {
+        return candidate.page.id == row.page.id && candidate.page.generation == row.page.generation &&
+               candidate.slot.slot == row.slot.slot && candidate.slot.generation == row.slot.generation;
+    };
+    const auto found = std::find_if(entries.begin(), entries.end(), [&](const IndexEntry& entry) {
+        return IndexKey::compare(entry.key, key) == 0 && sameRow(entry.row);
+    });
+    if (found == entries.end()) return false;
+    entries.erase(found);
+    root_ = std::make_unique<Node>();
+    size_ = 0;
+    for (auto& entry : entries) {
+        if (!insert(std::move(entry.key), entry.row))
+            throw MiniSqlError(ErrorCode::Storage, "Cannot restore in-memory B+ tree after erase");
+    }
+    return true;
+}
 std::optional<BPlusTree::Split> BPlusTree::insert(Node& node, IndexKey key, RowRef row) {
     if (node.leaf) {
         const auto position = std::lower_bound(node.keys.begin(), node.keys.end(), key,
@@ -134,15 +155,7 @@ const BPlusTree::Node* BPlusTree::findLeaf(const IndexKey& key) const {
     return node;
 }
 std::vector<RowRef> BPlusTree::search(const IndexKey& key) const {
-    const auto* leaf = findLeaf(key);
-    auto found = std::lower_bound(leaf->keys.begin(), leaf->keys.end(), key,
-        [](const IndexKey& left, const IndexKey& right) { return IndexKey::compare(left, right) < 0; });
-    std::vector<RowRef> rows;
-    while (found != leaf->keys.end() && IndexKey::compare(*found, key) == 0) {
-        rows.push_back(leaf->values[static_cast<std::size_t>(found - leaf->keys.begin())]);
-        ++found;
-    }
-    return rows;
+    return range(key, true, key, true);
 }
 void BPlusTree::collect(const Node& node, const std::optional<IndexKey>& lower, bool lowerInclusive,
                         const std::optional<IndexKey>& upper, bool upperInclusive, std::vector<RowRef>& rows) const {
@@ -155,6 +168,14 @@ void BPlusTree::collect(const Node& node, const std::optional<IndexKey>& lower, 
         return;
     }
     for (const auto& child : node.children) collect(*child, lower, lowerInclusive, upper, upperInclusive, rows);
+}
+void BPlusTree::collectEntries(const Node& node, std::vector<IndexEntry>& entries) const {
+    if (node.leaf) {
+        for (std::size_t index = 0; index < node.keys.size(); ++index)
+            entries.push_back({node.keys[index], node.values[index]});
+        return;
+    }
+    for (const auto& child : node.children) collectEntries(*child, entries);
 }
 std::vector<RowRef> BPlusTree::range(const std::optional<IndexKey>& lower, bool lowerInclusive,
                                      const std::optional<IndexKey>& upper, bool upperInclusive) const {
@@ -247,7 +268,10 @@ void BPlusTree::load(const std::filesystem::path& path, const std::string& expec
 }
 bool BPlusTree::validateNode(const Node& node, std::size_t depth, std::size_t& leafDepth) const {
     if (node.keys.size() > maxKeys_ || (!node.leaf && node.children.size() != node.keys.size() + 1)) return false;
-    for (std::size_t index = 1; index < node.keys.size(); ++index) if (IndexKey::compare(node.keys[index - 1], node.keys[index]) >= 0) return false;
+    for (std::size_t index = 1; index < node.keys.size(); ++index) {
+        const auto order = IndexKey::compare(node.keys[index - 1], node.keys[index]);
+        if (order > 0 || (unique_ && order == 0)) return false;
+    }
     if (node.leaf) {
         if (leafDepth == 0) leafDepth = depth;
         return leafDepth == depth;

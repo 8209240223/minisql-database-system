@@ -129,12 +129,22 @@ private:
     bool pageFileIndexes_ = true;   // 索引主路径引擎：true=页级 PageBPlusTree，false=内存 BPlusTree（MINISQL_INDEX_ENGINE=memory 时关闭）
     std::vector<std::unique_ptr<RuntimeIndex>> indexes_;
     void rebuildIndexes(std::uint64_t tableId);
+    void initializeIndexes(std::uint64_t tableId, bool forceRebuild, bool allowRebuild);
+    void reloadIndexRuntimes();
+    void insertIndexEntries(std::uint64_t tableId, const storage::Row& row, storage::RowRef ref);
+    void eraseIndexEntries(std::uint64_t tableId, const storage::Row& row, storage::RowRef ref);
+    void persistMemoryIndexes(std::uint64_t tableId);
     std::string tableFingerprint(std::uint64_t tableId);
     std::uint64_t indexOwnerId(const std::string& table, const std::string& index) const;
     void clearIndexPages(std::uint64_t owner);
     void persistIndexPages(storage::BPlusTree& tree, std::uint64_t owner, const std::string& fingerprint);
-    bool loadIndexPages(storage::BPlusTree& tree, std::uint64_t owner, const std::string& fingerprint);
+    bool loadIndexPages(storage::BPlusTree& tree, std::uint64_t owner, const std::string& fingerprint,
+                        std::string* failure = nullptr);
     void validateUniqueIndexes(std::uint64_t tableId, const storage::Row& row, const std::optional<storage::RowRef>& ignored = std::nullopt);
+    std::uint64_t indexFullRebuilds_ = 0;
+    std::uint64_t indexRuntimeReloads_ = 0;
+    std::uint64_t indexEntriesInserted_ = 0;
+    std::uint64_t indexEntriesErased_ = 0;
     std::vector<storage::Row> joinRows(const sql::LogicalPlan& plan);
     nlohmann::json aggregateRows(const sql::LogicalPlan& plan);
     void materializeSubqueries(std::vector<sql::LogicalPlan>& plans);

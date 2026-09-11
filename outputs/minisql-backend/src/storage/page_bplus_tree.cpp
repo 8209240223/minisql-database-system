@@ -280,7 +280,18 @@ PageRef PageBPlusTree::liftLeaf(PageRef root, const IndexKey& key) const {
     for (;;) {
         auto node = readNode(current);
         if (node.leaf) return current;
-        current = node.children[childIndex(node.keys, key)];
+        current = node.children[lowerBound(node.keys, key)];
+    }
+}
+IndexKey PageBPlusTree::minimumKey(PageRef node) const {
+    for (;;) {
+        const auto current = readNode(node);
+        if (current.leaf) {
+            if (current.keys.empty()) fail("Index child has no minimum key");
+            return current.keys.front();
+        }
+        if (current.children.empty()) fail("Index internal node has no children");
+        node = current.children.front();
     }
 }
 
@@ -455,16 +466,22 @@ bool PageBPlusTree::eraseInto(PageRef node, const IndexKey& key, RowRef row, con
         if (!samePage(node, root)) underflow = current.keys.size() < minKeys_;
         return true;
     }
-    const auto position = childIndex(current.keys, key);
-    const auto child = current.children[position];
-    bool childUnderflow = false;
-    const bool found = eraseInto(child, key, row, root, rootReplace, childUnderflow);
-    if (!found) { underflow = false; return false; }
-    if (childUnderflow) rebalanceChild(current, position, child, samePage(node, root));
-    replaceNode(node, current);
+    const auto first = lowerBound(current.keys, key);
+    const auto upper = static_cast<std::size_t>(std::upper_bound(current.keys.begin(), current.keys.end(), key,
+        [](const IndexKey& value, const IndexKey& separator) { return compareKey(value, separator) < 0; }) - current.keys.begin());
+    for (std::size_t position = first; position <= upper && position < current.children.size(); ++position) {
+        const auto child = current.children[position];
+        bool childUnderflow = false;
+        if (!eraseInto(child, key, row, root, rootReplace, childUnderflow)) continue;
+        if (childUnderflow) rebalanceChild(current, position, child, samePage(node, root));
+        for (std::size_t index = 0; index < current.keys.size(); ++index)
+            current.keys[index] = minimumKey(current.children[index + 1]);
+        replaceNode(node, current);
+        underflow = !samePage(node, root) && current.keys.size() < minKeys_;
+        return true;
+    }
     underflow = false;
-    if (!samePage(node, root) && current.keys.size() < minKeys_) underflow = true;
-    return true;
+    return false;
 }
 
 bool PageBPlusTree::rebalanceChild(Node& n, std::size_t childIdx, PageRef childRef, bool nodeIsRoot) {
@@ -559,25 +576,7 @@ bool PageBPlusTree::rebalanceChild(Node& n, std::size_t childIdx, PageRef childR
 }
 
 std::vector<RowRef> PageBPlusTree::search(const IndexKey& key) const {
-    if (!exists()) return {};
-    PageRef root;
-    std::size_t size;
-    requireMeta(root, size);
-    if (root.id == kInvalidPageId) return {};
-    std::vector<RowRef> rows;
-    auto current = root;
-    for (;;) {
-        auto node = readNode(current);
-        if (node.leaf) {
-            const auto position = lowerBound(node.keys, key);
-            for (std::size_t i = position; i < node.keys.size(); ++i) {
-                if (compareKey(node.keys[i], key) != 0) break;
-                rows.push_back(node.values[i]);
-            }
-            return rows;
-        }
-        current = node.children[childIndex(node.keys, key)];
-    }
+    return range(key, true, key, true);
 }
 
 std::vector<RowRef> PageBPlusTree::range(const std::optional<IndexKey>& lower, bool lowerInclusive,
@@ -725,7 +724,8 @@ bool PageBPlusTree::validateNode(PageRef ref, std::uint32_t depth, std::optional
     const auto node = readNode(ref);
     if (node.keys.size() > maxKeys_) return false;
     for (std::size_t i = 1; i < node.keys.size(); ++i) {
-        if (compareKey(node.keys[i - 1], node.keys[i]) >= 0) return false;
+        const auto order = compareKey(node.keys[i - 1], node.keys[i]);
+        if (order > 0 || (unique_ && order == 0)) return false;
     }
     for (std::size_t i = 0; i < node.keys.size(); ++i) {
         if (left && compareKey(node.keys[i], **left) < 0) return false;
