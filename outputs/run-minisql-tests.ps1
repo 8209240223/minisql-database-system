@@ -50,7 +50,8 @@ $groups = @{
         'tests/statistics-smoke.mjs',
         'tests/analyze-stats-smoke.mjs',
         'tests/correlated-aggregate-smoke.mjs',
-        'tests/decorrelate-apply-smoke.mjs'
+        'tests/decorrelate-apply-smoke.mjs',
+        'tests/sql-dialect-smoke.mjs'
     )
     execution = @(
         'tests/database-process.mjs',
@@ -71,6 +72,7 @@ $groups = @{
         'tests/auto-checkpoint-smoke.mjs',
         'tests/x22-fault-injection.mjs',
         'tests/background-checkpoint-fault-injection.mjs',
+        'tests/cli-input-and-buffer-log.mjs',
         'tests/journal-process.mjs',
         'tests/index-smoke.mjs',
         'tests/index-performance-curve.mjs',

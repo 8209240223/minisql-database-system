@@ -6,14 +6,39 @@
 #include "minisql/sql/serialization.hpp"
 #include "minisql/common/wire_json.hpp"
 #include <nlohmann/json.hpp>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <iterator>
+#include <string>
 using json = nlohmann::json;
+namespace {
+// 从 SQL 文件读取源码：显式失败优于静默空输入，并去掉 UTF-8 BOM。
+std::string readSqlFile(const std::filesystem::path& path) {
+    std::ifstream stream(path, std::ios::binary);
+    if (!stream) throw minisql::MiniSqlError(minisql::ErrorCode::InvalidArgument, "Cannot open SQL file: " + path.string());
+    std::string source{std::istreambuf_iterator<char>(stream), {}};
+    if (source.size() >= 3 && static_cast<unsigned char>(source[0]) == 0xEF &&
+        static_cast<unsigned char>(source[1]) == 0xBB && static_cast<unsigned char>(source[2]) == 0xBF)
+        source.erase(0, 3);
+    return source;
+}
+}
 int main(int argc, char** argv) {
     try {
-        const bool parseOnly = argc == 2 && std::string(argv[1]) == "--parse-only";
-        if (argc > 1 && !parseOnly) throw minisql::MiniSqlError(minisql::ErrorCode::InvalidArgument, "Unknown option");
-        std::string source{std::istreambuf_iterator<char>(std::cin), {}};
+        bool parseOnly = false;
+        std::filesystem::path sqlFile;
+        for (int index = 1; index < argc; ++index) {
+            const std::string argument = argv[index];
+            if (argument == "--parse-only") { parseOnly = true; continue; }
+            if (argument == "--file" || argument == "-f") {
+                if (index + 1 >= argc) throw minisql::MiniSqlError(minisql::ErrorCode::InvalidArgument, "--file requires a path");
+                sqlFile = argv[++index];
+                continue;
+            }
+            throw minisql::MiniSqlError(minisql::ErrorCode::InvalidArgument, "Unknown option: " + argument);
+        }
+        const std::string source = sqlFile.empty() ? std::string{std::istreambuf_iterator<char>(std::cin), {}} : readSqlFile(sqlFile);
         auto tok = minisql::sql::tokenize(source);
         auto ast = minisql::sql::parse(tok);
         const auto tokens = minisql::sql::serializeTokens(tok);

@@ -110,8 +110,7 @@ void scanImpl(const std::string& s, const std::function<void(const Token&)>& con
             if(!closed&&!recovered){const SourceLocation end{line,column};report("Unterminated string literal",loc,end);drop();}
             if(recovered){continue;} // already dropped+safely skipped past the newline
             type="STRING";
-        } else if(two=="=="||two=="<>"){const SourceLocation end{line,column};report("Unsupported comparison operator",loc,end);advance();advance();drop();continue;}
-        else if(two==">="||two=="<="||two=="!="){advance();advance();type="OPERATOR";}
+        } else if(two==">="||two=="<="||two=="!="||two=="=="||two=="<>"){advance();advance();type="OPERATOR";}
         else if(std::string("=<>+-*/").find(c)!=std::string::npos){advance();type="OPERATOR";}
         else if(c=='.' && i+1<s.size() && digit(s[i+1])){const SourceLocation end{line,column};report("Unsupported numeric literal",loc,end);drop();continue;}
         else if(std::string("(),;.").find(c)!=std::string::npos){advance();type="DELIMITER";}

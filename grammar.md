@@ -243,10 +243,11 @@ negation          ::= "NOT" negation | comparison ;
 -- NOT 作用于后续完整比较表达式，因此 NOT a = 1 解析为 NOT (a = 1)。
 
 comparison        ::= addition
-                      [ ( "=" | "!=" | "<" | "<=" | ">" | ">=" ) addition
+                      [ ( "=" | "==" | "!=" | "<>" | "<" | "<=" | ">" | ">=" ) addition
                       | [ "NOT" ] "IN" "(" in_operand ")"
                       | "IS" [ "NOT" ] "NULL" ] ;
 -- 比较运算包括等值、范围和 IN，IS NULL 用于空值判断。
+-- `==` 与 `=` 等价，`<>` 与 `!=` 等价；Token 词素保留源码原文，语义按规范算子（`=` / `!=`）处理。
 
 in_operand        ::= expression { "," expression } | select_stmt_without_semicolon ;
 -- IN 的右侧可以是值列表或 SELECT 子查询。
@@ -354,7 +355,7 @@ primary               -> primary
 | 冲突项 | 当前处理 |
 | --- | --- |
 | NOT 优先级文字与表达式文法冲突 | 以表达式文法为准，`NOT` 作用于完整比较表达式 |
-| 双等号 `==` | 不接受，等于比较只使用单等号 `=` |
+| 双等号 `==`、尖括号 `<>` | 接受为方言写法：`==` 等价 `=`，`<>` 等价 `!=`；词素保留源码原文 |
 | 小数常量没有基础数据类型 | 当前实现支持 DECIMAL 和 FLOAT |
 | 基础配置只要求四类 SQL | 当前扩展支持 UPDATE、JOIN、GROUP BY、ORDER BY 和子查询 |
 | 课件计划清单没有 Delete 节点 | 当前实现生成 Delete 计划节点 |

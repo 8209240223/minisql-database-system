@@ -57,6 +57,35 @@ npm.cmd run test:history
 npm.cmd run test:csv
 ```
 
+## 命令行用法
+
+引擎与编译器入口都支持标准输入和 `--file/-f` 文件输入：
+
+```powershell
+# 标准输入
+Get-Content .\query.sql | .\build\windows\Release\minisql_database.exe .\data\demo.pages execute
+
+# 文件输入（两种入口同等支持）
+.\build\windows\Release\minisql_database.exe .\data\demo.pages execute --file .\query.sql
+.\build\windows\Release\minisql_compile.exe --file .\query.sql
+```
+
+词法/语法/语义/计划四个阶段一次输出：`minisql_compile.exe --file query.sql` 返回 `tokens`、`ast`、`plan`、`optimizedPlan` 和分阶段 `stages`。
+
+比较运算符接受 `=`、`==`、`!=`、`<>`、`<`、`<=`、`>`、`>=`；`==` 等价 `=`，`<>` 等价 `!=`，Token 词素保留源码原文。
+
+缓存与存储调优开关（环境变量）：
+
+| 变量 | 作用 |
+| --- | --- |
+| `MINISQL_BUFFER_FRAMES` | 缓冲池帧数（默认 64），便于观察命中率与替换行为 |
+| `MINISQL_BUFFER_LOG` | 页替换日志文件路径，每次淘汰追加一行（序号/策略/页号/代数/脏页/写回状态） |
+| `MINISQL_MAX_RESULT_ROWS` | 单条语句结果行预算 |
+| `MINISQL_TEMP_DIR` | 外部排序/聚合临时目录 |
+| `MINISQL_AUTO_CHECKPOINT_*` | 自动检查点阈值（写入数、WAL 字节、脏页数/比例、时间窗口） |
+
+命中统计与淘汰记录也可通过 `statistics` 命令的 `buffer` 字段读取，无需开启日志文件。
+
 ## 启动工作台
 
 ```powershell

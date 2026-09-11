@@ -2,6 +2,8 @@
 #include "minisql/common/wire_json.hpp"
 #include "minisql/security/access_catalog.hpp"
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <iterator>
 #ifdef _WIN32
@@ -11,6 +13,16 @@
 
 namespace {
 using json = nlohmann::json;
+// 从 SQL 文件读取源码：显式失败优于静默空输入，并去掉 UTF-8 BOM。
+std::string readSqlFile(const std::filesystem::path& path) {
+    std::ifstream stream(path, std::ios::binary);
+    if (!stream) throw minisql::MiniSqlError(minisql::ErrorCode::InvalidArgument, "Cannot open SQL file: " + path.string());
+    std::string source{std::istreambuf_iterator<char>(stream), {}};
+    if (source.size() >= 3 && static_cast<unsigned char>(source[0]) == 0xEF &&
+        static_cast<unsigned char>(source[1]) == 0xBB && static_cast<unsigned char>(source[2]) == 0xBF)
+        source.erase(0, 3);
+    return source;
+}
 void authorizeRequest(minisql::execution::Database& database, const minisql::security::AccessCatalog& access, const json& request,
                       const std::string& operation, const std::string& sql = {},
                       const std::string& table = {}, const std::string& index = {}) {
@@ -195,8 +207,23 @@ int session(minisql::execution::Database& database, minisql::security::AccessCat
 
 int main(int argc, char** argv) {
     try {
-        if (argc != 3) throw minisql::MiniSqlError(minisql::ErrorCode::InvalidArgument, "Usage: minisql_database <database.pages> <execute|compile|diagnostics|statistics|catalog|session>");
-        const std::string mode = argv[2];
+        // 位置参数：<database.pages> <mode>；可选 `--file/-f <query.sql>` 从文件读 SQL（默认标准输入）。
+        std::filesystem::path sqlFile;
+        std::vector<std::string> positional;
+        int databaseArgIndex = -1;
+        for (int index = 1; index < argc; ++index) {
+            const std::string argument = argv[index];
+            if (argument == "--file" || argument == "-f") {
+                if (index + 1 >= argc) throw minisql::MiniSqlError(minisql::ErrorCode::InvalidArgument, "--file requires a path");
+                sqlFile = argv[++index];
+                continue;
+            }
+            if (databaseArgIndex < 0) databaseArgIndex = index;
+            positional.push_back(argument);
+        }
+        if (positional.size() != 2) throw minisql::MiniSqlError(minisql::ErrorCode::InvalidArgument,
+            "Usage: minisql_database <database.pages> <execute|compile|diagnostics|statistics|catalog|session> [--file <query.sql>]");
+        const std::string mode = positional[1];
         if (mode != "execute" && mode != "compile" && mode != "diagnostics" && mode != "statistics" && mode != "catalog" && mode != "session")
             throw minisql::MiniSqlError(minisql::ErrorCode::InvalidArgument, "Unknown database command");
         std::filesystem::path path;
@@ -207,7 +234,7 @@ int main(int argc, char** argv) {
             if (wideArgs) LocalFree(wideArgs);
             throw minisql::MiniSqlError(minisql::ErrorCode::InvalidArgument, "Cannot decode command line");
         }
-        path = wideArgs[1];
+        path = wideArgs[databaseArgIndex];
         LocalFree(wideArgs);
 #else
         path = argv[1];
@@ -218,7 +245,7 @@ int main(int argc, char** argv) {
         nlohmann::json result;
         if (mode == "catalog") { authorizeDirect(database, access, mode); result = database.catalog(); }
         else {
-            const std::string source{std::istreambuf_iterator<char>(std::cin), {}};
+            const std::string source = sqlFile.empty() ? std::string{std::istreambuf_iterator<char>(std::cin), {}} : readSqlFile(sqlFile);
             authorizeDirect(database, access, mode, source);
             result = mode == "execute" ? database.executeScript(source) : mode == "diagnostics" ? database.diagnostics(source) : mode == "statistics" ? database.statistics() : database.compile(source);
         }

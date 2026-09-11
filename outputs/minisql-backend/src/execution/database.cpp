@@ -38,6 +38,15 @@ std::string key(std::string value) {
     std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
     return value;
 }
+// 缓冲池帧数：默认取构造参数，MINISQL_BUFFER_FRAMES 可覆盖（用于观察命中率与替换日志）。
+std::size_t resolveBufferFrames(std::size_t frames) {
+    if (const char* configured = std::getenv("MINISQL_BUFFER_FRAMES")) {
+        char* end = nullptr;
+        const auto parsed = std::strtoull(configured, &end, 10);
+        if (end && *end == '\0' && parsed >= 1 && parsed <= 1000000) return static_cast<std::size_t>(parsed);
+    }
+    return frames;
+}
 bool sqlIdentifier(const std::string& value) {
     if (value.empty() || !(std::isalpha(static_cast<unsigned char>(value.front())) || value.front() == '_')) return false;
     return std::all_of(value.begin() + 1, value.end(), [](unsigned char c) {
@@ -391,7 +400,7 @@ struct Database::RuntimeIndex {
     bool validate() const { return pageFile ? pageTree->validate() : tree.validate(); }
 };
 Database::Database(const std::filesystem::path& path, std::size_t frames, storage::PageFile::CommitObserver observer)
-    : file_(std::make_shared<storage::PageFile>(path, std::move(observer))), buffer_(file_, frames, storage::ReplacementPolicy::LRU),
+    : file_(std::make_shared<storage::PageFile>(path, std::move(observer))), buffer_(file_, resolveBufferFrames(frames), storage::ReplacementPolicy::LRU),
       heap_(file_, buffer_), catalog_(heap_) {
     lastCheckpointAt_ = std::chrono::steady_clock::now();
     lastCheckpointAtMs_ = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -432,6 +441,8 @@ Database::Database(const std::filesystem::path& path, std::size_t frames, storag
     sortTempDirectory_ = std::getenv("MINISQL_TEMP_DIR") ? std::filesystem::path(std::getenv("MINISQL_TEMP_DIR")) : path.parent_path() / ".minisql-sort";
     if (const char* configured = std::getenv("MINISQL_SESSION_ID"); configured && *configured) sessionId_ = configured;
     if (const char* configured = std::getenv("MINISQL_CANCEL_FILE"); configured && *configured) cancelFile_ = configured;
+    // 页替换日志（指导书"替换日志输出"）：设置后每次淘汰追加一行到该文件。
+    if (const char* configured = std::getenv("MINISQL_BUFFER_LOG"); configured && *configured) buffer_.setEvictionLog(configured);
     if (const char* configured = std::getenv("MINISQL_BACKGROUND_CHECKPOINT_MS")) {
         char* end = nullptr;const auto parsed = std::strtoull(configured, &end, 10);
         if (end && *end == '\0' && parsed > 0 && parsed <= 3600000) backgroundCheckpointMs_ = static_cast<std::size_t>(parsed);
@@ -2136,10 +2147,18 @@ nlohmann::json Database::diagnostics(const std::string& source) const {
                 const auto matched = closestName(target, candidates);
                 suggestion = matched.empty() ? "Check the table name and confirm the table was created." : "Did you mean: " + matched + "?";
             }
-            else if (message.find("Column does not exist") != std::string::npos || message.find("Unknown column") != std::string::npos)
+            else if (message.find("Column does not exist") != std::string::npos || message.find("Unknown column") != std::string::npos ||
+                     message.find("does not exist in table") != std::string::npos)
             {
-                const auto separator = message.find(':');
-                const auto target = message.substr(separator == std::string::npos ? 0 : separator + 1);
+                // 新消息形如 Column 'ag' does not exist in table 'student'；旧消息形如 Column does not exist: ag。
+                std::string target;
+                const auto open = message.find('\'');
+                const auto close = open == std::string::npos ? std::string::npos : message.find('\'', open + 1);
+                if (open != std::string::npos && close != std::string::npos) target = message.substr(open + 1, close - open - 1);
+                else {
+                    const auto separator = message.find(':');
+                    target = message.substr(separator == std::string::npos ? 0 : separator + 1);
+                }
                 std::vector<std::string> candidates;
                 for (const auto& table : catalog_.tables()) for (const auto& column : table.definition.columns) candidates.push_back(column.name);
                 const auto matched = closestName(target, candidates);

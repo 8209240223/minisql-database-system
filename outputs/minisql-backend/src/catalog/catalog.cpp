@@ -25,6 +25,13 @@ std::string key(std::string value) {
 [[noreturn]] void fail(const std::string& message, SourceLocation location) {
     throw MiniSqlError(ErrorCode::Semantic, message, location);
 }
+// 错误消息里按 SQL 写法展示类型名：int -> INT、varchar(40) -> VARCHAR(40)。
+std::string typeLabel(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
+        return static_cast<char>(std::toupper(c));
+    });
+    return value;
+}
 bool assignable(const std::string& source, const std::string& target) {
     if (stringType(source) && stringType(target)) return true;
     if (source == "null" || source == target || (target == "bigint" && source == "int")) return true;
@@ -130,7 +137,8 @@ std::string expressionType(const sql::Expr& expression, const Table& table,
     const auto right = expressionType(*expression.right, table, statementLocation, depth + 1, allowAggregate);
     const auto numeric = [](const std::string& type) { return type == "int" || type == "bigint" || type == "float" || decimalType(type).has_value(); };
     if (isArithmetic(expression.value)) {
-        if ((!numeric(left) && left != "null") || (!numeric(right) && right != "null")) fail("Arithmetic requires numeric operands", location);
+        if ((!numeric(left) && left != "null") || (!numeric(right) && right != "null"))
+            fail("operator '" + expression.value + "' cannot be applied to " + typeLabel(left) + " and " + typeLabel(right), location);
         if (left == "float" || right == "float") {
             if ((left != "float" && left != "null") || (right != "float" && right != "null"))
                 fail("FLOAT arithmetic requires explicit CAST for mixed numeric types", location);
@@ -253,7 +261,7 @@ std::size_t resolveColumnIndex(const Table& table, const std::string& name, Sour
         if (match != table.columns.size()) fail("Ambiguous column: " + name, location);
         match = i;
     }
-    if (match == table.columns.size()) fail("Column does not exist: " + name, location);
+    if (match == table.columns.size()) fail("Column '" + name + "' does not exist in table '" + table.name + "'", location);
     return match;
 }
 Table queryScope(const sql::Statement& statement, const Catalog& catalog, std::size_t joinCount) {
@@ -489,6 +497,7 @@ void validate(const std::vector<sql::Statement>& statements, Catalog& catalog) {
                 fail("INSERT column/value count mismatch", statement.location);
             }
             std::unordered_set<std::string> seen;
+            std::vector<std::string> mismatches;
             for (std::size_t i = 0; i < names.size(); ++i) {
                 const auto& name = names[i];
                 const auto& target = column(*table, name, statement.location);
@@ -500,8 +509,15 @@ void validate(const std::vector<sql::Statement>& statements, Catalog& catalog) {
                 if (type == "null" && !target.nullable)
                     fail("NOT NULL constraint failed" + notNullConstraintSuffix(*catalog.find(statement.table), resolveColumnIndex(*table, name)), statement.location);
                 if ((type == "null" && !target.nullable) || !assignable(type, key(target.type))) {
-                    fail("INSERT value type mismatch for column: " + name, statement.location);
+                    // 收集全部不匹配的列，一次报告（验收示例要求同时给出 id 与 name 两处）。
+                    mismatches.push_back(statement.table + "." + name + " expects " + typeLabel(target.type) +
+                        ", but " + typeLabel(type) + " found");
                 }
+            }
+            if (!mismatches.empty()) {
+                std::string message = "INSERT type mismatch: ";
+                for (std::size_t i = 0; i < mismatches.size(); ++i) message += (i == 0 ? "" : "; ") + mismatches[i];
+                fail(message, statement.location);
             }
             for (const auto& target : table->columns)
                 if (!seen.contains(key(target.name)) && !target.nullable && !target.defaultValue)

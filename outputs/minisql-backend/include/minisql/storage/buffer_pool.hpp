@@ -51,6 +51,8 @@ public:
     void commitWriteBatch();
     void setPolicy(ReplacementPolicy policy);
     void resetStats();
+    // 页替换日志输出：非空路径时，每次淘汰都以追加方式写一行文本日志（命中统计仍走 stats()）。
+    void setEvictionLog(std::filesystem::path path);
     const BufferStats& stats() const { return stats_; }
     const std::vector<Eviction>& evictions() const { return evictions_; }
     std::size_t size() const { return frames_.size(); }
@@ -66,8 +68,10 @@ private:
     std::unordered_map<PageId, std::shared_ptr<BufferFrame>> frames_;
     BufferStats stats_;
     std::vector<Eviction> evictions_;
+    std::filesystem::path evictionLogPath_;
     void makeRoom();
     void writeBack(BufferFrame& frame);
+    void appendEvictionLog(const Eviction& event) const;
     SlottedPage readPage(PageRef ref);
     void requireUnpinned() const;
 };

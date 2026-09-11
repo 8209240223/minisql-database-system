@@ -1,5 +1,7 @@
 #include "minisql/storage/buffer_pool.hpp"
 #include "minisql/common/error.hpp"
+#include <chrono>
+#include <fstream>
 #include <utility>
 
 namespace minisql::storage {
@@ -51,6 +53,23 @@ void BufferPool::writeBack(BufferFrame& frame) {
     else ++stats_.pageWrites;
     frame.dirty = false;
 }
+void BufferPool::setEvictionLog(std::filesystem::path path) {
+    evictionLogPath_ = std::move(path);
+}
+void BufferPool::appendEvictionLog(const Eviction& event) const {
+    if (evictionLogPath_.empty()) return;
+    std::ofstream stream(evictionLogPath_, std::ios::app);
+    // 日志写入失败不改变替换语义：统计与淘汰仍以内存状态为准。
+    if (!stream) return;
+    const auto atMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    stream << atMs << " seq=" << event.sequence
+           << " policy=" << (event.policy == ReplacementPolicy::LRU ? "LRU" : "FIFO")
+           << " page=" << event.page.id
+           << " generation=" << event.page.generation
+           << " dirty=" << (event.dirty ? 1 : 0)
+           << " writeBack=" << event.writeBack << '\n';
+}
 void BufferPool::makeRoom() {
     if (frames_.size() < capacity_) return;
     auto victim = frames_.end();
@@ -66,10 +85,12 @@ void BufferPool::makeRoom() {
     catch (...) {
         event.writeBack = "failed";
         evictions_.push_back(event);
+        appendEvictionLog(event);
         throw;
     }
     if (event.dirty) event.writeBack = file_->writeBatchActive() ? "staged" : "written";
     evictions_.push_back(event);
+    appendEvictionLog(event);
     frames_.erase(victim);
 }
 PageGuard BufferPool::get(PageRef ref) {

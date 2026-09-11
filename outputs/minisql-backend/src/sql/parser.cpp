@@ -413,7 +413,12 @@ private:
             return negate?std::make_shared<Expr>(Expr{"Unary","NOT",terms.front(),{},op.location}):terms.front();
         }
         if(keyword("IS")){auto op=take();bool negate=keyword("NOT");if(negate)++i;expect("NULL");return std::make_shared<Expr>(Expr{"Unary",negate?"IS NOT NULL":"IS NULL",left,{},op.location});}
-        if(at("=")||at("!=")||at("<")||at("<=")||at(">")||at(">=")){auto op=take();auto right=addition();return std::make_shared<Expr>(Expr{"Binary",op.lexeme,left,right,op.location});}
+        // 方言归一：`==` 等价 `=`，`<>` 等价 `!=`。词素保持源码原文，语义统一按规范算子处理。
+        if(at("=")||at("==")||at("!=")||at("<>")||at("<")||at("<=")||at(">")||at(">=")){
+            auto op=take();auto right=addition();
+            const auto normalized=op.lexeme=="=="?std::string("="):op.lexeme=="<>"?std::string("!="):op.lexeme;
+            return std::make_shared<Expr>(Expr{"Binary",normalized,left,right,op.location});
+        }
         return left;
     }
     std::shared_ptr<Expr> addition(){auto left=multiplication();while(at("+")||at("-")){auto op=take();left=std::make_shared<Expr>(Expr{"Binary",op.lexeme,left,multiplication(),op.location});}return left;}
