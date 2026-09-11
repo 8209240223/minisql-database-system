@@ -51,13 +51,17 @@ jobs:
         with:
           node-version: '24'
       - name: 安装依赖
-        run: npm ci || npm install
+        run: npm ci
       - name: 变更安全（整表变异提示）
         run: npm run test:safety
       - name: 查询历史
         run: npm run test:history
       - name: CSV 导出
         run: npm run test:csv
+      - name: SQL 格式化
+        run: npm run test:format
+      - name: 结果虚拟窗口
+        run: npm run test:virtual
       - name: 类型与构建
         run: npm run build
 
@@ -73,10 +77,16 @@ jobs:
         shell: pwsh
         working-directory: outputs/minisql-backend
         run: |
-          cmake --preset windows -DBUILD_TESTING=OFF
+          cmake --preset windows --fresh -DBUILD_TESTING=ON
           if ($LASTEXITCODE -ne 0) { throw 'CMake configuration failed.' }
           cmake --build --preset windows-release --parallel
           if ($LASTEXITCODE -ne 0) { throw 'CMake Release build failed.' }
+      - name: C++ 注册测试
+        shell: pwsh
+        working-directory: outputs/minisql-backend
+        run: |
+          ctest --preset windows-release --no-tests=error
+          if ($LASTEXITCODE -ne 0) { throw 'CTest Release regression failed.' }
       - name: 安装工作台浏览器回归依赖
         run: npm ci
         working-directory: outputs/minisql-workbench

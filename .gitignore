@@ -13,6 +13,7 @@ outputs/minisql-backend/tests/artifacts/
 
 # Frontend dependencies and generated output
 outputs/minisql-workbench/node_modules/
+outputs/minisql-workbench/.npm-cache/
 outputs/minisql-workbench/dist/
 outputs/minisql-workbench/*.tsbuildinfo
 

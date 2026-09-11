@@ -31,6 +31,15 @@ function Invoke-FrontendTests {
     } finally { Pop-Location }
 }
 
+if (-not (Test-Path -LiteralPath (Join-Path $frontend 'node_modules'))) {
+    Write-Host "`n>>> npm.cmd ci" -ForegroundColor Cyan
+    Push-Location $frontend
+    try {
+        npm.cmd ci
+        if ($LASTEXITCODE -ne 0) { throw 'Frontend dependency installation failed.' }
+    } finally { Pop-Location }
+}
+
 if ($Build) {
     Write-Host "`n>>> cmake build Release" -ForegroundColor Cyan
     Push-Location $backend
