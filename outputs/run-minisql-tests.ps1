@@ -49,6 +49,29 @@ if ($Build) {
     } finally { Pop-Location }
 }
 
+# 仓库里 43 个进程测试从 bin/ 读取可执行体（bin/ 被 .gitignore 忽略，属于本地产物）。
+# 不同步的话，回归会静默地验证上一次构建的旧二进制 —— 曾因此把一个真实的栈溢出
+# 崩溃误判成“既有失败”。跑测试前把最新构建产物同步回 bin/。
+$releaseDir = Join-Path $backend 'build/windows/Release'
+if (Test-Path -LiteralPath $releaseDir) {
+    $binDir = Join-Path $backend 'bin'
+    New-Item -ItemType Directory -Force -Path $binDir | Out-Null
+    $synced = 0
+    Get-ChildItem -Path (Join-Path $releaseDir '*.exe'), (Join-Path $releaseDir '*.dll') -ErrorAction SilentlyContinue | ForEach-Object {
+        Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $binDir $_.Name) -Force
+        $synced++
+    }
+    # journal_probe.exe 是 tests/journal-process.mjs 期望的文件名。
+    $journalProbe = Join-Path $releaseDir 'minisql_journal_probe.exe'
+    if (Test-Path -LiteralPath $journalProbe) {
+        Copy-Item -LiteralPath $journalProbe -Destination (Join-Path $binDir 'journal_probe.exe') -Force
+        $synced++
+    }
+    Write-Host "`n>>> synced $synced build artifacts into bin/" -ForegroundColor Cyan
+} else {
+    Write-Host "`n>>> build/windows/Release not found; using existing bin/ artifacts" -ForegroundColor Yellow
+}
+
 $groups = @{
     compiler = @(
         'tests/parser-regression.mjs',
@@ -76,6 +99,7 @@ $groups = @{
         'tests/transaction-savepoint.mjs'
         'tests/transaction-overflow.mjs'
         'tests/requirements-limits-process.mjs'
+        'tests/nesting-depth-process.mjs'
     )
     storage = @(
         'tests/checkpoint-smoke.mjs',

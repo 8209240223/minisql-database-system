@@ -190,12 +190,13 @@ powershell -ExecutionPolicy Bypass -File .\stop-minisql-workbench.ps1
 - X26 在线一致性快照、非零 WAL 截止位置重做与迁移失败回滚目录。
 - 第十七章 REQ-CORE-001/002 工程基线：标识符/批量语句/诊断数量上限，`SEM_INTEGER_OUT_OF_RANGE` 与 `PLAN_STALE_SCHEMA` 稳定错误码，以及序列化计划执行入口。
 - 第十九章 REQ-UI-010：`GET /api/storage/stats` 别名、未实现能力返回 501、资源超限返回 413 的完整状态映射。
+- 第十七章 §7.2 极端嵌套：表达式嵌套上限 256 现在真正可用（257 起报 `SyntaxError 2002`）；派生表与标量子查询的递归补上了缺失的深度保护；嵌套标量子查询（含非相关多层）可正常执行。
 
-已知失败（已在 `d2dc852` 基线上复现同样的失败模式，如实列出）：
+已知失败（均已在当前 `main` 上复现同样的失败模式，与嵌套深度修复无关，如实列出）：
 
-- `tests/cast-process.mjs`：260 层嵌套 `CAST` 触发子进程栈溢出（`0xC00000FD`），期望返回语法错误 `2002`。
+- `tests/transaction-savepoint.mjs`：`SELECT * FROM v`（表不存在）经 bridge 得到 `403`，期望 `422`。原因是 X25 fail-closed 鉴权在绑定不闭合时统一返回 403，而该测试写于 X25 之前。
 - `tests/backup-online-smoke.mjs`：在线快照请求返回 `503`，期望 `200`。
-- `tests/journal-process.mjs`：本机预置 `bin/journal_probe.exe` 与新建产物校验和不一致（环境问题）。
+- `tests/journal-process.mjs`：预置 `bin/journal_probe.exe` 与新构建产物不一致（环境问题）。
 
 仍待继续（不把专项测试通过等同于全量验收）：
 

@@ -81,6 +81,17 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'CMake configuration failed.' }
           cmake --build --preset windows-release --parallel
           if ($LASTEXITCODE -ne 0) { throw 'CMake Release build failed.' }
+      - name: 同步构建产物到 bin（进程测试的约定位置）
+        shell: pwsh
+        working-directory: outputs/minisql-backend
+        run: |
+          # bin/ 被 .gitignore 忽略，43 个进程测试却从它读取可执行体。
+          # 不同步会让 CI 直接报"文件不存在"，或更糟——静默验证过时的预置副本。
+          New-Item -ItemType Directory -Force -Path bin | Out-Null
+          Copy-Item build/windows/Release/*.exe -Destination bin -Force
+          Copy-Item build/windows/Release/*.dll -Destination bin -Force -ErrorAction SilentlyContinue
+          Copy-Item build/windows/Release/minisql_journal_probe.exe -Destination bin/journal_probe.exe -Force
+          if ($LASTEXITCODE -ne 0) { throw 'bin/ artifact sync failed.' }
       - name: C++ 注册测试
         shell: pwsh
         working-directory: outputs/minisql-backend
@@ -129,6 +140,7 @@ jobs:
         run: |
           node tests/requirements-limits-process.mjs
           node tests/requirements-http-contract.mjs
+          node tests/nesting-depth-process.mjs
         working-directory: outputs/minisql-backend
       - name: 索引规模回归（1000 行）
         env:

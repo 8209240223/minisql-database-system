@@ -256,6 +256,12 @@ json evaluate(const json& expression, const Row& row) {
         }
         return hasNull ? json(nullptr) : json(false);
     }
+    // 未物化的子查询节点没有 left/operator 字段，直接取键会抛出 json 异常。
+    // 这里转成正式诊断，避免把内部异常当成 InternalError 泄露给调用方。
+    if (kind == "ScalarSubquery" || kind == "Exists" || kind == "InSubquery") {
+        const std::string detail = "Subquery was not materialized before evaluation: " + kind;
+        fail(detail.c_str());
+    }
     const json left = evaluate(expression.at("left"), row);
     const SourceLocation location{expression.value("line", std::size_t(0)), expression.value("column", std::size_t(0))};
     if (kind == "Cast") {
@@ -2774,7 +2780,11 @@ void Database::materializeSubqueries(std::vector<sql::LogicalPlan>& plans) {
         const auto ast = sql::parse(sql::tokenize(sql + ";"));
         if (ast.size() != 1 || ast.front().kind != "Select")
             throw MiniSqlError(ErrorCode::Semantic, "Subquery must be a single SELECT");
-        const auto subplans = sql::compilePlans(ast, catalog_.view());
+        auto subplans = sql::compilePlans(ast, catalog_.view());
+        // 内层子查询必须先递归物化。否则嵌套标量子查询的内层会以原始
+        // ScalarSubquery 节点进入求值器，在 expression.at("left") 处抛出
+        // nlohmann json 异常并泄漏成 InternalError。相关子查询路径同样先物化。
+        materializeSubqueries(subplans);
         const auto result = run(subplans.front());
         if (result.at("columns").size() != 1)
             throw MiniSqlError(ErrorCode::Semantic, "IN subquery must return exactly one column");
