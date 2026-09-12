@@ -22,6 +22,7 @@ public:
 
     bool insert(IndexKey key, RowRef row);
     bool erase(const IndexKey& key, RowRef row);
+    void reset();   // 清空所有节点，供索引重建复用同一实例
     std::vector<RowRef> search(const IndexKey& key) const;
     std::vector<RowRef> range(const std::optional<IndexKey>& lower, bool lowerInclusive,
                               const std::optional<IndexKey>& upper, bool upperInclusive) const;

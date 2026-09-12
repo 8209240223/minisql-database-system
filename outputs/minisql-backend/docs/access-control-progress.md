@@ -42,9 +42,16 @@
 
 - **X25 绑定统一（2026-09-12 补）**：新增 `src/sql/binder.cpp` 与 `include/minisql/sql/binding.hpp`，提供稳定的 `RelationId/ColumnId/ExpressionId` 与作用域树。`AccessCatalog::authorize` 改为消费 `security::AccessRequest`（每个对象带自己的动作），`security/access_catalog.cpp` 中 `firstKeyword`/`sqlWords`/`tableReferences`/`astTableReferences` 共 187 行 SQL 文本扫描与对 `sql/lexer.hpp`、`sql/parser.hpp` 的依赖一并删除，`execution/database.cpp` 的 `lexicalAccessObjects` 同时删除。解析器新增非递归 `WITH`，CTE 成为真语法而非扫描对象；绑定不闭合时 `authorize` 一律拒绝（fail-closed），不存在文本兜底。详见 `docs/x25-binding-identity-progress.md`。
 
+- **移除桥接/CLI 侧 SQL 文本扫描鉴权（2026-09-12 补）**：此前 `scripts/sql-object-references.mjs` 仍被 `scripts/authorizer.mjs` 与 `scripts/database-bridge.mjs` 用于“早拒”和审计对象提取。本轮删除该模块，授权完全交给 C++ 绑定结果：
+  - 引擎新增会话操作 `bindAccess` 与 CLI 模式 `bindAccess`，返回 `bound` / `statementAction` / `objects[{object,action}]`；`execute`/`compile`/`diagnostics` 的响应额外附 `accessObjects` 供审计。
+  - bridge 不再对 SQL 文本做任何词法扫描；一次性执行路径不再设置 `MINISQL_AUTH_BYPASS`，改为把 `MINISQL_USER`/`MINISQL_PASSWORD` 与 `MINISQL_ACCESS_FILE` 透传给引擎，由引擎按绑定结果判定；权限错误映射为 HTTP 403。
+  - 流式入口的只读兜底同样消费绑定结果（`statementAction` 与对象动作），不再用关键字猜测。
+  - `authorizer.mjs` 的 `sqlPermissionChecks` 换成 `permissionChecksFromBinding`，未绑定语句 fail-closed。
+  - `diagnostics` 是错误报告入口，只要求 `compile` 权限、不要求对象闭合；否则无法诊断“表不存在”这类待报告的错误。
+
 ## 限制
 
 - 当前访问目录由版本化页文件（`access.catalog.pages`）和 `PersistentCatalog` 保留系统堆表共同维护：页文件供 HTTP bridge 原子更新，C++ 引擎在打开数据库或检测到更高权限版本时同步到系统表，重启时可以仅依赖系统表恢复。旧版 `access.catalog.json` 仅用于迁移读取。C++ 入口的对象绑定已统一到 X25 绑定器：结构化 AST + 作用域树，别名/派生表别名/CTE 名都是作用域名而非对象，绑定不闭合即拒绝执行。递归 CTE 仍未实现（显式 `NotImplemented`），planner/optimizer/序列化对绑定结果的消费按 `docs/x25-binding-identity-progress.md` 的阶段二至五推进。
 - 权限感知 CLI（`scripts/minisql-cli.mjs`）通过 HTTP bridge 强制携带身份；直接调用 `minisql_database.exe` 也已支持 `MINISQL_USER` / `MINISQL_PASSWORD` 身份校验，但这组环境变量只适合作为受控本地入口，不替代后续正式登录协议。
-- HTTP/CLI 层仍保留轻量词法扫描，但它只用于早拒；真正的授权判定完全在 C++ 绑定结果上，且 C++ 侧已无任何 SQL 文本扫描。受权对象按动作分派，`DELETE FROM a WHERE id IN (SELECT id FROM b)` 只要求 a 的 DELETE 与 b 的 SELECT，不再把子查询来源升级为 DELETE。
+- 授权判定已完全在 C++ 绑定结果上，bridge/CLI 不再存在任何 SQL 文本扫描（`scripts/sql-object-references.mjs` 已删除）。受权对象按动作分派，`DELETE FROM a WHERE id IN (SELECT id FROM b)` 只要求 a 的 DELETE 与 b 的 SELECT，不再把子查询来源升级为 DELETE。绑定器在批内应用 DDL（CREATE TABLE/INDEX、DROP INDEX）推进目录快照，因此 `CREATE TABLE t(...); INSERT INTO t ...` 这类脚本能一次性完成对象绑定。
 - 工作台权限/审计面板已接入（`AccessControl.tsx`），请求会携带当前连接的用户和密码；多会话面板已列出会话、锁等待和持锁状态，并提供活动请求取消。`c2-resilience-dom.cjs` 已纳入基础浏览器 DOM、移动端无溢出、客户端超时、活动请求取消、备份替换、迁移校验成功/失败、损坏备份失败隔离和恢复后查询验收。

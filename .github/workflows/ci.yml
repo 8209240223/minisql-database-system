@@ -30,8 +30,8 @@ jobs:
         run: node tests/access-catalog-atomic-contract.mjs
       - name: 权限原子 HTTP 端点（X24）
         run: node tests/access-atomic-http.mjs
-      - name: SQL 对象引用扫描契约（X24）
-        run: node tests/sql-object-references-contract.mjs
+      - name: 绑定结果驱动鉴权契约（X25）
+        run: node tests/access-binding-process.mjs
       - name: Fuzz 生成器/缩减器契约（X27）
         run: node tests/fuzz-model-contract.mjs
       - name: 固定种子状态机语料（X27）

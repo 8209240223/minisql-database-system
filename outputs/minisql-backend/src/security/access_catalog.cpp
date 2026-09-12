@@ -298,6 +298,14 @@ void AccessCatalog::authorize(const std::string& user, const std::string& operat
     if (mode == "catalog" || mode == "statistics" || mode == "buffer") return requireAll(user, "read", {"*"});
     if (mode == "indexinspect")
         return requireAll(user, "read", table.empty() ? std::vector<std::string>{"*"} : std::vector<std::string>{normalized(table)});
+    // 索引一致性检查只读；在线重建会改写索引页，按对象写权限（update）收紧。
+    if (mode == "indexverify")
+        return requireAll(user, "read", table.empty() ? std::vector<std::string>{"*"} : std::vector<std::string>{normalized(table)});
+    if (mode == "indexrebuild")
+        return requireAll(user, "update", table.empty() ? std::vector<std::string>{"*"} : std::vector<std::string>{normalized(table)});
+    // diagnostics 是只读错误报告入口：待分析的 SQL 本身可能无法绑定（这正是它要报告
+    // 的错误），因此只要求 compile 权限，不要求对象集合闭合。
+    if (mode == "diagnostics") return requireAll(user, "compile", {"*"});
 
     // X25 fail-closed：绑定器没有给出闭合的对象集合就一律拒绝。此处不存在、
     // 也不允许存在任何基于 SQL 文本的兜底扫描。
