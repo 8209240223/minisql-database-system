@@ -1,7 +1,5 @@
 #include "minisql/security/access_catalog.hpp"
 #include "minisql/common/error.hpp"
-#include "minisql/sql/lexer.hpp"
-#include "minisql/sql/parser.hpp"
 
 #include <algorithm>
 #include <array>
@@ -153,194 +151,6 @@ bool constantTimeEqual(std::string_view actual, std::string_view expected) {
     return difference == 0;
 }
 
-std::string firstKeyword(std::string_view source) {
-    std::size_t index = 0;
-    for (;;) {
-        while (index < source.size() && std::isspace(static_cast<unsigned char>(source[index]))) ++index;
-        if (index + 1 < source.size() && source[index] == '-' && source[index + 1] == '-') {
-            index = source.find('\n', index + 2);
-            if (index == std::string_view::npos) return {};
-            continue;
-        }
-        if (index + 1 < source.size() && source[index] == '/' && source[index + 1] == '*') {
-            const auto end = source.find("*/", index + 2);
-            if (end == std::string_view::npos) return {};
-            index = end + 2;
-            continue;
-        }
-        const auto begin = index;
-        while (index < source.size() && std::isalpha(static_cast<unsigned char>(source[index]))) ++index;
-        return begin == index ? std::string{} : lower(std::string(source.substr(begin, index - begin)));
-    }
-}
-
-std::vector<std::string> sqlWords(std::string_view source) {
-    std::vector<std::string> words;
-    const auto alpha = [](char value) { return std::isalpha(static_cast<unsigned char>(value)) || value == '_'; };
-    const auto digit = [](char value) { return std::isdigit(static_cast<unsigned char>(value)); };
-    for (std::size_t index = 0; index < source.size();) {
-        const char character = source[index];
-        if (std::isspace(static_cast<unsigned char>(character))) { ++index; continue; }
-        if (index + 1 < source.size() && source[index] == '-' && source[index + 1] == '-') {
-            index += 2;
-            while (index < source.size() && source[index] != '\n' && source[index] != '\r') ++index;
-            continue;
-        }
-        if (index + 1 < source.size() && source[index] == '/' && source[index + 1] == '*') {
-            index += 2;
-            while (index + 1 < source.size() && !(source[index] == '*' && source[index + 1] == '/')) ++index;
-            index = std::min(source.size(), index + 2);
-            continue;
-        }
-        if (character == '\'') {
-            ++index;
-            while (index < source.size()) {
-                if (source[index] != '\'') { ++index; continue; }
-                if (index + 1 < source.size() && source[index + 1] == '\'') { index += 2; continue; }
-                ++index;
-                break;
-            }
-            continue;
-        }
-        if (alpha(character)) {
-            const auto begin = index++;
-            while (index < source.size() && (alpha(source[index]) || digit(source[index]))) ++index;
-            words.push_back(lower(std::string(source.substr(begin, index - begin))));
-            continue;
-        }
-        words.emplace_back(1, character);
-        ++index;
-    }
-    return words;
-}
-
-std::vector<std::string> tableReferences(std::string_view source, const std::string& keyword) {
-    const auto words = sqlWords(source);
-    std::vector<std::string> result;
-    std::unordered_set<std::string> ctes;
-    const auto identifier = [](const std::string& value) {
-        return !value.empty() && (std::isalpha(static_cast<unsigned char>(value.front())) || value.front() == '_') &&
-            std::all_of(value.begin() + 1, value.end(), [](char character) {
-                return std::isalnum(static_cast<unsigned char>(character)) || character == '_';
-            });
-    };
-    const auto add = [&](const std::string& value) {
-        if (identifier(value) && !ctes.contains(value) && std::find(result.begin(), result.end(), value) == result.end()) result.push_back(value);
-    };
-    const auto addAfter = [&](std::size_t index, bool allowParenthesized) {
-        auto cursor = index + 1;
-        if (allowParenthesized && cursor < words.size() && words[cursor] == "(") return;
-        if (cursor < words.size() && words[cursor] == "lateral") ++cursor;
-        if (cursor < words.size()) add(words[cursor]);
-    };
-    if (!words.empty() && words.front() == "with") {
-        std::size_t cursor = words.size() > 1 && words[1] == "recursive" ? 2 : 1;
-        for (;;) {
-            if (cursor >= words.size() || !identifier(words[cursor])) break;
-            ctes.insert(words[cursor++]);
-            if (cursor + 1 >= words.size() || words[cursor] != "as" || words[cursor + 1] != "(") break;
-            cursor += 2;
-            std::size_t depth = 1;
-            while (cursor < words.size() && depth) {
-                if (words[cursor] == "(") ++depth;
-                else if (words[cursor] == ")") --depth;
-                ++cursor;
-            }
-            if (cursor >= words.size() || words[cursor] != ",") break;
-            ++cursor;
-        }
-    }
-    const auto effectiveKeyword = keyword == "explain"
-        ? std::find_if(words.begin(), words.end(), [](const std::string& value) {
-            return value == "select" || value == "insert" || value == "update" || value == "delete";
-        })
-        : words.end();
-    const auto command = keyword == "explain" && effectiveKeyword != words.end() ? *effectiveKeyword : keyword;
-    for (std::size_t index = 0; index < words.size(); ++index) {
-        const auto& word = words[index];
-        if (word == "from" || word == "join" || word == "into" || word == "update" || word == "references") addAfter(index, true);
-        if (command == "drop" && word == "table") addAfter(index, false);
-        if (command == "create" && (word == "table" || word == "on")) addAfter(index, false);
-    }
-    return result;
-}
-
-bool sqlIdentifier(std::string_view value) {
-    if (value.empty() || !(std::isalpha(static_cast<unsigned char>(value.front())) || value.front() == '_')) return false;
-    return std::all_of(value.begin() + 1, value.end(), [](char character) {
-        return std::isalnum(static_cast<unsigned char>(character)) || character == '_';
-    });
-}
-
-void addAstObject(const std::string& value, std::vector<std::string>& result,
-                 std::unordered_set<std::string>& seen) {
-    const auto object = normalized(value);
-    if (sqlIdentifier(object) && seen.insert(object).second) result.push_back(object);
-}
-
-void collectAstStatementObjects(const sql::Statement& statement, std::vector<std::string>& result,
-                                std::unordered_set<std::string>& seen);
-
-void collectAstExpressionObjects(const std::shared_ptr<sql::Expr>& expression,
-                                 std::vector<std::string>& result,
-                                 std::unordered_set<std::string>& seen) {
-    if (!expression) return;
-    collectAstExpressionObjects(expression->left, result, seen);
-    collectAstExpressionObjects(expression->right, result, seen);
-    if (expression->subquery) collectAstStatementObjects(*expression->subquery, result, seen);
-    else if (!expression->subquerySql.empty()) {
-        try {
-            auto nestedSql = expression->subquerySql;
-            if (nestedSql.find_last_not_of(" \t\r\n") == std::string::npos ||
-                nestedSql[nestedSql.find_last_not_of(" \t\r\n")] != ';') nestedSql += ';';
-            for (const auto& nested : sql::parse(sql::tokenize(nestedSql)))
-                collectAstStatementObjects(nested, result, seen);
-        } catch (const MiniSqlError&) {
-            // The caller will use the lexical fallback when the complete source cannot be parsed.
-        }
-    }
-}
-
-void collectAstStatementObjects(const sql::Statement& statement, std::vector<std::string>& result,
-                                std::unordered_set<std::string>& seen) {
-    // A derived-table alias is a scope name, not a database object. Its nested statement is collected below.
-    if (!statement.table.empty() && !(statement.kind == "Select" && statement.fromSubquery))
-        addAstObject(statement.table, result, seen);
-    for (const auto& join : statement.joins) addAstObject(join.table, result, seen);
-    for (const auto& foreignKey : statement.foreignKeys) addAstObject(foreignKey.table, result, seen);
-    for (const auto& column : statement.columns)
-        if (column.references) addAstObject(column.references->first, result, seen);
-    if (statement.fromSubquery) collectAstStatementObjects(*statement.fromSubquery, result, seen);
-    collectAstExpressionObjects(statement.where, result, seen);
-    collectAstExpressionObjects(statement.having, result, seen);
-    for (const auto& item : statement.selectItems) collectAstExpressionObjects(item.expression, result, seen);
-    for (const auto& item : statement.orderBy) collectAstExpressionObjects(item.expression, result, seen);
-    for (const auto& item : statement.assignments) collectAstExpressionObjects(item.expression, result, seen);
-    for (const auto& item : statement.groupBy) collectAstExpressionObjects(item, result, seen);
-    for (const auto& item : statement.checks) collectAstExpressionObjects(item, result, seen);
-    for (const auto& item : statement.valueExpressions) collectAstExpressionObjects(item, result, seen);
-    for (const auto& row : statement.valueRows)
-        for (const auto& item : row) collectAstExpressionObjects(item, result, seen);
-}
-
-std::vector<std::string> astTableReferences(std::string_view source, const std::string& keyword) {
-    try {
-        auto tokens = sql::tokenize(std::string(source));
-        if (keyword == "explain" && !tokens.empty()) {
-            const auto lowerLexeme = [](const sql::Token& token) { return normalized(token.lexeme); };
-            if (lowerLexeme(tokens.front()) == "explain") tokens.erase(tokens.begin());
-            if (!tokens.empty() && lowerLexeme(tokens.front()) == "analyze") tokens.erase(tokens.begin());
-        }
-        std::vector<std::string> result;
-        std::unordered_set<std::string> seen;
-        for (const auto& statement : sql::parse(tokens)) collectAstStatementObjects(statement, result, seen);
-        return result.empty() ? tableReferences(source, keyword) : result;
-    } catch (const MiniSqlError&) {
-        // Unsupported or malformed syntax is still checked by the conservative scanner before execution.
-        return tableReferences(source, keyword);
-    }
-}
-
 bool permissionIn(const nlohmann::json& grants, const std::string& permission, const std::string& object) {
     if (!grants.is_array()) return false;
     for (const auto& grant : grants) {
@@ -459,30 +269,61 @@ bool AccessCatalog::verify(const std::string& user, const std::string& password)
     return expected.size() == 64 && constantTimeEqual(hex(sha256(salt + ":" + password)), expected);
 }
 
-void AccessCatalog::authorize(const std::string& user, const std::string& operation, const std::string& sql,
-                              const std::string& table, const std::string& index,
-                              const std::vector<std::string>& resolvedObjects) const {
+std::string permissionName(AccessAction action) {
+    switch (action) {
+        case AccessAction::Connect: return "connect";
+        case AccessAction::Compile: return "compile";
+        case AccessAction::Read: return "read";
+        case AccessAction::Select: return "select";
+        case AccessAction::Insert: return "insert";
+        case AccessAction::Update: return "update";
+        case AccessAction::Delete: return "delete";
+        case AccessAction::Create: return "create";
+        case AccessAction::Drop: return "drop";
+        case AccessAction::Transaction: return "transaction";
+        case AccessAction::Checkpoint: return "checkpoint";
+    }
+    return "compile";
+}
+
+void AccessCatalog::authorize(const std::string& user, const std::string& operation, const AccessRequest& request,
+                              const std::string& table, const std::string& index) const {
     if (!enabled_) return;
     const auto mode = normalized(operation);
-    const auto keyword = firstKeyword(sql);
-    std::string permission = "compile";
-    if (mode == "snapshot" || mode == "restore") permission = "checkpoint";
-    if (mode == "catalog" || mode == "statistics" || mode == "buffer") permission = "read";
-    else if (mode == "close") permission = "connect";
-    else if (mode == "indexinspect") permission = "read";
-    else if (keyword == "begin" || keyword == "commit" || keyword == "rollback" || keyword == "checkpoint") permission = "transaction";
-    else if (keyword == "create") permission = "create";
-    else if (keyword == "drop") permission = "drop";
-    else if (keyword == "select") permission = mode == "compile" || mode == "diagnostics" ? "compile" : "select";
-    else if (keyword == "insert" || keyword == "update" || keyword == "delete") permission = keyword;
-    std::vector<std::string> objects;
-    if (mode == "indexinspect" && !table.empty()) objects.push_back(normalized(table));
-    else if (!resolvedObjects.empty()) objects = resolvedObjects;
-    else objects = astTableReferences(sql, keyword);
-    if (objects.empty()) objects.push_back("*");
     (void)index;
+
+    // 入口动作优先：这些请求不携带 SQL，权限只由入口决定。
+    if (mode == "snapshot" || mode == "restore") return requireAll(user, "checkpoint", {"*"});
+    if (mode == "close") return requireAll(user, "connect", {"*"});
+    if (mode == "catalog" || mode == "statistics" || mode == "buffer") return requireAll(user, "read", {"*"});
+    if (mode == "indexinspect")
+        return requireAll(user, "read", table.empty() ? std::vector<std::string>{"*"} : std::vector<std::string>{normalized(table)});
+
+    // X25 fail-closed：绑定器没有给出闭合的对象集合就一律拒绝。此处不存在、
+    // 也不允许存在任何基于 SQL 文本的兜底扫描。
+    if (!request.bound)
+        throw MiniSqlError(ErrorCode::Permission,
+            request.diagnostic.empty() ? "Permission denied: statement could not be bound"
+                                       : "Permission denied: statement could not be bound (" + request.diagnostic + ")");
+
+    // 只编译不执行时，读动作降级为 compile 权限；写动作不降级。
+    const bool compileOnly = mode == "compile" || mode == "diagnostics";
+    const auto effective = [&](AccessAction action) {
+        if (compileOnly && (action == AccessAction::Select || action == AccessAction::Read)) return std::string("compile");
+        return permissionName(action);
+    };
+
+    if (request.objects.empty()) return requireAll(user, effective(request.statementAction), {"*"});
+    for (const auto& object : request.objects)
+        if (!canPermission(catalog_, user, effective(object.action), object.object))
+            throw MiniSqlError(ErrorCode::Permission, "Permission denied");
+}
+
+void AccessCatalog::requireAll(const std::string& user, const std::string& permission,
+                               const std::vector<std::string>& objects) const {
     for (const auto& object : objects)
-        if (!canPermission(catalog_, user, permission, object)) throw MiniSqlError(ErrorCode::Permission, "Permission denied");
+        if (!canPermission(catalog_, user, permission, object))
+            throw MiniSqlError(ErrorCode::Permission, "Permission denied");
 }
 
 } // namespace minisql::security

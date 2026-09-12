@@ -43,8 +43,9 @@ void authorizeRequest(minisql::execution::Database& database, const minisql::sec
     const auto& user = request["user"].get_ref<const std::string&>();
     const auto& password = request["password"].get_ref<const std::string&>();
     if (!access.verify(user, password)) throw minisql::MiniSqlError(minisql::ErrorCode::Permission, "Permission denied");
-    const auto resolvedObjects = database.resolveAccessObjects(sql);
-    access.authorize(user, operation, sql, table, index, resolvedObjects);
+    // 入口不再传 SQL 文本：权限只看绑定结果。
+    access.authorize(user, operation, sql.empty() ? minisql::security::AccessRequest{} : database.bindAccess(sql),
+                     table, index);
 }
 
 void authorizeDirect(minisql::execution::Database& database, const minisql::security::AccessCatalog& access, const std::string& operation,
@@ -56,8 +57,7 @@ void authorizeDirect(minisql::execution::Database& database, const minisql::secu
     const std::string user = configuredUser ? configuredUser : "";
     const std::string password = configuredPassword ? configuredPassword : "";
     if (!access.verify(user, password)) throw minisql::MiniSqlError(minisql::ErrorCode::Permission, "Permission denied");
-    const auto resolvedObjects = database.resolveAccessObjects(sql);
-    access.authorize(user, operation, sql, {}, {}, resolvedObjects);
+    access.authorize(user, operation, sql.empty() ? minisql::security::AccessRequest{} : database.bindAccess(sql));
 }
 
 minisql::security::AccessCatalog reconcileAccessCatalog(minisql::execution::Database& database,

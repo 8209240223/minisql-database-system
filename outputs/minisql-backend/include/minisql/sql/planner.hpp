@@ -1,8 +1,15 @@
 #pragma once
 #include "minisql/catalog/catalog.hpp"
+#include "minisql/sql/binding.hpp"
 #include <nlohmann/json.hpp>
 
 namespace minisql::sql {
+// X25：columnId 与 binding 是两件事，此前被同一个字段兼任。
+//   columnId —— 运行时槽位：执行器用它索引子节点产出的行（row.at(columnId)）。
+//               JOIN 会把左右两侧的槽位拼接，谓词下推因此需要重基。
+//   binding  —— 稳定身份（sql::ColumnId 的原始值，0 表示没有绑定身份，
+//               例如表达式列、聚合输出、排序临时列）。裁剪、下推、计划对比
+//               都应当看它，因为它不随槽位变化。
 struct PlanColumn {
     std::string name;
     std::string type;
@@ -12,7 +19,8 @@ struct PlanColumn {
     bool primaryKey = false;
     bool unique = false;
     std::optional<std::pair<std::string,std::string>> references{};
-    std::string identity{};
+    std::uint32_t binding = 0;   // sql::ColumnId
+    std::uint32_t relation = 0;  // sql::RelationId：该列来自哪个 FROM 项
 };
 
 struct LogicalPlan {

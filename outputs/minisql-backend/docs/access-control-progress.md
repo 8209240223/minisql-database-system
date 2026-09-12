@@ -40,9 +40,11 @@
 - `database-http.mjs` 全套通过。
 - `session-http.mjs`、`session-process.mjs`、`cancel-smoke.mjs`、`backup-smoke.mjs` 通过。
 
+- **X25 绑定统一（2026-09-12 补）**：新增 `src/sql/binder.cpp` 与 `include/minisql/sql/binding.hpp`，提供稳定的 `RelationId/ColumnId/ExpressionId` 与作用域树。`AccessCatalog::authorize` 改为消费 `security::AccessRequest`（每个对象带自己的动作），`security/access_catalog.cpp` 中 `firstKeyword`/`sqlWords`/`tableReferences`/`astTableReferences` 共 187 行 SQL 文本扫描与对 `sql/lexer.hpp`、`sql/parser.hpp` 的依赖一并删除，`execution/database.cpp` 的 `lexicalAccessObjects` 同时删除。解析器新增非递归 `WITH`，CTE 成为真语法而非扫描对象；绑定不闭合时 `authorize` 一律拒绝（fail-closed），不存在文本兜底。详见 `docs/x25-binding-identity-progress.md`。
+
 ## 限制
 
-- 当前访问目录由版本化页文件（`access.catalog.pages`）和 `PersistentCatalog` 保留系统堆表共同维护：页文件供 HTTP bridge 原子更新，C++ 引擎在打开数据库或检测到更高权限版本时同步到系统表，重启时可以仅依赖系统表恢复。旧版 `access.catalog.json` 仅用于迁移读取。C++ 入口对当前支持的语句先解析结构化 AST 并递归收集基础表对象，解析失败时使用 Catalog 绑定的保守扫描；复杂 SQL 的完整名称绑定、未限定相关作用域和更广 SQL 的统一语义绑定仍未闭合。
+- 当前访问目录由版本化页文件（`access.catalog.pages`）和 `PersistentCatalog` 保留系统堆表共同维护：页文件供 HTTP bridge 原子更新，C++ 引擎在打开数据库或检测到更高权限版本时同步到系统表，重启时可以仅依赖系统表恢复。旧版 `access.catalog.json` 仅用于迁移读取。C++ 入口的对象绑定已统一到 X25 绑定器：结构化 AST + 作用域树，别名/派生表别名/CTE 名都是作用域名而非对象，绑定不闭合即拒绝执行。递归 CTE 仍未实现（显式 `NotImplemented`），planner/optimizer/序列化对绑定结果的消费按 `docs/x25-binding-identity-progress.md` 的阶段二至五推进。
 - 权限感知 CLI（`scripts/minisql-cli.mjs`）通过 HTTP bridge 强制携带身份；直接调用 `minisql_database.exe` 也已支持 `MINISQL_USER` / `MINISQL_PASSWORD` 身份校验，但这组环境变量只适合作为受控本地入口，不替代后续正式登录协议。
-- HTTP/CLI 层的对象识别已从正则升级为跳过注释/字符串、识别嵌套 FROM/JOIN/INTO/UPDATE/REFERENCES、排除 CTE 别名和派生表的轻量词法扫描；C++ 层对 MiniSQL 当前支持的派生表、子查询、JOIN、外键和索引使用真实 Catalog + 结构化 AST 绑定对象，对解析失败的 CTE/扩展 SQL 使用 Catalog 绑定的保守对象提取。未限定相关作用域和完整语义绑定仍未闭合，DELETE 中的子查询也可能被保守地要求主表的 DELETE 权限。
+- HTTP/CLI 层仍保留轻量词法扫描，但它只用于早拒；真正的授权判定完全在 C++ 绑定结果上，且 C++ 侧已无任何 SQL 文本扫描。受权对象按动作分派，`DELETE FROM a WHERE id IN (SELECT id FROM b)` 只要求 a 的 DELETE 与 b 的 SELECT，不再把子查询来源升级为 DELETE。
 - 工作台权限/审计面板已接入（`AccessControl.tsx`），请求会携带当前连接的用户和密码；多会话面板已列出会话、锁等待和持锁状态，并提供活动请求取消。`c2-resilience-dom.cjs` 已纳入基础浏览器 DOM、移动端无溢出、客户端超时、活动请求取消、备份替换、迁移校验成功/失败、损坏备份失败隔离和恢复后查询验收。

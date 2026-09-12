@@ -11,6 +11,7 @@
 #include <unordered_map>
 #include <vector>
 #include "minisql/catalog/persistent_catalog.hpp"
+#include "minisql/security/access_catalog.hpp"
 #include "minisql/sql/planner.hpp"
 #include "minisql/storage/bplus_tree.hpp"
 #include "minisql/execution/executor.hpp"
@@ -27,8 +28,11 @@ public:
                                     const std::function<bool(const nlohmann::json&)>& emitRow);
     const char* transactionState() const;
     nlohmann::json compile(const std::string& sql) const;
-    // 解析并通过当前 Catalog 规范化 SQL 实际访问的基础表对象。
-    // 该结果供入口层权限校验使用，别名和派生表作用域不会被当成持久化对象。
+    // X25：把 SQL 绑定成权限层可直接消费的请求。别名、派生表别名和 CTE 名是
+    // 作用域名，不会被当成持久化对象；绑定不闭合时返回 bound == false，
+    // 入口层据此 fail-closed 拒绝，不存在文本扫描兜底。
+    security::AccessRequest bindAccess(const std::string& sql) const;
+    // 兼容既有契约：按出现顺序去重的物理表名；绑定失败时为空。
     std::vector<std::string> resolveAccessObjects(const std::string& sql) const;
     nlohmann::json diagnostics(const std::string& sql) const;
     nlohmann::json catalog();

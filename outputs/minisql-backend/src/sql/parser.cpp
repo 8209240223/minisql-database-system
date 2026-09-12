@@ -113,7 +113,47 @@ private:
         return "decimal("+std::to_string(precision)+","+std::to_string(scale)+")";
     }
     void semicolon(){if(at(";"))++i;else fail(ErrorCode::Syntax, "Expected ';'", i<t.size()?t[i].location:SourceLocation{}, {}, actualToken(), {";"});}
-    Statement statement(){auto loc=t[i].location;Statement s;if(keyword("BEGIN")||keyword("COMMIT")||keyword("ROLLBACK")||keyword("SAVEPOINT")||keyword("RELEASE"))s=transaction();else if(keyword("CREATE"))s=create();else if(keyword("INSERT"))s=insert();else if(keyword("SELECT"))s=select();else if(keyword("DELETE"))s=remove();else if(keyword("UPDATE"))s=update();else if(keyword("CHECKPOINT"))s=checkpointStatement();else if(keyword("DROP"))s=dropIndex();else fail(ErrorCode::Syntax, "Expected SQL statement or transaction command", loc, {}, actualToken(), {"BEGIN", "COMMIT", "ROLLBACK", "SAVEPOINT", "RELEASE", "CREATE", "INSERT", "SELECT", "DELETE", "UPDATE", "CHECKPOINT", "DROP"});s.location=loc;return s;}
+    Statement statement(){auto loc=t[i].location;Statement s;if(keyword("BEGIN")||keyword("COMMIT")||keyword("ROLLBACK")||keyword("SAVEPOINT")||keyword("RELEASE"))s=transaction();else if(keyword("CREATE"))s=create();else if(keyword("INSERT"))s=insert();else if(keyword("SELECT"))s=select();else if(keyword("DELETE"))s=remove();else if(keyword("UPDATE"))s=update();else if(keyword("CHECKPOINT"))s=checkpointStatement();else if(keyword("DROP"))s=dropIndex();else if(keyword("WITH"))s=withQuery();else fail(ErrorCode::Syntax, "Expected SQL statement or transaction command", loc, {}, actualToken(), {"BEGIN", "COMMIT", "ROLLBACK", "SAVEPOINT", "RELEASE", "CREATE", "INSERT", "SELECT", "DELETE", "UPDATE", "CHECKPOINT", "DROP", "WITH"});s.location=loc;return s;}
+    // X25: 非递归 WITH。CTE 名是作用域名，绑定器据此把引用解析到内部查询，
+    // 因此权限层不会把 CTE 别名误当成数据库对象，也不需要任何文本扫描兜底。
+    Statement withQuery(){
+        expect("WITH");
+        if(keyword("RECURSIVE")) fail(ErrorCode::NotImplemented, "Recursive common table expressions are not supported",
+            t[i].location, {}, actualToken(), {"IDENTIFIER"});
+        std::vector<CommonTableExpr> ctes;
+        do {
+            if(ctes.size()>=32) fail(ErrorCode::Syntax, "Common table expression count exceeds 32", t[i].location);
+            CommonTableExpr cte;
+            cte.location=i<t.size()?t[i].location:SourceLocation{};
+            cte.name=identifier();
+            for(const auto& existing: ctes)
+                if(equalNames(existing.name,cte.name))
+                    fail(ErrorCode::Semantic, "Duplicate common table expression name", cte.location, {}, cte.name, {});
+            if(at("(")){
+                ++i;
+                do { cte.columns.push_back(identifier()); } while(at(",")&&(++i,true));
+                expect(")");
+            }
+            expect("AS");expect("(");
+            auto query=select(false);
+            expect(")");
+            if(!cte.columns.empty()&&!query.selectItems.empty()&&query.selectList.size()==query.selectItems.size()&&
+               cte.columns.size()!=query.selectItems.size())
+                fail(ErrorCode::Semantic, "Common table expression column count does not match its query", cte.location);
+            cte.query=std::make_shared<Statement>(std::move(query));
+            ctes.push_back(std::move(cte));
+        } while(at(",")&&(++i,true));
+        if(!keyword("SELECT")) fail(ErrorCode::Syntax, "Expected SELECT after WITH",
+            i<t.size()?t[i].location:SourceLocation{}, {}, actualToken(), {"SELECT"});
+        auto s=select();
+        s.ctes=std::move(ctes);
+        return s;
+    }
+    static bool equalNames(std::string left,std::string right){
+        const auto fold=[](std::string& value){std::transform(value.begin(),value.end(),value.begin(),
+            [](unsigned char c){return static_cast<char>(std::tolower(c));});};
+        fold(left);fold(right);return left==right;
+    }
     Statement dropIndex(){Statement s{"DropIndex"};expect("DROP");expect("INDEX");s.indexName=identifier();if(keyword("ON")){++i;s.table=identifier();}semicolon();return s;}
     Statement checkpointStatement(){Statement s{"Checkpoint"};expect("CHECKPOINT");semicolon();return s;}
     Statement transaction() {

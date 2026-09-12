@@ -21,6 +21,10 @@ struct KeyConstraint { bool primary = false; std::vector<std::string> columns{};
 struct ForeignKey { std::vector<std::string> columns{}; std::string table{}; std::vector<std::string> referencedColumns{}; };
 struct ConstraintName { std::string name; std::string kind; std::size_t index; };
 struct IndexDef { std::string name; std::vector<std::string> columns; bool unique = false; };
+// X25: `WITH name [(columns)] AS ( SELECT ... )`. A CTE name is a scope name, not a
+// database object: the binder resolves references to it inside the statement scope and
+// never emits an access object for it. Recursive CTEs are rejected by the parser.
+struct CommonTableExpr { std::string name; std::vector<std::string> columns{}; std::shared_ptr<Statement> query{}; SourceLocation location{}; };
 struct Statement {
     std::string kind{};
     std::string table{};
@@ -40,6 +44,8 @@ struct Statement {
     std::vector<Join> joins{};
     // X09: FROM 派生表 `( SELECT ... ) AS alias` —— 结构化子查询节点 + 显式别名。
     std::shared_ptr<Statement> fromSubquery{};
+    // X25: WITH 子句引入的公共表表达式，按书写顺序；后一个可以引用前一个。
+    std::vector<CommonTableExpr> ctes{};
     std::vector<std::shared_ptr<Expr>> valueExpressions{};
     bool defaultValues = false;
     std::vector<std::vector<std::shared_ptr<Expr>>> valueRows{};

@@ -148,6 +148,37 @@ bool safePushdownExpression(const json& expression, std::size_t depth = 0) {
     return expression.contains("left") && expression.contains("right") &&
         safePushdownExpression(expression.at("left"), depth + 1) && safePushdownExpression(expression.at("right"), depth + 1);
 }
+// X25：表达式引用到的稳定列身份（sql::ColumnId 原始值）。与 collectColumns
+// 的区别是它不随槽位平移而变化，因此裁剪与下推可以直接比对。
+void collectBindings(const json& expression, std::set<std::uint32_t>& bindings, std::size_t depth = 0) {
+    if (!expression.is_object() || depth > 64) return;
+    if (expression.value("kind", "") == "Identifier") {
+        const auto binding = expression.value("binding", std::uint32_t{0});
+        if (binding) bindings.insert(binding);
+    }
+    if (expression.contains("left")) collectBindings(expression.at("left"), bindings, depth + 1);
+    if (expression.contains("right")) collectBindings(expression.at("right"), bindings, depth + 1);
+}
+
+// 表达式引用到的关系身份。空集表示「没有任何带身份的列引用」，
+// 调用方据此退回旧的槽位判断。
+void collectRelations(const json& expression, std::set<std::uint32_t>& relations, std::size_t depth = 0) {
+    if (!expression.is_object() || depth > 64) return;
+    if (expression.value("kind", "") == "Identifier") {
+        const auto relation = expression.value("relation", std::uint32_t{0});
+        if (relation) relations.insert(relation);
+    }
+    if (expression.contains("left")) collectRelations(expression.at("left"), relations, depth + 1);
+    if (expression.contains("right")) collectRelations(expression.at("right"), relations, depth + 1);
+}
+
+std::set<std::uint32_t> planRelations(const sql::LogicalPlan& plan) {
+    std::set<std::uint32_t> relations;
+    for (const auto& column : plan.output)
+        if (column.relation) relations.insert(column.relation);
+    return relations;
+}
+
 void collectColumns(const json& expression, std::set<std::size_t>& columns, std::size_t depth = 0) {
     if (!expression.is_object() || depth > 64) return;
     if (expression.value("kind", "") == "Identifier" && expression.contains("columnId"))
@@ -211,8 +242,17 @@ bool pruneProjectColumns(sql::LogicalPlan& project, json& changes, std::size_t s
     std::set<std::size_t> required;
     for (const auto& expression : project.projections) collectColumns(expression, required);
     if (filter) collectColumns(filter->predicate, required);
+    std::set<std::uint32_t> requiredBindings;
+    for (const auto& expression : project.projections) collectBindings(expression, requiredBindings);
+    if (filter) collectBindings(filter->predicate, requiredBindings);
+    // 有稳定身份就按身份裁剪：身份不随裁剪或下推平移，因此不需要任何重基。
+    // 没有身份（旧计划文档、表达式列）时退回槽位比较，行为与改造前一致。
+    const auto keep = [&](const sql::PlanColumn& column) {
+        if (column.binding && !requiredBindings.empty()) return requiredBindings.contains(column.binding);
+        return required.contains(column.columnId);
+    };
     std::vector<sql::PlanColumn> pruned;
-    for (const auto& column : scan->output) if (required.contains(column.columnId)) pruned.push_back(column);
+    for (const auto& column : scan->output) if (keep(column)) pruned.push_back(column);
     if (pruned.size() == scan->output.size()) return false;
     const auto before = sql::serializePlans({project});
     scan->output = std::move(pruned);
@@ -228,6 +268,8 @@ bool pushPredicateIntoJoin(sql::LogicalPlan& filter, json& changes, std::size_t 
         return false;
     }
     const auto leftSize = join.children[0].output.size();
+    const auto leftRelations = planRelations(join.children[0]);
+    const auto rightRelations = planRelations(join.children[1]);
     std::vector<json> terms, leftTerms, rightTerms, remaining;
     splitConjuncts(filter.predicate, terms);
     for (auto& term : terms) {
@@ -235,8 +277,21 @@ bool pushPredicateIntoJoin(sql::LogicalPlan& filter, json& changes, std::size_t 
         std::set<std::size_t> columns;
         collectColumns(term, columns);
         if (columns.empty()) { remaining.push_back(std::move(term)); continue; }
-        const bool leftOnly = std::all_of(columns.begin(), columns.end(), [&](std::size_t id) { return id < leftSize; });
-        const bool rightOnly = std::all_of(columns.begin(), columns.end(), [&](std::size_t id) { return id >= leftSize; });
+        std::set<std::uint32_t> termRelations;
+        collectRelations(term, termRelations);
+        bool leftOnly = false, rightOnly = false;
+        if (!termRelations.empty() && !leftRelations.empty() && !rightRelations.empty()) {
+            // 按关系身份判断归属。此前用的是 `id < leftSize`，即左子节点 output
+            // 的宽度——一旦有规则裁剪过子节点 output，这个界就不再等于行宽，
+            // 判断会静默出错。关系身份与 output 宽度无关。
+            leftOnly = std::all_of(termRelations.begin(), termRelations.end(),
+                [&](std::uint32_t id) { return leftRelations.contains(id); });
+            rightOnly = !leftOnly && std::all_of(termRelations.begin(), termRelations.end(),
+                [&](std::uint32_t id) { return rightRelations.contains(id); });
+        } else {
+            leftOnly = std::all_of(columns.begin(), columns.end(), [&](std::size_t id) { return id < leftSize; });
+            rightOnly = std::all_of(columns.begin(), columns.end(), [&](std::size_t id) { return id >= leftSize; });
+        }
         if (leftOnly) leftTerms.push_back(std::move(term));
         else if (rightOnly) rightTerms.push_back(shiftColumns(std::move(term), leftSize));
         else remaining.push_back(std::move(term));
@@ -300,6 +355,7 @@ void rewritePlan(sql::LogicalPlan& plan, const Options& options, json& changes, 
                 plan.output[i].columnId != input.output[i].columnId || plan.output[i].nullable != input.output[i].nullable ||
                 plan.output[i].defaultValue != input.output[i].defaultValue ||
                 plan.output[i].primaryKey != input.output[i].primaryKey || plan.output[i].unique != input.output[i].unique ||
+                plan.output[i].binding != input.output[i].binding || plan.output[i].relation != input.output[i].relation ||
                 plan.output[i].references != input.output[i].references) return;
         }
         record(changes, "remove-true-filter", statement, {{"kind", "Filter"}}, {{"kind", plan.children.front().kind}});
