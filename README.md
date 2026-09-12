@@ -132,9 +132,33 @@ WAL 采用记录级格式（扩展头记录 `txId`、逻辑 LSN、`prevLsn` 链�
 | `indexInspect` | `POST /api/sessions/:id/index-inspect` | 表 `READ` |
 | `indexVerify` | `POST /api/sessions/:id/index-verify` | 表 `READ` |
 | `indexRebuild` | `POST /api/sessions/:id/index-rebuild` | 表 `UPDATE` |
+| `executePlan` | `POST /api/sessions/:id/execute-plan`（CLI 也有 `executePlan` 模式） | 按计划节点推导的对象动作 |
+
+`executePlan` 执行 `compile` 返回的计划文档。计划在编译期绑定 Catalog 指纹（表名与列定义
+的稳定哈希），执行前重新校验；不一致时拒绝执行并返回 `PLAN_STALE_SCHEMA`（HTTP 422），
+不会按旧列偏移访问新数据。受权对象由计划节点推导，不重新扫描 SQL 文本。
 
 `statistics` 的 `wal` 字段给出逻辑 LSN 水位、扩展/撤销计数、归档段与双写状态；
 `checkpointRecord` 额外给出 `walLsn`、`checkpointBeginLsn` / `checkpointEndLsn` 与归档计数。
+
+## 输入上限与错误码
+
+第十七章列出的工程基线边界已实现，超限一律给出明确诊断而不是静默截断：
+
+| 边界 | 默认值 | 越界表现 |
+| --- | --- | --- |
+| 输入 SQL | 8 MiB | HTTP 413 / 会话帧拒绝 |
+| 批量语句 | 10000 | `ExecutionError`，消息含 `budget exceeded`，HTTP 413 |
+| 单标识符 | 128 个字符 | `LexicalError: Identifier exceeds 128 characters` |
+| 表达式嵌套 | 256 | `SyntaxError`（`2002`） |
+| collectDiagnostics | 100 条错误 | 结果附 `limit` 与 `truncated` |
+| Buffer Pool | 64 帧 | `MINISQL_BUFFER_FRAMES` 可覆盖 |
+
+两个稳定符号错误码：`SEM_INTEGER_OUT_OF_RANGE`（字面量超出 INT64，或能装进 BIGINT 但装不进
+INT 列时的窄化转换）与 `PLAN_STALE_SCHEMA`（计划绑定的 Catalog 指纹已失效）。
+
+HTTP 状态映射：`400` 请求格式不合法，`403` 权限拒绝或绑定不闭合（fail-closed），
+`413` 资源超限，`422` SQL 检查失败，`501` 能力未实现（`NotImplemented`），`503` 后端不可用。
 
 ## 启动工作台
 
@@ -164,6 +188,14 @@ powershell -ExecutionPolicy Bypass -File .\stop-minisql-workbench.ps1
 - X24 访问目录（页式文件 + PersistentCatalog 系统表）、对象权限、角色继承、原子 GRANT/REVOKE 端点、身份绑定、审计过滤、直接入口身份校验和工作台权限/审计面板。
 - X20 页级 B+ 树节点遍历、删除借位/合并/根收缩、结构校验、唯一索引三阶段建造、一致性检查与在线重建。
 - X26 在线一致性快照、非零 WAL 截止位置重做与迁移失败回滚目录。
+- 第十七章 REQ-CORE-001/002 工程基线：标识符/批量语句/诊断数量上限，`SEM_INTEGER_OUT_OF_RANGE` 与 `PLAN_STALE_SCHEMA` 稳定错误码，以及序列化计划执行入口。
+- 第十九章 REQ-UI-010：`GET /api/storage/stats` 别名、未实现能力返回 501、资源超限返回 413 的完整状态映射。
+
+已知失败（已在 `d2dc852` 基线上复现同样的失败模式，如实列出）：
+
+- `tests/cast-process.mjs`：260 层嵌套 `CAST` 触发子进程栈溢出（`0xC00000FD`），期望返回语法错误 `2002`。
+- `tests/backup-online-smoke.mjs`：在线快照请求返回 `503`，期望 `200`。
+- `tests/journal-process.mjs`：本机预置 `bin/journal_probe.exe` 与新建产物校验和不一致（环境问题）。
 
 仍待继续（不把专项测试通过等同于全量验收）：
 

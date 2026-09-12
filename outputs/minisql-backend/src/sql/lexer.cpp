@@ -2,6 +2,8 @@
 #include <unordered_set>
 namespace minisql::sql {
 namespace {
+// 第十七章 REQ-CORE-001 的工程基线默认值：单标识符上限 128 个 ASCII 字符。
+constexpr std::size_t kMaxIdentifierLength = 128;
 const std::unordered_set<std::string>& keywords() {
     static const std::unordered_set<std::string> k{"SELECT","FROM","WHERE","CREATE","TABLE","INSERT","INTO","VALUES","DELETE","AND","OR","NOT","INT","BIGINT","FLOAT","VARCHAR","AS","DISTINCT","LIMIT","OFFSET","ORDER","BY","ASC","DESC","UPDATE","SET","JOIN","INNER","ON","LEFT","RIGHT","FULL","OUTER","CROSS","NATURAL","USING","NULL","IS","TRUE","FALSE","NULLS","FIRST","LAST","GROUP","HAVING","CHECKPOINT"};
     return k;
@@ -73,6 +75,13 @@ void scanImpl(const std::string& s, const std::function<void(const Token&)>& con
             auto normalized=s.substr(start,i-start);
             for(char& ch:normalized)if(ch>='a'&&ch<='z')ch-=32;
             type=isKeyword(normalized)?"KEYWORD":"IDENTIFIER";
+            // 词法只接受 ASCII 字母/数字/下划线，因此字节数即字符数。
+            if(type=="IDENTIFIER"&&i-start>kMaxIdentifierLength){
+                const SourceLocation end{line,column};
+                report("Identifier exceeds 128 characters",loc,end);
+                drop();
+                continue;
+            }
         } else if(digit(c)){
             while(i<s.size()&&digit(s[i]))advance();
             type="INTEGER";

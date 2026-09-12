@@ -85,6 +85,16 @@ mkdirSync(backupDirectory, { recursive: true });
 const cancelDirectory = resolve(dirname(database), 'cancellation');
 mkdirSync(cancelDirectory, { recursive: true });
 function sessionCancelFile(id) { return resolve(cancelDirectory, `${id}.cancel`); }
+// 序列化计划的受权对象来自已解析的计划节点本身，不做任何 SQL 文本扫描。
+function collectPlanTables(document) {
+  const rows = Array.isArray(document) ? document
+    : document && typeof document === 'object' && Array.isArray(document.plans) ? document.plans : [];
+  const tables = new Set();
+  for (const row of rows) {
+    if (row && typeof row === 'object' && typeof row.table === 'string' && row.table) tables.add(row.table.toLowerCase());
+  }
+  return [...tables];
+}
 function clearCancelFile(file) { if (file) { try { unlinkSync(file); } catch { /* The token may already be absent. */ } } }
 function backupName(raw) {
   const name = String(raw ?? '').replace(/[^a-zA-Z0-9._-]/g, '');
@@ -858,10 +868,14 @@ const server = http.createServer(async (req, res) => {
       capabilities: ['backupRestore', 'backupIncremental', 'backupChain', 'backupMigration', 'permissions', 'audit', 'create', 'insert', 'multiRowInsert', 'select', 'delete', 'update', 'arithmetic', 'projection', 'tableAlias', 'innerJoin', 'leftJoin', 'null', 'notNull', 'bigint', 'float', 'default', 'primaryKey', 'unique', 'compositeKey', 'distinct', 'orderBy', 'limit', 'groupBy', 'having', 'count', 'sum', 'min', 'max', 'avg', 'compile', 'diagnostics', 'inSubquery', 'existsSubquery', 'scalarSubquery', 'correlatedSubquery', 'astRoundTrip', 'planRoundTrip', 'hashJoin', 'predicatePushdown', 'pruneColumns', 'statistics', 'createIndex', 'indexScan', 'uniqueIndex', 'indexPersistence', 'indexSnapshots', 'indexPageStorage', 'checkpoint', 'nodeStatistics', 'optimizer', 'storageStats', 'externalSort', 'sortSpill', 'externalAggregate', 'aggregateSpill', 'distinctSpill', 'joinSpill', 'queryResourceManager', 'cancellation', 'streamingResults', 'autoCheckpoint', 'multiSession', 'sessionRegistry', 'health'] });
     return;
   }
-  if (req.method === 'GET' && req.url === '/api/storage') {
+  // 第十九章 REQ-UI-010 列出的是 GET /api/storage/stats；/api/storage 为既有兼容路径。
+  if (req.method === 'GET' && (req.url === '/api/storage' || req.url === '/api/storage/stats')) {
     try {
       const bytes = statSync(database).size;
-      send(200, { pageSize: 4096, fileBytes: bytes, allocatedPages: Math.ceil(bytes / 4096), buffer: { available: false }, policy: 'backend-not-exposed' });
+      // 未接通的能力明确标记不可用，不伪造零值；缓存明细走 /api/sessions/:id/buffer。
+      send(200, { pageSize: 4096, fileBytes: bytes, allocatedPages: Math.ceil(bytes / 4096),
+        buffer: { available: false, reason: 'backend-not-exposed', endpoint: '/api/sessions/:id/buffer' },
+        policy: 'backend-not-exposed' });
     } catch (error) { send(503, { error: { message: error instanceof Error ? error.message : String(error) } }); }
     return;
   }
@@ -1121,6 +1135,43 @@ const server = http.createServer(async (req, res) => {
     } catch (error) { send(error.status ?? 400, { success: false, error: { message: error instanceof Error ? error.message : String(error) } }); }
     return;
   }
+  // 第十七章 REQ-CORE-002：执行已序列化的计划文档；指纹失效由引擎返回 PLAN_STALE_SCHEMA。
+  const planRoute = req.url?.match(/^\/api\/sessions\/([a-zA-Z0-9-]+)\/execute-plan$/);
+  if (planRoute) {
+    if (req.method !== 'POST') { send(405, { success: false, error: { code: 405, message: 'Plan execution requires POST' } }); return; }
+    const session = sessions.get(planRoute[1]);
+    if (!session) { send(404, { success: false, error: { code: 404, message: 'Session not found or expired' } }); return; }
+    if (session.user !== requestUser) { send(403, { success: false, error: { code: 7001, message: 'Permission denied' } }); return; }
+    try {
+      const chunks = [];
+      let length = 0;
+      for await (const chunk of req) {
+        length += chunk.length;
+        if (length > 8 * 1024 * 1024) { send(413, { error: { message: 'Request exceeds 8 MiB' } }); return; }
+        chunks.push(chunk);
+      }
+      let body;
+      try { body = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks))); }
+      catch { send(400, { success: false, error: { code: 400, message: 'Invalid JSON body' } }); return; }
+      if (!body || body.plan === undefined || body.plan === null) {
+        send(400, { success: false, error: { code: 400, message: 'Expected a serialized plan document' } }); return;
+      }
+      // 形状先在这里判为请求不合法（400）；引擎侧仍会 fail-closed 兜底。
+      const planArray = Array.isArray(body.plan);
+      const planWrapped = !planArray && typeof body.plan === 'object' && Array.isArray(body.plan.plans);
+      if (!planArray && !planWrapped) {
+        send(400, { success: false, error: { code: 400, message: 'Expected a serialized plan document (node array or { plans: [...] })' } }); return;
+      }
+      auditSql = 'EXECUTE PLAN';
+      const tables = collectPlanTables(body.plan);
+      if (tables.length) auditObjects = tables;
+      const data = await runSessionOperation(session, 'executePlan', '', res, { plan: body.plan });
+      send(data.success === false
+        ? (data.error?.code === 7001 ? 403 : data.error?.code === 9001 ? 501 : quarantined ? 503 : 422)
+        : 200, data);
+    } catch (error) { send(error.status ?? 400, { success: false, error: { message: error instanceof Error ? error.message : String(error) } }); }
+    return;
+  }
   const sessionRoute = req.url?.match(/^\/api\/sessions\/([a-zA-Z0-9-]+)\/(execute|compile|diagnostics|statistics|catalog|close|buffer)(\/stream)?$/);
   const streamed = req.url === '/api/execute/stream' || Boolean(sessionRoute?.[3]);
   let mode;
@@ -1206,8 +1257,10 @@ const server = http.createServer(async (req, res) => {
       auditObjects = data.accessObjects.map(object => String(object).toLowerCase());
     const permissionDenied = data.error?.code === 7001;
     const readOnlyViolation = !permissionDenied && /read-?only/i.test(data.error?.message ?? '');
+    // 第十七章：未实现的能力不得伪装成成功，统一按 501 返回。
+    const notImplemented = !permissionDenied && data.error?.code === 9001;
     const status = data.success === false
-      ? (permissionDenied ? 403 : readOnlyViolation ? 400 : quarantined ? 503 : resourceLimited ? 413 : 422)
+      ? (permissionDenied ? 403 : readOnlyViolation ? 400 : notImplemented ? 501 : quarantined ? 503 : resourceLimited ? 413 : 422)
       : 200;
     const response = mode === 'catalog' || mode === 'buffer' || mode === 'diagnostics' || mode === 'statistics' ? data : queryResult(data, performance.now() - started);
     if (data.success === false && data.completedStatements > 0) {

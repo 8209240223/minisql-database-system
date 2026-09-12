@@ -11,6 +11,9 @@ public:
     void createIndex(const sql::Statement& statement);
     void dropIndex(const sql::Statement& statement);
     const Table* find(const std::string& name) const;
+    // 稳定 schema 指纹：表名 + 列名/类型/可空/主键/唯一，按表名排序后哈希。
+    // 计划绑定该指纹；执行时不一致即 PLAN_STALE_SCHEMA（第十七章 REQ-CORE-002）。
+    std::string schemaFingerprint() const;
 private:
     std::unordered_map<std::string, Table> tables_;
 };

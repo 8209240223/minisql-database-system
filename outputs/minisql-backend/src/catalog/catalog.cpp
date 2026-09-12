@@ -60,9 +60,26 @@ std::string literalType(const std::string& raw, SourceLocation location) {
     std::int64_t value{};
     const auto result = std::from_chars(start, end, value);
     if (result.ec != std::errc{} || result.ptr != end) {
-        fail("Integer literal is outside INT64 range: " + raw, location);
+        throw MiniSqlError(ErrorCode::IntegerOutOfRange,
+                           "SEM_INTEGER_OUT_OF_RANGE: integer literal is outside INT64 range: " + raw,
+                           location);
     }
     return value < INT32_MIN || value > INT32_MAX ? "bigint" : "int";
+}
+
+// 第十七章 REQ-CORE-001：语义在任何窄化转换之前检查 INT 范围。
+// 字面量能装进 BIGINT 但装不进 INT（-2147483648..2147483647）而目标列是 INT 时，
+// 报告稳定符号错误码 SEM_INTEGER_OUT_OF_RANGE，而不是笼统的类型不匹配。
+// BIGINT 目标仍按 EXT-SQL-003 扩展接受，这是本项目的超集行为。
+void rejectNarrowedInteger(const std::string& raw, const std::string& sourceType,
+                           const std::string& targetType, SourceLocation location) {
+    if (sourceType != "bigint" || key(targetType) != "int") return;
+    if (raw.empty() || raw.front() == '\'') return;                  // 字符串字面量不参与
+    if (raw.find_first_of("eE.") != std::string::npos) return;       // 小数/浮点不参与
+    throw MiniSqlError(ErrorCode::IntegerOutOfRange,
+        "SEM_INTEGER_OUT_OF_RANGE: " + raw +
+        " does not fit INT (-2147483648..2147483647); use BIGINT or an explicit CAST",
+        location);
 }
 
 std::string expressionType(const sql::Expr& expression, const Table& table,
@@ -311,6 +328,7 @@ void Catalog::create(const sql::Statement& statement) {
             const bool dateLiteral = tokens.size() == 3 && key(tokens[0].lexeme) == "date" && tokens[1].type == "STRING";
             if (!unsignedLiteral && !signedLiteral && !dateLiteral) fail("DEFAULT requires one literal", statement.location);
             const auto type = literalType(*definition.defaultValue, statement.location);
+            rejectNarrowedInteger(*definition.defaultValue, type, declared, statement.location);
             if ((type == "null" && !definition.nullable) || !assignable(type, declared))
                 fail("DEFAULT type mismatch for column: " + definition.name, statement.location);
             if (const auto limit=varcharLength(declared);limit && type!="null")
@@ -448,6 +466,39 @@ const Table* Catalog::find(const std::string& name) const {
     return it == tables_.end() ? nullptr : &it->second;
 }
 
+std::string Catalog::schemaFingerprint() const {
+    // 表遍历顺序取决于 unordered_map，必须先按名字排序才能得到稳定指纹。
+    std::vector<const Table*> ordered;
+    ordered.reserve(tables_.size());
+    for (const auto& entry : tables_) ordered.push_back(&entry.second);
+    std::sort(ordered.begin(), ordered.end(), [](const Table* left, const Table* right) {
+        return key(left->name) < key(right->name);
+    });
+    std::uint64_t hash = 0xcbf29ce484222325ULL;
+    const auto mix = [&hash](const std::string& text) {
+        for (const unsigned char byte : text) { hash ^= byte; hash *= 0x100000001b3ULL; }
+        hash ^= 0x1f; hash *= 0x100000001b3ULL;   // 字段分隔符，避免拼接歧义
+    };
+    for (const auto* table : ordered) {
+        mix(key(table->name));
+        for (const auto& column : table->columns) {
+            mix(key(column.name));
+            mix(key(column.type));
+            mix(column.nullable ? "1" : "0");
+            mix(column.primaryKey ? "1" : "0");
+            mix(column.unique ? "1" : "0");
+        }
+        mix("|");   // 表边界
+    }
+    static constexpr char digits[] = "0123456789abcdef";
+    std::string out(16, '0');
+    for (int index = 15; index >= 0; --index) {
+        out[static_cast<std::size_t>(index)] = digits[hash & 0xfULL];
+        hash >>= 4;
+    }
+    return out;
+}
+
 std::vector<std::string> insertColumns(const sql::Statement& statement, const Table& table) {
     if (statement.defaultValues) {
         if (!statement.names.empty() || !statement.values.empty() || !statement.valueExpressions.empty())
@@ -484,7 +535,8 @@ void validate(const std::vector<sql::Statement>& statements, Catalog& catalog) {
         // X09 3.3: 派生表基座。内层 select 仍在真实 catalog 上校验；外层列绑定、
         // 类型与 WHERE 校验交由 planner 的 Scope 链完成（catalog 未知派生别名）。
         if (statement.fromSubquery != nullptr) {
-            if (statement.kind != "Select") fail("DELETE/UPDATE is not supported over a derived table", statement.location);
+            // 第十九章 REQ-UI-010：能力未实现与 SQL 检查失败必须区分，前者走 501。
+            if (statement.kind != "Select") throw MiniSqlError(ErrorCode::NotImplemented, "DELETE/UPDATE is not supported over a derived table", statement.location);
             validate({*statement.fromSubquery}, catalog);
             continue;
         }
@@ -506,6 +558,10 @@ void validate(const std::vector<sql::Statement>& statements, Catalog& catalog) {
                 const auto type = statement.valueExpressions.empty() ? literalType(statement.values[i], statement.location)
                     : statement.valueExpressions[i]->kind == "Default" ? literalType(target.defaultValue.value_or("NULL"), statement.location)
                     : expressionType(*statement.valueExpressions[i], Table{"", {}}, statement.location);
+                if (statement.valueExpressions.empty())
+                    rejectNarrowedInteger(statement.values[i], type, target.type, statement.location);
+                else if (statement.valueExpressions[i]->kind == "Literal")
+                    rejectNarrowedInteger(statement.valueExpressions[i]->value, type, target.type, statement.location);
                 if (type == "null" && !target.nullable)
                     fail("NOT NULL constraint failed" + notNullConstraintSuffix(*catalog.find(statement.table), resolveColumnIndex(*table, name)), statement.location);
                 if ((type == "null" && !target.nullable) || !assignable(type, key(target.type))) {
@@ -532,6 +588,8 @@ void validate(const std::vector<sql::Statement>& statements, Catalog& catalog) {
                 if (!item.expression) fail("Missing UPDATE expression", statement.location);
                 const auto type = item.expression->kind == "Default" ? literalType(target.defaultValue.value_or("NULL"), statement.location)
                     : expressionType(*item.expression, *table, statement.location);
+                if (item.expression->kind == "Literal")
+                    rejectNarrowedInteger(item.expression->value, type, target.type, statement.location);
                 if (type == "null" && !target.nullable)
                     fail("NOT NULL constraint failed" + notNullConstraintSuffix(*catalog.find(statement.table), resolveColumnIndex(*table, item.column)), statement.location);
                 if ((type == "null" && !target.nullable) || !assignable(type, key(target.type)))

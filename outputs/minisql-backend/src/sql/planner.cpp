@@ -462,11 +462,13 @@ LogicalPlan build(const Statement& statement, const catalog::Catalog& catalog, c
         }
     } else if (statement.kind == "Select" || statement.kind == "Delete" || statement.kind == "Update") {
         if (derivedBase && statement.kind != "Select")
-            throw MiniSqlError(ErrorCode::Semantic, "DELETE/UPDATE is not supported over a derived table", statement.location);
+            // 第十九章 REQ-UI-010：这是能力未实现而不是 SQL 检查失败，
+            // 因此用 NotImplemented（HTTP 501）而不是 Semantic（HTTP 422）。
+            throw MiniSqlError(ErrorCode::NotImplemented, "DELETE/UPDATE is not supported over a derived table", statement.location);
         LogicalPlan input;
         if (derivedBase) {
             if (!statement.joins.empty())
-                throw MiniSqlError(ErrorCode::Semantic, "JOIN over a derived table is not supported yet", statement.location);
+                throw MiniSqlError(ErrorCode::NotImplemented, "JOIN over a derived table is not supported yet", statement.location);
             // 派生表基座：直接以内层 select 计划作为输入，外层谓词/投影按 derivedScope 绑定。
             input = std::move(derivedInput);
         } else {
@@ -683,7 +685,15 @@ std::vector<LogicalPlan> compilePlans(const std::vector<Statement>& statements,
             // 逐句绑定：批内 DDL 会改变 Catalog 快照，所以不能对整批只绑一次。
             // 传指针而非拷贝，保证 BindResult 里的裸指针指向调用方持有的语句。
             const auto bound = bindStatements({&statement}, snapshot);
-            plans.push_back(build(statement, snapshot, bound));
+            auto built = build(statement, snapshot, bound);
+            // 计划绑定编译时的 Catalog 指纹，供执行阶段检测 schema 失效。
+            const auto fingerprint = snapshot.schemaFingerprint();
+            std::function<void(LogicalPlan&)> stamp = [&](LogicalPlan& node) {
+                node.catalogFingerprint = fingerprint;
+                for (auto& child : node.children) stamp(child);
+            };
+            stamp(built);
+            plans.push_back(std::move(built));
         }
     }
     return plans;
@@ -703,6 +713,7 @@ nlohmann::json serializePlans(const std::vector<LogicalPlan>& plans) {
         }
         rows.push_back({{"id", id}, {"parent", parent}, {"depth", depth}, {"statementIndex", statementIndex},
                         {"kind", plan.kind}, {"detail", plan.kind + " " + plan.table}, {"table", plan.table},
+                        {"catalogFingerprint", plan.catalogFingerprint},
                         {"indexName", plan.indexName}, {"savepointName", plan.savepointName}, {"subqueryJoinKind", plan.subqueryJoinKind}, {"uniqueIndex", plan.uniqueIndex}, {"indexColumns", plan.indexColumns}, {"indexValues", plan.indexValues}, {"indexRangeOperator", plan.indexRangeOperator}, {"indexRangeValue", plan.indexRangeValue},
                         {"output", output}, {"preservesRowId", plan.preservesRowId},
                         {"predicate", plan.predicate}, {"values", plan.values}, {"insertExpressions", plan.insertExpressions}, {"insertRows", plan.insertRows},
@@ -771,8 +782,7 @@ std::vector<LogicalPlan> deserializePlans(const nlohmann::json& document) {
         item.plan.preservesRowId = row.at("preservesRowId").get<bool>();
     item.plan.indexName = row.value("indexName", std::string{});
     item.plan.savepointName = row.value("savepointName", std::string{});
-    item.plan.subqueryJoinKind = row.value("subqueryJoinKind", std::string{});
-        item.plan.uniqueIndex = row.value("uniqueIndex", false);
+    item.plan.subqueryJoinKind = row.value("subqueryJoinKind", std::string{});        item.plan.catalogFingerprint = row.value("catalogFingerprint", std::string{});        item.plan.uniqueIndex = row.value("uniqueIndex", false);
         item.plan.indexColumns = row.value("indexColumns", std::vector<std::string>{});
         item.plan.indexValues = row.value("indexValues", nlohmann::json::array());
         item.plan.indexRangeOperator = row.value("indexRangeOperator", std::string{});

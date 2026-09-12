@@ -11,13 +11,23 @@ namespace {
 // the statement-level handler can synchronize and continue.
 struct Recovered {};
 
+// 第十七章 REQ-CORE-001：批量语句上限 10000。超限按资源预算诊断，
+// 消息含 "budget exceeded" 以便 HTTP 适配层映射到 413。
+constexpr std::size_t kMaxStatements = 10000;
+const char* kStatementBudgetMessage = "Statement budget exceeded: batch input exceeds 10000 statements";
+
 class Parser {
 public:
     explicit Parser(const std::vector<Token>& tokens): t(tokens) {}
     // Strict parse: throws MiniSqlError on the first error (classic behaviour).
     std::vector<Statement> all(){
         std::vector<Statement> out;
-        while(i<t.size() && t[i].type!="END"){out.push_back(statement());}
+        while(i<t.size() && t[i].type!="END"){
+            if(out.size()>=kMaxStatements)
+                throw MiniSqlError(ErrorCode::Execution, kStatementBudgetMessage,
+                                   i<t.size()?t[i].location:SourceLocation{});
+            out.push_back(statement());
+        }
         return out;
     }
     // Enables recovery mode: syntax errors are pushed into `errors` (never
@@ -29,6 +39,11 @@ public:
     std::vector<Statement> allRecoverable(){
         std::vector<Statement> out;
         while(i<t.size() && t[i].type!="END"){
+            if(out.size()>=kMaxStatements){
+                errors_->emplace_back(ErrorCode::Execution, std::string(kStatementBudgetMessage),
+                                      i<t.size()?t[i].location:SourceLocation{});
+                break;
+            }
             try {
                 auto st = statement();
                 if (inError_) st.invalid = true;
