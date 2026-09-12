@@ -83,6 +83,15 @@ Get-Content .\query.sql | .\build\windows\Release\minisql_database.exe .\data\de
 | `MINISQL_MAX_RESULT_ROWS` | 单条语句结果行预算 |
 | `MINISQL_TEMP_DIR` | 外部排序/聚合临时目录 |
 | `MINISQL_AUTO_CHECKPOINT_*` | 自动检查点阈值（写入数、WAL 字节、脏页数/比例、时间窗口） |
+| `MINISQL_GROUP_COMMIT` | 设为 `1` 时合并多个提交的日志 fsync 与数据页应用（group commit），默认关闭 |
+| `MINISQL_GROUP_COMMIT_BYTES` | group commit 单组最大暂存字节（默认 16 MiB），超过立即同步 |
+| `MINISQL_FUZZY_CHECKPOINT` | 设为 `1` 时使用模糊检查点：记录检查点边界与截止位置并保留日志，不强制刷出缓存 |
+| `MINISQL_ARCHIVE_WAL` | 设为 `1` 时检查点回收日志前先把被回收的前缀归档到 `.wal.archive.N` |
+| `MINISQL_DOUBLEWRITE` | 设为 `1` 时启用双写缓冲（`.dwb`），为数据页写提供 torn-page 防护 |
+
+WAL 采用记录级格式（扩展头记录 `txId`、逻辑 LSN、`prevLsn` 链与提交/撤销记录），
+回滚写入 Abort 记录，`statistics` 的 `wal` 字段暴露 LSN 水位、扩展计数、归档与双写状态。
+详见 [WAL 与恢复增强](outputs/minisql-backend/docs/wal-recovery-progress.md)。
 
 命中统计与淘汰记录也可通过 `statistics` 命令的 `buffer` 字段读取，无需开启日志文件。
 

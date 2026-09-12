@@ -554,14 +554,23 @@ nlohmann::json Database::checkpoint() {
     std::lock_guard<std::recursive_mutex> guard(mu_);
     requireAvailable();
     if (transaction_ != TransactionState::Idle) throw MiniSqlError(ErrorCode::Transaction, "CHECKPOINT requires an idle transaction");
-    buffer_.flushAll();
-    file_->checkpoint({catalogVersion_, indexVersion_});
+    // 模糊检查点（MINISQL_FUZZY_CHECKPOINT=1）不强制刷出缓存，只记录检查点边界并保留日志。
+    const bool fuzzy = std::getenv("MINISQL_FUZZY_CHECKPOINT") != nullptr;
+    const bool archive = std::getenv("MINISQL_ARCHIVE_WAL") != nullptr;
+    if (!fuzzy) buffer_.flushAll();
+    storage::CheckpointOptions options;
+    options.catalogVersion = catalogVersion_;
+    options.indexVersion = indexVersion_;
+    options.fuzzy = fuzzy;
+    options.archive = archive;
+    file_->checkpoint(options);
     pendingAutoCheckpointWrites_ = 0;
     pendingAutoCheckpointWalBytes_ = 0;
     lastCheckpointAt_ = std::chrono::steady_clock::now();
     lastCheckpointAtMs_ = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count());
-    return {{"success", true}, {"kind", "Checkpoint"}, {"wal", "truncated"}};
+    return {{"success", true}, {"kind", "Checkpoint"}, {"wal", fuzzy ? "retained" : "truncated"},
+            {"fuzzy", fuzzy}, {"archived", archive}};
 }
 
 class ScanRowStream : public RowStream {
@@ -1280,6 +1289,7 @@ nlohmann::json Database::statistics() {
     const auto dirtyPages = buffer_.dirtyPages();
     const auto dirtyRatio = buffer_.capacity() == 0 ? 0.0 : static_cast<double>(dirtyPages) / static_cast<double>(buffer_.capacity());
     const auto& record = file_->checkpointRecord();
+    const auto wal = file_->walStatistics();
     const auto analyzedAtMs = analyzed ? analyzed->value("analyzedAtMs", std::uint64_t{0}) : std::uint64_t{0};
     const auto refreshedAt = analyzed ? analyzedAtMs : static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count());
@@ -1296,7 +1306,18 @@ nlohmann::json Database::statistics() {
         {"checkpointRecord", {{"present", record.present}, {"walCutoffBytes", record.walCutoffBytes},
             {"dirtyWatermark", record.dirtyWatermark}, {"catalogVersion", record.catalogVersion},
             {"indexVersion", record.indexVersion}, {"committedSequence", record.committedSequence},
-            {"timestampMs", record.timestampMs}}},
+            {"timestampMs", record.timestampMs}, {"walLsn", record.walLsn},
+            {"checkpointBeginLsn", record.checkpointBeginLsn}, {"checkpointEndLsn", record.checkpointEndLsn},
+            {"archivedBytes", record.archivedBytes}, {"archiveSegments", record.archiveSegments}}},
+        // 记录级 WAL 统计：逻辑 LSN 链、事务/记录类型计数与归档状态。
+        {"wal", {{"walBytes", wal.walBytes}, {"nextLsn", wal.nextLsn}, {"lastExtentLsn", wal.lastExtentLsn},
+            {"lastCheckpointLsn", wal.lastCheckpointLsn}, {"committedSequence", wal.committedSequence},
+            {"dirtyWatermark", wal.dirtyWatermark}, {"committedExtents", wal.committedExtents},
+            {"abortedExtents", wal.abortedExtents}, {"recordedPages", wal.recordedPages},
+            {"trackedPages", wal.trackedPages}, {"archivedBytes", wal.archivedBytes},
+            {"archiveSegments", wal.archiveSegments}, {"pendingCommitBytes", wal.pendingCommitBytes},
+            {"groupCommit", wal.groupCommit}, {"doubleWrite", wal.doubleWrite},
+            {"fuzzyCheckpoint", wal.fuzzyCheckpoint}}},
         {"lastCheckpointAtMs", lastCheckpointAtMs_}, {"lastAutoCheckpointAtMs", lastAutoCheckpointAtMs_},
         {"lastAutoCheckpointReasons", lastAutoCheckpointReasons_},
         {"indexMaintenance", {{"engine", pageFileIndexes_ ? "page-file" : "memory"},
@@ -2437,15 +2458,25 @@ nlohmann::json Database::runStatement(const sql::LogicalPlan& plan) {
     if (plan.kind == "IndexInspect") return indexInspect(plan.table, plan.indexName);
     if (plan.kind == "Checkpoint") {
         if (transaction_ != TransactionState::Idle) throw MiniSqlError(ErrorCode::Transaction, "CHECKPOINT requires an idle transaction");
-        buffer_.flushAll();
-        file_->checkpoint({catalogVersion_, indexVersion_});
+        // 模糊检查点（MINISQL_FUZZY_CHECKPOINT=1）只记录检查点边界并保留日志，不强制刷出缓存。
+        const bool fuzzy = std::getenv("MINISQL_FUZZY_CHECKPOINT") != nullptr;
+        const bool archive = std::getenv("MINISQL_ARCHIVE_WAL") != nullptr;
+        if (!fuzzy) buffer_.flushAll();
+        storage::CheckpointOptions options;
+        options.catalogVersion = catalogVersion_;
+        options.indexVersion = indexVersion_;
+        options.fuzzy = fuzzy;
+        options.archive = archive;
+        file_->checkpoint(options);
         ++checkpointCount_;
         pendingAutoCheckpointWrites_ = 0;
         pendingAutoCheckpointWalBytes_ = 0;
         lastCheckpointAt_ = std::chrono::steady_clock::now();
         lastCheckpointAtMs_ = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::system_clock::now().time_since_epoch()).count());
-        return {{"kind", plan.kind}, {"columns", json::array()}, {"rows", json::array()}, {"affectedRows", 0}, {"commitState", "committed"}};
+        return {{"kind", plan.kind}, {"columns", json::array()}, {"rows", json::array()}, {"affectedRows", 0},
+                {"commitState", "committed"}, {"wal", fuzzy ? "retained" : "truncated"},
+                {"fuzzy", fuzzy}, {"archived", archive}};
     }
     if (plan.kind == "Rollback") {
         if (transaction_ == TransactionState::Idle) throw MiniSqlError(ErrorCode::Transaction, "No active transaction");
