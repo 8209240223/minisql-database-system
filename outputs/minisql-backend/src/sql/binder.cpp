@@ -54,6 +54,9 @@ public:
             if (statement->invalid) failBind("statement did not parse cleanly");
             result_.topLevel.push_back(result_.statements.size());
             bindStatement(*statement, ScopeId::Invalid, 0);
+            // 批内 DDL 推进目录快照：后一条语句才能解析到刚建的表/索引。
+            // 授权对象集合因此与实际执行顺序一致；失败留给执行器报错。
+            applyDdl(*statement);
         }
         if (!statements.empty()) result_.statementAction = statementActionFor(statements.front()->kind);
         result_.complete = true;
@@ -62,9 +65,20 @@ public:
 private:
     static constexpr std::size_t kMaxDepth = 64;
 
-    const catalog::Catalog& catalog_;
+    catalog::Catalog catalog_;
     BindResult& result_;
     std::size_t currentStatement_ = 0;  // 表达式归属的 BoundStatement 下标
+
+    void applyDdl(const Statement& statement) {
+        try {
+            if (statement.kind == "CreateTable") catalog_.create(statement);
+            else if (statement.kind == "CreateIndex") catalog_.createIndex(statement);
+            else if (statement.kind == "DropIndex") catalog_.dropIndex(statement);
+        } catch (const MiniSqlError&) {
+            // 目录推进失败不在这里失败：后续语句会因此无法闭合而 fail-closed，
+            // 真实错误由执行器在运行阶段给出。
+        }
+    }
 
     struct StatementScope {
         Binder& binder;

@@ -40,6 +40,10 @@ public:
     nlohmann::json checkpoint();
     nlohmann::json createSnapshot(const std::filesystem::path& target);
     nlohmann::json indexInspect(const std::string& table, const std::string& index);   // 页级索引结构校验（页类型/height/keyCount/兄弟指针/叶链/根可达）
+    // 堆表与索引的双向一致性检查：结构、行数、每行条目可达、每条目指向存活行。
+    nlohmann::json indexVerify(const std::string& table, const std::string& index);
+    // 在线重建单个索引：build → validate → publish，全程在写批次内，随事务原子提交/回滚。
+    nlohmann::json indexRebuild(const std::string& table, const std::string& index);
     // 将已由入口层校验的权限快照同步到 PersistentCatalog 的保留系统表。
     void synchronizeAccessCatalog(const nlohmann::json& document, std::uint32_t permissionVersion);
     const std::optional<catalog::AccessCatalogRecord>& accessCatalogRecord() const { return catalog_.accessCatalogRecord(); }
@@ -134,6 +138,13 @@ private:
     std::vector<std::unique_ptr<RuntimeIndex>> indexes_;
     void rebuildIndexes(std::uint64_t tableId);
     void initializeIndexes(std::uint64_t tableId, bool forceRebuild, bool allowRebuild);
+    // 三阶段索引建造：build 从堆表全量构建条目，validate 校验结构与条目数；
+    // 通过后由调用方 publish（登记进 indexes_ 或目录）。返回校验问题，空表示通过。
+    std::vector<std::string> buildIndexEntries(RuntimeIndex& index, std::uint64_t tableId,
+                                               const storage::RowSchema& schema, std::size_t* entries);
+    // 堆与索引双向一致性检查（结构/条目数/缺失条目/悬挂条目）。
+    nlohmann::json verifyIndexConsistency(RuntimeIndex& index, std::uint64_t tableId,
+                                          const storage::RowSchema& schema);
     void reloadIndexRuntimes();
     void insertIndexEntries(std::uint64_t tableId, const storage::Row& row, storage::RowRef ref);
     void eraseIndexEntries(std::uint64_t tableId, const storage::Row& row, storage::RowRef ref);
@@ -149,6 +160,8 @@ private:
     std::uint64_t indexRuntimeReloads_ = 0;
     std::uint64_t indexEntriesInserted_ = 0;
     std::uint64_t indexEntriesErased_ = 0;
+    std::uint64_t indexOnlineRebuilds_ = 0;
+    std::uint64_t indexVerifications_ = 0;
     std::vector<storage::Row> joinRows(const sql::LogicalPlan& plan);
     nlohmann::json aggregateRows(const sql::LogicalPlan& plan);
     void materializeSubqueries(std::vector<sql::LogicalPlan>& plans);

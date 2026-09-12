@@ -31,9 +31,14 @@ std::string readSqlFile(const std::filesystem::path& path) {
         source.erase(0, 3);
     return source;
 }
-void authorizeRequest(minisql::execution::Database& database, const minisql::security::AccessCatalog& access, const json& request,
-                      const std::string& operation, const std::string& sql = {},
-                      const std::string& table = {}, const std::string& index = {}) {
+// 把绑定阶段确定的受权对象附到响应上，供审计使用（不参与授权判定）。
+void attachAccessObjects(json& result, const minisql::security::AccessRequest& binding) {
+    if (binding.objects.empty()) return;
+    json objects = json::array();
+    for (const auto& object : binding.objects) objects.push_back(object.object);
+    result["accessObjects"] = std::move(objects);
+}
+void authorizeIdentity(const minisql::security::AccessCatalog& access, const json& request) {
     if (!access.enabled()) return;
     if (!request.contains("user") || !request["user"].is_string() ||
         !request.contains("password") || !request["password"].is_string() ||
@@ -43,9 +48,17 @@ void authorizeRequest(minisql::execution::Database& database, const minisql::sec
     const auto& user = request["user"].get_ref<const std::string&>();
     const auto& password = request["password"].get_ref<const std::string&>();
     if (!access.verify(user, password)) throw minisql::MiniSqlError(minisql::ErrorCode::Permission, "Permission denied");
-    // 入口不再传 SQL 文本：权限只看绑定结果。
-    access.authorize(user, operation, sql.empty() ? minisql::security::AccessRequest{} : database.bindAccess(sql),
-                     table, index);
+}
+minisql::security::AccessRequest authorizeRequest(minisql::execution::Database& database, const minisql::security::AccessCatalog& access, const json& request,
+                      const std::string& operation, const std::string& sql = {},
+                      const std::string& table = {}, const std::string& index = {}) {
+    // 权限判定只消费绑定结果；返回它供审计记录受权对象，不再扫描 SQL 文本。
+    auto binding = sql.empty() ? minisql::security::AccessRequest{} : database.bindAccess(sql);
+    if (!access.enabled()) return binding;
+    authorizeIdentity(access, request);
+    const auto& user = request["user"].get_ref<const std::string&>();
+    access.authorize(user, operation, binding, table, index);
+    return binding;
 }
 
 void authorizeDirect(minisql::execution::Database& database, const minisql::security::AccessCatalog& access, const std::string& operation,
@@ -58,6 +71,13 @@ void authorizeDirect(minisql::execution::Database& database, const minisql::secu
     const std::string password = configuredPassword ? configuredPassword : "";
     if (!access.verify(user, password)) throw minisql::MiniSqlError(minisql::ErrorCode::Permission, "Permission denied");
     access.authorize(user, operation, sql.empty() ? minisql::security::AccessRequest{} : database.bindAccess(sql));
+}
+// 直接入口（CLI）返回绑定结果，供 main 把受权对象附到响应上。
+minisql::security::AccessRequest directAccessRequest(minisql::execution::Database& database, const minisql::security::AccessCatalog& access,
+                                                   const std::string& operation, const std::string& sql) {
+    auto binding = sql.empty() ? minisql::security::AccessRequest{} : database.bindAccess(sql);
+    authorizeDirect(database, access, operation, sql);
+    return binding;
 }
 
 minisql::security::AccessCatalog reconcileAccessCatalog(minisql::execution::Database& database,
@@ -141,8 +161,9 @@ int session(minisql::execution::Database& database, minisql::security::AccessCat
                 if (!request.contains("sql") || !request["sql"].is_string())
                     throw minisql::MiniSqlError(minisql::ErrorCode::InvalidArgument, "Expected SQL string");
                 const auto source = request["sql"].get<std::string>();
-                authorizeRequest(database, access, request, operation, source);
+                const auto binding = authorizeRequest(database, access, request, operation, source);
                 result = operation == "execute" ? database.execute(source) : database.compile(source);
+                attachAccessObjects(result, binding);
             } else if (operation == "executeStream") {
                 if (!request.contains("sql") || !request["sql"].is_string())
                     throw minisql::MiniSqlError(minisql::ErrorCode::InvalidArgument, "Expected SQL string");
@@ -169,8 +190,9 @@ int session(minisql::execution::Database& database, minisql::security::AccessCat
             } else if (operation == "diagnostics") {
                 if (!request.contains("sql") || !request["sql"].is_string())
                     throw minisql::MiniSqlError(minisql::ErrorCode::InvalidArgument, "Expected SQL string");
-                authorizeRequest(database, access, request, operation, request["sql"].get<std::string>());
+                const auto binding = authorizeRequest(database, access, request, operation, request["sql"].get<std::string>());
                 result = database.diagnostics(request["sql"].get<std::string>());
+                attachAccessObjects(result, binding);
             } else if (operation == "statistics") { authorizeRequest(database, access, request, operation); result = database.statistics(); }
             else if (operation == "catalog") { authorizeRequest(database, access, request, operation); result = database.catalog(); }
             else if (operation == "indexInspect") {
@@ -179,6 +201,30 @@ int session(minisql::execution::Database& database, minisql::security::AccessCat
                     throw minisql::MiniSqlError(minisql::ErrorCode::InvalidArgument, "Expected table and index strings");
                 authorizeRequest(database, access, request, operation, {}, request["table"].get<std::string>(), request["index"].get<std::string>());
                 result = database.indexInspect(request["table"].get<std::string>(), request["index"].get<std::string>());
+            } else if (operation == "indexVerify") {
+                if (!request.contains("table") || !request["table"].is_string() ||
+                    !request.contains("index") || !request["index"].is_string())
+                    throw minisql::MiniSqlError(minisql::ErrorCode::InvalidArgument, "Expected table and index strings");
+                authorizeRequest(database, access, request, operation, {}, request["table"].get<std::string>(), request["index"].get<std::string>());
+                result = database.indexVerify(request["table"].get<std::string>(), request["index"].get<std::string>());
+            } else if (operation == "indexRebuild") {
+                if (!request.contains("table") || !request["table"].is_string() ||
+                    !request.contains("index") || !request["index"].is_string())
+                    throw minisql::MiniSqlError(minisql::ErrorCode::InvalidArgument, "Expected table and index strings");
+                authorizeRequest(database, access, request, operation, {}, request["table"].get<std::string>(), request["index"].get<std::string>());
+                result = database.indexRebuild(request["table"].get<std::string>(), request["index"].get<std::string>());
+            } else if (operation == "bindAccess") {
+                if (!request.contains("sql") || !request["sql"].is_string())
+                    throw minisql::MiniSqlError(minisql::ErrorCode::InvalidArgument, "Expected SQL string");
+                // 只验证身份：调用方用返回的绑定结果自行决定对象权限，避免再次扫描 SQL 文本。
+                authorizeIdentity(access, request);
+                const auto binding = database.bindAccess(request["sql"].get<std::string>());
+                json objects = json::array();
+                for (const auto& object : binding.objects)
+                    objects.push_back({{"object", object.object}, {"action", minisql::security::permissionName(object.action)}});
+                result = {{"success", true}, {"bound", binding.bound},
+                          {"statementAction", minisql::security::permissionName(binding.statementAction)},
+                          {"objects", std::move(objects)}, {"diagnostic", binding.diagnostic}};
             } else if (operation == "snapshot") {
                 if (!request.contains("target") || !request["target"].is_string())
                     throw minisql::MiniSqlError(minisql::ErrorCode::InvalidArgument, "Expected snapshot target string");
@@ -232,9 +278,9 @@ int main(int argc, char** argv) {
             positional.push_back(argument);
         }
         if (positional.size() != 2) throw minisql::MiniSqlError(minisql::ErrorCode::InvalidArgument,
-            "Usage: minisql_database <database.pages> <execute|compile|diagnostics|statistics|catalog|session> [--file <query.sql>]");
+            "Usage: minisql_database <database.pages> <execute|compile|diagnostics|statistics|catalog|session|bindAccess> [--file <query.sql>]");
         const std::string mode = positional[1];
-        if (mode != "execute" && mode != "compile" && mode != "diagnostics" && mode != "statistics" && mode != "catalog" && mode != "session")
+        if (mode != "execute" && mode != "compile" && mode != "diagnostics" && mode != "statistics" && mode != "catalog" && mode != "session" && mode != "bindAccess")
             throw minisql::MiniSqlError(minisql::ErrorCode::InvalidArgument, "Unknown database command");
         std::filesystem::path path;
 #ifdef _WIN32
@@ -254,11 +300,34 @@ int main(int argc, char** argv) {
         auto access = reconcileAccessCatalog(database, path);
         if (mode == "session") return session(database, std::move(access), path);
         nlohmann::json result;
+        // bindAccess：只做名称解析（对象、动作、是否闭合），供入口在授权/只读判定与
+        // 审计中消费，取代任何基于 SQL 文本的扫描。启用权限目录时先校验身份。
+        if (mode == "bindAccess") {
+            const std::string source = sqlFile.empty() ? std::string{std::istreambuf_iterator<char>(std::cin), {}} : readSqlFile(sqlFile);
+            const auto* bypass = std::getenv("MINISQL_AUTH_BYPASS");
+            if (access.enabled() && !(bypass && std::string(bypass) == "1")) {
+                const auto* configuredUser = std::getenv("MINISQL_USER");
+                const auto* configuredPassword = std::getenv("MINISQL_PASSWORD");
+                if (!access.verify(configuredUser ? configuredUser : "", configuredPassword ? configuredPassword : ""))
+                    throw minisql::MiniSqlError(minisql::ErrorCode::Permission, "Permission denied");
+            }
+            const auto binding = database.bindAccess(source);
+            json objects = json::array();
+            for (const auto& object : binding.objects)
+                objects.push_back({{"object", object.object}, {"action", minisql::security::permissionName(object.action)}});
+            result = {{"success", true}, {"bound", binding.bound},
+                      {"statementAction", minisql::security::permissionName(binding.statementAction)},
+                      {"objects", std::move(objects)}, {"diagnostic", binding.diagnostic}};
+            result["integerEncoding"] = "safe-number-or-decimal-string";
+            std::cout << minisql::wireJson(result).dump() << '\n';
+            return 0;
+        }
         if (mode == "catalog") { authorizeDirect(database, access, mode); result = database.catalog(); }
         else {
             const std::string source = sqlFile.empty() ? std::string{std::istreambuf_iterator<char>(std::cin), {}} : readSqlFile(sqlFile);
-            authorizeDirect(database, access, mode, source);
+            const auto binding = directAccessRequest(database, access, mode, source);
             result = mode == "execute" ? database.executeScript(source) : mode == "diagnostics" ? database.diagnostics(source) : mode == "statistics" ? database.statistics() : database.compile(source);
+            attachAccessObjects(result, binding);
         }
         result["integerEncoding"] = "safe-number-or-decimal-string";
         std::cout << minisql::wireJson(result).dump() << '\n';

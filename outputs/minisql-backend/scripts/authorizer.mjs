@@ -12,9 +12,6 @@ import {
   normalizeAccess, publicAccess, roleNames, verifyUser,
 } from './access-catalog.mjs';
 import { openStore, pagesPathFor, readHeader, writeStore } from './access-store.mjs';
-import { firstKeyword, tableReferences } from './sql-object-references.mjs';
-
-export { firstKeyword, tableReferences };
 
 export const PERMISSION_DENIED_CODE = 7001;
 
@@ -67,22 +64,26 @@ function requirePermissions(raw) {
 }
 
 // ---------------------------------------------------------------------------
-// SQL → 权限检查项映射（CLI 与 HTTP 共用，保证两条路径判定完全一致）
+// 绑定结果 → 权限检查项映射（CLI 与 HTTP 共用，保证两条路径判定完全一致）
+//
+// 输入是 C++ 绑定器给出的 AccessRequest：statementAction 与每个对象的 action。
+// 本模块不再读取、不解析、也不扫描 SQL 文本；未绑定的语句一律 fail-closed。
 // ---------------------------------------------------------------------------
 
-export function sqlPermissionChecks(mode, sql) {
+export function permissionChecksFromBinding(binding, mode) {
   if (mode === 'catalog' || mode === 'statistics' || mode === 'buffer') return [{ permission: 'read', object: '*' }];
   if (mode === 'health' || mode === 'audit' || mode === 'capabilities') return [{ permission: 'read', object: '*' }];
   if (mode === 'close') return [{ permission: 'connect', object: '*' }];
-  const keyword = firstKeyword(sql);
-  const objects = tableReferences(sql, keyword);
-  let permission = 'compile';
-  if (keyword === 'BEGIN' || keyword === 'COMMIT' || keyword === 'ROLLBACK' || keyword === 'CHECKPOINT') permission = 'transaction';
-  else if (keyword === 'CREATE') permission = 'create';
-  else if (keyword === 'DROP') permission = 'drop';
-  else if (keyword === 'SELECT' || keyword === 'INSERT' || keyword === 'UPDATE' || keyword === 'DELETE') permission = keyword.toLowerCase();
-  if (!objects.length) return [{ permission, object: '*' }];
-  return objects.map(object => ({ permission, object }));
+  if (!binding || binding.bound !== true) throw new AccessDeniedError('unbound-statement');
+  const compileOnly = mode === 'compile' || mode === 'diagnostics';
+  const permissionFor = action => {
+    const name = String(action ?? '').toLowerCase();
+    if (compileOnly && (name === 'select' || name === 'read')) return 'compile';
+    return name;
+  };
+  const objects = Array.isArray(binding.objects) ? binding.objects : [];
+  if (!objects.length) return [{ permission: permissionFor(binding.statementAction), object: '*' }];
+  return objects.map(object => ({ permission: permissionFor(object.action), object: String(object.object) }));
 }
 
 // ---------------------------------------------------------------------------
@@ -187,8 +188,8 @@ export class Authorizer {
     return this.permissionVersion;
   }
 
-  authorizeSql(user, mode, sql) {
-    return this.authorize(user, sqlPermissionChecks(mode, sql));
+  authorizeBinding(user, mode, binding) {
+    return this.authorize(user, permissionChecksFromBinding(binding, mode));
   }
 
   /** 目录/统计响应过滤：无 SELECT 权限的表不得出现在任何面向用户的列表里。 */

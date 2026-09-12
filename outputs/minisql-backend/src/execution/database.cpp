@@ -47,6 +47,15 @@ std::string key(std::string value) {
     std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
     return value;
 }
+// 把索引建造/校验阶段收集到的问题列表拼成一条诊断消息。
+std::string joinProblems(const std::vector<std::string>& problems) {
+    std::string message;
+    for (const auto& problem : problems) {
+        if (!message.empty()) message += "; ";
+        message += problem;
+    }
+    return message;
+}
 // 缓冲池帧数：默认取构造参数，MINISQL_BUFFER_FRAMES 可覆盖（用于观察命中率与替换日志）。
 std::size_t resolveBufferFrames(std::size_t frames) {
     if (const char* configured = std::getenv("MINISQL_BUFFER_FRAMES")) {
@@ -717,6 +726,85 @@ nlohmann::json Database::indexInspect(const std::string& table, const std::strin
             {"leafChainLinked", state.leafChainLinked}, {"parentLinksValid", state.parentLinksValid},
             {"storage", "page-file"}, {"problems", std::move(problems)}, {"pages", std::move(pages)}};
 }
+nlohmann::json Database::indexVerify(const std::string& table, const std::string& index) {
+    std::lock_guard<std::recursive_mutex> guard(mu_);
+    requireAvailable();
+    const catalog::StoredTable* stored = nullptr;
+    for (const auto& candidate : catalog_.tables())
+        if (key(candidate.definition.table) == key(table)) { stored = &candidate; break; }
+    if (!stored) throw MiniSqlError(ErrorCode::Catalog, "Index table not found: " + table);
+    RuntimeIndex* found = nullptr;
+    for (auto& candidate : indexes_)
+        if (key(candidate->table) == key(table) && key(candidate->name) == key(index)) { found = candidate.get(); break; }
+    if (!found) throw MiniSqlError(ErrorCode::Catalog, "Index not found: " + index);
+    ++indexVerifications_;
+    auto report = verifyIndexConsistency(*found, stored->id, rowSchema(stored->definition));
+    report["kind"] = "IndexVerify";
+    report["table"] = found->table;
+    report["index"] = found->name;
+    report["unique"] = found->unique;
+    report["storage"] = found->pageFile ? "page-file" : "memory";
+    report["height"] = found->height();
+    return report;
+}
+nlohmann::json Database::indexRebuild(const std::string& table, const std::string& index) {
+    std::lock_guard<std::recursive_mutex> guard(mu_);
+    requireAvailable();
+    if (transaction_ == TransactionState::Aborted)
+        throw MiniSqlError(ErrorCode::Transaction, "Transaction aborted; ROLLBACK required");
+    const catalog::StoredTable* stored = nullptr;
+    for (const auto& candidate : catalog_.tables())
+        if (key(candidate.definition.table) == key(table)) { stored = &candidate; break; }
+    if (!stored) throw MiniSqlError(ErrorCode::Catalog, "Index table not found: " + table);
+    const auto* definition = catalog_.view().find(stored->definition.table);
+    if (!definition) throw MiniSqlError(ErrorCode::Catalog, "Index table definition not found");
+    const catalog::Index* definitionIndex = nullptr;
+    for (const auto& candidate : definition->indexes)
+        if (key(candidate.name) == key(index)) { definitionIndex = &candidate; break; }
+    if (!definitionIndex) throw MiniSqlError(ErrorCode::Catalog, "Index not found: " + index);
+    std::vector<std::size_t> columns;
+    for (const auto& name : definitionIndex->columns) columns.push_back(catalog::resolveColumnIndex(*definition, name));
+    const auto schema = rowSchema(stored->definition);
+    // 在线重建与堆页变更共用写批次：事务内随事务提交/回滚，事务外自成一批。
+    const bool ownBatch = transaction_ != TransactionState::Active;
+    if (ownBatch) buffer_.beginWriteBatch();
+    try {
+        // 阶段一 build + 阶段二 validate。
+        auto candidate = std::make_unique<RuntimeIndex>(definitionIndex->name, stored->definition.table,
+                                                        columns, definitionIndex->unique, pageFileIndexes_);
+        std::size_t entries = 0;
+        const auto problems = buildIndexEntries(*candidate, stored->id, schema, &entries);
+        if (!problems.empty()) {
+            const auto detail = "Index rebuild validation failed: " + index + " (" + joinProblems(problems) + ")";
+            throw MiniSqlError(ErrorCode::Execution, detail);
+        }
+        // 阶段三 publish：替换同一索引的运行实例，旧节点页随批次释放。
+        indexes_.erase(std::remove_if(indexes_.begin(), indexes_.end(), [&](const auto& runtime) {
+            return key(runtime->table) == key(stored->definition.table) && key(runtime->name) == key(index);
+        }), indexes_.end());
+        const auto height = candidate->height();
+        const auto pages = file_->pagesFor(indexOwnerId(stored->definition.table, index)).size();
+        indexes_.push_back(std::move(candidate));
+        ++indexOnlineRebuilds_;
+        ++indexVersion_;
+        if (!pageFileIndexes_) persistMemoryIndexes(stored->id);
+        if (ownBatch) {
+            const auto committedDirtyPages = file_->stagedPageCount();
+            buffer_.commitWriteBatch();
+            invalidateAnalyzeSnapshot();
+            evaluateAutoCheckpoint(1, committedDirtyPages);
+        } else {
+            ++transactionWriteStatements_;
+            invalidateAnalyzeSnapshot();
+        }
+        return {{"kind", "IndexRebuild"}, {"table", stored->definition.table}, {"index", index},
+                {"entries", entries}, {"height", height}, {"pages", pages},
+                {"commitState", ownBatch ? "committed" : "pending"}};
+    } catch (...) {
+        if (ownBatch) rollbackBatch();
+        throw;
+    }
+}
 void Database::evaluateAutoCheckpoint(std::size_t committedWriteStatements, std::size_t committedDirtyPages) {
     if (committedWriteStatements == 0) return;
     if (pendingAutoCheckpointWrites_ > std::numeric_limits<std::size_t>::max() - committedWriteStatements)
@@ -898,43 +986,131 @@ void Database::initializeIndexes(std::uint64_t tableId, bool forceRebuild, bool 
         for (const auto& name : index.columns) columns.push_back(catalog::resolveColumnIndex(*definition, name));
         auto runtime = std::make_unique<RuntimeIndex>(index.name, stored->definition.table, columns, index.unique, pageFileIndexes_);
         const auto owner = indexOwnerId(stored->definition.table, index.name);
+        // 复用路径不重写页：已持久化且结构校验通过（或内存快照可还原）时直接发布。
+        bool reusable = false;
         if (pageFileIndexes_) {
             runtime->pageTree = std::make_unique<storage::PageBPlusTree>(file_, buffer_, owner, 64, index.unique);
             if (!forceRebuild && runtime->pageTree->exists()) {
                 try {
-                    if (runtime->pageTree->validate()) {
-                        indexes_.push_back(std::move(runtime));
-                        continue;
-                    }
+                    reusable = runtime->pageTree->validate();
                 } catch (const MiniSqlError&) {
                     if (!allowRebuild) throw;
                 }
             }
-            if (!allowRebuild) throw MiniSqlError(ErrorCode::Storage, "Index pages missing after rollback: " + index.name);
-            clearIndexPages(owner);
-            runtime->pageTree = std::make_unique<storage::PageBPlusTree>(file_, buffer_, owner, 64, index.unique);
-            if (!runtime->pageTree->create()) throw MiniSqlError(ErrorCode::Catalog, "Failed to create page index: " + index.name);
-            heap_.scan(tableId, schema, [&](storage::RowRef ref, const storage::Row& row) {
-                const auto indexKey = runtime->keyFor(row);
-                if (!runtime->insert(indexKey, ref)) throw MiniSqlError(ErrorCode::Execution, "UNIQUE index violation: " + index.name);
-            });
-            ++indexFullRebuilds_;
-            indexes_.push_back(std::move(runtime));continue;
+        } else if (!forceRebuild) {
+            std::string loadFailure;
+            reusable = loadIndexPages(runtime->tree, owner, fingerprint, &loadFailure);
+            if (!reusable && !allowRebuild)
+                throw MiniSqlError(ErrorCode::Storage, "Index snapshot missing after rollback: " + index.name + " (" + loadFailure + ")");
         }
-        std::string loadFailure;
-        if (!forceRebuild && loadIndexPages(runtime->tree, owner, fingerprint, &loadFailure)) {
-            indexes_.push_back(std::move(runtime));continue;
-        }
-        if (!allowRebuild) throw MiniSqlError(ErrorCode::Storage,
-            "Index snapshot missing after rollback: " + index.name + " (" + loadFailure + ")");
-        heap_.scan(tableId, schema, [&](storage::RowRef ref, const storage::Row& row) {
-            const auto indexKey = runtime->keyFor(row);
-            if (!runtime->insert(indexKey, ref)) throw MiniSqlError(ErrorCode::Execution, "UNIQUE index violation: " + index.name);
-        });
-        persistIndexPages(runtime->tree, owner, fingerprint);
+        if (reusable) { indexes_.push_back(std::move(runtime)); continue; }
+        if (!allowRebuild) throw MiniSqlError(ErrorCode::Storage, "Index pages missing after rollback: " + index.name);
+        // 阶段一 build + 阶段二 validate：候选树在写批次内重建并校验；
+        // 失败抛出即随批次回滚，绝不把未通过校验的索引发给优化器。
+        std::size_t entries = 0;
+        const auto problems = buildIndexEntries(*runtime, tableId, schema, &entries);
+        if (!problems.empty())
+            throw MiniSqlError(ErrorCode::Execution, "Index build validation failed: " + index.name + " (" + joinProblems(problems) + ")");
         ++indexFullRebuilds_;
+        // 阶段三 publish：内存引擎写回快照，页级引擎的节点页已落在 owner 下。
+        if (!pageFileIndexes_) persistIndexPages(runtime->tree, owner, fingerprint);
         indexes_.push_back(std::move(runtime));
     }
+}
+// 三阶段建造的 build + validate：把堆表全量条目写进 index（页级引擎先清空 owner 页），
+// 再校验树结构、条目数与唯一性。返回的问题列表为空才算通过；调用方负责 publish。
+std::vector<std::string> Database::buildIndexEntries(RuntimeIndex& index, std::uint64_t tableId,
+                                                     const storage::RowSchema& schema, std::size_t* entries) {
+    std::vector<std::string> problems;
+    if (index.pageFile) {
+        const auto owner = indexOwnerId(index.table, index.name);
+        clearIndexPages(owner);
+        index.pageTree = std::make_unique<storage::PageBPlusTree>(file_, buffer_, owner, 64, index.unique);
+        if (!index.pageTree->create()) problems.push_back("cannot create index pages");
+    } else {
+        index.tree.reset();
+    }
+    std::size_t built = 0, duplicates = 0;
+    heap_.scan(tableId, schema, [&](storage::RowRef ref, const storage::Row& row) {
+        const auto indexKey = index.keyFor(row);
+        if (!RuntimeIndex::indexable(indexKey)) return;
+        if (index.insert(indexKey, ref)) ++built;
+        else ++duplicates;
+    });
+    const bool structureValid = index.pageFile ? index.pageTree->validate() : index.tree.validate();
+    if (!structureValid) problems.push_back("index structure invalid");
+    if (duplicates > 0) problems.push_back("duplicate keys for unique index (" + std::to_string(duplicates) + ")");
+    if (index.size() != built) problems.push_back("entry count mismatch (" + std::to_string(index.size()) + " != " + std::to_string(built) + ")");
+    if (entries) *entries = built;
+    return problems;
+}
+// 堆表与索引的双向一致性检查：结构、条目数、每条堆行在索引内可达、每个索引条目指向存活且键一致的堆行。
+nlohmann::json Database::verifyIndexConsistency(RuntimeIndex& index, std::uint64_t tableId,
+                                                const storage::RowSchema& schema) {
+    nlohmann::json foundProblems = nlohmann::json::array();
+    const auto appendProblem = [&](const std::string& problem) {
+        if (foundProblems.size() < 32) foundProblems.push_back(problem);
+    };
+    const auto sameRow = [](const storage::RowRef& a, const storage::RowRef& b) {
+        return a.page.id == b.page.id && a.page.generation == b.page.generation &&
+               a.slot.slot == b.slot.slot && a.slot.generation == b.slot.generation;
+    };
+    bool structureValid = false;
+    try {
+        structureValid = index.validate();
+    } catch (const std::exception&) {
+        structureValid = false;
+    }
+    if (!structureValid) appendProblem("index structure invalid");
+    if (index.pageFile) {
+        const auto state = index.pageTree->inspect();
+        for (const auto& problem : state.problems) appendProblem(problem);
+    }
+    std::size_t heapRows = 0, indexableRows = 0, missing = 0;
+    heap_.scan(tableId, schema, [&](storage::RowRef ref, const storage::Row& row) {
+        ++heapRows;
+        const auto indexKey = index.keyFor(row);
+        if (!RuntimeIndex::indexable(indexKey)) return;
+        ++indexableRows;
+        const auto matches = index.search(indexKey);
+        if (std::none_of(matches.begin(), matches.end(), [&](const storage::RowRef& candidate) { return sameRow(candidate, ref); })) {
+            ++missing;
+            appendProblem("heap row missing from index");
+        }
+    });
+    const auto allEntries = index.range(std::nullopt, true, std::nullopt, true);
+    std::size_t dangling = 0, keyMismatch = 0;
+    for (const auto& ref : allEntries) {
+        storage::Row row;
+        bool alive = true;
+        try {
+            row = heap_.read(tableId, schema, ref);
+        } catch (const std::exception&) {
+            alive = false;
+        }
+        if (!alive) {
+            ++dangling;
+            appendProblem("index entry points to a missing row");
+            continue;
+        }
+        const auto indexKey = index.keyFor(row);
+        if (!RuntimeIndex::indexable(indexKey)) {
+            ++dangling;
+            appendProblem("index entry points to a non-indexable row");
+            continue;
+        }
+        const auto matches = index.search(indexKey);
+        if (std::none_of(matches.begin(), matches.end(), [&](const storage::RowRef& candidate) { return sameRow(candidate, ref); })) {
+            ++keyMismatch;
+            appendProblem("index entry key mismatch");
+        }
+    }
+    const std::size_t indexRows = allEntries.size();
+    return {{"consistent", structureValid && missing == 0 && dangling == 0 && keyMismatch == 0 &&
+                            indexRows == indexableRows && index.size() == indexRows},
+            {"structureValid", structureValid}, {"heapRows", heapRows}, {"indexableRows", indexableRows},
+            {"indexRows", indexRows}, {"runtimeEntries", index.size()}, {"missingEntries", missing},
+            {"danglingEntries", dangling}, {"keyMismatches", keyMismatch}, {"problems", std::move(foundProblems)}};
 }
 void Database::reloadIndexRuntimes() {
     indexes_.clear();
@@ -1834,23 +2010,30 @@ nlohmann::json Database::runNode(const sql::LogicalPlan& plan) {
         if (!definition) fail("Index table definition missing");
         std::vector<std::size_t> columns;
         for (const auto& name : plan.indexColumns) columns.push_back(catalog::resolveColumnIndex(*definition, name));
-        if (plan.uniqueIndex) {
-            std::set<json> keys;
-            heap_.scan(stored->id, rowSchema(stored->definition), [&](storage::RowRef, const storage::Row& row) {
-                json key = json::array();
-                bool hasNull = false;
-                for (const auto column : columns) { key.push_back(cell(row[column]));hasNull = hasNull || key.back().is_null(); }
-                if (hasNull) return;
-                if (!keys.insert(key).second) fail("UNIQUE index contains duplicate keys");
+        // 唯一索引建造三阶段：先在候选树里 build，再 validate（结构/条目数/唯一性），
+        // 只有全部通过才在 publish 阶段登记目录与运行实例；任一步失败随写批次回滚。
+        auto candidate = std::make_unique<RuntimeIndex>(plan.indexName, stored->definition.table, columns,
+                                                        plan.uniqueIndex, pageFileIndexes_);
+        std::size_t entries = 0;
+        const auto problems = buildIndexEntries(*candidate, stored->id, rowSchema(stored->definition), &entries);
+        if (!problems.empty()) {
+            const bool duplicate = std::any_of(problems.begin(), problems.end(), [](const std::string& problem) {
+                return problem.rfind("duplicate keys", 0) == 0;
             });
+            if (plan.uniqueIndex && duplicate) fail("UNIQUE index contains duplicate keys");
+            const auto detail = "Index build validation failed: " + plan.indexName + " (" + joinProblems(problems) + ")";
+            fail(detail.c_str());
         }
         sql::Statement indexDefinition;
         indexDefinition.kind = "CreateIndex";indexDefinition.indexName = plan.indexName;
         indexDefinition.uniqueIndex = plan.uniqueIndex;indexDefinition.table = plan.table;
         indexDefinition.indexColumns = plan.indexColumns;
         catalog_.createIndex(indexDefinition);
-        rebuildIndexes(stored->id);
+        indexes_.push_back(std::move(candidate));
+        // 内存引擎需把发布后的树写回快照，否则后续失败回滚无法还原运行时。
+        if (!pageFileIndexes_) persistMemoryIndexes(stored->id);
         result["kind"] = "CreateIndex";
+        result["entriesBuilt"] = entries;
         return result;
     }
     if (plan.kind == "DropIndex") {

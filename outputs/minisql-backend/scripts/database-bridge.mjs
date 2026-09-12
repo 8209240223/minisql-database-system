@@ -5,7 +5,6 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createHash, randomUUID } from 'node:crypto';
 import { openSession } from './session-process.mjs';
-import { firstKeyword, tableReferences } from './sql-object-references.mjs';
 import { can, canConnect, defaultAccess, normalizeAccess, publicAccess,
   createUser, dropUser, createRole, dropRole, setPassword, addRole, removeRole, grant, revoke } from './access-catalog.mjs';
 import { openStore, readHeader, writeStore } from './access-store.mjs';
@@ -58,26 +57,28 @@ let turnOwner;
 let activeOperation;
 const transactionWaiters = [];
 const turnWaiters = [];
-function sqlPermissionChecks(mode, sql) {
-  if (mode === 'catalog' || mode === 'statistics' || mode === 'buffer') return [{ permission: 'READ', object: '*' }];
-  if (mode === 'health' || mode === 'audit' || mode === 'capabilities') return [{ permission: 'READ', object: '*' }];
-  if (mode === 'close') return [{ permission: 'CONNECT', object: '*' }];
-  const keyword = firstKeyword(sql);
-  const objects = tableReferences(sql, keyword);
-  let permission = 'COMPILE';
-  if (keyword === 'BEGIN' || keyword === 'COMMIT' || keyword === 'ROLLBACK' || keyword === 'CHECKPOINT') permission = 'TRANSACTION';
-  else if (keyword === 'CREATE') permission = 'CREATE';
-  else if (keyword === 'DROP') permission = 'DROP';
-  else if (keyword === 'SELECT' || keyword === 'INSERT' || keyword === 'UPDATE' || keyword === 'DELETE') permission = keyword;
-  if (!objects.length) return [{ permission, object: '*' }];
-  return objects.map(object => ({ permission, object }));
-}
-function authorizeSql(user, mode, sql) {
-  for (const check of sqlPermissionChecks(mode, sql)) {
-    if (!can(access, user, check.permission, check.object)) {
-      throw httpError(403, 'Permission denied');
-    }
+// 授权判定完全交给 C++ 绑定结果：bridge 不再读取或扫描 SQL 文本。
+// 会话内取绑定供只读判定与审计用（不用于授权决策）。
+async function bindAccessForSql(sql, sessionRoute, user, password) {
+  if (sessionRoute) {
+    const session = sessions.get(sessionRoute[1]);
+    if (!session) throw httpError(404, 'Session not found or expired');
+    if (session.user !== user) throw httpError(403, 'Permission denied');
+    return enqueue(async () => {
+      const currentEngine = await ensureEngine();
+      return currentEngine.worker.request('bindAccess', sql, { sessionId: session.id, cancelFile: session.cancelFile, user: session.user, password: session.password ?? '' });
+    });
   }
+  return callDatabase('bindAccess', sql, {}, { user, password });
+}
+const READ_ONLY_ACTIONS = new Set(['select', 'read', 'compile']);
+// 流式入口只读兜底：同样只看绑定结果，不看 SQL 文本。
+function readOnlyBinding(binding) {
+  if (!binding || binding.success === false) return { allowed: false, message: binding?.error?.message ?? 'Permission denied' };
+  const allowed = binding.bound === true && READ_ONLY_ACTIONS.has(String(binding.statementAction ?? '').toLowerCase()) &&
+    (binding.objects ?? []).every(object => READ_ONLY_ACTIONS.has(String(object.action ?? '').toLowerCase()));
+  if (!allowed) return { allowed: false, message: 'Streaming endpoint accepts read-only SELECT or EXPLAIN SQL' };
+  return { allowed: true, objects: [...new Set((binding.objects ?? []).map(object => String(object.object).toLowerCase()))] };
 }
 const backupDirectory = resolve(process.env.MINISQL_BACKUP_DIR ?? resolve(dirname(database), 'backups'));
 mkdirSync(backupDirectory, { recursive: true });
@@ -492,9 +493,18 @@ function touchSession(session) {
   }, sessionIdleMs);
 }
 
-function callDatabase(mode, sql = '', extraEnv = {}) {
+function callDatabase(mode, sql = '', extraEnv = {}, authorization = null) {
   return new Promise((resolveResult, reject) => {
-    const child = spawn(executable, [database, mode], { windowsHide: true, env: { ...process.env, ...extraEnv, MINISQL_AUTH_BYPASS: '1' } });
+    // authorization 为空表示 bridge 内部调用（备份/恢复/健康检查）自己承担授权；
+    // 否则把身份透传给引擎，由引擎按绑定结果判定对象权限。
+    const env = { ...process.env, ...extraEnv, MINISQL_ACCESS_FILE: accessPagesFile };
+    if (authorization) {
+      env.MINISQL_USER = authorization.user ?? '';
+      env.MINISQL_PASSWORD = authorization.password ?? '';
+    } else {
+      env.MINISQL_AUTH_BYPASS = '1';
+    }
+    const child = spawn(executable, [database, mode], { windowsHide: true, env });
     const output = [];
     let length = 0, stopped = false;
     const stop = () => { stopped = true; child.kill(); };
@@ -843,6 +853,8 @@ const server = http.createServer(async (req, res) => {
       atomicPermissionEndpoints: true, permissionEndpoints: ['POST /users', 'DELETE /users/:name', 'POST /users/:name/password', 'POST /users/:name/roles', 'DELETE /users/:name/roles/:role', 'POST /roles', 'DELETE /roles/:name', 'POST /grants', 'POST /revokes'],
       passwordHashing: 'sha256-salted', auditFiltering: true, sessionIdentity: true,
       indexPageStorage: true,
+      indexVerify: true, indexRebuild: true, indexConsistencyCheck: true,
+      uniqueIndexBuildPhases: ['build', 'validate', 'publish'], indexIncrementalMaintenance: true,
       capabilities: ['backupRestore', 'backupIncremental', 'backupChain', 'backupMigration', 'permissions', 'audit', 'create', 'insert', 'multiRowInsert', 'select', 'delete', 'update', 'arithmetic', 'projection', 'tableAlias', 'innerJoin', 'leftJoin', 'null', 'notNull', 'bigint', 'float', 'default', 'primaryKey', 'unique', 'compositeKey', 'distinct', 'orderBy', 'limit', 'groupBy', 'having', 'count', 'sum', 'min', 'max', 'avg', 'compile', 'diagnostics', 'inSubquery', 'existsSubquery', 'scalarSubquery', 'correlatedSubquery', 'astRoundTrip', 'planRoundTrip', 'hashJoin', 'predicatePushdown', 'pruneColumns', 'statistics', 'createIndex', 'indexScan', 'uniqueIndex', 'indexPersistence', 'indexSnapshots', 'indexPageStorage', 'checkpoint', 'nodeStatistics', 'optimizer', 'storageStats', 'externalSort', 'sortSpill', 'externalAggregate', 'aggregateSpill', 'distinctSpill', 'joinSpill', 'queryResourceManager', 'cancellation', 'streamingResults', 'autoCheckpoint', 'multiSession', 'sessionRegistry', 'health'] });
     return;
   }
@@ -1085,11 +1097,12 @@ const server = http.createServer(async (req, res) => {
     } catch (error) { send(503, { success: false, error: { message: error instanceof Error ? error.message : String(error) } }); }
     return;
   }
-  const inspectRoute = req.url?.match(/^\/api\/sessions\/([a-zA-Z0-9-]+)\/index-inspect$/);
-  if (inspectRoute) {
+  const indexRoute = req.url?.match(/^\/api\/sessions\/([a-zA-Z0-9-]+)\/index-(inspect|verify|rebuild)$/);
+  if (indexRoute) {
     req.resume();
-    if (req.method !== 'POST') { send(405, { success: false, error: { code: 405, message: 'Index inspection requires POST' } }); return; }
-    const session = sessions.get(inspectRoute[1]);
+    const action = indexRoute[2];
+    if (req.method !== 'POST') { send(405, { success: false, error: { code: 405, message: `Index ${action} requires POST` } }); return; }
+    const session = sessions.get(indexRoute[1]);
     if (!session) { send(404, { success: false, error: { code: 404, message: 'Session not found or expired' } }); return; }
     if (session.user !== requestUser) { send(403, { success: false, error: { code: 7001, message: 'Permission denied' } }); return; }
     try {
@@ -1097,11 +1110,14 @@ const server = http.createServer(async (req, res) => {
       for await (const chunk of req) chunks.push(chunk);
       const body = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks)));
       if (typeof body.table !== 'string' || typeof body.index !== 'string') throw httpError(400, 'Expected table and index strings');
-      if (!can(access, requestUser, 'READ', body.table)) throw httpError(403, 'Permission denied');
-      auditSql = `INDEX INSPECT ${body.table}.${body.index}`;
+      // 结构检查只读；在线重建改写索引页，按对象写权限（UPDATE）收紧。
+      const permission = action === 'rebuild' ? 'UPDATE' : 'READ';
+      if (!can(access, requestUser, permission, body.table)) throw httpError(403, 'Permission denied');
+      auditSql = `INDEX ${action.toUpperCase()} ${body.table}.${body.index}`;
       auditObjects = [body.table.toLowerCase()];
-      const data = await runSessionOperation(session, 'indexInspect', '', res, { table: body.table, index: body.index });
-      send(data.success === false ? (quarantined ? 503 : 422) : 200, data);
+      const operation = action === 'inspect' ? 'indexInspect' : action === 'verify' ? 'indexVerify' : 'indexRebuild';
+      const data = await runSessionOperation(session, operation, '', res, { table: body.table, index: body.index });
+      send(data.success === false ? (data.error?.code === 7001 ? 403 : quarantined ? 503 : 422) : 200, data);
     } catch (error) { send(error.status ?? 400, { success: false, error: { message: error instanceof Error ? error.message : String(error) } }); }
     return;
   }
@@ -1132,16 +1148,17 @@ const server = http.createServer(async (req, res) => {
         if (typeof body.requestId === 'string' && body.requestId.length > 0 && body.requestId.length <= 128) requestId = body.requestId;
         sql = body.sql;
         auditSql = sql.slice(0, 4096);
-        auditObjects = tableReferences(sql, firstKeyword(sql));
-        if (streamed && firstKeyword(sql) !== 'SELECT' && firstKeyword(sql) !== 'EXPLAIN') {
-          send(400, { success: false, error: { code: 400, message: 'Streaming endpoint accepts read-only SELECT or EXPLAIN SQL' } }); return;
-        }
-        try { authorizeSql(requestUser, mode, sql); }
-        catch (error) { send(403, { success: false, error: { code: 7001, message: 'Permission denied' } }); return; }
       } catch { send(400, { error: { message: 'Expected UTF-8 JSON with a sql string' } }); return; }
+      if (streamed) {
+        // 只读兜底也只看绑定结果：一旦出现写动作，就在开始分帧前拒绝。
+        let binding;
+        try { binding = await bindAccessForSql(sql, sessionRoute, requestUser, requestPassword); }
+        catch (error) { send(error.status ?? 400, { success: false, error: { message: error.message } }); return; }
+        const readOnly = readOnlyBinding(binding);
+        if (!readOnly.allowed) { send(400, { success: false, error: { code: 400, message: readOnly.message } }); return; }
+        if (readOnly.objects.length) auditObjects = readOnly.objects;
+      }
     }
-    try { authorizeSql(requestUser, mode, sql); }
-    catch (error) { send(403, { success: false, error: { code: 7001, message: 'Permission denied' } }); return; }
     const started = performance.now();
     const data = await (async () => {
       if (!sessionRoute) {
@@ -1156,7 +1173,7 @@ const server = http.createServer(async (req, res) => {
             }
           };
           res.once('close', disconnected);
-          try { return await callDatabase(mode, sql, { MINISQL_CANCEL_FILE: cancelFile }); }
+          try { return await callDatabase(mode, sql, { MINISQL_CANCEL_FILE: cancelFile }, { user: requestUser, password: requestPassword ?? '' }); }
           finally { res.off('close', disconnected); clearCancelFile(cancelFile); }
         });
       }
@@ -1184,7 +1201,14 @@ const server = http.createServer(async (req, res) => {
       data.tables = data.tables.filter(table => can(access, requestUser, 'SELECT', table.name));
     }
     const resourceLimited = data.error?.code === 5001 && /budget exceeded/i.test(data.error?.message ?? '');
-    const status = data.success === false ? (quarantined ? 503 : resourceLimited ? 413 : 422) : 200;
+    // 审计对象来自引擎绑定结果；权限/只读错误按语义映射到 403/400。
+    if (Array.isArray(data?.accessObjects) && data.accessObjects.length)
+      auditObjects = data.accessObjects.map(object => String(object).toLowerCase());
+    const permissionDenied = data.error?.code === 7001;
+    const readOnlyViolation = !permissionDenied && /read-?only/i.test(data.error?.message ?? '');
+    const status = data.success === false
+      ? (permissionDenied ? 403 : readOnlyViolation ? 400 : quarantined ? 503 : resourceLimited ? 413 : 422)
+      : 200;
     const response = mode === 'catalog' || mode === 'buffer' || mode === 'diagnostics' || mode === 'statistics' ? data : queryResult(data, performance.now() - started);
     if (data.success === false && data.completedStatements > 0) {
       const committed = (data.results ?? []).filter(result => result.commitState === 'committed').length;

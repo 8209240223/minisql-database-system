@@ -73,6 +73,10 @@ BPlusTree::BPlusTree(std::size_t maxKeys, bool unique) : maxKeys_(maxKeys), uniq
     if (maxKeys < 3 || maxKeys > 4096) throw MiniSqlError(ErrorCode::InvalidArgument, "B+ tree maxKeys must be between 3 and 4096");
     root_ = std::make_unique<Node>();
 }
+void BPlusTree::reset() {
+    root_ = std::make_unique<Node>();
+    size_ = 0;
+}
 bool BPlusTree::insert(IndexKey key, RowRef row) {
     if (unique_ && !search(key).empty()) return false;
     auto split = insert(*root_, std::move(key), row);
