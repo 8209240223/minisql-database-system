@@ -5,7 +5,7 @@ import { lintGutter, setDiagnostics } from '@codemirror/lint';
 import { sql } from '@codemirror/lang-sql';
 import { Activity, Braces, ChevronDown, ChevronRight, CircleHelp, Database, FileCode2, FolderTree, History, MoreHorizontal, Play, Plus, RefreshCw, Search, Settings2, Shield, Table2, Terminal, Trash2, X } from 'lucide-react';
 import { getCatalog, getHealth, getStorage, runSql, openApiSession, closeApiSession, releaseApiSession, cancelSession,
-  getCapabilities, getBackups, createBackup, restoreBackup, validateBackup, inspectIndex } from './client';
+  getCapabilities, getBackups, createBackup, restoreBackup, validateBackup, inspectIndex, verifyIndex, rebuildIndex } from './client';
 import type { IndexInspect } from './client';
 import { AccessControl } from './AccessControl';
 import { StorageStatisticsView } from './StorageStatistics';
@@ -16,7 +16,7 @@ import { Plug, Unplug, Check, Undo2, CirclePlay, Pencil, Upload, Download, WandS
 import { Plan, Diagnostics, TokenStream } from './CompilerViews';
 import type { BackupEntry, Capabilities, Connection, ConnectionProfile, Diagnostic, HistoryItem, QueryTab, SqlToken, Table } from './types';
 import { Results } from './Results';
-import { DRAFT_KEY, emptyView, restoreTabs } from './query-tabs';
+import { DRAFT_KEY, emptyView, newQueryTab, restoreTabs, serializeTabs } from './query-tabs';
 import type { QueryView } from './query-tabs';
 import './query-tabs.css';
 import { decodeSqlFile, sqlFilename, MAX_SQL_FILE_BYTES } from './sql-files';
@@ -86,8 +86,9 @@ function App() {
   const [connectionFeedback, setConnectionFeedback] = useState<string>();
   const [connectionTest, setConnectionTest] = useState<string>();
   const [tables, setTables] = useState<Table[]>([]);
-  const [tabs, setTabs] = useState<QueryTab[]>(() => restoreTabs([{ id: 'q1', name: 'query_1.sql', sql: starter }]));
+  const [tabs, setTabs] = useState<QueryTab[]>(() => restoreTabs([newQueryTab({ id: 'q1', name: 'query_1.sql', sql: starter })]));
   const [active, setActive] = useState(tabs[0].id);
+  const current = tabs.find(t => t.id === active) ?? tabs[0];
   const [views, setViews] = useState<Record<string, QueryView>>({});
   const liveTabs = useRef(new Set(tabs.map(tab => tab.id)));
   liveTabs.current = new Set(tabs.map(tab => tab.id));
@@ -98,15 +99,23 @@ function App() {
   const fileInput = useRef<HTMLInputElement>(null);
   const [draftSaved, setDraftSaved] = useState(true);
   const importing = useRef(false);
-  const [runningTab, setRunningTab] = useState<string>();
-  function updateView(patch: Partial<QueryView>) {
-    const id = active;
+  const activeRef = useRef(active);
+  activeRef.current = active;
+  const tabsRef = useRef(tabs);
+  tabsRef.current = tabs;
+  const controllers = useRef(new Map<string, AbortController>());
+  function updateViewFor(id: string, patch: Partial<QueryView>) {
     setViews(previous => liveTabs.current.has(id) ? { ...previous, [id]: { ...(previous[id] ?? emptyView), ...patch } } : previous);
+  }
+  function updateView(patch: Partial<QueryView>) { updateViewFor(active, patch); }
+  function updateTab(id: string, patch: Partial<QueryTab>) {
+    setTabs(previous => previous.map(tab => tab.id === id ? { ...tab, ...patch } : tab));
   }
   function setOutput(value: QueryView['output']) { updateView({ output: value }); }
   function setNotice(value: string) { updateView({ notice: value, diagnostic: undefined, diagnostics: undefined }); }
-  function settlePending(value: string) {
-    setViews(previous => Object.fromEntries(Object.entries(previous).map(([id, view]) => [id, view.outcome === 'pending' ? { ...view, outcome: value } : view])));
+  function settlePending(id: string, value: string) {
+    setViews(previous => previous[id]?.outcome === 'pending'
+      ? { ...previous, [id]: { ...previous[id], outcome: value } } : previous);
   }
   const [running, setRunning] = useState(false);
   const [history, setHistory] = useState<HistoryItem[]>(restoreHistory);
@@ -201,29 +210,35 @@ const [accessOpen, setAccessOpen] = useState(false);
       document.body.classList.remove('sidebar-resizing');
     };
   }, []);
-  function recordHistory(source: string, compile: boolean, durationMs: number, rows: number, error?: string) {
+  function recordHistory(source: string, compile: boolean, durationMs: number, rows: number, error?: string, sourceConnection = effectiveConnection) {
     setHistoryOmitted(source.length > MAX_HISTORY_SQL);
     if (source.length > MAX_HISTORY_SQL) return;
     const item: HistoryItem = { id: crypto.randomUUID(), sql: source, at: Date.now(), durationMs, rows,
-      mode: connection.mode, connection: connection.name, action: compile ? 'compile' : 'execute',
+      mode: sourceConnection.mode, connection: sourceConnection.name, action: compile ? 'compile' : 'execute',
       ...(error === undefined ? {} : { error: error.slice(0, 1000) }) };
     setHistory(previous => limitHistory([item, ...previous]));
   }
   const [filter, setFilter] = useState('');
   const [expanded, setExpanded] = useState<Record<string, boolean>>({ students: true, courses: false, enrollments: false });
   const [treeExpanded, setTreeExpanded] = useState({ schemas: true, schema: true, tables: true });
-  const [sessionId, setSessionId] = useState<string>();
+  const sessionId = current.sessionId;
+  const transactionState = current.transactionState;
+  const busy = useRef(false);
+  const effectiveConnection = { ...(current.connection ?? connection), sessionId };
   useEffect(() => {
     if (!sessionId) return;
-    const timer = window.setInterval(() => { void getHealth(connection).then(value => setHealth(value.status)).catch(() => setHealth('degraded')); }, 15000);
+    const timer = window.setInterval(() => { void getHealth(effectiveConnection).then(value => setHealth(value.status)).catch(() => setHealth('degraded')); }, 15000);
     return () => window.clearInterval(timer);
-  }, [connection.url, connection.user, connection.password, sessionId]);
-  const [transactionState, setTransactionState] = useState('IDLE');
-  const busy = useRef(false);
-  const effectiveConnection = { ...connection, sessionId };
-  const controller = useRef<AbortController | null>(null);
-  const current = tabs.find(t => t.id === active) ?? tabs[0];
+  }, [effectiveConnection.url, effectiveConnection.user, effectiveConnection.password, sessionId]);
   const visibleTables = useMemo(() => tables.filter(t => t.name.toLowerCase().includes(filter.toLowerCase())), [tables, filter]);
+  useEffect(() => {
+    if (!sessionId) { setTables([]); setStorageInfo(undefined); return; }
+    const tabId = active;
+    void Promise.all([getCatalog(effectiveConnection), getStorage(effectiveConnection), getHealth(effectiveConnection)]).then(([catalog, storage, nextHealth]) => {
+      if (activeRef.current !== tabId) return;
+      setTables(catalog); setStorageInfo(storage); setHealth(nextHealth.status);
+    }).catch(error => { if (activeRef.current === tabId) handleFailure(error, tabId); });
+  }, [active, sessionId]);
   useEffect(() => {
     if (!editorInstance?.dom.isConnected) return;
     const valid = diagnostic && notice && editorInstance.state.doc.toString() === diagnostic.source;
@@ -233,15 +248,18 @@ const [accessOpen, setAccessOpen] = useState(false);
     }] : []));
   }, [editorInstance, current.sql, diagnostic, notice]);
 
-  function handleFailure(error: unknown) {
+  function handleFailure(error: unknown, tabId = active) {
     const details = error as { transactionState?: string; status?: number; commitState?: string };
-    if (sessionId) {
-      if (details.transactionState === 'ABORTED') settlePending('rolledBack');
-      if (details.commitState === 'unknown') settlePending('unknown');
-      if (details.status === 404) { setSessionId(undefined); setTransactionState('EXPIRED'); setTables([]); setViews({}); }
-      else setTransactionState(details.commitState === 'unknown' ? 'UNKNOWN' : details.transactionState ?? 'UNKNOWN');
+    const tab = tabsRef.current.find(item => item.id === tabId);
+    if (tab?.sessionId) {
+      if (details.transactionState === 'ABORTED') settlePending(tabId, 'rolledBack');
+      if (details.commitState === 'unknown') settlePending(tabId, 'unknown');
+      if (details.status === 404) {
+        updateTab(tabId, { sessionId: undefined, transactionState: 'EXPIRED', running: false });
+        if (activeRef.current === tabId) { setTables([]); setStorageInfo(undefined); }
+      } else updateTab(tabId, { transactionState: details.commitState === 'unknown' ? 'UNKNOWN' : details.transactionState ?? 'UNKNOWN' });
     }
-    setNotice(error instanceof Error ? error.message : String(error));
+    updateViewFor(tabId, { notice: error instanceof Error ? error.message : String(error), diagnostic: undefined, diagnostics: undefined });
   }
   async function refresh() { try { setTables(await getCatalog(effectiveConnection)); } catch (e) { handleFailure(e); } }
   async function refreshStorage() { if (sessionId) { try { setStorageInfo(await getStorage(effectiveConnection)); } catch (e) { handleFailure(e); } } }
@@ -266,6 +284,27 @@ const [accessOpen, setAccessOpen] = useState(false);
     catch (error) { handleFailure(error); }
     finally { busy.current = false; setRunning(false); }
   }
+  async function verifyInspectedIndex() {
+    if (!inspectInfo || busy.current || !sessionId) return;
+    busy.current = true; setRunning(true);
+    try {
+      const result = await verifyIndex(effectiveConnection, inspectInfo.table, inspectInfo.index);
+      const refreshed = await inspectIndex(effectiveConnection, inspectInfo.table, inspectInfo.index);
+      setInspectInfo({ ...refreshed, message: result.valid === false ? `索引校验失败：${result.problems?.join('；') || '结构与堆表不一致'}` : '索引校验通过。' });
+    } catch (error) { handleFailure(error); }
+    finally { busy.current = false; setRunning(false); }
+  }
+  async function rebuildInspectedIndex() {
+    if (!inspectInfo || busy.current || !sessionId) return;
+    if (!window.confirm(`在线重建索引 ${inspectInfo.table}.${inspectInfo.index}？`)) return;
+    busy.current = true; setRunning(true);
+    try {
+      await rebuildIndex(effectiveConnection, inspectInfo.table, inspectInfo.index);
+      const refreshed = await inspectIndex(effectiveConnection, inspectInfo.table, inspectInfo.index);
+      setInspectInfo({ ...refreshed, message: '索引重建完成并已重新校验。' });
+    } catch (error) { handleFailure(error); }
+    finally { busy.current = false; setRunning(false); }
+  }
   function inspectTable(table: Table) {
     setTableInspect(table);
     setInspectInfo(undefined);
@@ -273,7 +312,7 @@ const [accessOpen, setAccessOpen] = useState(false);
     setOutput('inspect');
   }
   useEffect(() => {
-    try { localStorage.setItem(DRAFT_KEY, JSON.stringify(tabs)); setDraftSaved(true); }
+    try { localStorage.setItem(DRAFT_KEY, serializeTabs(tabs)); setDraftSaved(true); }
     catch { setDraftSaved(false); }
   }, [tabs]);
   useEffect(() => {
@@ -284,10 +323,13 @@ const [accessOpen, setAccessOpen] = useState(false);
     } catch { setHistorySaved(false); }
   }, [history]);
   useEffect(() => {
-    const release = () => releaseApiSession(effectiveConnection);
+    const release = () => {
+      for (const tab of tabsRef.current) if (tab.sessionId && tab.connection)
+        releaseApiSession({ ...tab.connection, sessionId: tab.sessionId });
+    };
     window.addEventListener('pagehide', release);
     return () => window.removeEventListener('pagehide', release);
-  }, [connection.url, sessionId]);
+  }, []);
   useEffect(() => {
     const scroller = tabScrollRef.current;
     if (!scroller) return;
@@ -405,92 +447,129 @@ const [accessOpen, setAccessOpen] = useState(false);
   }
   async function connect(target: Connection = connection) {
     if (busy.current) return;
+    const tabId = active;
     busy.current = true; setRunning(true); setNotice('');
     let openedId: string | undefined;
     try {
       const opened = await openApiSession(target);
       openedId = opened.sessionId;
-      setConnection(target); setSessionId(opened.sessionId); setTransactionState(opened.transactionState);
+      setConnection(target);
+      updateTab(tabId, { connection: { ...target, sessionId: undefined }, sessionId: opened.sessionId,
+        transactionState: opened.transactionState, running: false });
       setHealth((await getHealth(target)).status);
       setTables(await getCatalog({ ...target, sessionId: opened.sessionId }));
       setStorageInfo(await getStorage({ ...target, sessionId: opened.sessionId }));
       await refreshSystem({ ...target, sessionId: opened.sessionId });
-    } catch (e) { handleFailure(e); if (openedId) setTransactionState('UNKNOWN'); }
+    } catch (e) { handleFailure(e, tabId); if (openedId) updateTab(tabId, { transactionState: 'UNKNOWN' }); }
     finally { busy.current = false; setRunning(false); }
   }
   async function disconnect() {
     if (busy.current) return;
+    const tabId = active;
     if (sessionId && transactionState !== 'IDLE' && !window.confirm(transactionState === 'UNKNOWN' ? '提交结果未知，断开不会撤销已提交的数据。确认断开？' : '断开会话将撤销未提交修改。确认断开？')) return;
     busy.current = true; setRunning(true);
     try {
       await closeApiSession(effectiveConnection);
-      setSessionId(undefined); setTransactionState('IDLE'); setTables([]); setViews({});
+      controllers.current.get(tabId)?.abort();
+      controllers.current.delete(tabId);
+      updateTab(tabId, { sessionId: undefined, transactionState: 'IDLE', running: false });
+      updateViewFor(tabId, { result: null, notice: '', diagnostics: undefined, diagnostic: undefined });
+      setTables([]);
       setHealth(undefined); setStorageInfo(undefined);
       setCapabilities(undefined); setBackups([]); setSystemError(undefined);
-    } catch (e) { handleFailure(e); }
+    } catch (e) { handleFailure(e, tabId); }
     finally { busy.current = false; setRunning(false); }
   }
-  function updateSql(sqlText: string) { setTabs(v => v.map(t => t.id === active ? { ...t, sql: sqlText, dirty: t.dirty || t.sql !== sqlText } : t)); }
+  function updateSql(sqlText: string) { setTabs(v => v.map(t => t.id === active ? { ...t, sql: sqlText,
+    editVersion: t.editVersion + (t.sql === sqlText ? 0 : 1), dirty: t.dirty || t.sql !== sqlText } : t)); }
   async function execute(compile = false, command?: string) {
+    const tabId = active;
+    const submittedTab = current;
+    const tabConnection = { ...(submittedTab.connection ?? connection), sessionId: submittedTab.sessionId };
     const range = editor.current?.state.selection.main;
     const selected = range && !range.empty ? editor.current!.state.sliceDoc(range.from, range.to) : '';
     const hasSelection = !!range && !range.empty;
-    const source = command ?? (hasSelection ? selected : current.sql);
+    const source = command ?? (hasSelection ? selected : submittedTab.sql);
     const selection = command === undefined && hasSelection;
-    const documentSource = selection ? editor.current!.state.doc.toString() : current.sql;
+    const documentSource = selection ? editor.current!.state.doc.toString() : submittedTab.sql;
     const submittedFrom = selection ? range!.from : 0;
     const submittedTo = selection ? range!.to : documentSource.length;
-    if (busy.current || !source.trim() || !sessionId || transactionState === 'UNKNOWN') return;
-    if (compile && transactionState === 'ABORTED') return;
+    if (submittedTab.running || !source.trim() || !submittedTab.sessionId || submittedTab.transactionState === 'UNKNOWN') return;
+    if (compile && submittedTab.transactionState === 'ABORTED') return;
+    const streamedReadOnly = !compile && /^\s*SELECT\b/i.test(source);
     const warning = compile ? undefined : mutationWarning(source);
     if (warning && !window.confirm(warning)) return;
-    busy.current = true;
-    setRunningTab(active);
-    controller.current?.abort(); const requestController = new AbortController(); controller.current = requestController; setRunning(true); setNotice('');
+    const requestController = new AbortController();
+    controllers.current.set(tabId, requestController);
+    updateTab(tabId, { running: true });
+    updateViewFor(tabId, { notice: '', diagnostic: undefined, diagnostics: undefined });
     const started = Date.now();
     let clientTimedOut = false;
+    let cancellationResult: Promise<{ transactionState?: QueryTab['transactionState'] } | undefined> | undefined;
     let hardTimeoutTimer: number | undefined;
     const timeoutTimer = window.setTimeout(() => {
       clientTimedOut = true;
-      void cancelSession(effectiveConnection, sessionId).catch(() => {});
+      cancellationResult = cancelSession(tabConnection, submittedTab.sessionId!)
+        .then(value => value as { transactionState?: QueryTab['transactionState'] })
+        .catch(() => undefined);
       hardTimeoutTimer = window.setTimeout(() => requestController.abort(), 5000);
     }, clientTimeoutMs);
     try {
-      const data = await runSql(effectiveConnection, source, compile, requestController.signal);
+      const data = await runSql(tabConnection, source, compile, requestController.signal);
       if (clientTimedOut) throw Object.assign(new Error(`客户端请求超时，已发送取消请求。`), { transactionState: data.transactionState });
-      if (data.transactionState) setTransactionState(data.transactionState);
+      if (data.transactionState) updateTab(tabId, { transactionState: data.transactionState });
       for (const item of data.results ?? []) {
-        if (item.kind === 'Commit') settlePending('committed');
-        if (item.kind === 'Rollback') settlePending('rolledBack');
+        if (item.kind === 'Commit') settlePending(tabId, 'committed');
+        if (item.kind === 'Rollback') settlePending(tabId, 'rolledBack');
       }
-      if (command === undefined) updateView({ result: data, output: compile ? 'plan' : 'results', source: current.sql, selection, outcome: compile ? undefined : data.results?.at(-1)?.commitState });
-      recordHistory(source, compile, data.durationMs, data.rows.length);
-      if (!compile) { await refresh(); await refreshStorage(); }
+      if (command === undefined) updateViewFor(tabId, { result: data, output: compile ? 'plan' : 'results',
+        source: documentSource, selection, outcome: compile ? undefined : data.results?.at(-1)?.commitState });
+      recordHistory(source, compile, data.durationMs, data.rows.length, undefined, tabConnection);
+      if (!compile) {
+        const [nextTables, nextStorage] = await Promise.all([getCatalog(tabConnection), getStorage(tabConnection)]);
+        if (activeRef.current === tabId) { setTables(nextTables); setStorageInfo(nextStorage); }
+      }
     } catch (e) {
-      const failure = clientTimedOut ? Object.assign(new Error(`客户端请求超时，已发送取消请求。`), e && typeof e === 'object' ? e : {}) : e;
+      const cancellation = clientTimedOut ? await cancellationResult : undefined;
+      const failure = clientTimedOut ? Object.assign(new Error(`客户端请求超时，已发送取消请求。`), {
+        ...(e && typeof e === 'object' ? e : {}),
+        ...(streamedReadOnly ? { commitState: undefined,
+          transactionState: cancellation?.transactionState ?? submittedTab.transactionState } :
+          cancellation?.transactionState ? { transactionState: cancellation.transactionState } : {}),
+      }) : e;
       const baseMessage = failure instanceof Error ? failure.message : String(failure);
       const suggestion = (failure as { suggestion?: string }).suggestion;
       const message = suggestion ? `${baseMessage}；${suggestion}` : baseMessage;
-      handleFailure(failure);
+      handleFailure(failure, tabId);
       const responseDiagnostics = (failure as { response?: { diagnostics?: Diagnostic[] } }).response?.diagnostics ?? [];
-      if ((e as { transactionState?: string }).transactionState === 'ABORTED') await refresh();
+      if ((e as { transactionState?: string }).transactionState === 'ABORTED') {
+        const nextTables = await getCatalog(tabConnection).catch(() => undefined);
+        if (nextTables && activeRef.current === tabId) setTables(nextTables);
+      }
       if (command === undefined) {
         const position = e as { line?: number; column?: number };
-        updateView({ diagnostics: responseDiagnostics.length ? responseDiagnostics : undefined,
+        updateViewFor(tabId, { diagnostics: responseDiagnostics.length ? responseDiagnostics : undefined,
           diagnosticFrom: submittedFrom, diagnosticTo: submittedTo,
           diagnostic: mapDiagnostic(documentSource, submittedFrom, submittedTo,
             responseDiagnostics[0]?.line ?? position.line ?? 0, responseDiagnostics[0]?.column ?? position.column ?? 0) });
       }
-      recordHistory(source, compile, Date.now() - started, 0, message);
-    } finally { window.clearTimeout(timeoutTimer); if (hardTimeoutTimer !== undefined) window.clearTimeout(hardTimeoutTimer); busy.current = false; setRunning(false); setRunningTab(undefined); }
+      recordHistory(source, compile, Date.now() - started, 0, message, tabConnection);
+    } finally {
+      window.clearTimeout(timeoutTimer);
+      if (hardTimeoutTimer !== undefined) window.clearTimeout(hardTimeoutTimer);
+      if (controllers.current.get(tabId) === requestController) {
+        controllers.current.delete(tabId);
+        updateTab(tabId, { running: false });
+      }
+    }
   }
-  function addTab() { if (tabs.length >= 50) { setNotice('最多保留 50 个查询标签。'); return; } const id = crypto.randomUUID(); setTabs(v => [...v, { id, name: `query_${v.length + 1}.sql`, sql: '-- New query\n' }]); setActive(id); }
+  function addTab() { if (tabs.length >= 50) { setNotice('最多保留 50 个查询标签。'); return; } const id = crypto.randomUUID(); setTabs(v => [...v, newQueryTab({ id, name: `query_${v.length + 1}.sql`, sql: '-- New query\n', connection: { ...effectiveConnection, sessionId: undefined } })]); setActive(id); }
   function insertTable(table: Table) { updateSql(`${current.sql}\nSELECT * FROM ${table.name};`); }
   function queryColumn(table: Table, column: Table['columns'][number]) {
     if (tabs.length >= 50) { setNotice('最多保留 50 个查询标签。'); return; }
     const id = crypto.randomUUID();
     const sql = `SELECT ${column.name} FROM ${table.name};`;
-    setTabs(previous => [...previous, { id, name: `${table.name}.${column.name}.sql`, sql }]);
+    setTabs(previous => [...previous, newQueryTab({ id, name: `${table.name}.${column.name}.sql`, sql, connection: { ...effectiveConnection, sessionId: undefined } })]);
     setActive(id);
     pendingAutoRun.current = { id, sql };
   }
@@ -500,10 +579,17 @@ const [accessOpen, setAccessOpen] = useState(false);
     pendingAutoRun.current = undefined;
     void execute(false);
   }, [tabs, active]);
-  function closeTab(id: string) {
+  async function closeTab(id: string) {
     if (tabs.length === 1) return;
-    if (id === runningTab) { setNotice('该标签正在执行，请等待请求结束。'); return; }
-    if (tabs.find(tab => tab.id === id)?.dirty && !window.confirm('关闭标签将删除此 SQL 草稿，确认关闭？')) return;
+    const closing = tabs.find(tab => tab.id === id);
+    if (!closing) return;
+    if (closing.running) { updateViewFor(id, { notice: '该标签正在执行，请等待请求结束。' }); return; }
+    if (closing.dirty && !window.confirm('关闭标签将删除此 SQL 草稿，确认关闭？')) return;
+    if (closing.sessionId && closing.transactionState !== 'IDLE' && !window.confirm('关闭标签将释放独立会话并回滚未提交修改，确认关闭？')) return;
+    if (closing.sessionId && closing.connection) {
+      try { await closeApiSession({ ...closing.connection, sessionId: closing.sessionId }); }
+      catch (error) { handleFailure(error, id); return; }
+    }
     const next = tabs.filter(tab => tab.id !== id);
     liveTabs.current.delete(id);setTabs(next);
     setViews(previous => { const copy = { ...previous };delete copy[id];return copy; });
@@ -524,7 +610,8 @@ const [accessOpen, setAccessOpen] = useState(false);
       const source = decodeSqlFile(new Uint8Array(await file.arrayBuffer()));
       if (liveTabs.current.size >= 50) throw new Error('最多保留 50 个查询标签。');
       const id = crypto.randomUUID();
-      setTabs(previous => [...previous, { id, name: file.name.slice(0, 100), sql: source, dirty: false }]);
+      setTabs(previous => [...previous, newQueryTab({ id, name: file.name.slice(0, 100), sql: source, dirty: false,
+        connection: { ...effectiveConnection, sessionId: undefined } })]);
       setActive(id);
     } catch (error) { setNotice(error instanceof Error ? error.message : String(error)); }
     finally { importing.current = false; }
@@ -643,17 +730,17 @@ const [accessOpen, setAccessOpen] = useState(false);
     {!draftSaved && <div className="draft-alert" role="alert">草稿保存失败：当前修改仅保留在此页面，请导出 SQL 后再关闭。</div>}
     {!historySaved && <div className="draft-alert" role="alert">历史保存失败：本次历史修改尚未写入本地存储。</div>}
     {historyOmitted && <div className="draft-alert" role="status">本次 SQL 超过历史单条容量，未加入历史；执行结果不受影响。</div>}
-    <header className="topbar"><div className="brand"><div className="brand-mark"><Database size={17}/></div><span>MiniSQL</span><b>Studio</b></div><div className="top-actions"><button className="connection-select" disabled={running} title="打开连接管理" onClick={openConnectionManager}><span className={health === 'ok' ? 'status-dot' : 'status-dot status-warn'}/>{connection.name}<ChevronDown size={14}/></button><span className="connection-mode">{connectionKindLabel(connection.kind)}</span>{health && <span className="health-label" title="C++ bridge 健康状态">{health === 'ok' ? '服务正常' : '服务降级'}</span>}<button className="history-toggle" title="打开查询历史" aria-haspopup="dialog" onClick={() => setHistoryDialogOpen(true)}><History size={17}/></button><button className="settings-toggle" title="打开权限与审计" aria-label="打开权限与审计" onClick={() => setAccessOpen(true)}><Shield size={17}/></button><button className="settings-toggle" title="打开设置" aria-label="打开设置" onClick={() => setSettingsOpen(true)}><Settings2 size={17}/></button><button className="mobile-more" title="更多工具" aria-label="打开更多工具" aria-expanded={mobileMenuOpen} onClick={() => setMobileMenuOpen(value => !value)}><MoreHorizontal size={17}/></button><button className="avatar" title={`当前用户 ${connection.user}`}>{connection.user.slice(0, 1).toUpperCase() || '?'}</button>{mobileMenuOpen && <div className="mobile-tools-menu"><button onClick={() => { setMobileMenuOpen(false); setAccessOpen(true); }}><Shield size={14}/>权限与审计</button><button onClick={() => { setMobileMenuOpen(false); setSettingsOpen(true); }}><Settings2 size={14}/>设置</button><button onClick={() => { setMobileMenuOpen(false); setHistoryDialogOpen(true); }}><History size={14}/>查询历史</button></div>}</div></header>
+    <header className="topbar"><div className="brand"><div className="brand-mark"><Database size={17}/></div><span>MiniSQL</span><b>Studio</b></div><div className="top-actions"><button className="connection-select" disabled={running || current.running} title="打开连接管理" onClick={openConnectionManager}><span className={health === 'ok' ? 'status-dot' : 'status-dot status-warn'}/>{effectiveConnection.name}<ChevronDown size={14}/></button><span className="connection-mode">{connectionKindLabel(effectiveConnection.kind)}</span>{health && <span className="health-label" title="C++ bridge 健康状态">{health === 'ok' ? '服务正常' : '服务降级'}</span>}<button className="history-toggle" title="打开查询历史" aria-haspopup="dialog" onClick={() => setHistoryDialogOpen(true)}><History size={17}/></button><button className="settings-toggle" title="打开权限与审计" aria-label="打开权限与审计" onClick={() => setAccessOpen(true)}><Shield size={17}/></button><button className="settings-toggle" title="打开设置" aria-label="打开设置" onClick={() => setSettingsOpen(true)}><Settings2 size={17}/></button><button className="mobile-more" title="更多工具" aria-label="打开更多工具" aria-expanded={mobileMenuOpen} onClick={() => setMobileMenuOpen(value => !value)}><MoreHorizontal size={17}/></button><button className="avatar" title={`当前用户 ${effectiveConnection.user}`}>{effectiveConnection.user.slice(0, 1).toUpperCase() || '?'}</button>{mobileMenuOpen && <div className="mobile-tools-menu"><button onClick={() => { setMobileMenuOpen(false); setAccessOpen(true); }}><Shield size={14}/>权限与审计</button><button onClick={() => { setMobileMenuOpen(false); setSettingsOpen(true); }}><Settings2 size={14}/>设置</button><button onClick={() => { setMobileMenuOpen(false); setHistoryDialogOpen(true); }}><History size={14}/>查询历史</button></div>}</div></header>
     <div className="transaction-toolbar" aria-label="事务控制">
       <span role="status" data-testid="transaction-state">{!sessionId ? transactionState === 'EXPIRED' ? '会话已过期' : '未连接' : ({ IDLE: '自动提交', ACTIVE: '事务进行中 · 未提交', ABORTED: '事务失败 · 必须回滚', UNKNOWN: '提交状态未知' }[transactionState] ?? transactionState)}</span>
-      <button className="icon-btn" title="连接会话" aria-label="连接会话" disabled={running || !!sessionId} onClick={() => void connect()}><Plug size={16}/></button>
-      <button className="icon-btn" title="断开会话" aria-label="断开会话" disabled={running || !sessionId} onClick={() => disconnect()}><Unplug size={16}/></button>
-      <button className="icon-btn" title="开始事务" aria-label="开始事务" disabled={running || !sessionId || transactionState !== 'IDLE'} onClick={() => execute(false, 'BEGIN;')}><CirclePlay size={16}/></button>
-      <button className="icon-btn" title="提交事务" aria-label="提交事务" disabled={running || !sessionId || transactionState !== 'ACTIVE'} onClick={() => execute(false, 'COMMIT;')}><Check size={16}/></button>
-      <button className="icon-btn" title="回滚事务" aria-label="回滚事务" disabled={running || !sessionId || !['ACTIVE', 'ABORTED'].includes(transactionState)} onClick={() => execute(false, 'ROLLBACK;')}><Undo2 size={16}/></button>
+      <button className="icon-btn" title="连接会话" aria-label="连接会话" disabled={running || current.running || !!sessionId} onClick={() => void connect()}><Plug size={16}/></button>
+      <button className="icon-btn" title="断开会话" aria-label="断开会话" disabled={running || current.running || !sessionId} onClick={() => void disconnect()}><Unplug size={16}/></button>
+      <button className="icon-btn" title="开始事务" aria-label="开始事务" disabled={running || current.running || !sessionId || transactionState !== 'IDLE'} onClick={() => void execute(false, 'BEGIN;')}><CirclePlay size={16}/></button>
+      <button className="icon-btn" title="提交事务" aria-label="提交事务" disabled={running || current.running || !sessionId || transactionState !== 'ACTIVE'} onClick={() => void execute(false, 'COMMIT;')}><Check size={16}/></button>
+      <button className="icon-btn" title="回滚事务" aria-label="回滚事务" disabled={running || current.running || !sessionId || !['ACTIVE', 'ABORTED'].includes(transactionState)} onClick={() => void execute(false, 'ROLLBACK;')}><Undo2 size={16}/></button>
     </div>
     <div className="workspace">
-      <aside className="sidebar"><div className="side-head"><span>DATABASE</span><button className="icon-btn" title="刷新目录" onClick={refresh}><RefreshCw size={15}/></button></div><div className="database-node"><Database size={15}/><span>{connection.name}</span><span className="online">●</span></div><div className="tree-content">
+      <aside className="sidebar"><div className="side-head"><span>DATABASE</span><button className="icon-btn" title="刷新目录" onClick={refresh}><RefreshCw size={15}/></button></div><div className="database-node"><Database size={15}/><span>{effectiveConnection.name}</span><span className="online">●</span></div><div className="tree-content">
         <div className="tree-section">
           <button className="tree-toggle" aria-label={treeExpanded.schemas ? '折叠 SCHEMAS' : '展开 SCHEMAS'} aria-expanded={treeExpanded.schemas} onClick={() => setTreeExpanded(value => ({ ...value, schemas: !value.schemas }))}>{treeExpanded.schemas ? <ChevronDown size={14}/> : <ChevronRight size={14}/>}</button>
           <FolderTree size={15}/><span>SCHEMAS</span>
@@ -679,11 +766,11 @@ const [accessOpen, setAccessOpen] = useState(false);
           </>}
         </>}
       </div><div className="sidebar-bottom"><button><CircleHelp size={15}/> Documentation</button><span>v0.1.0 · C++ engine</span></div></aside>
-      <main className="main"><div className="query-tabs"><div className="tab-scroll" ref={tabScrollRef}>{tabs.map(tab => <button className={tab.id === active ? 'query-tab active' : 'query-tab'} key={tab.id} onClick={() => setActive(tab.id)}><FileCode2 size={14}/><span>{tab.name}</span><X size={13} onClick={e => { e.stopPropagation(); closeTab(tab.id); }}/></button>)}<button className="new-tab" title="新建查询" onClick={addTab}><Plus size={16}/></button></div><div className="tab-actions"><button className="toolbar-btn" disabled={running || (!sessionId || ['UNKNOWN','ABORTED'].includes(transactionState))} onClick={() => execute(true)}><Braces size={15}/> Explain</button><button className="run-btn" onClick={() => execute(false)} disabled={running || (!sessionId || transactionState === 'UNKNOWN')}><Play size={15} fill="currentColor"/>{running ? 'Running...' : 'Run'}</button></div></div>
-        <div className="query-state"><span title={current.name}>{current.name}</span><button className="icon-btn" aria-label="重命名查询" title="重命名查询" onClick={renameTab}><Pencil size={14}/></button>{current.dirty && <small>已修改</small>}{runningTab === active && <small role="status">执行中</small>}{result && resultSource !== current.sql && <small data-testid="stale-result">结果对应旧 SQL</small>}{['pending','rolledBack','unknown'].includes(outcome ?? '') && <small data-testid="result-outcome">{outcome === 'pending' ? '未提交结果' : outcome === 'rolledBack' ? '事务已回滚' : '提交状态未知'}</small>}</div>
+      <main className="main"><div className="query-tabs"><div className="tab-scroll" ref={tabScrollRef}>{tabs.map(tab => <button className={tab.id === active ? 'query-tab active' : 'query-tab'} key={tab.id} onClick={() => setActive(tab.id)}><FileCode2 size={14}/><span>{tab.name}</span>{tab.running && <small aria-label={`${tab.name} 执行中`}>...</small>}<X size={13} onClick={e => { e.stopPropagation(); void closeTab(tab.id); }}/></button>)}<button className="new-tab" title="新建查询" onClick={addTab}><Plus size={16}/></button></div><div className="tab-actions"><button className="toolbar-btn" disabled={running || current.running || (!sessionId || ['UNKNOWN','ABORTED'].includes(transactionState))} onClick={() => void execute(true)}><Braces size={15}/> Explain</button><button className="run-btn" onClick={() => void execute(false)} disabled={running || current.running || (!sessionId || transactionState === 'UNKNOWN')}><Play size={15} fill="currentColor"/>{current.running ? 'Running...' : 'Run'}</button></div></div>
+        <div className="query-state"><span title={current.name}>{current.name}</span><button className="icon-btn" aria-label="重命名查询" title="重命名查询" onClick={renameTab}><Pencil size={14}/></button>{current.dirty && <small>已修改</small>}{current.running && <small role="status">执行中</small>}{result && resultSource !== current.sql && <small data-testid="stale-result">结果对应旧 SQL</small>}{['pending','rolledBack','unknown'].includes(outcome ?? '') && <small data-testid="result-outcome">{outcome === 'pending' ? '未提交结果' : outcome === 'rolledBack' ? '事务已回滚' : '提交状态未知'}</small>}</div>
         <div className="file-toolbar"><button className="icon-btn" aria-label="导入 SQL" title="导入 SQL" onClick={() => fileInput.current?.click()}><Upload size={15}/></button><button className="icon-btn" aria-label="导出 SQL" title="导出 SQL" onClick={exportSql}><Download size={15}/></button><button className="icon-btn" aria-label="格式化 SQL" title="格式化 SQL" onClick={formatCurrentSql}><WandSparkles size={15}/></button>{selectedResult && <small data-testid="selection-result">选区结果</small>}{diagnostic && <><button className="icon-btn" aria-label="定位错误" title={`第 ${diagnostic.line} 行，第 ${diagnostic.column} 列`} disabled={current.sql.replace(/\r\n|\r/g, '\n') !== diagnostic.source} onClick={locateDiagnostic}><Search size={15}/></button><small data-testid="diagnostic-position">第 {diagnostic.line} 行，第 {diagnostic.column} 列{current.sql.replace(/\r\n|\r/g, '\n') !== diagnostic.source ? ' · 原 SQL 已修改' : ''}</small></>}</div>
         <section className="editor-wrap"><CodeMirror key={active} onCreateEditor={view => { editor.current = view; setEditorInstance(view); }} value={current?.sql ?? ''} height="100%" theme="light" extensions={editorExtensions} onChange={updateSql} basicSetup={{ lineNumbers: true, foldGutter: true, highlightActiveLine: true, autocompletion: true }} /></section>
-        <section className="output"><div className="output-tabs"><button className={output === 'results' ? 'selected' : ''} onClick={() => setOutput('results')}><Table2 size={14}/> Result <span>{result?.rows.length ?? 0}</span></button><button className={output === 'plan' ? 'selected' : ''} onClick={() => setOutput('plan')}><Activity size={14}/> Plan <span>{result?.plan.length ?? 0}</span></button><button className={output === 'ast' ? 'selected' : ''} onClick={() => setOutput('ast')}><Braces size={14}/> AST</button><button className={output === 'tokens' ? 'selected' : ''} onClick={() => setOutput('tokens')}><Terminal size={14}/> Token 流 <span>{result?.tokens?.length ?? 0}</span></button><button className={output === 'diagnostics' ? 'selected' : ''} onClick={() => setOutput('diagnostics')}><Search size={14}/> Diagnostics</button><button className={output === 'inspect' ? 'selected' : ''} onClick={() => setOutput('inspect')}><Database size={14}/> Inspect</button><div className="output-spacer"/><span className="query-meta">{result ? `${result.durationMs.toFixed(1)} ms · ${result.affectedRows} affected` : 'Ready'}</span></div><div className="output-body">{notice ? <div className="error-state"><span>!</span><div><strong>Query failed</strong><p>{notice}</p>{diagnostics?.[0] && (diagnostics[0].actual || diagnostics[0].expected?.length) && <p>实际：{diagnostics[0].actual || '空'} · 期望：{diagnostics[0].expected?.join(' | ') || '未提供'}</p>}{diagnostics && diagnostics.length > 1 && <div className="diagnostic-list">{diagnostics.map((item, index) => <button key={`${item.statementIndex ?? index}-${item.column ?? 0}`} onClick={() => locateDiagnosticItem(item)}><b>{item.code ?? 'SQL'}</b> 第 {item.line ?? 1} 行，第 {item.column ?? 1} 列：{item.message}</button>)}</div>}<button onClick={() => setNotice('')}>Dismiss</button></div></div> : output === 'results' ? <Results result={result}/> : output === 'plan' ? <Plan result={result}/> : output === 'ast' ? <pre className="json-view">{result?.ast ? JSON.stringify(result.ast, null, 2) : 'Compile a query to inspect its AST.'}</pre> : output === 'tokens' ? <TokenStream result={result} onSelect={locateToken}/> : output === 'diagnostics' ? <Diagnostics result={result}/> : inspectInfo ? <IndexInspectView info={inspectInfo}/> : <TableInspectView table={tableInspect}/>}</div></section>
+        <section className="output"><div className="output-tabs"><button className={output === 'results' ? 'selected' : ''} onClick={() => setOutput('results')}><Table2 size={14}/> Result <span>{result?.rows.length ?? 0}</span></button><button className={output === 'plan' ? 'selected' : ''} onClick={() => setOutput('plan')}><Activity size={14}/> Plan <span>{result?.plan.length ?? 0}</span></button><button className={output === 'ast' ? 'selected' : ''} onClick={() => setOutput('ast')}><Braces size={14}/> AST</button><button className={output === 'tokens' ? 'selected' : ''} onClick={() => setOutput('tokens')}><Terminal size={14}/> Token 流 <span>{result?.tokens?.length ?? 0}</span></button><button className={output === 'diagnostics' ? 'selected' : ''} onClick={() => setOutput('diagnostics')}><Search size={14}/> Diagnostics</button><button className={output === 'inspect' ? 'selected' : ''} onClick={() => setOutput('inspect')}><Database size={14}/> Inspect</button><div className="output-spacer"/><span className="query-meta">{result ? `${result.durationMs.toFixed(1)} ms · ${result.affectedRows} affected` : 'Ready'}</span></div><div className="output-body">{notice ? <div className="error-state"><span>!</span><div><strong>Query failed</strong><p>{notice}</p>{diagnostics?.[0] && (diagnostics[0].actual || diagnostics[0].expected?.length) && <p>实际：{diagnostics[0].actual || '空'} · 期望：{diagnostics[0].expected?.join(' | ') || '未提供'}</p>}{diagnostics && diagnostics.length > 1 && <div className="diagnostic-list">{diagnostics.map((item, index) => <button key={`${item.statementIndex ?? index}-${item.column ?? 0}`} onClick={() => locateDiagnosticItem(item)}><b>{item.code ?? 'SQL'}</b> 第 {item.line ?? 1} 行，第 {item.column ?? 1} 列：{item.message}</button>)}</div>}<button onClick={() => setNotice('')}>Dismiss</button></div></div> : output === 'results' ? <Results result={result}/> : output === 'plan' ? <Plan result={result}/> : output === 'ast' ? <pre className="json-view">{result?.ast ? JSON.stringify(result.ast, null, 2) : 'Compile a query to inspect its AST.'}</pre> : output === 'tokens' ? <TokenStream result={result} onSelect={locateToken}/> : output === 'diagnostics' ? <Diagnostics result={result}/> : inspectInfo ? <IndexInspectView info={inspectInfo} busy={running} onVerify={verifyInspectedIndex} onRebuild={rebuildInspectedIndex}/> : <TableInspectView table={tableInspect}/>}</div></section>
       </main>
       <aside className="rightbar">{historyContent}<div className="right-bottom"><Search size={14}/><input placeholder="Search tables" value={filter} onChange={e => setFilter(e.target.value)}/></div></aside>
     </div>

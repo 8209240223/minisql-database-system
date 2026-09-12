@@ -407,6 +407,13 @@ LogicalPlan build(const Statement& statement, const catalog::Catalog& catalog, c
         for (const auto& column : derivedInput.output)
             derived.columns.push_back({column.name, column.type, derived.name, column.nullable, column.defaultValue, column.primaryKey, column.unique, column.references});
         bindScope = std::move(derived);
+        for (const auto& join : statement.joins) {
+            const auto* right = catalog.find(join.table);
+            if (!right) invalid("missing join table");
+            const auto qualifier = join.alias.empty() ? right->name : join.alias;
+            if (join.right) for (auto& column : bindScope.columns) column.nullable = true;
+            for (auto column : right->columns) { column.qualifier = qualifier; if (join.left) column.nullable = true; bindScope.columns.push_back(std::move(column)); }
+        }
     } else {
         plan.table = table->name;
         for (const auto& check : table->checks)
@@ -461,16 +468,17 @@ LogicalPlan build(const Statement& statement, const catalog::Catalog& catalog, c
             }
         }
     } else if (statement.kind == "Select" || statement.kind == "Delete" || statement.kind == "Update") {
-        if (derivedBase && statement.kind != "Select")
-            // 第十九章 REQ-UI-010：这是能力未实现而不是 SQL 检查失败，
-            // 因此用 NotImplemented（HTTP 501）而不是 Semantic（HTTP 422）。
-            throw MiniSqlError(ErrorCode::NotImplemented, "DELETE/UPDATE is not supported over a derived table", statement.location);
         LogicalPlan input;
         if (derivedBase) {
-            if (!statement.joins.empty())
-                throw MiniSqlError(ErrorCode::NotImplemented, "JOIN over a derived table is not supported yet", statement.location);
-            // 派生表基座：直接以内层 select 计划作为输入，外层谓词/投影按 derivedScope 绑定。
-            input = std::move(derivedInput);
+            if (statement.kind == "Select") input = std::move(derivedInput);
+            else {
+                const auto* physical = catalog.find(statement.fromSubquery->table);
+                if (!physical || derivedInput.kind != "Project" || derivedInput.children.size() != 1)
+                    invalid("derived table is not updatable");
+                plan.table = physical->name;
+                table = physical;
+                input = std::move(derivedInput.children.front());
+            }
         } else {
         LogicalPlan scan;
         scan.kind = "SeqScan";
@@ -528,15 +536,22 @@ LogicalPlan build(const Statement& statement, const catalog::Catalog& catalog, c
             const auto& source = statement.joins[i];
             const auto* right = catalog.find(source.table);
             if (!right) invalid("missing join table");
-            const auto prefix = catalog::queryScope(statement, catalog, i + 1);
-            const auto rightOffset = prefix.columns.size() - right->columns.size();
+            catalog::Table prefix;
+            const auto rightOffset = input.output.size();
+            prefix.name = bindScope.name;
+            prefix.columns.assign(bindScope.columns.begin(), bindScope.columns.begin() + static_cast<std::ptrdiff_t>(rightOffset + right->columns.size()));
             LogicalPlan rightScan;
             rightScan.kind = "SeqScan";rightScan.table = right->name;
             rightScan.output = schema(*right, slotWindow(slots, rightOffset, right->columns.size()));
             rightScan.preservesRowId = true;
             LogicalPlan join;
-            join.kind = source.left && source.right ? "FullJoin" : source.left ? "LeftJoin" : source.right ? "RightJoin" : "NestedLoopJoin";join.table = table->name;
-            join.output = schema(prefix, slots);join.predicate = bindExpression(*source.on, prefix, context);
+            join.kind = source.left && source.right ? "FullJoin" : source.left ? "LeftJoin" : source.right ? "RightJoin" : "NestedLoopJoin";join.table = plan.table;
+            join.output = input.output;
+            if (source.right) for (auto& column : join.output) column.nullable = true;
+            auto rightOutput = rightScan.output;
+            if (source.left) for (auto& column : rightOutput) column.nullable = true;
+            join.output.insert(join.output.end(), rightOutput.begin(), rightOutput.end());
+            join.predicate = bindExpression(*source.on, prefix, context);
             join.children.push_back(std::move(input));join.children.push_back(std::move(rightScan));
             input = std::move(join);
         }
@@ -690,6 +705,7 @@ std::vector<LogicalPlan> compilePlans(const std::vector<Statement>& statements,
             const auto fingerprint = snapshot.schemaFingerprint();
             std::function<void(LogicalPlan&)> stamp = [&](LogicalPlan& node) {
                 node.catalogFingerprint = fingerprint;
+                if (node.sourceSpan.line == 0) node.sourceSpan = statement.location;
                 for (auto& child : node.children) stamp(child);
             };
             stamp(built);
@@ -711,11 +727,16 @@ nlohmann::json serializePlans(const std::vector<LogicalPlan>& plans) {
             output.push_back({{"name", column.name}, {"type", column.type}, {"columnId", column.columnId}, {"binding", column.binding}, {"relation", column.relation}, {"nullable", column.nullable},
                 {"defaultValue", column.defaultValue ? nlohmann::json(*column.defaultValue) : nlohmann::json(nullptr)}, {"primaryKey", column.primaryKey}, {"unique", column.unique}, {"references", serializeReference(column.references)}});
         }
-        rows.push_back({{"id", id}, {"parent", parent}, {"depth", depth}, {"statementIndex", statementIndex},
+        const auto endLine = plan.sourceSpan.endLine ? plan.sourceSpan.endLine : plan.sourceSpan.line;
+        const auto endColumn = plan.sourceSpan.endColumn ? plan.sourceSpan.endColumn : plan.sourceSpan.column + (plan.sourceSpan.line ? 1 : 0);
+        rows.push_back({{"id", id}, {"nodeId", id}, {"parent", parent}, {"depth", depth}, {"statementIndex", statementIndex},
                         {"kind", plan.kind}, {"detail", plan.kind + " " + plan.table}, {"table", plan.table},
+                        {"sourceSpan", {{"start", {{"line", plan.sourceSpan.line}, {"column", plan.sourceSpan.column}}},
+                                        {"end", {{"line", endLine}, {"column", endColumn}}}}},
                         {"catalogFingerprint", plan.catalogFingerprint},
+                        {"optimizerDecision", plan.optimizerDecision},
                         {"indexName", plan.indexName}, {"savepointName", plan.savepointName}, {"subqueryJoinKind", plan.subqueryJoinKind}, {"uniqueIndex", plan.uniqueIndex}, {"indexColumns", plan.indexColumns}, {"indexValues", plan.indexValues}, {"indexRangeOperator", plan.indexRangeOperator}, {"indexRangeValue", plan.indexRangeValue},
-                        {"output", output}, {"preservesRowId", plan.preservesRowId},
+                        {"output", output}, {"outputSchema", output}, {"preservesRowId", plan.preservesRowId},
                         {"predicate", plan.predicate}, {"values", plan.values}, {"insertExpressions", plan.insertExpressions}, {"insertRows", plan.insertRows},
                         {"columnMapping", plan.columnMapping}, {"projections", plan.projections}, {"children", nlohmann::json::array()}});
         rows[rowIndex]["limit"] = plan.limit ? nlohmann::json(std::to_string(*plan.limit)) : nlohmann::json(nullptr);
@@ -780,6 +801,14 @@ std::vector<LogicalPlan> deserializePlans(const nlohmann::json& document) {
         item.plan.kind = row.at("kind").get<std::string>();
         item.plan.table = row.at("table").get<std::string>();
         item.plan.preservesRowId = row.at("preservesRowId").get<bool>();
+        item.plan.optimizerDecision = row.value("optimizerDecision", nlohmann::json(nullptr));
+        if (row.contains("sourceSpan")) {
+            const auto& span = row.at("sourceSpan");
+            if (!span.is_object() || !span.contains("start") || !span.contains("end") ||
+                !span.at("start").is_object() || !span.at("end").is_object()) invalid();
+            item.plan.sourceSpan = {span.at("start").value("line", std::size_t{0}), span.at("start").value("column", std::size_t{0}),
+                                    span.at("end").value("line", std::size_t{0}), span.at("end").value("column", std::size_t{0})};
+        }
     item.plan.indexName = row.value("indexName", std::string{});
     item.plan.savepointName = row.value("savepointName", std::string{});
     item.plan.subqueryJoinKind = row.value("subqueryJoinKind", std::string{});        item.plan.catalogFingerprint = row.value("catalogFingerprint", std::string{});        item.plan.uniqueIndex = row.value("uniqueIndex", false);

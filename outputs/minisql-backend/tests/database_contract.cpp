@@ -163,5 +163,25 @@ int main() {
             require(database.execute("SELECT * FROM t;")["results"][0]["rows"].size() == (std::string(point) == "published" ? 2 : 0), "transaction commit recovery is complete");
         }
     }
+    const auto derivedPath = directory / "derived.pages";
+    {
+        minisql::execution::Database database(derivedPath, 2);
+        require(database.execute("CREATE TABLE t(id INT,n INT); CREATE TABLE u(id INT,v INT); INSERT INTO t VALUES(1,10),(2,20),(3,30); INSERT INTO u VALUES(2,200),(3,300);")["success"] == true,
+                "derived fixture");
+        require(database.execute("SELECT d.id,u.v FROM (SELECT * FROM t WHERE n>=20) AS d JOIN u ON d.id=u.id ORDER BY d.id;")["results"][0]["rows"] ==
+                json::array({json::array({2,200}), json::array({3,300})}), "derived table join executes");
+        require(database.execute("SELECT a.id FROM t a WHERE EXISTS (SELECT b.id FROM t b WHERE b.id=a.id AND EXISTS (SELECT c.id FROM t c WHERE c.id=b.id AND c.id=a.id)) ORDER BY a.id;")["results"][0]["rows"] ==
+                json::array({json::array({1}),json::array({2}),json::array({3})}), "three-level correlated scope chain");
+        require(database.execute("SELECT a.id FROM t a WHERE EXISTS (SELECT b.id FROM t b WHERE EXISTS (SELECT c.id FROM t c WHERE c.id=a.id)) ORDER BY a.id;")["results"][0]["rows"] ==
+                json::array({json::array({1}),json::array({2}),json::array({3})}), "grandparent-only correlated reference");
+        require(database.execute("UPDATE (SELECT * FROM t WHERE id>=2) AS d SET n=n+1 WHERE d.id=2;")["results"][0]["affectedRows"] == 1,
+                "updatable derived table update");
+        require(database.execute("DELETE FROM (SELECT * FROM t WHERE id>=2) AS d WHERE d.id=3;")["results"][0]["affectedRows"] == 1,
+                "updatable derived table delete");
+        require(database.execute("SELECT * FROM t ORDER BY id;")["results"][0]["rows"] == json::array({json::array({1,10}),json::array({2,21})}),
+                "derived dml preserves base table semantics");
+        require(database.execute("UPDATE (SELECT id FROM t) AS d SET n=0;")["error"]["code"] == 2003,
+                "non-updatable derived table rejected explicitly");
+    }
     std::cout << checks << " database execution checks passed\nEvidence: " << directory.string() << '\n';
 }

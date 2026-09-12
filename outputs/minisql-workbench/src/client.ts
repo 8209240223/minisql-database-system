@@ -20,6 +20,7 @@ async function api(connection: Connection, path: string, options?: RequestInit) 
 }
 
 async function streamApi(connection: Connection, path: string, sql: string, signal: AbortSignal) {
+  const maxBufferedRows = 100000;
   const requestId = crypto.randomUUID();
   const response = await fetch(`${connection.url.replace(/\/$/, '')}${path}`, {
     method: 'POST', headers: requestHeaders(connection, { 'Content-Type': 'application/json' }), body: JSON.stringify({ sql, requestId }), signal,
@@ -31,8 +32,15 @@ async function streamApi(connection: Connection, path: string, sql: string, sign
   const data: any = { columns: [], rows: [], plan: [], affectedRows: 0, statements: 1, durationMs: 0 };
   const consume = (frame: any) => {
     if (frame.type === 'meta') Object.assign(data, frame);
-    else if (frame.type === 'row') data.rows.push(frame.values);
-    else if (frame.type === 'complete') Object.assign(data, frame);
+    else if (frame.type === 'row') {
+      if (data.rows.length < maxBufferedRows) data.rows.push(frame.values);
+      else data.truncated = true;
+    }
+    else if (frame.type === 'complete') {
+      Object.assign(data, frame);
+      data.rowCount = frame.rowCount ?? data.rows.length;
+      if (data.rowCount > data.rows.length) data.truncated = true;
+    }
     else if (frame.type === 'error') {
       throw Object.assign(new Error(frame.error?.message ?? '流式查询失败'), frame.error ?? {}, {
         status: response.status, response: frame, commitState: frame.commitState, transactionState: frame.transactionState,
@@ -255,6 +263,29 @@ export async function inspectIndex(connection: Connection, table: string, index:
   return api(connection, sessionPath(connection, '/index-inspect'), {
     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ table, index }),
   });
+}
+export interface IndexMaintenanceResult {
+  kind: 'IndexVerify' | 'IndexRebuild';
+  table: string;
+  index: string;
+  valid?: boolean;
+  entries?: number;
+  height?: number;
+  pages?: number;
+  commitState?: string;
+  problems?: string[];
+}
+async function maintainIndex(connection: Connection, table: string, index: string, action: 'verify' | 'rebuild'): Promise<IndexMaintenanceResult> {
+  if (connection.mode !== 'api' || !connection.sessionId) throw new Error('需要真实数据库会话。');
+  return api(connection, sessionPath(connection, `/index-${action}`), {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ table, index }),
+  });
+}
+export function verifyIndex(connection: Connection, table: string, index: string) {
+  return maintainIndex(connection, table, index, 'verify');
+}
+export function rebuildIndex(connection: Connection, table: string, index: string) {
+  return maintainIndex(connection, table, index, 'rebuild');
 }
 
 export async function runSql(connection: Connection, sql: string, compile: boolean, signal: AbortSignal): Promise<QueryResult> {

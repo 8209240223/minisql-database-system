@@ -1,124 +1,166 @@
-# MiniSQL V3 Feature Matrix
+# MiniSQL V3 实际功能矩阵
 
-日期：2026-09-12（新增 REQ-CORE-001/002 与 §19.11 闭环及偏离登记，见文末）
+审计日期：2026-09-12
 
-本矩阵按当前代码和本轮实际验证结果填写。`部分实现` 表示主路径已经存在，但仍有需求边界、跨模块组合或验收条件没有闭合；不把配置字段、演示数据或单独的前端展示计为完整实现。
+源码基线：`6839d8d` + 本轮 P0/P1 实现分支
 
-| 编号 | 对应扩展 | 当前状态 | 已验证范围 | 尚未闭合范围 |
-| --- | --- | --- | --- | --- |
-| X01 | EXT-SQL-001 算术与复杂表达式 | 部分实现 | WHERE、投影、INSERT、UPDATE、溢出/除零、短路和常量折叠 | 全部类型组合与跨扩展验收 |
-| X02 | EXT-SQL-002 NULL 与三值逻辑 | 部分实现 | nullable、NULL 位图、IS NULL、排序、DISTINCT、LEFT JOIN、聚合 | 全部组合和边界语义验收 |
-| X03 | EXT-SQL-003 类型与 CAST | 部分实现 | BIGINT、DECIMAL、FLOAT、BOOL、DATE、VARCHAR(n)、CAST、指数形式、重启 | 完整 X03 组合及偶发优化器夹具收口 |
-| X04 | EXT-SQL-004 UPDATE | 部分实现 | 多赋值、旧行求值、过滤、变长迁移、约束、事务 | 索引维护与完整组合验收 |
-| X05 | EXT-SQL-005 ORDER BY 与分页 | 部分实现 | 多键排序、别名、DISTINCT、NULL 排序、LIMIT/OFFSET、外部排序 | 完整组合验收 |
-| X06 | EXT-SQL-006 GROUP BY、聚合、HAVING | 部分实现 | 五类聚合、NULL 处理、分组、HAVING、外部分组、多 run 合并 | FLOAT 全组合、流式输入和完整预算验收 |
-| X07 | EXT-SQL-007 DISTINCT | 部分实现 | 完整投影去重、表达式、NULL、排序分页、重启 | 外存溢写和完整组合验收 |
-| X08 | EXT-SQL-008 JOIN | 部分实现 | INNER/LEFT JOIN、多表、自连接、ON 绑定、补 NULL、HashJoin | 外存连接和完整改写验收 |
-| X09 | EXT-SQL-009 子查询 | 已实现（基础版） | IN、NOT IN、EXISTS、标量、限定名相关作用域、派生表、结构化按值绑定、重复参数分组复用、Apply/SemiJoin/AntiJoin 计划节点、优化器 `decorrelate-subquery` 改写、NULL、UPDATE/DELETE；derived-smoke 12 项、correlated-exec-smoke 8 项、subquery-smoke 25 项通过 | 更激进的跨边界 Join 重写为后续增强 |
-| X10 | EXT-SQL-010 投影与别名 | 部分实现 | 表达式、输出别名、表别名、限定列、混合限定星号和歧义检查 | 嵌套作用域与稳定计算列身份 |
-| X11 | EXT-SQL-011 约束与多行 VALUES | 部分实现 | NOT NULL、DEFAULT、主键、复合键、UNIQUE、CHECK、外键、多行 VALUES 原子性 | 完整验收与稳定性风险跟踪 |
-| X12 | EXT-CMP-001 诊断与纠错 | 已实现（基础版） | 单语句多诊断、恢复模式 tokenizer、clause-level recovery、错误位置、source 片段、工作台多诊断列表与点击定位、未知表/列编辑距离建议、写操作不执行；diagnostics-smoke 25 项通过 | 更高级的智能纠错策略为后续增强 |
-| X13 | EXT-CMP-002 可扩展 AST/LR | 已实现（基础版） | AST/Plan/Catalog schema versioning、未知主版本拒绝、迁移入口、中断恢复、稳定列 identity（`表名.列名`）、canonical LR(0)、LR(1) 和 LALR 表生成器；parser-regression 18 项、迁移契约 20 项、planner contract 通过 | 冲突诊断和文法优化为后续增强 |
-| X14 | EXT-CMP-003 AST/Plan JSON | 部分实现 | 数组/版本包装、反序列化、往返、损坏结构拒绝、schema versioning、工作台展示 | 完整 Schema 迁移与稳定列身份 |
-| X15 | EXT-OPT-001 规则框架 | 部分实现 | 4 条规则、固定点、禁用规则、预算、收敛诊断、三值折叠 | 通用注册和其余规则 |
-| X16 | EXT-OPT-002 列裁剪与冗余节点 | 部分实现 | 恒真/恒假/NULL Filter、简单列裁剪、Schema/执行等价检查 | 连接、聚合和复杂表达式列裁剪 |
-| X17 | EXT-OPT-003 谓词下推与连接改写 | 部分实现 | INNER JOIN 单表谓词下推、直接等值 HashJoin 改写 | LEFT JOIN、跨表条件和完整改写 |
-| X18 | EXT-OPT-004 统计信息与代价 | 已实现（基础版） | 表/列统计、distinct、NULL 比例、min/max、Top 值直方图、等宽 valueHistogram、索引 entries/height/pageCount、统计版本/刷新时间、stats-v1 估计、EXPLAIN statsSource、SeqScan/IndexScan 候选成本比较和确定性选择；statistics-smoke 21 项通过 | 更复杂直方图和成本公式为后续增强 |
-| X19 | EXT-OPT-005 EXPLAIN/ANALYZE | 部分实现 | 原始/优化计划、实际行数/耗时、逐节点统计、写语句拒绝 | 完整 X19 组合验收 |
-| X20 | EXT-SYS-001 B+ 树与索引 | 已实现（基础版） | 页级 B+ 树主路径、页类型/元页、根到叶遍历、分裂、借位/合并、重启恢复、结构 inspect、索引 HTTP/工作台入口；29+41+44 项索引检查通过；1000/5000/10000 行性能曲线（height 2/3/3，pages 33/162/323）已产出 | MB 级性能压力为后续增强，不纳入基础版 |
-| X21 | EXT-SYS-002 事务与原子性 | 已实现（声明方案） | DDL/DML 事务、提交/回滚、HTTP 常驻会话、失败回滚、锁等待、SAVEPOINT/RELEASE/ROLLBACK TO（7 项）、事务溢写预算与回滚（5 项） | MVCC 和行级隔离等高级模式为后续增强，不纳入基础版 |
-| X22 | EXT-SYS-003 WAL/检查点/故障注入 | 已实现（基础版） | 重做恢复、显式/自动/后台检查点、持久化 checkpoint 记录、累积 WAL/LSN、非零截止位置重做、五阶段故障注入、在线一致性快照；62+30+88 项检查通过 | 复杂并发恢复压力为后续增强，不纳入基础版 |
-| X23 | EXT-SYS-004 并发控制 | 已实现（声明方案） | 多会话、数据库级两阶段锁、锁等待/超时、关闭回滚、同记录竞争 44 项 | 当前方案不提供 MVCC，并行读写不在承诺范围 |
-| X24 | EXT-SYS-005 权限与审计 | 部分实现 | 页式访问目录、PersistentCatalog 保留系统堆表、角色继承、对象授权、加盐密码、身份绑定、原子 HTTP 端点、CLI 身份、权限/审计面板；C++ session 与直连二进制已校验身份和对象权限，当前支持语法以及解析失败的 CTE/扩展 SQL 均会通过真实 Catalog 规范化基础表名，权限版本支持热重载和重启恢复 | 未限定相关作用域和更广 SQL 的完整语义 Catalog/AST 绑定仍未闭合 |
-| X25 | EXT-SYS-006 外部排序、取消、资源 | 已实现（基础版） | 外部排序/聚合、NDJSON、drain 背压、会话取消、结果预算、工作台字段；执行器 `RowStream`、`Scan/Filter/Project/LimitRowStream`、`MaterializedRowStream`、HTTP resourceUsage、会话级 C++ 多帧 `meta/row/complete`，x25 流式 HTTP 18 项、session stream 9 项通过 | 排序/聚合完全逐行生产和完整压力验收为后续增强 |
-| X26 | EXT-SYS-007 备份恢复与迁移 | 已实现（基础版） | v2 全量备份、v1 迁移、v3 增量链、v4 在线一致性快照、活动事务未提交时快照隔离、非零 WAL 截止位置重做、恢复回滚目录与失败自动还原、备份链深度、逐页 materialize 恢复、页文件校验和原子恢复；备份 smoke 56 项、在线快照 22 项检查通过 | 在线恢复超高并发压力为后续增强，不纳入基础版 |
-| X27 | EXT-QA-001 Fuzz 与长期回归 | 部分实现 | SELECT 差分 500 项、DDL/DML 状态机、3 种固定种子 96 步回归、2 种固定种子 512 步长跑、固定持续时间/轮次可配置重复 soak、逐文件语料复现、失败 artifact 重放入口、失败分类、DATE/BOOL 回归、五阶段跨进程崩溃恢复组合、4 种子 × 512 步 × 4096 条压力数据的溢写/资源回归、CI 入口 | 多小时长期运行资源趋势仍需在长期环境执行 |
+需求基线：`MiniSQL数据库管理系统_完整详细需求规格说明书_V3.md`
 
-## 与需求规格书的偏离登记
+## 1. 判定口径
 
-下表记录实现与《MiniSQL数据库管理系统_完整详细需求规格说明书_V3》之间的**有意识偏离**。偏离方向均为“实现超集”，即比规格书默认要求做得更多；此处逐项列明，不当作“已按规格书实现”。
+本文件按当前源码、CMake 目标、启动脚本、前端调用链和测试入口重新审计，不沿用旧完成报告中的自述结论。
 
-| 规格条款 | 规格书要求 | 当前实现 | 判定 |
+| 状态 | 含义 |
+| --- | --- |
+| 已实现 | 当前源码存在完整调用链，并有对应自动化测试证据 |
+| 部分实现 | 主路径可用，但需求中的接口字段、组合场景、资源边界或验收条件尚未闭合 |
+| 未实现 | 源码明确返回 `NotImplemented`、501，或只有固定占位结果 |
+| 结构占位 | 构建目标存在，但没有该模块的实际实现代码 |
+
+“存在文件、接口、按钮或测试脚本”本身不作为已实现证据。压力测试、浏览器测试或 CTest 没有被默认验收脚本执行时，也不写成“全量通过”。
+
+## 2. 当前项目实际结构
+
+| 层次/入口 | 实际位置 | 当前作用 | 判定 |
 | --- | --- | --- | --- |
-| §3.4 表达式、Q05 双等号 | 基础版仅接受 `=`/`!=`；完整的 `==` 应返回 `LEX_UNSUPPORTED_OPERATOR` | `src/sql/lexer.cpp` 把 `==` 与 `<>` 识别为运算符，`src/sql/parser.cpp` 分别规范化为 `=` 与 `!=` | 超集偏离。规格书注明该项“待确认”且“不影响 P2”；若课程口径要求拒绝，须按 §20.4 补独立变更记录 |
-| §13.9 EXT-SQL-008 | RIGHT/FULL/NATURAL/USING 不在精确语法清单内，必须明确拒绝 | NATURAL/USING/CROSS 均已明确拒绝；RIGHT/FULL JOIN 已实现，证据 `tests/outer-join-smoke.mjs` | 超集偏离。§20.2 说明 RIGHT/FULL“不自动追加为目标”，因此属额外能力，不计入 X08 的验收依据 |
-| §16.3、§18.4 完成判据 | 完成证据包含 X01-X27 全量组合验收 | 本矩阵 X01-X08、X10、X11、X14-X17、X19、X24、X27 仍为“部分实现” | **未达成**。新增闭环不改变此项判定 |
+| 公共层 | `outputs/minisql-backend/src/common`、`src/security/access_catalog.cpp` | 错误、配置、日志及访问目录 | 已实现 |
+| SQL 前端 | `src/sql/lexer.cpp`、`parser.cpp` | Tokenize、Parser、AST | 已实现；Token 包含 UTF-8 半开字节区间和起止行列 |
+| Binder | `src/sql/binder.cpp` | 名称、作用域和访问对象绑定 | 已实现；相关引用使用可链式作用域身份 |
+| Catalog | `src/catalog/catalog.cpp`、`persistent_catalog.cpp` | 内存视图及页式持久目录 | 已实现，但持久类型标识仍为字符串 |
+| Planner | `src/sql/planner.cpp` | Logical Plan、子查询、派生表和聚合降级 | 已实现；派生表 JOIN 及受限可更新派生表 DML 已接通 |
+| Optimizer | `src/optimizer/optimizer.cpp` | 固定点规则、下推、通用必要列传播和 Join 代价选择 | 已实现需求内主路径；逐节点 I/O 仍归 X19 |
+| Execution | `src/execution/database.cpp`、`executor.cpp` | DDL/DML/查询、事务、流式结果、EXPLAIN | 已实现；流式结果执行和传输均有 100000 行硬上限 |
+| Storage | `src/storage` | PageFile、Buffer Pool、Heap、B+ 树、WAL/检查点 | 已实现 |
+| 事务目标 | `CMakeLists.txt` 中 `minisql_transaction` | 仅 `INTERFACE` 目标 | **结构占位**；事务逻辑实际散落在 `Database`/`PageFile` |
+| `minisql_lexer` | `src/server/lexer_main.cpp` | 独立词法入口 | 已实现 |
+| `minisql_compile` | `src/server/compile_main.cpp` | 独立编译入口 | 已实现 |
+| `minisql_database` | `src/server/database_main.cpp` | 真正的数据库会话/帧协议进程 | 已实现，是 Node bridge 调用的核心入口 |
+| `minisql` | `src/main.cpp`、`src/server/application.cpp` | 数据库 CLI | 已实现；`-e/--execute` 和交互模式共用 `execution::Database` |
+| 当前 HTTP bridge | `scripts/database-bridge.mjs` | HTTP、会话、权限、备份、NDJSON 适配 | 已实现，依赖 `minisql_database` 子进程；不是 C++ 原生 HTTP 服务 |
+| 旧 HTTP bridge | `scripts/bridge.mjs` | 编译演示入口 | **未实现执行与真实 Catalog**；Catalog 固定为空，执行返回 501 |
+| React 工作台 | `outputs/minisql-workbench/src` | 连接、标签级会话、编辑、结果、计划、索引维护、权限和存储界面 | 已实现主流程；完整可访问性证据仍归 UI09 |
+| 验收脚本 | `outputs/run-minisql-tests.ps1` | Node 分组测试和前端单测/构建 | 部分覆盖，不等于仓库全量测试 |
 
-## 已知失败案例（如实列出）
+## 3. 核心契约矩阵
 
-**当前状态：本机 Windows Release 全量回归 105/105 通过**（`tests/*.mjs` 102 项 + 3 项慢用例 `fuzz-state-machine-soak.mjs`、`fuzz-state-machine-long-run.mjs`、`index-performance-curve.mjs`）。此前列出的六项失败已全部收口，按性质分两类如实区分：实现缺陷，以及断言与规范不一致。
+| 编号 | 状态 | 已实现证据 | 尚未实现/未闭合 |
+| --- | --- | --- | --- |
+| REQ-CORE-001 输入资源与数值边界 | 已实现 | 输入、批量、标识符、诊断数、整数范围、Token UTF-8 半开范围及 256/257 层嵌套边界均有回归 | 未发现需求内明确缺口 |
+| REQ-CORE-002 稳定接口契约 | 已实现 | Catalog 指纹、`PLAN_STALE_SCHEMA`、AST/Plan `nodeId/sourceSpan/outputSchema` 和 Token 起止范围均有往返/唯一性 contract | 未发现需求内明确缺口 |
+| REQ-CORE-003 行页布局与生命周期 | 已实现 | Page、Heap、RowId/slot generation、空闲页和损坏检查存在 C++ contract | 未发现需求级明确空实现 |
+| REQ-CORE-004 缓冲区和统计口径 | 已实现 | Buffer Pool、LRU/FIFO、pin/dirty、I/O 统计和 contract 存在 | 工作台固定序列实验属于 UI08 边界，不影响后端主路径判定 |
+| REQ-CORE-005 持久化与提交边界 | 已实现 | 页文件、WAL、checkpoint、错误状态和重启恢复路径存在 | 高并发/故障组合仍由 X22/X26 单列 |
+| REQ-CORE-006 固定端到端验收 | 已实现 | `minisql.exe`、`minisql_database.exe` 和 bridge 均调用真实数据库核心；CLI process smoke 验证 DDL/DML/查询 | 未发现需求级明确空实现 |
 
-（一）实现缺陷，已修复：
+## 4. X01-X27 扩展功能矩阵
 
-| 用例 | 根因 | 修复 |
-| --- | --- | --- |
-| `tests/journal-process.mjs` | WAL 重做路径的 `validatePage` 不比对页自校验和，损坏的日志页先被 `applyExtent` 写进数据文件，随后才在构造函数里以误导性的 `file header` 报错——数据文件已被改动 | `src/storage/page_file.cpp` 在 `validatePage` 首行比对 `checksum(bytes)`；损坏记录现在在写入前被拒（`STORAGE_CORRUPTION: redo page checksum`），DB 保持 UNCHANGED |
-| `tests/backup-online-smoke.mjs` | 快照响应携带非 UTF-8 字节 → nlohmann 抛 `type_error.316` → 引擎回 `InternalError 9999` → bridge 置 `quarantined` → 在线备份 503 | 见下「UTF-8 边界」 |
-| `tests/cast-process.mjs` | 回归脚本与 CI 未把构建产物同步到 `bin/`，用例读到过时的预置副本 | 见上（bin 同步） |
-| `tests/decimal-journal-process.mjs`、`tests/write-batch-process.mjs`、`tests/arithmetic64-differential.mjs` | 三处用例引用了不带 `minisql_` 前缀的探针名（`journal_probe.exe` 等），`spawnSync` 静默 ENOENT | 用例改用真实产物名；`run-minisql-tests.ps1` 与 `ci.yml` 增加「所有被引用的 `bin/*.exe` 必须存在」的校验，避免同类静默失败 |
+| 编号 | 功能 | 状态 | 实际实现与缺口 |
+| --- | --- | --- | --- |
+| X01 | 算术与复杂表达式 | 已实现 | 四则、一元运算、优先级、溢出/除零、短路及优化前后一致性均有实现和测试 |
+| X02 | NULL 与三值逻辑 | 已实现 | NULL 位图、比较、布尔逻辑、排序、去重、外连接和聚合路径已接通 |
+| X03 | 类型与 CAST | 部分实现 | BIGINT/DECIMAL/FLOAT/BOOL/DATE/VARCHAR 与 CAST 主路径可用；持久 Catalog 写入类型字符串，未实现需求要求的稳定数值 `typeId` |
+| X04 | UPDATE | 已实现 | 多赋值旧行求值、变长迁移、约束、索引、事务和重启路径存在 |
+| X05 | ORDER BY 与分页 | 已实现 | 多键、别名、NULL 顺序、LIMIT/OFFSET 和外部排序已实现 |
+| X06 | GROUP BY/聚合/HAVING | 已实现 | 五类聚合、NULL、HAVING 和外部分组/归并均有实际执行路径 |
+| X07 | DISTINCT | 已实现 | 表达式、NULL、排序分页和持久化场景已覆盖 |
+| X08 | JOIN | 部分实现 | INNER/LEFT/RIGHT/FULL、自连接、直接等值 HashJoin 及派生表作为左输入均可执行；外存 HashJoin 仍未实现 |
+| X09 | 子查询 | 已实现 | IN/NOT IN/EXISTS/标量、派生表、多层相关作用域和祖先参数缓存均可用；三层父级+祖父级及仅祖父级引用通过实际执行 |
+| X10 | 投影与别名 | 部分实现 | 表达式/表别名/列别名/限定星号可用；嵌套作用域与计算列稳定身份没有完整契约 |
+| X11 | 约束与多行 VALUES | 已实现 | NOT NULL、DEFAULT、主键、复合键、UNIQUE、CHECK、外键以及语句级原子性已实现 |
+| X12 | 诊断与纠错 | 已实现 | 多诊断、恢复、源码片段、建议及写操作不执行路径已接通 |
+| X13 | 可扩展 AST/LR | 已实现 | AST/Plan/Catalog 版本拒绝与迁移入口、LR(0)/LR(1)/LALR 表生成器存在 |
+| X14 | AST/Plan JSON | 已实现 | 版本包装、往返、损坏拒绝、稳定唯一 `nodeId`、`sourceSpan`、`outputSchema` 和 children 契约均通过 |
+| X15 | 优化规则框架 | 已实现 | 固定点、预算、禁用规则、收敛诊断及规则记录存在 |
+| X16 | 列裁剪与冗余节点 | 已实现 | 必要 binding 可穿过 Aggregate/Sort/Filter；JOIN 保留连接键和物理行边界，DML 保留 RowId/约束列，优化前后结果 contract 通过 |
+| X17 | 谓词下推与连接改写 | 已实现 | INNER JOIN 单表谓词下推、外连接安全边界和等值 HashJoin 改写已有规则及 contract |
+| X18 | 统计信息与代价 | 已实现 | 表列/索引统计、直方图、实时表行数和 Scan 成本可用；Join 在 NestedLoop/Hash 两候选间按唯一键估计与内存预算选择，`optimizerDecision` 可追踪 |
+| X19 | EXPLAIN/ANALYZE | 部分实现 | 原始/优化计划、实际行数、耗时、写语句不执行已实现；逐节点仅有 `actualRows/durationMs/loops`，I/O 仍只有查询级统计 |
+| X20 | B+ 树与索引 | 已实现 | 页级树、分裂、借位/合并、范围查询、删除、恢复及 Inspect 接口存在 |
+| X21 | 事务与原子性 | 已实现 | BEGIN/COMMIT/ROLLBACK、SAVEPOINT、失败回滚和会话事务可用；实现位于执行/存储层，独立 transaction 模块仍为空目标 |
+| X22 | WAL/检查点/故障注入 | 已实现 | WAL、重做、自动/后台 checkpoint、LSN 和故障注入路径存在 |
+| X23 | 并发控制 | 已实现 | 多会话、数据库级两阶段锁、等待/超时、关闭回滚存在；当前声明方案不是 MVCC/行级锁 |
+| X24 | 权限与审计 | 部分实现 | 用户、角色继承、授权、密码、审计、热重载及 HTTP/CLI 身份链路存在；复杂/未支持 SQL 的对象绑定依赖回退路径，未形成覆盖全部语法的统一 AST/Catalog 授权闭环 |
+| X25 | 外部执行、取消与资源 | 已实现 | 外部排序/聚合、资源管理、取消、NDJSON 顺序背压可用；C++ 和浏览器各自限制 100000 行并报告截断，断流/超时取消不会击穿 bridge |
+| X26 | 备份恢复与迁移 | 已实现 | 全量/增量、版本迁移、校验、失败恢复目录和 Windows UTF-8 在线快照路径均可用；在线备份 22 项通过 |
+| X27 | Fuzz 与长期回归 | 部分实现 | 固定种子、差分、状态机、崩溃恢复、压力、重放入口存在；失败输入不会自动最小化，长时 soak 未形成默认、持续运行的验收证据 |
 
-（二）断言与规范不一致，已按规范修正（不是「改测试让它变绿」，口径变更逐条记录）：
+汇总：21 项已实现，6 项部分实现，0 项整项完全空白。剩余部分实现集中在 X03、X08、X10、X19、X24、X27，不再包含 P0/P1 缺口。
 
-| 用例 | 原断言 | 处置 |
-| --- | --- | --- |
-| `tests/transaction-savepoint.mjs`（第 55 行） | `SELECT * FROM v`（表不存在）期望 422，实际 403 | **按确认口径改实现**：X25 仍是未绑定即拒绝执行（fail-closed 不变），但错误码回报真实原因——`AccessRequest`/`BindResult` 新增 `failureCode`/`failureLocation`，`AccessCatalog::authorize` 未绑定时抛出原始错误。表不存在 → `Catalog 3001` → 422；身份校验仍在授权之前完成，未授权调用方拿到的依旧是 403 |
-| `tests/requirements-http-contract.mjs` | 不可绑定语句一律 403 / 7001 | 同上改为按真实错误码：`WITH RECURSIVE`（解析期 `NotImplemented`）→ 501 / 9001，表不存在 → 422 / 3001；新增 3 项断言锁定该口径（现 40 项） |
-| `tests/decimal-literal-process.mjs`（第 39 行） | 把 `1.2e3` 列为非法 `DECIMAL`（期望 2001） | 该断言写于 FLOAT 指数形式实现之前，与 `grammar.md`（`float_literal` 含可选 `exponent`）及 `src/sql/lexer.cpp`（指数 → `FLOAT`）冲突。`1.2e3` 已移出非法清单，改为断言它是合法 FLOAT（`1.2e3 → 1200`、`1.2E-3 → 0.0012`） |
+## 5. UI01-UI10 工作台矩阵
 
-## C4 证据索引
+| 编号 | 功能 | 状态 | 实际实现与缺口 |
+| --- | --- | --- | --- |
+| UI01 | 连接与能力发现 | 已实现 | 真实连接、状态、鉴权和能力接口可用；每个 QueryTab 保存无密码连接快照和独立后端 session 归属 |
+| UI02 | 对象浏览器 | 已实现 | 真实表、列、类型、索引、刷新、过滤和生成查询入口存在 |
+| UI03 | SQL 编辑与多标签 | 已实现 | 每标签独立保存连接、session、事务、结果、诊断、编辑版本和运行状态；可并行执行且乱序响应按 tab ID 写回，关闭标签释放其 session |
+| UI04 | 编译、执行与取消 | 已实现 | 编译/执行分离、requestId、取消、超时、危险 UPDATE/DELETE 确认路径存在 |
+| UI05 | 查询结果与反馈 | 已实现 | 类型化列、NULL、CSV、虚拟窗口可用；流式客户端使用 100000 行有界缓存并显示后端/客户端截断状态 |
+| UI06 | 编译中间结果 | 已实现 | Token/AST/Plan/诊断视图展示稳定 Token 起止范围、AST/Plan 节点身份、源码范围和输出 Schema |
+| UI07 | 诊断与源码定位 | 已实现 | 多诊断、行列定位、Unicode/选区偏移和网络错误区分已有实现与测试 |
+| UI08 | 历史、设置与存储统计 | 已实现 | 历史/设置持久化、检索、存储统计及真实后端来源存在 |
+| UI09 | 布局与可访问性 | 部分实现 | 响应式布局和若干浏览器断言存在；未形成键盘完成全部常用操作、200% 缩放和三视口完整可访问性证据 |
+| UI10 | HTTP 集成契约 | 已实现 | UTF-8、错误状态、超限、进程失败、501、会话和请求体限制有协议级测试 |
 
-下表把每个 X 编号连接到当前代码路径和可复跑命令。命令均从对应工作目录执行；`run-minisql-tests.ps1 -Suite all` 会顺序覆盖编译器、执行、存储、HTTP 和工作台基础回归。状态只反映当前证据，不代表仍列为“部分实现”的需求缺口已经消失。
+汇总：9 项已实现，1 项部分实现（UI09 可访问性完整验收）。
 
-| 编号 | 主责 | 代码路径 | 主要可复跑命令 | 证据与边界 |
-| --- | --- | --- | --- | --- |
-| X01 | A | `src/common/arithmetic.hpp`、`src/sql/planner.cpp`、`src/execution/database.cpp` | `node tests/arithmetic64-differential.mjs`；`node tests/insert-expression-process.mjs`；`node tests/decimal-arithmetic-process.mjs` | WHERE/投影/DML 算术、溢出、除零和短路已覆盖；完整类型组合仍部分实现 |
-| X02 | A/B | `src/storage/heap.cpp`、`src/sql/planner.cpp`、`src/execution/database.cpp` | `node tests/null-process.mjs`；`node tests/outer-join-smoke.mjs`；`node tests/aggregate-process.mjs` | NULL 位图、三值逻辑、排序、DISTINCT、LEFT JOIN、聚合已覆盖；全组合边界仍部分实现 |
-| X03 | A/B | `src/common/cast.hpp`、`src/common/decimal.hpp`、`src/common/date.hpp`、`src/storage/heap.cpp` | `node tests/bigint-process.mjs`；`node tests/decimal-column-process.mjs`；`node tests/float-process.mjs`；`node tests/date-column-process.mjs`；`node tests/cast-process.mjs`；`node tests/varchar-column-process.mjs` | 主要类型、CAST、持久化和重启已覆盖；完整组合及优化器偶发夹具仍部分实现 |
-| X04 | B | `src/sql/planner.cpp`、`src/execution/database.cpp`、`src/storage/heap.cpp` | `node tests/update-process.mjs`；`node tests/transaction-process.mjs`；`node tests/index-smoke.mjs` | 多赋值、旧行求值、过滤、变长迁移、事务和约束已覆盖；完整索引维护组合仍部分实现 |
-| X05 | B | `src/execution/external_sort.cpp`、`src/execution/database.cpp` | `node tests/external-sort-smoke.mjs`；`node tests/planner-regression.mjs` | 多键排序、NULL、分页、外部 run/归并已覆盖；完整组合仍部分实现 |
-| X06 | B | `src/execution/database.cpp`、`src/execution/external_sort.cpp` | `node tests/aggregate-process.mjs`；`node tests/avg-process.mjs`；`node tests/external-aggregate-smoke.mjs` | 聚合、GROUP BY、HAVING、NULL 和外部分组已覆盖；FLOAT 全组合与执行器流式输入仍部分实现 |
-| X07 | B | `src/sql/planner.cpp`、`src/execution/database.cpp` | `node tests/aggregate-process.mjs`；`node tests/null-process.mjs`；`node tests/external-sort-smoke.mjs` | 投影去重、表达式、NULL、排序分页和重启路径已有证据；外存溢写组合仍部分实现 |
-| X08 | A/B | `src/sql/parser.cpp`、`src/sql/planner.cpp`、`src/execution/database.cpp` | `node tests/join-process.mjs`；`node tests/outer-join-smoke.mjs` | INNER/LEFT、多表、自连接、ON 绑定、HashJoin 和补 NULL 已覆盖；外存连接及完整改写仍部分实现 |
-| X09 | A | `src/sql/parser.cpp`、`src/sql/planner.cpp`、`src/execution/database.cpp` | `node tests/subquery-smoke.mjs`；`node tests/derived-smoke.mjs`；`node tests/correlated-exec-smoke.mjs` | IN/EXISTS/标量、派生表、相关作用域、按值复用和基础 Apply/SemiJoin 标记已完成基础版；完整优化器去相关为后续增强 |
-| X10 | A | `src/sql/parser.cpp`、`src/sql/planner.cpp`、`src/execution/database.cpp` | `node tests/alias-process.mjs`；`node tests/join-process.mjs`；`node tests/derived-smoke.mjs` | 表别名、限定列、星号和歧义检查已有证据；嵌套作用域与稳定计算列身份仍部分实现 |
-| X11 | A/B | `src/sql/planner.cpp`、`src/catalog/catalog.cpp`、`src/execution/database.cpp` | `node tests/named-constraint-process.mjs`；`node tests/multirow-process.mjs`；`node tests/foreign-key-process.mjs`；`node tests/composite-key-process.mjs` | NOT NULL、DEFAULT、主键、复合键、UNIQUE、CHECK、外键和多行 VALUES 已覆盖；完整组合仍部分实现 |
-| X12 | A | `src/sql/lexer.cpp`、`src/sql/parser.cpp`、`src/execution/database.cpp`、`src/App.tsx` | `node tests/diagnostics-smoke.mjs`；`node tests/parser-regression.mjs`；`npm run build` | 批量诊断、单语句多诊断、错误范围、基础纠错建议、工作台列表定位和写操作不执行已完成基础版 |
-| X13 | A | `src/sql/parser.cpp`、`src/sql/serialization.cpp`、`src/catalog/persistent_catalog.cpp`、`src/sql/planner.cpp` | `node tests/parser-regression.mjs`；`node tests/catalog_migration_contract.cpp`；`ctest -R minisql_catalog_migration_contract` | AST/Plan/Catalog schema versioning、迁移入口、中断恢复和稳定列 identity 已完成基础版 |
-| X14 | A | `src/sql/serialization.cpp`、`src/sql/planner.cpp`、`src/optimizer/optimizer.cpp` | `node tests/parser-regression.mjs`；`node tests/planner-regression.mjs`；`node tests/explain-smoke.mjs` | JSON 数组/版本包装、往返和损坏结构拒绝已有证据；完整迁移与稳定列身份仍部分实现 |
-| X15 | A | `src/optimizer/optimizer.cpp`、`include/minisql/optimizer/optimizer.hpp` | `ctest -R minisql_optimizer_contract`；`node tests/explain-smoke.mjs` | 规则固定点、禁用、预算、收敛诊断和三值折叠已有证据；通用注册与其余规则仍部分实现 |
-| X16 | A | `src/optimizer/optimizer.cpp`、`src/sql/planner.cpp` | `ctest -R minisql_optimizer_contract`；`node tests/explain-smoke.mjs` | 恒真/恒假/NULL Filter 和简单列裁剪已有证据；连接、聚合和复杂表达式裁剪仍部分实现 |
-| X17 | A | `src/optimizer/optimizer.cpp`、`src/sql/planner.cpp` | `ctest -R minisql_optimizer_contract`；`node tests/join-process.mjs` | INNER JOIN 单表谓词下推和直接等值 HashJoin 已覆盖；LEFT JOIN、跨表条件和完整改写仍部分实现 |
-| X18 | A | `src/execution/database.cpp`、`src/catalog/catalog.cpp`、`src/sql/planner.cpp` | `node tests/statistics-smoke.mjs`；`node tests/explain-smoke.mjs` | 表/列统计、distinct、NULL、min/max、直方图、索引统计、统计版本和 stats-v1/EXPLAIN 来源已完成基础版 |
-| X19 | A | `src/execution/database.cpp`、`src/optimizer/optimizer.cpp` | `node tests/explain-smoke.mjs`；`node tests/statistics-smoke.mjs` | 原始/优化计划、实际行数/耗时、逐节点统计和写语句拒绝已有证据；完整组合仍部分实现 |
-| X20 | B | `src/storage/page_bplus_tree.cpp`、`src/storage/bplus_tree.cpp`、`src/execution/database.cpp` | `node tests/index-smoke.mjs`；`node tests/index-scale-smoke.mjs`；`node tests/index-performance-curve.mjs`；`ctest -R minisql_page_bplus_tree_contract`；`node tests/database-http.mjs` | 页级 B+ 树、分裂、借位/合并、重启、inspect、规模回归、性能曲线和 HTTP 入口已完成基础版；MB 级压力为后续增强 |
-| X21 | B | `src/execution/database.cpp`、`src/storage/page_file.cpp`、`src/sql/parser.cpp`、`src/sql/planner.cpp`、`src/server/database_main.cpp` | `node tests/transaction-process.mjs`；`node tests/transaction-savepoint.mjs`；`node tests/transaction-overflow.mjs`；`node tests/session-http.mjs`；`node tests/multi-session-http.mjs` | DDL/DML 事务、提交/回滚、失败回滚、锁等待、保存点、溢写预算与回滚已完成基础版；MVCC 和行级隔离为后续增强 |
-| X22 | B | `src/storage/page_file.cpp`、`src/execution/database.cpp`、`src/server/database_main.cpp`、`scripts/database-bridge.mjs` | `node tests/journal-process.mjs`；`node tests/auto-checkpoint-smoke.mjs`；`node tests/x22-fault-injection.mjs`；`node tests/backup-online-smoke.mjs` | WAL 重做、显式/自动/后台 checkpoint、LSN、五阶段故障注入和在线快照已完成基础版；复杂并发恢复压力为后续增强 |
-| X23 | B | `src/server/database_main.cpp`、`scripts/database-bridge.mjs` | `node tests/multi-session-http.mjs`；`node tests/session-process.mjs` | 多会话、数据库级两阶段锁、等待/超时和关闭回滚已覆盖；当前方案不提供 MVCC |
-| X24 | C | `src/security/access_catalog.cpp`、`src/execution/database.cpp`、`scripts/access-catalog.mjs`、`scripts/database-bridge.mjs`、`src/catalog/persistent_catalog.cpp`、`src/server/database_main.cpp` | `node tests/access-store-contract.mjs`；`node tests/access-catalog-atomic-contract.mjs`；`node tests/access-atomic-http.mjs`；`node tests/access-control-process.mjs`；`node tests/access-control-http.mjs`；`ctest -R minisql_access_catalog_system_contract`；`ctest -R minisql_access_binding_contract`；`node tests/cli-contract.mjs` | C1 权限、审计、页式目录、PersistentCatalog、身份热重载、Catalog/CTE 绑定和工作台入口已验证；未限定相关作用域与更广 SQL 完整语义绑定仍受 A/X09 边界影响 |
-| X25 | B/C | `src/execution/external_sort.cpp`、`src/execution/database.cpp`、`src/execution/executor.hpp`、`src/server/database_main.cpp`、`scripts/session-process.mjs`、`scripts/database-bridge.mjs` | `node tests/external-sort-smoke.mjs`；`node tests/external-aggregate-smoke.mjs`；`node tests/cancel-smoke.mjs`；`node tests/result-budget-smoke.mjs`；`node tests/x25-stream-http.mjs`；`node tests/x25-row-stream-contract.mjs`；`node tests/session-stream-process.mjs` | 外部 run、NDJSON、背压、取消、结果预算、RowStream、会话级多帧流和 HTTP 资源回传已完成基础版；排序/聚合完全逐行生产为后续增强 |
-| X26 | B | `scripts/database-bridge.mjs`、`src/storage/page_file.cpp`、`src/execution/database.cpp` | `node tests/backup-smoke.mjs`；`node tests/backup-online-smoke.mjs`；`ctest -R minisql_catalog_migration_contract` | 全量备份、迁移、增量链、v4 在线快照、非零 WAL 重做、恢复回滚目录、失败自动还原、逐页 materialize 和校验已完成基础版；超高并发压力为后续增强 |
-| X27 | C | `tests/fuzz-state-machine.mjs`、`tests/fuzz-state-machine-differential.mjs`、`tests/fuzz-state-machine-crash-recovery.mjs`、`tests/fuzz-state-machine-pressure.mjs`、`tests/fuzz-state-machine-soak.mjs`、`tests/fuzz/*` | `node tests/fuzz-differential.mjs`；`node tests/fuzz-state-machine-differential.mjs`；`node tests/fuzz-state-machine-long-run.mjs`；`node tests/fuzz-state-machine-crash-recovery.mjs`；`node tests/fuzz-state-machine-pressure.mjs`；`node tests/fuzz-state-machine-soak.mjs`；`node tests/fuzz-state-machine-replay-contract.mjs`；`node tests/fuzz/reproducibility-contract.mjs` | 固定种子、DDL/DML、崩溃恢复、压力资源、重放和 CI 入口已验证；无限输入和多小时资源曲线仍需长期环境证据 |
+## 6. P0/P1 完成状态与剩余缺口
 
-### C4 当前判定
+本轮原清单中的 3 项 P0 和 6 项 P1 均已实现并进入回归：
 
-C4 的交付物已经具备：X01-X27 均有负责人、代码路径、验证命令、证据范围和未闭合边界；全套分组回归 `powershell -ExecutionPolicy Bypass -File ./outputs/run-minisql-tests.ps1 -Suite all` 已通过。C4 不把“有证据”偷换成“需求已全部实现”，因此 X01-X22、X24-X27 中仍有明确边界的条目继续标记为“部分实现”。
+| 原优先级 | 原缺口 | 当前状态 | 验证证据 |
+| --- | --- | --- | --- |
+| P0 | 在线备份失败 | 已完成 | Windows 中文路径使用 UTF-8 转换；`backup-online-smoke.mjs` 22 项通过 |
+| P0 | 流式查询无端到端结果上限 | 已完成 | C++ 与客户端均有 100000 行硬上限/截断状态；session stream 16 项和浏览器取消回归通过 |
+| P0 | `minisql.exe` 是 SQL 外壳 | 已完成 | `-e/--execute`、交互模式接入真实 `execution::Database`；`cli.process_smoke` 通过真实 DDL/DML/SELECT |
+| P1 | 派生表 JOIN/UPDATE/DELETE | 已完成 | 支持派生 JOIN 左输入及受限可更新派生表；不可更新形状返回 2003；database contract 覆盖成功与拒绝边界 |
+| P1 | 多层相关子查询 | 已完成 | 执行器使用祖先参数作用域栈，缓存键包含祖先绑定；三层与仅祖父级引用均通过 |
+| P1 | AST/Plan/Token 稳定传输契约 | 已完成 | Token UTF-8 半开字节范围；AST/Plan `nodeId/sourceSpan/outputSchema` 唯一性、children 和往返 contract 通过 |
+| P1 | 通用列裁剪和 Join 代价选择 | 已完成 | 必要 binding 穿过 Aggregate/Sort/Filter，JOIN/DML 保留隐藏物理列；两类 Join 候选、成本、内存预算和理由进入 `optimizerDecision` |
+| P1 | 标签不是独立会话单元 | 已完成 | 单元测试与浏览器回归验证独立 session、并行执行、乱序响应隔离、关闭释放和无敏感持久化 |
+| P1 | 索引维护 UI 不完整 | 已完成 | Verify/Rebuild 入口、确认、忙状态和结果提示已接入；浏览器回归验证两个真实请求 |
 
-## 本轮新增闭环
+剩余未实现/未闭合项均为 P2 或长期验收项：
 
-- UTF-8 边界（本轮修复，同时是 `backup-online-smoke.mjs` 503 的根因）：Windows 上 `std::filesystem::path::string()` 返回**本地 ANSI 窄编码**，含非 ASCII 的路径（例如中文用户名下的临时目录）会产生非法 UTF-8 字节，使 nlohmann 序列化抛 `type_error.316`，整个响应随之丢失。三处修复：(1) `snapshot` 会话操作把 JSON 字符串隐式转成 `std::filesystem::path`，窄字符串按 ANSI 解释导致目标路径被改写——改用既有的 `pathFromUtf8`；(2) `Database::createSnapshot` 回显 `target.string()` 改为 `pathUtf8(target)`；(3) `access_catalog.cpp` 与 `bplus_tree.cpp` 的路径拼接同样去 ANSI 化。另外 `database_main.cpp` 的 `emit` 原先在 `try` 之外，序列化失败会逃逸成**没有 `id` 的错误帧**并终止会话，现已加固为回报带 `id` 的 `InternalError` 并且 JSON 全 ASCII 兜底。证据：`tests/backup-online-smoke.mjs`（22 项）与含中文用户名的快照探针。
-- 不可绑定语句的错误码口径（本轮变更，见「已知失败案例」第二类）：新增 `AccessRequest::failureCode/failureLocation` 与 `BindResult::failureCode/failureLocation`（`include/minisql/security/access_catalog.hpp`、`include/minisql/sql/binding.hpp`），绑定器在 `failBind`/捕获 `MiniSqlError` 时带上错误码与位置（`unknown relation` → `Catalog`，嵌套子查询透传内层码，`bindSource` 的解析失败同样透传），`AccessCatalog::authorize` 在未绑定时抛出它。**安全问题不变**：未绑定一律拒绝执行，不存在任何基于 SQL 文本的兜底扫描；改动只消除「是否配置权限目录」导致的同一句 SQL 状态码不一致。证据：`tests/transaction-savepoint.mjs`（7 项）、`tests/requirements-http-contract.mjs`（40 项）、`tests/access-control-*`。
-- §7.2 极端嵌套不得崩溃（本轮修复，从“已知失败”表中移出）：修复前 200 层嵌套 `CAST`/括号、100 层派生表、200 层标量子查询都会让进程**栈溢出崩溃**（`0xC00000FD`），既不是诊断也不是拒绝。修复分三步——(1) `CMakeLists.txt` 为 MSVC 目标加 `/STACK:16777216`，使已声明的 256 层上限真正可用（此前 1 MiB 默认栈在约 150–200 层就溢出）；(2) `src/sql/parser.cpp` 为派生表与标量子查询两条**完全没有深度保护**的递归补上计数；(3) 回归脚本与 CI 在跑测试前把构建产物同步到 `bin/`，避免回归静默验证过时的预置副本。证据：`tests/nesting-depth-process.mjs`（57 项，覆盖 256 通过 / 257 报 `2002` / 2000 层不崩溃 / 三种递归路径）。
-- 嵌套标量子查询（本轮修复）：非相关子查询的物化路径原先不递归物化内层，导致 `SELECT (SELECT (SELECT i FROM t) FROM t) FROM t;` 在内层以原始 `ScalarSubquery` 节点进入求值器，命中 `expression.at("left")` 抛出 nlohmann json 异常并泄漏成 `InternalError 9999`。现在 `materializeSubqueries` 的 `executeSubquery` 先递归物化（与相关子查询路径一致），求值器也对未物化子查询节点给出正式诊断而不是泄漏内部异常（`src/execution/database.cpp`）。
-- REQ-CORE-001（第十七章）：补齐四项工程基线边界并通过 `tests/requirements-limits-process.mjs`（44 项）——单标识符 128 字符上限（`src/sql/lexer.cpp`）；collectDiagnostics 最多 100 条错误并回报 `limit`/`truncated`（`src/execution/database.cpp`）；批量语句 10000 上限（`src/sql/parser.cpp` 与 `execute`/`diagnostics` 两条逐条切分路径共用同一消息，超限消息含 `budget exceeded` 以便 HTTP 映射 413）。
-- REQ-CORE-001 错误码：新增稳定符号码 `SEM_INTEGER_OUT_OF_RANGE`（`include/minisql/common/error.hpp`、`src/common/error.cpp`），在“字面量超出 INT64”与“能装进 BIGINT 但装不进 INT 列”两处窄化检查中抛出（`src/catalog/catalog.cpp`）；BIGINT 目标仍按 EXT-SQL-003 接受。
-- REQ-CORE-002：新增 `PLAN_STALE_SCHEMA`。计划在编译期绑定 Catalog 指纹（`Catalog::schemaFingerprint()`，按表名排序后哈希表名与列定义），指纹随计划文档序列化往返（`src/sql/planner.cpp`）；`Database::executeSerializedPlan` 执行前重新校验，不一致即拒绝（`src/execution/database.cpp`）。入口为 CLI `executePlan`、会话操作 `executePlan` 与 `POST /api/sessions/:id/execute-plan`，受权对象由计划节点推导而不是扫描 SQL 文本。
-- §19.11 HTTP 契约：`GET /api/storage/stats` 与既有 `/api/storage` 等价，`buffer` 明确标记 `available:false, reason:'backend-not-exposed'` 且不伪造零值；未实现能力（`ErrorCode::NotImplemented`，包括“派生表上的 JOIN/DELETE/UPDATE”这类真实未实现构造）统一返回 HTTP 501。无法绑定的语句仍然**一律不执行**（fail-closed 不变），但错误码回报真实原因：解析期未实现构造 → 501/9001，对象不存在 → 422/3001，只有真正的授权失败才是 403/7001；身份校验仍在对象授权之前完成，因此未授权调用方拿到的依旧是权限错误。证据：`tests/requirements-http-contract.mjs`（40 项）。
-- 授权链路上的资源上限顺序修正：批量超限原先会在绑定阶段被掩盖成 HTTP 403，现在 `Database::bindAccess` 先判定批量上限（`enforceBatchStatementBudget`），超限请求按规格书返回 413；正常请求因分号快速排除而不产生额外词法开销。
-- X24：`access-catalog.mjs` 的原子用户/角色/授权操作映射到 HTTP 资源端点；CLI 通过 HTTP bridge 携带身份；C++ session 和直连二进制入口从 `access.catalog.pages` 同步到 `PersistentCatalog` 保留系统堆表，对当前支持语句以及解析失败的 CTE/扩展 SQL 先通过真实 Catalog 规范化基础表对象，再执行身份/对象权限校验，并按权限版本热重载；重启时已验证旁路页文件不可用仍可使用系统表快照。
-- X27：状态机差分脚本优先选择 `build/windows/Release/minisql_database.exe`，小规模、3 种 96 步回归和 2 种 512 步长跑均通过；新增可配置重复 soak 入口、DATE/BOOL 字面量规划回归、五阶段跨进程崩溃恢复组合和 4 种子 × 512 步 × 4096 条压力数据的溢写/资源回归，固定种子逐文件复现契约、失败 artifact 重放入口和 Windows 引擎回归均已接入 CI/本地验收链。
-- 全套分组回归：迁移 `join-process.mjs`、`aggregate-process.mjs`、`null-process.mjs` 的参考引擎到 Node 24 `node:sqlite`，移除对已删除 `sql.js`/Demo Worker 的依赖；`run-minisql-tests.ps1 -Suite all` 的编译、执行、存储、HTTP 和工作台基础回归全部通过。
-- C2：工作台已加入用户/密码身份、权限/审计/会话、锁等待和取消、客户端请求超时、资源预算、备份列表与恢复操作入口；真实浏览器 DOM 回归已覆盖连接错误/恢复、身份请求头、权限会话、设置、侧栏拖动、390px 移动端无溢出，以及成功/失败查询、客户端超时、活动请求取消、全量备份、替换恢复、损坏备份失败隔离和恢复后查询。
+| 优先级 | 缺口 | 直接证据 | 完成标准 |
+| --- | --- | --- | --- |
+| P2 | EXPLAIN 缺逐节点 I/O | 节点统计仅 `actualRows/durationMs/loops` | 每节点提供可归属的 hit/miss/read/write，无法归属时明确 unavailable |
+| P2 | 持久 Catalog 无稳定数值类型 ID | `persistent_catalog.cpp` 将 `column.type` 字符串写入 descriptor | 引入版本化数值 `typeId`，保留旧版本迁移和未知类型拒绝 |
+| P2 | JOIN 没有外存 Hash 算法 | 当前 HashJoin 以执行内存预算做选择，但没有分区溢写执行器 | 在内存预算不足时分区溢写并验证大表结果、清理和取消 |
+| P2 | Fuzz 失败样本不自动最小化 | `docs/fuzz-progress.md` 将 minimization 列为未实现 | 失败后自动生成保持同类故障的最小 SQL/状态机序列并可重放 |
+| P2 | 独立 transaction 目标为空 | CMake 将 `minisql_transaction` 声明为 `INTERFACE` | 若架构仍要求该模块，将事务状态/WAL 协调迁入真实库；否则删除目标并修正文档 |
+| P2 | 旧 `bridge.mjs` 是误导性占位 | `/api/catalog` 固定空数组，capabilities 声明 execution=false | 删除旧入口，或转发到 `database-bridge.mjs`/真实数据库核心 |
+| 长期验收 | 多小时 soak 证据需持续积累 | 默认短回归不形成跨版本资源趋势 | 建立独立长时 CI 阶段并保存资源趋势和最小失败样本 |
 
-## 判定
+## 7. 验收脚本覆盖缺口
 
-当前版本应标记为“V3 基础版开发完成，成员 A/B 基础功能和成员 C 专项任务均已完成”。A 的 LR/生成器、完整优化器去相关和复杂成本模型，B 的高级压力、MVCC、超大性能曲线等项均按用户范围调整排除在基础版之外；整体全量验收仍按上表真实状态维护。
+`powershell -ExecutionPolicy Bypass -File ./outputs/run-minisql-tests.ps1 -Suite all` 当前只运行选定的 Node 测试、前端若干单测和 `npm run build`。它没有执行：
+
+- CTest/C++ contract 测试；
+- `tests/cast-process.mjs`；
+- `tests/backup-online-smoke.mjs`；
+- fuzz 差分、状态机、崩溃恢复、pressure、long-run、soak 测试；
+- 前端 `test:browser` 浏览器回归。
+
+本轮已手动补跑 CTest、在线备份、流式进程、前端标签单测、生产构建和浏览器回归；但默认 `-Suite all` 仍没有自动纳入这些入口。建议新增 `full` 套件，明确区分短回归、浏览器回归、故障注入和长时测试，并让 CI 报告每个实际执行的命令。
+
+## 8. 与规格书的行为偏离
+
+| 条款 | 规格要求 | 当前行为 | 判定 |
+| --- | --- | --- | --- |
+| `==` 运算符 | 默认要求拒绝并返回 `LEX_UNSUPPORTED_OPERATOR` | Lexer 接受，Parser 规范化为 `=` | 实现超集，但不符合当前默认验收口径 |
+| RIGHT/FULL JOIN | 精确语法清单外应明确拒绝 | 当前已经实现 | 实现超集，不应作为 X08 必需完成证据 |
+
+## 9. 本轮验证说明
+
+- Release 原生目标完整构建成功；仅保留已有的 `date.hpp` 名称遮蔽编译警告。
+- `ctest --test-dir build/verification -C Release`：20/20 通过；其中 CLI process smoke 已改为验证真实 DDL/DML/SELECT。
+- `minisql_optimizer_contract`：525 项通过；`minisql_database_contract`：89 项通过；Planner AST/Plan/Token contract 通过。
+- `backup-online-smoke.mjs`：22 项通过；`session-stream-process.mjs`：16 项通过。
+- `nesting-depth-process.mjs`：57 项通过，覆盖 256 层接受、257 层拒绝和 2000 层不崩溃。
+- `npm run test:tabs`：2 项通过；`npm run build` 通过。
+- 浏览器已验证编译视图、标签独立会话/乱序响应、索引 Verify/Rebuild，以及成功、语义失败、超时、活动取消、备份恢复、失败隔离与恢复后查询。
+- 长时 fuzz/soak 与多小时资源趋势未在本轮执行，不写成通过。
+
+## 10. 结论
+
+本轮列出的 P0/P1 已全部实现并通过对应短回归。项目仍不能宣称“V3 所有增强和长期验收全部完成”：第 6 节保留的 P2 架构/能力缺口、UI09 完整可访问性证据以及长时 fuzz/soak 仍待后续处理。

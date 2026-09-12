@@ -259,6 +259,103 @@ bool pruneProjectColumns(sql::LogicalPlan& project, json& changes, std::size_t s
     record(changes, "prune-columns", statement, before, sql::serializePlans({project}));
     return true;
 }
+void collectPlanBindings(const sql::LogicalPlan& plan, std::set<std::uint32_t>& bindings,
+                         std::set<std::size_t>& slots) {
+    const auto collect = [&](const json& expression) {
+        collectBindings(expression, bindings);
+        collectColumns(expression, slots);
+    };
+    collect(plan.predicate);
+    for (const auto& value : plan.projections) collect(value);
+    for (const auto& value : plan.sortKeys) collect(value);
+    for (const auto& value : plan.groupKeys) collect(value);
+    for (const auto& value : plan.insertExpressions) collect(value);
+    for (const auto& row : plan.insertRows)
+        if (row.is_object() && row.contains("expressions")) for (const auto& value : row.at("expressions")) collect(value);
+    for (const auto& aggregate : plan.aggregates)
+        if (aggregate.is_object() && aggregate.contains("argument") && !aggregate.at("argument").is_null()) collect(aggregate.at("argument"));
+}
+bool pruneRequiredColumns(sql::LogicalPlan& root, json& changes, std::size_t statement) {
+    const auto before = sql::serializePlans({root});
+    bool changed = false;
+    std::function<void(sql::LogicalPlan&, std::set<std::uint32_t>, std::set<std::size_t>, bool)> visit;
+    visit = [&](sql::LogicalPlan& plan, std::set<std::uint32_t> requiredBindings,
+                std::set<std::size_t> requiredSlots, bool preservePhysicalRow) {
+        collectPlanBindings(plan, requiredBindings, requiredSlots);
+        const bool join = plan.kind == "NestedLoopJoin" || plan.kind == "HashJoin" || plan.kind == "LeftJoin" ||
+                          plan.kind == "RightJoin" || plan.kind == "FullJoin";
+        const bool dml = plan.kind == "Update" || plan.kind == "Delete" || plan.kind == "Insert";
+        if (plan.kind == "SeqScan" || plan.kind == "IndexScan") {
+            if (preservePhysicalRow || dml) return;
+            const bool identities = std::any_of(plan.output.begin(), plan.output.end(), [](const auto& column) { return column.binding != 0; });
+            std::vector<sql::PlanColumn> output;
+            for (const auto& column : plan.output) {
+                const bool keep = identities ? requiredBindings.contains(column.binding) : requiredSlots.contains(column.columnId);
+                if (keep) output.push_back(column);
+            }
+            if (output.size() != plan.output.size()) { plan.output = std::move(output); changed = true; }
+            return;
+        }
+        for (auto& child : plan.children)
+            visit(child, requiredBindings, requiredSlots, preservePhysicalRow || join || dml);
+    };
+    visit(root, {}, {}, false);
+    if (changed) record(changes, "prune-columns", statement, before, sql::serializePlans({root}));
+    return changed;
+}
+
+std::string folded(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+    return value;
+}
+double estimateRows(const sql::LogicalPlan& plan, const Options& options) {
+    if (plan.kind == "SeqScan" || plan.kind == "IndexScan") {
+        const auto found = options.tableRows.find(folded(plan.table));
+        const auto rows = found == options.tableRows.end() ? options.defaultTableRows : found->second;
+        return plan.kind == "IndexScan" ? std::max(1.0, rows * 0.1) : rows;
+    }
+    if (plan.children.empty()) return 1.0;
+    const auto left = estimateRows(plan.children.front(), options);
+    if (plan.kind == "Filter") return std::max(0.0, left * 0.33);
+    if (plan.kind == "Limit" && plan.limit) return std::min(left, static_cast<double>(*plan.limit));
+    if (plan.kind == "Aggregate") return plan.groupKeys.empty() ? 1.0 : std::max(1.0, std::sqrt(left));
+    if ((plan.kind == "NestedLoopJoin" || plan.kind == "HashJoin") && plan.children.size() == 2) {
+        const auto right = estimateRows(plan.children[1], options);
+        std::size_t leftKey{}, rightKey{};
+        if (!hashJoinKeys(plan.predicate, plan.children[0].output.size(), leftKey, rightKey)) return left * right * 0.33;
+        const auto leftDistinct = leftKey < plan.children[0].output.size() &&
+            (plan.children[0].output[leftKey].unique || plan.children[0].output[leftKey].primaryKey) ? left : std::max(1.0, std::sqrt(left));
+        const auto rightDistinct = rightKey < plan.children[1].output.size() &&
+            (plan.children[1].output[rightKey].unique || plan.children[1].output[rightKey].primaryKey) ? right : std::max(1.0, std::sqrt(right));
+        return left * right / std::max(leftDistinct, rightDistinct);
+    }
+    return left;
+}
+bool chooseJoinAlgorithm(sql::LogicalPlan& plan, const Options& options, json& changes, std::size_t statement) {
+    if ((plan.kind != "NestedLoopJoin" && plan.kind != "HashJoin") || plan.children.size() != 2) return false;
+    const auto leftRows = estimateRows(plan.children[0], options);
+    const auto rightRows = estimateRows(plan.children[1], options);
+    const auto nestedCost = leftRows * rightRows;
+    std::size_t leftKey{}, rightKey{};
+    const bool hashable = hashJoinKeys(plan.predicate, plan.children[0].output.size(), leftKey, rightKey);
+    const auto rowBytes = std::max<std::size_t>(32, plan.children[1].output.size() * 16);
+    const auto buildBytes = rightRows * static_cast<double>(rowBytes);
+    const auto spillPasses = options.memoryBudgetBytes == 0 ? 1.0 : std::max(0.0, std::ceil(buildBytes / options.memoryBudgetBytes) - 1.0);
+    const auto hashCost = hashable ? leftRows + rightRows + spillPasses * rightRows : std::numeric_limits<double>::infinity();
+    const auto selected = hashable && hashCost <= nestedCost ? "HashJoin" : "NestedLoopJoin";
+    json decision = {{"model", "join-cost-v1"}, {"estimatedRows", {{"left", leftRows}, {"right", rightRows}, {"output", estimateRows(plan, options)}}},
+        {"distinctEstimate", "unique-key-or-sqrt-rows"}, {"memoryBudgetBytes", options.memoryBudgetBytes}, {"estimatedBuildBytes", buildBytes},
+        {"candidates", json::array({{{"kind", "NestedLoopJoin"}, {"estimatedCost", nestedCost}},
+                                      {{"kind", "HashJoin"}, {"estimatedCost", hashable ? json(hashCost) : json(nullptr)}, {"eligible", hashable}}})},
+        {"selected", selected}, {"reason", hashable ? "minimum-estimated-cost" : "no-direct-equality-key"}};
+    const bool changed = plan.kind != selected || plan.optimizerDecision != decision;
+    if (!changed) return false;
+    const auto beforeKind = plan.kind;
+    plan.kind = selected;
+    plan.optimizerDecision = decision;
+    record(changes, "hash-join", statement, {{"kind", beforeKind}}, {{"kind", selected}, {"decision", decision}});
+    return true;
+}
 bool pushPredicateIntoJoin(sql::LogicalPlan& filter, json& changes, std::size_t statement) {
     if (filter.kind != "Filter" || filter.children.size() != 1 || (filter.children.front().kind != "NestedLoopJoin" && filter.children.front().kind != "HashJoin")) return false;
     auto joined = std::move(filter.children.front());
@@ -329,7 +426,6 @@ void rewritePlan(sql::LogicalPlan& plan, const Options& options, json& changes, 
     for (auto& expression : plan.insertExpressions) expression = rewrite(expression, options, changes, statement);
     for (auto& row : plan.insertRows)
         for (auto& expression : row.at("expressions")) expression = rewrite(expression, options, changes, statement);
-    if (plan.kind == "Project" && options.pruneColumns && pruneProjectColumns(plan, changes, statement)) return;
     if (plan.kind != "Filter" && plan.kind != "SemiJoin" && plan.kind != "AntiJoin" && plan.kind != "Apply" &&
         plan.kind != "NestedLoopJoin" && plan.kind != "LeftJoin" && plan.kind != "HashJoin") return;
     plan.predicate = rewrite(plan.predicate, options, changes, statement);
@@ -338,13 +434,7 @@ void rewritePlan(sql::LogicalPlan& plan, const Options& options, json& changes, 
             {{"kind", plan.subqueryJoinKind}, {"execution", "grouped-parameter-instances"}});
         plan.kind = plan.subqueryJoinKind;
     }
-    if (plan.kind == "NestedLoopJoin" && options.hashJoin && plan.children.size() == 2) {
-        std::size_t leftKey{}, rightKey{};
-        if (hashJoinKeys(plan.predicate, plan.children[0].output.size(), leftKey, rightKey)) {
-            record(changes, "hash-join", statement, {{"kind", "NestedLoopJoin"}}, {{"kind", "HashJoin"}});
-            plan.kind = "HashJoin";
-        }
-    }
+    if (options.hashJoin && chooseJoinAlgorithm(plan, options, changes, statement)) return;
     if (plan.kind != "Filter") return;
     if (options.predicatePushdown && pushPredicateIntoJoin(plan, changes, statement)) return;
     if (options.removeTrueFilter && boolean(plan.predicate) && plan.predicate.at("value").get<bool>() && plan.children.size() == 1) {
@@ -449,7 +539,10 @@ Result optimize(const std::vector<sql::LogicalPlan>& plans, Options options) {
     std::set<std::string> seen{previous};
     for (std::size_t iteration = 1; iteration <= options.maxIterations; ++iteration) {
         const auto start = result.changes.size();
-        for (std::size_t i = 0; i < result.plans.size(); ++i) rewritePlan(result.plans[i], options, result.changes, i);
+        for (std::size_t i = 0; i < result.plans.size(); ++i) {
+            rewritePlan(result.plans[i], options, result.changes, i);
+            if (options.pruneColumns) pruneRequiredColumns(result.plans[i], result.changes, i);
+        }
         checkBudget(result.plans, options.maxNodes);
         result.iterations = iteration;
         for (std::size_t i = start; i < result.changes.size(); ++i) {

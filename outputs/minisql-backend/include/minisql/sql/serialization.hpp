@@ -4,6 +4,7 @@
 #include "minisql/common/date.hpp"
 #include "minisql/common/varchar.hpp"
 #include <nlohmann/json.hpp>
+#include <algorithm>
 #include <charconv>
 #include <cstdint>
 #include <limits>
@@ -76,8 +77,12 @@ inline std::shared_ptr<Expr> readCheckExpression(const nlohmann::json& node, std
         if (expression->subquerySql.empty() || expression->subquerySql.size() > 1048576) invalid();
     }
     const std::size_t expectedSize = binary ? 6u : unary ? 5u : subqueryKind ? (kind == "InSubquery" ? 6u : 5u) : 4u;
-    if (node.size() != expectedSize ||
+    const auto metadataSize = static_cast<std::size_t>(node.contains("nodeId")) + static_cast<std::size_t>(node.contains("sourceSpan"));
+    if (node.size() != expectedSize + metadataSize ||
         node.contains("left") != (binary || unary || kind == "InSubquery") || node.contains("right") != binary) invalid();
+    if (node.contains("nodeId") && !node.at("nodeId").is_number_unsigned()) invalid();
+    if (node.contains("sourceSpan") && (!node.at("sourceSpan").is_object() ||
+        !node.at("sourceSpan").contains("start") || !node.at("sourceSpan").contains("end"))) invalid();
     if (binary && value != "AND" && value != "OR" && value != "=" && value != "!=" &&
         value != "<" && value != "<=" && value != ">" && value != ">=" &&
         value != "+" && value != "-" && value != "*" && value != "/") invalid();
@@ -160,6 +165,36 @@ inline nlohmann::json serializeStatement(const Statement& statement) {
     return node;
 }
 namespace detail {
+inline nlohmann::json astSourceSpan(const nlohmann::json& node) {
+    const auto line = node.value("line", std::size_t{0});
+    const auto column = node.value("column", std::size_t{0});
+    const auto endLine = node.value("endLine", line);
+    auto endColumn = node.value("endColumn", column);
+    if (endColumn == column && node.contains("value") && node.at("value").is_string())
+        endColumn += std::max<std::size_t>(1, node.at("value").get_ref<const std::string&>().size());
+    if (endColumn == column && line != 0) ++endColumn;
+    return {{"start", {{"line", line}, {"column", column}}},
+            {"end", {{"line", endLine}, {"column", endColumn}}}};
+}
+inline void annotateAst(nlohmann::json& node, std::size_t& nextId) {
+    if (node.is_array()) {
+        for (auto& child : node) annotateAst(child, nextId);
+        return;
+    }
+    if (!node.is_object()) return;
+    if (node.contains("kind") && node.at("kind").is_string()) {
+        node["nodeId"] = nextId++;
+        node["sourceSpan"] = astSourceSpan(node);
+        if (node.contains("selectItems")) {
+            auto schema = nlohmann::json::array();
+            for (const auto& item : node.at("selectItems"))
+                schema.push_back({{"name", item.value("alias", std::string{})}, {"type", "unknown"}});
+            node["outputSchema"] = std::move(schema);
+        }
+    }
+    for (auto& child : node.items())
+        if (child.key() != "sourceSpan" && child.key() != "outputSchema") annotateAst(child.value(), nextId);
+}
 inline Statement readStatement(const nlohmann::json& node, std::size_t depth = 0) {
     auto invalid = []() -> void { throw MiniSqlError(ErrorCode::Storage, "Invalid serialized AST statement"); };
     if (!node.is_object() || depth > 64) invalid();
@@ -288,17 +323,23 @@ inline std::vector<Statement> deserializeAst(const nlohmann::json& document) {
 inline nlohmann::json serializeAstDocument(const std::vector<Statement>& statements) {
     auto nodes = nlohmann::json::array();
     for (const auto& statement : statements) nodes.push_back(serializeStatement(statement));
+    std::size_t nextId = 0;
+    detail::annotateAst(nodes, nextId);
     return {{"schemaVersion", AST_SCHEMA_VERSION}, {"producerVersion", PRODUCER_VERSION}, {"statements", std::move(nodes)}};
 }
 inline nlohmann::json serializeAst(const std::vector<Statement>& statements) {
     auto nodes = nlohmann::json::array();
     for (const auto& statement : statements) nodes.push_back(serializeStatement(statement));
+    std::size_t nextId = 0;
+    detail::annotateAst(nodes, nextId);
     return nodes.size() == 1 ? nodes[0] : nodes;
 }
 inline nlohmann::json serializeTokens(const std::vector<Token>& tokens) {
     auto nodes = nlohmann::json::array();
     for (const auto& token : tokens) nodes.push_back({{"type", token.type}, {"text", token.lexeme},
-        {"line", token.location.line}, {"column", token.location.column}});
+        {"line", token.location.line}, {"column", token.location.column},
+        {"endLine", token.endLocation.line}, {"endColumn", token.endLocation.column},
+        {"byteStart", token.byteStart}, {"byteEnd", token.byteEnd}});
     return nodes;
 }
 }
