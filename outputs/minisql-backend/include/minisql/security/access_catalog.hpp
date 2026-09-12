@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <string>
+#include "minisql/common/error.hpp"
 #include <nlohmann/json.hpp>
 #include <vector>
 
@@ -47,6 +48,11 @@ struct AccessRequest {
     std::vector<AccessObjectRef> objects{};
     bool bound = false;
     std::string diagnostic{};  // 未绑定时的原因，仅用于错误信息与审计。
+    // 未绑定时按第十九章 HTTP 契约回报的真实 SQL 错误码（Ok 表示无可用原因，
+    // 例如序列化计划文档形状不合法）。安全层仍然一律拒绝执行，只是不再把
+    // 「SQL 检查失败」伪装成权限错误 403。
+    ErrorCode failureCode = ErrorCode::Ok;
+    SourceLocation failureLocation{};
 };
 
 class AccessCatalog {

@@ -22,7 +22,7 @@ const expected = ({ a, b, op }) => {
   const value = op === '+' ? a + b : op === '-' ? a - b : op === '*' ? a * b : a / b;
   return value < low || value > high ? 'ERR 5001 BIGINT arithmetic overflow' : `OK ${value}`;
 };
-const child = spawnSync(fileURLToPath(new URL('../bin/arithmetic64_probe.exe', import.meta.url)), [], {
+const child = spawnSync(fileURLToPath(new URL('../bin/minisql_arithmetic64_probe.exe', import.meta.url)), [], {
   input: cases.map(({ a, b, op }) => `${op} ${a} ${b}`).join('\n') + '\n', encoding: 'utf8', windowsHide: true,
   timeout: 15000, maxBuffer: 8 * 1024 * 1024,
 });

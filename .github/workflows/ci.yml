@@ -90,8 +90,12 @@ jobs:
           New-Item -ItemType Directory -Force -Path bin | Out-Null
           Copy-Item build/windows/Release/*.exe -Destination bin -Force
           Copy-Item build/windows/Release/*.dll -Destination bin -Force -ErrorAction SilentlyContinue
-          Copy-Item build/windows/Release/minisql_journal_probe.exe -Destination bin/journal_probe.exe -Force
-          if ($LASTEXITCODE -ne 0) { throw 'bin/ artifact sync failed.' }
+          # 测试引用的是构建产物原名，不做别名映射，避免静默 ENOENT。
+          $missing = Get-ChildItem tests -Recurse -Filter *.mjs | ForEach-Object {
+            $text = Get-Content -Raw -LiteralPath $_.FullName
+            [regex]::Matches($text, "'\.\./bin/([^']+)'") | ForEach-Object { $_.Groups[1].Value }
+          } | Sort-Object -Unique | Where-Object { -not (Test-Path -LiteralPath (Join-Path bin $_)) }
+          if ($missing) { throw "Tests reference binaries missing from bin/: $($missing -join ', ')" }
       - name: C++ 注册测试
         shell: pwsh
         working-directory: outputs/minisql-backend

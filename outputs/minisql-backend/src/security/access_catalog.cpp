@@ -127,9 +127,16 @@ std::string normalized(std::string value) {
     return lower(value.substr(first, last - first + 1));
 }
 
+// 与 database.cpp 同因：Windows 上 path::string() 返回本地 ANSI 窄编码，
+// 含非 ASCII 的路径会产生非法 UTF-8，使错误响应序列化失败并丢掉整帧。
+std::string pathUtf8(const std::filesystem::path& path) {
+    const auto value = path.generic_u8string();
+    return {reinterpret_cast<const char*>(value.data()), value.size()};
+}
+
 std::vector<std::uint8_t> readFile(const std::filesystem::path& path) {
     std::ifstream stream(path, std::ios::binary);
-    if (!stream) throw MiniSqlError(ErrorCode::Storage, "Cannot open access catalog: " + path.string());
+    if (!stream) throw MiniSqlError(ErrorCode::Storage, "Cannot open access catalog: " + pathUtf8(path));
     return {std::istreambuf_iterator<char>(stream), std::istreambuf_iterator<char>()};
 }
 
@@ -307,12 +314,19 @@ void AccessCatalog::authorize(const std::string& user, const std::string& operat
     // 的错误），因此只要求 compile 权限，不要求对象集合闭合。
     if (mode == "diagnostics") return requireAll(user, "compile", {"*"});
 
-    // X25 fail-closed：绑定器没有给出闭合的对象集合就一律拒绝。此处不存在、
-    // 也不允许存在任何基于 SQL 文本的兜底扫描。
-    if (!request.bound)
+    // X25 fail-closed：绑定器没有给出闭合的对象集合就一律拒绝执行。此处不存在、
+    // 也不允许存在任何基于 SQL 文本的兜底扫描。拒绝执行与回报原因分开：
+    // 第十九章规定 422 表示「SQL 检查失败」，因此绑定失败（如表不存在）回报
+    // 它自己的错误码与位置，只有真正的授权失败才是权限错误。
+    if (!request.bound) {
+        if (request.failureCode != ErrorCode::Ok)
+            throw MiniSqlError(request.failureCode,
+                               request.diagnostic.empty() ? "Statement could not be bound" : request.diagnostic,
+                               request.failureLocation);
         throw MiniSqlError(ErrorCode::Permission,
             request.diagnostic.empty() ? "Permission denied: statement could not be bound"
                                        : "Permission denied: statement could not be bound (" + request.diagnostic + ")");
+    }
 
     // 只编译不执行时，读动作降级为 compile 权限；写动作不降级。
     const bool compileOnly = mode == "compile" || mode == "diagnostics";

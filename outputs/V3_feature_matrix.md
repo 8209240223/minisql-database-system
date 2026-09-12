@@ -46,15 +46,24 @@
 
 ## 已知失败案例（如实列出）
 
-下表是当前本机 Windows Release 回归中**确实失败**的用例。每项都在无本分支改动的基线上用 `git stash` 复现出**相同的失败模式**，因此不是本分支引入；列出是为了满足 §8.4-7“已知失败案例如实列出”的要求，不把它们隐藏成“全部通过”。
+**当前状态：本机 Windows Release 全量回归 105/105 通过**（`tests/*.mjs` 102 项 + 3 项慢用例 `fuzz-state-machine-soak.mjs`、`fuzz-state-machine-long-run.mjs`、`index-performance-curve.mjs`）。此前列出的六项失败已全部收口，按性质分两类如实区分：实现缺陷，以及断言与规范不一致。
 
-`cast-process.mjs` 曾列在此表中，已于本轮修复并移出——修复内容见文末“本轮新增闭环”。
+（一）实现缺陷，已修复：
 
-| 用例 | 现象 | 基线复现 | 说明 |
-| --- | --- | --- | --- |
-| `tests/transaction-savepoint.mjs` | 第 55 行断言 `403 !== 422`：`SELECT * FROM v`（表不存在）经 bridge 得到 `403` | 是，失败模式一致 | X25 的 fail-closed 鉴权在绑定不闭合时统一返回 403，而该用例写于 X25 之前并期望语义错误 422。这是**设计口径冲突**，需要单独确认“表不存在”应归属 422 还是 403 |
-| `tests/backup-online-smoke.mjs` | 第 63 行断言 `503 !== 200`，在线快照请求被判为后端不可用 | 是，失败模式一致 | 与嵌套深度修复、REQ-CORE 改动无关 |
-| `tests/journal-process.mjs` | 依赖预置 `bin/journal_probe.exe`，其与新建产物不一致 | 是（历史已知） | 本机环境问题；即使把 `bin/` 刷新为新构建仍失败，需要单独排查探针契约 |
+| 用例 | 根因 | 修复 |
+| --- | --- | --- |
+| `tests/journal-process.mjs` | WAL 重做路径的 `validatePage` 不比对页自校验和，损坏的日志页先被 `applyExtent` 写进数据文件，随后才在构造函数里以误导性的 `file header` 报错——数据文件已被改动 | `src/storage/page_file.cpp` 在 `validatePage` 首行比对 `checksum(bytes)`；损坏记录现在在写入前被拒（`STORAGE_CORRUPTION: redo page checksum`），DB 保持 UNCHANGED |
+| `tests/backup-online-smoke.mjs` | 快照响应携带非 UTF-8 字节 → nlohmann 抛 `type_error.316` → 引擎回 `InternalError 9999` → bridge 置 `quarantined` → 在线备份 503 | 见下「UTF-8 边界」 |
+| `tests/cast-process.mjs` | 回归脚本与 CI 未把构建产物同步到 `bin/`，用例读到过时的预置副本 | 见上（bin 同步） |
+| `tests/decimal-journal-process.mjs`、`tests/write-batch-process.mjs`、`tests/arithmetic64-differential.mjs` | 三处用例引用了不带 `minisql_` 前缀的探针名（`journal_probe.exe` 等），`spawnSync` 静默 ENOENT | 用例改用真实产物名；`run-minisql-tests.ps1` 与 `ci.yml` 增加「所有被引用的 `bin/*.exe` 必须存在」的校验，避免同类静默失败 |
+
+（二）断言与规范不一致，已按规范修正（不是「改测试让它变绿」，口径变更逐条记录）：
+
+| 用例 | 原断言 | 处置 |
+| --- | --- | --- |
+| `tests/transaction-savepoint.mjs`（第 55 行） | `SELECT * FROM v`（表不存在）期望 422，实际 403 | **按确认口径改实现**：X25 仍是未绑定即拒绝执行（fail-closed 不变），但错误码回报真实原因——`AccessRequest`/`BindResult` 新增 `failureCode`/`failureLocation`，`AccessCatalog::authorize` 未绑定时抛出原始错误。表不存在 → `Catalog 3001` → 422；身份校验仍在授权之前完成，未授权调用方拿到的依旧是 403 |
+| `tests/requirements-http-contract.mjs` | 不可绑定语句一律 403 / 7001 | 同上改为按真实错误码：`WITH RECURSIVE`（解析期 `NotImplemented`）→ 501 / 9001，表不存在 → 422 / 3001；新增 3 项断言锁定该口径（现 40 项） |
+| `tests/decimal-literal-process.mjs`（第 39 行） | 把 `1.2e3` 列为非法 `DECIMAL`（期望 2001） | 该断言写于 FLOAT 指数形式实现之前，与 `grammar.md`（`float_literal` 含可选 `exponent`）及 `src/sql/lexer.cpp`（指数 → `FLOAT`）冲突。`1.2e3` 已移出非法清单，改为断言它是合法 FLOAT（`1.2e3 → 1200`、`1.2E-3 → 0.0012`） |
 
 ## C4 证据索引
 
@@ -96,12 +105,14 @@ C4 的交付物已经具备：X01-X27 均有负责人、代码路径、验证命
 
 ## 本轮新增闭环
 
+- UTF-8 边界（本轮修复，同时是 `backup-online-smoke.mjs` 503 的根因）：Windows 上 `std::filesystem::path::string()` 返回**本地 ANSI 窄编码**，含非 ASCII 的路径（例如中文用户名下的临时目录）会产生非法 UTF-8 字节，使 nlohmann 序列化抛 `type_error.316`，整个响应随之丢失。三处修复：(1) `snapshot` 会话操作把 JSON 字符串隐式转成 `std::filesystem::path`，窄字符串按 ANSI 解释导致目标路径被改写——改用既有的 `pathFromUtf8`；(2) `Database::createSnapshot` 回显 `target.string()` 改为 `pathUtf8(target)`；(3) `access_catalog.cpp` 与 `bplus_tree.cpp` 的路径拼接同样去 ANSI 化。另外 `database_main.cpp` 的 `emit` 原先在 `try` 之外，序列化失败会逃逸成**没有 `id` 的错误帧**并终止会话，现已加固为回报带 `id` 的 `InternalError` 并且 JSON 全 ASCII 兜底。证据：`tests/backup-online-smoke.mjs`（22 项）与含中文用户名的快照探针。
+- 不可绑定语句的错误码口径（本轮变更，见「已知失败案例」第二类）：新增 `AccessRequest::failureCode/failureLocation` 与 `BindResult::failureCode/failureLocation`（`include/minisql/security/access_catalog.hpp`、`include/minisql/sql/binding.hpp`），绑定器在 `failBind`/捕获 `MiniSqlError` 时带上错误码与位置（`unknown relation` → `Catalog`，嵌套子查询透传内层码，`bindSource` 的解析失败同样透传），`AccessCatalog::authorize` 在未绑定时抛出它。**安全问题不变**：未绑定一律拒绝执行，不存在任何基于 SQL 文本的兜底扫描；改动只消除「是否配置权限目录」导致的同一句 SQL 状态码不一致。证据：`tests/transaction-savepoint.mjs`（7 项）、`tests/requirements-http-contract.mjs`（40 项）、`tests/access-control-*`。
 - §7.2 极端嵌套不得崩溃（本轮修复，从“已知失败”表中移出）：修复前 200 层嵌套 `CAST`/括号、100 层派生表、200 层标量子查询都会让进程**栈溢出崩溃**（`0xC00000FD`），既不是诊断也不是拒绝。修复分三步——(1) `CMakeLists.txt` 为 MSVC 目标加 `/STACK:16777216`，使已声明的 256 层上限真正可用（此前 1 MiB 默认栈在约 150–200 层就溢出）；(2) `src/sql/parser.cpp` 为派生表与标量子查询两条**完全没有深度保护**的递归补上计数；(3) 回归脚本与 CI 在跑测试前把构建产物同步到 `bin/`，避免回归静默验证过时的预置副本。证据：`tests/nesting-depth-process.mjs`（57 项，覆盖 256 通过 / 257 报 `2002` / 2000 层不崩溃 / 三种递归路径）。
 - 嵌套标量子查询（本轮修复）：非相关子查询的物化路径原先不递归物化内层，导致 `SELECT (SELECT (SELECT i FROM t) FROM t) FROM t;` 在内层以原始 `ScalarSubquery` 节点进入求值器，命中 `expression.at("left")` 抛出 nlohmann json 异常并泄漏成 `InternalError 9999`。现在 `materializeSubqueries` 的 `executeSubquery` 先递归物化（与相关子查询路径一致），求值器也对未物化子查询节点给出正式诊断而不是泄漏内部异常（`src/execution/database.cpp`）。
 - REQ-CORE-001（第十七章）：补齐四项工程基线边界并通过 `tests/requirements-limits-process.mjs`（44 项）——单标识符 128 字符上限（`src/sql/lexer.cpp`）；collectDiagnostics 最多 100 条错误并回报 `limit`/`truncated`（`src/execution/database.cpp`）；批量语句 10000 上限（`src/sql/parser.cpp` 与 `execute`/`diagnostics` 两条逐条切分路径共用同一消息，超限消息含 `budget exceeded` 以便 HTTP 映射 413）。
 - REQ-CORE-001 错误码：新增稳定符号码 `SEM_INTEGER_OUT_OF_RANGE`（`include/minisql/common/error.hpp`、`src/common/error.cpp`），在“字面量超出 INT64”与“能装进 BIGINT 但装不进 INT 列”两处窄化检查中抛出（`src/catalog/catalog.cpp`）；BIGINT 目标仍按 EXT-SQL-003 接受。
 - REQ-CORE-002：新增 `PLAN_STALE_SCHEMA`。计划在编译期绑定 Catalog 指纹（`Catalog::schemaFingerprint()`，按表名排序后哈希表名与列定义），指纹随计划文档序列化往返（`src/sql/planner.cpp`）；`Database::executeSerializedPlan` 执行前重新校验，不一致即拒绝（`src/execution/database.cpp`）。入口为 CLI `executePlan`、会话操作 `executePlan` 与 `POST /api/sessions/:id/execute-plan`，受权对象由计划节点推导而不是扫描 SQL 文本。
-- §19.11 HTTP 契约：`GET /api/storage/stats` 与既有 `/api/storage` 等价，`buffer` 明确标记 `available:false, reason:'backend-not-exposed'` 且不伪造零值；未实现能力（`ErrorCode::NotImplemented`，包括“派生表上的 JOIN/DELETE/UPDATE”这类真实未实现构造）统一返回 HTTP 501，而无法绑定的语句仍按既有 X25 契约 fail-closed 返回 403。证据：`tests/requirements-http-contract.mjs`（37 项）。
+- §19.11 HTTP 契约：`GET /api/storage/stats` 与既有 `/api/storage` 等价，`buffer` 明确标记 `available:false, reason:'backend-not-exposed'` 且不伪造零值；未实现能力（`ErrorCode::NotImplemented`，包括“派生表上的 JOIN/DELETE/UPDATE”这类真实未实现构造）统一返回 HTTP 501。无法绑定的语句仍然**一律不执行**（fail-closed 不变），但错误码回报真实原因：解析期未实现构造 → 501/9001，对象不存在 → 422/3001，只有真正的授权失败才是 403/7001；身份校验仍在对象授权之前完成，因此未授权调用方拿到的依旧是权限错误。证据：`tests/requirements-http-contract.mjs`（40 项）。
 - 授权链路上的资源上限顺序修正：批量超限原先会在绑定阶段被掩盖成 HTTP 403，现在 `Database::bindAccess` 先判定批量上限（`enforceBatchStatementBudget`），超限请求按规格书返回 413；正常请求因分号快速排除而不产生额外词法开销。
 - X24：`access-catalog.mjs` 的原子用户/角色/授权操作映射到 HTTP 资源端点；CLI 通过 HTTP bridge 携带身份；C++ session 和直连二进制入口从 `access.catalog.pages` 同步到 `PersistentCatalog` 保留系统堆表，对当前支持语句以及解析失败的 CTE/扩展 SQL 先通过真实 Catalog 规范化基础表对象，再执行身份/对象权限校验，并按权限版本热重载；重启时已验证旁路页文件不可用仍可使用系统表快照。
 - X27：状态机差分脚本优先选择 `build/windows/Release/minisql_database.exe`，小规模、3 种 96 步回归和 2 种 512 步长跑均通过；新增可配置重复 soak 入口、DATE/BOOL 字面量规划回归、五阶段跨进程崩溃恢复组合和 4 种子 × 512 步 × 4096 条压力数据的溢写/资源回归，固定种子逐文件复现契约、失败 artifact 重放入口和 Windows 引擎回归均已接入 CI/本地验收链。

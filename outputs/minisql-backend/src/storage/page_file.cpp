@@ -583,6 +583,12 @@ void PageFile::recoverJournal(bool recovering) {
         return true;
     };
     const auto validatePage = [&](const PageBytes& bytes, PageId id, std::uint64_t finalCount, const std::array<std::uint64_t, 2>& identity) {
+        // 页自身校验和必须先比：checksum() 覆盖页头/槽目录/行数据但跳过校验和字段
+        // 本身（见 page.cpp），因此"只改校验和字段"的损坏只有显式比较才能发现。
+        // 修复前页 0 这条路径不校验校验和：损坏的日志页会通过验证、被 applyExtent
+        // 写进数据文件，随后在构造函数里以误导性的 file header 报错，而数据文件
+        // 已经被改动——违反了"损坏日志必须受控处理、不得留下部分应用"的要求。
+        if (readUnsigned(bytes, 4, 4) != checksum(bytes)) fail("STORAGE_CORRUPTION: redo page checksum");
         if (id == 0) {
             if (readUnsigned(bytes, 0, 4) != fileMagic || readUnsigned(bytes, 8, 4) != 2 || readUnsigned(bytes, 12, 4) != kPageSize ||
                 readUnsigned(bytes, 16, 8) != finalCount || readUnsigned(bytes, 24, 8) != identity[0] || readUnsigned(bytes, 32, 8) != identity[1])

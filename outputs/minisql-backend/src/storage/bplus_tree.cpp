@@ -223,7 +223,10 @@ std::string BPlusTree::dump(const std::string& fingerprint) const {
 }
 void BPlusTree::save(const std::filesystem::path& path, const std::string& fingerprint) const {
     const auto document = dump(fingerprint);
-    const auto temporary = path.string() + ".tmp";
+    // 不要用 path.string() + ".tmp"：Windows 上会把路径窄转换成本地 ANSI，
+    // 含非 ASCII 的路径会被改写。直接做路径拼接保留本地编码。
+    auto temporary = path;
+    temporary += ".tmp";
     { std::ofstream output(temporary, std::ios::binary | std::ios::trunc);if (!output) throw MiniSqlError(ErrorCode::Storage, "Cannot write B+ tree snapshot");output << document;if (!output) throw MiniSqlError(ErrorCode::Storage, "Cannot write B+ tree snapshot"); }
     std::filesystem::rename(temporary, path);
 }

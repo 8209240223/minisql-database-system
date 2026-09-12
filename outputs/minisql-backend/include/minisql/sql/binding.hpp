@@ -149,6 +149,10 @@ struct BindResult {
     // 但会让对应 BoundExpression::column 保持 nullopt。
     bool complete = false;
     std::string diagnostic;
+    // 失败时的原始错误码与位置：安全层 fail-closed 拒绝时用它回报真实原因，
+    // 使「SQL 检查失败」按第十九章映射到 422，而不是伪装成权限错误 403。
+    ErrorCode failureCode = ErrorCode::Ok;
+    SourceLocation failureLocation{};
     security::AccessAction statementAction = security::AccessAction::Compile;
     std::vector<security::AccessObjectRef> objects;  // 已按 (对象, 动作) 去重
 

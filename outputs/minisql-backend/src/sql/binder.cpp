@@ -19,11 +19,18 @@ std::pair<std::string, std::string> splitQualified(const std::string& value) {
 }
 
 // 绑定失败：对象集合无法闭合。调用方一律 fail-closed，不存在文本扫描兜底。
+// 携带错误码与位置：拒绝时按第十九章回报真实原因（表不存在 → Catalog），
+// 而不是把「SQL 检查失败」统一伪装成权限错误。
 struct BindFailure {
     std::string reason;
+    ErrorCode code = ErrorCode::Semantic;
+    SourceLocation location{};
 };
 
-[[noreturn]] void failBind(const std::string& reason) { throw BindFailure{reason}; }
+[[noreturn]] void failBind(const std::string& reason, ErrorCode code = ErrorCode::Semantic,
+                           SourceLocation location = {}) {
+    throw BindFailure{reason, code, location};
+}
 
 using security::AccessAction;
 
@@ -211,7 +218,7 @@ private:
     RelationId bindBaseRelation(const std::string& name, const std::string& alias, ScopeId scope,
                                 SourceLocation location, AccessAction action) {
         const auto* table = catalog_.find(name);
-        if (!table) failBind("unknown relation '" + name + "'");
+        if (!table) failBind("unknown relation '" + name + "'", ErrorCode::Catalog, location);
         BoundRelation relation;
         relation.kind = RelationKind::BaseTable;
         relation.name = name;
@@ -340,7 +347,9 @@ private:
                     bindStatement(*owned, scope, depth + 1);
                 }
             } catch (const MiniSqlError& error) {
-                failBind(std::string("nested subquery did not bind: ") + error.what());
+                // 嵌套子查询的真实错误码要透传：否则「子查询里的表不存在」会被
+                // 归成笼统的语义错误，丢失可诊断性。
+                failBind(std::string("nested subquery did not bind: ") + error.what(), error.code(), error.location());
             }
         }
         if (subqueryNode) recordCorrelated(expression.get(), scope, nestedBegin);
@@ -482,6 +491,8 @@ security::AccessRequest BindResult::accessRequest() const {
     request.statementAction = statementAction;
     request.bound = complete;
     request.diagnostic = diagnostic;
+    request.failureCode = failureCode;
+    request.failureLocation = failureLocation;
     if (complete) request.objects = objects;
     return request;
 }
@@ -501,10 +512,14 @@ void runBinder(const std::vector<const Statement*>& statements, const catalog::C
     } catch (const BindFailure& failure) {
         result.complete = false;
         result.diagnostic = failure.reason;
+        result.failureCode = failure.code;
+        result.failureLocation = failure.location;
         result.objects.clear();
     } catch (const MiniSqlError& error) {
         result.complete = false;
         result.diagnostic = error.what();
+        result.failureCode = error.code();
+        result.failureLocation = error.location();
         result.objects.clear();
     }
 }
@@ -552,9 +567,14 @@ BindResult bindSource(const std::string& source, const catalog::Catalog& catalog
         }
         return bindOwned(parse(tokens), catalog);
     } catch (const MiniSqlError& error) {
+        // 词法/语法错误在这里被收敛成「未绑定」。错误码必须一起带走：否则
+        // 启用权限目录时语法错误会被鉴权层报成 403，禁用权限目录时却是
+        // 422/2002——同一句 SQL 因是否配置权限而得到不同的状态码。
         BindResult result;
         result.complete = false;
         result.diagnostic = error.what();
+        result.failureCode = error.code();
+        result.failureLocation = error.location();
         return result;
     }
 }

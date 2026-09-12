@@ -79,12 +79,20 @@ try {
     equal(unsupported.data.error.type, 'NotImplementedError', 'unimplemented capability keeps its error type');
   }
   {
-    // 反例与安全性：无法绑定的语句按既有的 fail-closed 契约返回 403，
-    // 而不是 501 —— 否则会向未授权调用方泄露"语句是否被支持"。
+    // 无法绑定的语句一律不执行（fail-closed），但错误码回报真实原因，不再把
+    // 「SQL 检查失败」统一伪装成权限错误 403；否则同一句 SQL 在启用/禁用权限
+    // 目录时会得到不同的状态码。身份校验仍在授权之前完成，因此未授权调用方
+    // 拿到的依旧是权限错误，这里不构成能力泄露。
     const unbound = await request(session + '/execute', { sql: 'WITH RECURSIVE r(n) AS (SELECT id FROM t) SELECT * FROM r;' });
-    equal(unbound.status, 403, 'unbindable statement stays fail-closed at 403');
-    equal(unbound.data.error.code, 7001, 'fail-closed rejection keeps the permission code');
-    ok(/could not be bound/i.test(unbound.data.error.message), 'fail-closed diagnostic states the binding failure');
+    equal(unbound.status, 501, 'unbindable unimplemented construct maps to 501');
+    equal(unbound.data.error.code, 9001, 'unbindable statement keeps its real NotImplemented code');
+    equal(unbound.data.success, false, 'unbindable statement is not reported as success');
+
+    // 对象不存在属于「SQL 检查失败」，按第十九章映射到 422。
+    const missing = await request(session + '/execute', { sql: 'SELECT * FROM missing_relation;' });
+    equal(missing.status, 422, 'unbound missing relation maps to 422 instead of a permission error');
+    equal(missing.data.error.code, 3001, 'missing relation keeps the catalog error code');
+    ok(/missing_relation/.test(missing.data.error.message), 'missing relation diagnostic names the relation');
   }
 
   // ---- 序列化计划执行：指纹有效时可执行 ----
