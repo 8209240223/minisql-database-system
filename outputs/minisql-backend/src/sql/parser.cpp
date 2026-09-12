@@ -352,6 +352,8 @@ private:
         expect("FROM");
         if(at("(")) {
             // X09: 派生表 `FROM ( SELECT ... ) [AS] alias`，必须有显式别名。
+            // 第十七章：派生表嵌套必须计数，否则 `FROM (SELECT ... (SELECT ...))` 可以无界递归。
+            if(++depth>256) fail(ErrorCode::Syntax, "Query nesting depth exceeded", t[i].location);
             ++i;
             auto derived = select(false);
             expect(")");
@@ -380,6 +382,7 @@ private:
             s.fromSubquery=std::make_shared<Statement>(std::move(derived));
             s.tableAlias=alias;
             s.table=alias; // 3.3 planner 以 Scope 链消费 fromSubquery；此处占位保持既有表路径兼容。
+            --depth;
         } else {
             s.table=identifier();
             if(keyword("AS")){++i;s.tableAlias=identifier();}
@@ -523,7 +526,9 @@ private:
         if(at("(") && i+1<t.size()){
             auto next=t[i+1].lexeme;for(char& c:next)if(c>='a'&&c<='z')c-=32;
             if(next=="SELECT"){
-                const auto token=take();const auto start=i;auto query=select(false);const auto text=tokenText(start,i);expect(")");
+                // 第十七章：标量子查询同样计入嵌套深度，防止 `(SELECT (SELECT ...))` 无界递归。
+                if(++depth>256) fail(ErrorCode::Syntax, "Query nesting depth exceeded", t[i].location);
+                const auto token=take();const auto start=i;auto query=select(false);const auto text=tokenText(start,i);expect(")");--depth;
                 auto node=std::make_shared<Expr>(Expr{"ScalarSubquery","",nullptr,{},token.location,text});
                 node->subquery=std::make_shared<Statement>(std::move(query));
                 return node;

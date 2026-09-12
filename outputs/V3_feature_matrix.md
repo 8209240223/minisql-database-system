@@ -46,13 +46,15 @@
 
 ## 已知失败案例（如实列出）
 
-下表是当前本机 Windows Release 回归中**确实失败**的用例。三者已在改动前的基线（`d2dc852`）上用 `git stash` 复现出**完全相同的失败模式**，因此不是本轮新增缺口；列出是为了满足 §8.4-7“已知失败案例如实列出”的要求，不把它们隐藏成“全部通过”。
+下表是当前本机 Windows Release 回归中**确实失败**的用例。每项都在无本分支改动的基线上用 `git stash` 复现出**相同的失败模式**，因此不是本分支引入；列出是为了满足 §8.4-7“已知失败案例如实列出”的要求，不把它们隐藏成“全部通过”。
+
+`cast-process.mjs` 曾列在此表中，已于本轮修复并移出——修复内容见文末“本轮新增闭环”。
 
 | 用例 | 现象 | 基线复现 | 说明 |
 | --- | --- | --- | --- |
-| `tests/cast-process.mjs` | 第 52 项（`CAST(` 重复 260 层的嵌套表达式应返回语法错误 `2002`）触发子进程崩溃 `0xC00000FD`（栈溢出） | 是，失败模式一致 | 表达式深度上限未能在深层 CAST 嵌套上生效；需要单独排查解析/绑定/优化链路的递归深度，与本轮 REQ-CORE-001/002 改动无关 |
-| `tests/backup-online-smoke.mjs` | 第 63 行断言 `503 !== 200`，在线快照请求被判为后端不可用 | 是，失败模式一致 | 与本轮 §19.11 / REQ-CORE 改动无关 |
-| `tests/journal-process.mjs` | 依赖仓库预置 `bin/journal_probe.exe`（SHA256 `80A69871...`），与本机构建产物（`A4B5ACDF...`）不一致 | 是（历史已知） | 本机环境问题；本轮未改动该探针使用的代码路径 |
+| `tests/transaction-savepoint.mjs` | 第 55 行断言 `403 !== 422`：`SELECT * FROM v`（表不存在）经 bridge 得到 `403` | 是，失败模式一致 | X25 的 fail-closed 鉴权在绑定不闭合时统一返回 403，而该用例写于 X25 之前并期望语义错误 422。这是**设计口径冲突**，需要单独确认“表不存在”应归属 422 还是 403 |
+| `tests/backup-online-smoke.mjs` | 第 63 行断言 `503 !== 200`，在线快照请求被判为后端不可用 | 是，失败模式一致 | 与嵌套深度修复、REQ-CORE 改动无关 |
+| `tests/journal-process.mjs` | 依赖预置 `bin/journal_probe.exe`，其与新建产物不一致 | 是（历史已知） | 本机环境问题；即使把 `bin/` 刷新为新构建仍失败，需要单独排查探针契约 |
 
 ## C4 证据索引
 
@@ -94,6 +96,8 @@ C4 的交付物已经具备：X01-X27 均有负责人、代码路径、验证命
 
 ## 本轮新增闭环
 
+- §7.2 极端嵌套不得崩溃（本轮修复，从“已知失败”表中移出）：修复前 200 层嵌套 `CAST`/括号、100 层派生表、200 层标量子查询都会让进程**栈溢出崩溃**（`0xC00000FD`），既不是诊断也不是拒绝。修复分三步——(1) `CMakeLists.txt` 为 MSVC 目标加 `/STACK:16777216`，使已声明的 256 层上限真正可用（此前 1 MiB 默认栈在约 150–200 层就溢出）；(2) `src/sql/parser.cpp` 为派生表与标量子查询两条**完全没有深度保护**的递归补上计数；(3) 回归脚本与 CI 在跑测试前把构建产物同步到 `bin/`，避免回归静默验证过时的预置副本。证据：`tests/nesting-depth-process.mjs`（57 项，覆盖 256 通过 / 257 报 `2002` / 2000 层不崩溃 / 三种递归路径）。
+- 嵌套标量子查询（本轮修复）：非相关子查询的物化路径原先不递归物化内层，导致 `SELECT (SELECT (SELECT i FROM t) FROM t) FROM t;` 在内层以原始 `ScalarSubquery` 节点进入求值器，命中 `expression.at("left")` 抛出 nlohmann json 异常并泄漏成 `InternalError 9999`。现在 `materializeSubqueries` 的 `executeSubquery` 先递归物化（与相关子查询路径一致），求值器也对未物化子查询节点给出正式诊断而不是泄漏内部异常（`src/execution/database.cpp`）。
 - REQ-CORE-001（第十七章）：补齐四项工程基线边界并通过 `tests/requirements-limits-process.mjs`（44 项）——单标识符 128 字符上限（`src/sql/lexer.cpp`）；collectDiagnostics 最多 100 条错误并回报 `limit`/`truncated`（`src/execution/database.cpp`）；批量语句 10000 上限（`src/sql/parser.cpp` 与 `execute`/`diagnostics` 两条逐条切分路径共用同一消息，超限消息含 `budget exceeded` 以便 HTTP 映射 413）。
 - REQ-CORE-001 错误码：新增稳定符号码 `SEM_INTEGER_OUT_OF_RANGE`（`include/minisql/common/error.hpp`、`src/common/error.cpp`），在“字面量超出 INT64”与“能装进 BIGINT 但装不进 INT 列”两处窄化检查中抛出（`src/catalog/catalog.cpp`）；BIGINT 目标仍按 EXT-SQL-003 接受。
 - REQ-CORE-002：新增 `PLAN_STALE_SCHEMA`。计划在编译期绑定 Catalog 指纹（`Catalog::schemaFingerprint()`，按表名排序后哈希表名与列定义），指纹随计划文档序列化往返（`src/sql/planner.cpp`）；`Database::executeSerializedPlan` 执行前重新校验，不一致即拒绝（`src/execution/database.cpp`）。入口为 CLI `executePlan`、会话操作 `executePlan` 与 `POST /api/sessions/:id/execute-plan`，受权对象由计划节点推导而不是扫描 SQL 文本。

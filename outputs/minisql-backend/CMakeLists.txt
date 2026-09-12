@@ -28,6 +28,10 @@ add_library(minisql_options INTERFACE)
 if(MSVC)
     target_compile_options(minisql_options INTERFACE /W4 /permissive- /utf-8)
     target_compile_definitions(minisql_options INTERFACE NOMINMAX WIN32_LEAN_AND_MEAN)
+    # 第十七章 REQ-CORE-001：表达式嵌套上限为 256，而 MSVC 默认主线程栈只有 1 MiB。
+    # 解析/语义/优化链路每层嵌套约需数 KiB，默认栈会在保护阈值之前就溢出，
+    # 使深嵌套输入变成进程崩溃（而不是 SyntaxError 2002）。预留 16 MiB 给足余量。
+    target_link_options(minisql_options INTERFACE /STACK:16777216)
 else()
     target_compile_options(minisql_options INTERFACE -Wall -Wextra -Wpedantic)
 endif()
