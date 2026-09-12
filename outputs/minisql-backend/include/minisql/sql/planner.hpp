@@ -55,6 +55,9 @@ struct LogicalPlan {
     nlohmann::json indexRangeValue = nullptr;
     // 编译期 Catalog 指纹；执行时与当前 Catalog 不一致即 PLAN_STALE_SCHEMA。
     std::string catalogFingerprint{};
+    SourceLocation sourceSpan{};
+    // Optimizer candidate costs and deterministic choice, exposed by plan JSON/EXPLAIN.
+    nlohmann::json optimizerDecision = nullptr;
 };
 
 std::vector<LogicalPlan> compilePlans(const std::vector<Statement>& statements,

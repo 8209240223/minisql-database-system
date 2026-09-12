@@ -126,9 +126,9 @@ void scanImpl(const std::string& s, const std::function<void(const Token&)>& con
         else{const SourceLocation end{line,column};report("Illegal character",loc,end);advance();drop();continue;}
         if(dropped)continue;
         const SourceLocation endLoc{line,column};
-        consume({type,s.substr(start,i-start),loc,endLoc});
+        consume({type,s.substr(start,i-start),loc,endLoc,start,i});
     }
-    consume({"END","",{line,column},{line,column}});
+    consume({"END","",{line,column},{line,column},i,i});
 }
 } // namespace
 

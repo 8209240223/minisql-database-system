@@ -1,5 +1,6 @@
 #pragma once
 #include "minisql/sql/planner.hpp"
+#include <unordered_map>
 
 namespace minisql::optimizer {
 struct Options {
@@ -12,6 +13,9 @@ struct Options {
     bool pruneColumns = true;
     bool constantArithmetic = true;
     bool decorrelateSubquery = true;
+    double defaultTableRows = 1000.0;
+    std::size_t memoryBudgetBytes = 64 * 1024 * 1024;
+    std::unordered_map<std::string, double> tableRows{};
     std::size_t maxIterations = 16;
     std::size_t maxNodes = 65536;
     std::vector<std::string> disabledRules{};

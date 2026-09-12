@@ -60,15 +60,21 @@ TEST(Application, ConfigFileEnvironmentAndCliLayerCorrectly) {
     ASSERT_EQ(result.code, 0) << result.error;
     EXPECT_EQ(nlohmann::json::parse(result.output)["page_size"], 8192);
 }
-TEST(Application, UnimplementedFeaturesReturnStructuredError) {
-    for (const auto& args : std::vector<std::vector<std::string>>{
-        {"--execute", "SELECT 1;"}, {"--mode", "server"}}) {
-        const auto result = run(args);
-        ASSERT_EQ(result.code, 1);
-        const auto error = nlohmann::json::parse(result.error);
-        EXPECT_EQ(error["error"]["code"], 9001);
-        EXPECT_EQ(error["error"]["type"], "NotImplementedError");
-    }
+TEST(Application, ExecuteUsesDatabaseCoreAndServerModeIsExplicit) {
+    test::TempDirectory directory;
+    const auto executed = run({"--no-console", "--data", test::utf8(directory.path()),
+        "--wal-dir", test::utf8(directory.path() / "wal"),
+        "--catalog-dir", test::utf8(directory.path() / "catalog"),
+        "--log-dir", test::utf8(directory.path() / "logs"),
+        "--execute", "CREATE TABLE t(id INT); INSERT INTO t VALUES(7); SELECT * FROM t;"});
+    ASSERT_EQ(executed.code, 0) << executed.error;
+    const auto response = nlohmann::json::parse(executed.output);
+    ASSERT_TRUE(response["success"].get<bool>());
+    EXPECT_EQ(response["results"].back()["rows"], nlohmann::json::array({nlohmann::json::array({7})}));
+
+    const auto server = run({"--mode", "server"});
+    ASSERT_EQ(server.code, 1);
+    EXPECT_EQ(nlohmann::json::parse(server.error)["error"]["type"], "NotImplementedError");
 }
 TEST(Application, CheckConfigReportsMalformedConfiguration) {
     test::TempDirectory directory;
@@ -84,17 +90,17 @@ TEST(Application, MissingUnicodeFileRemainsAConfigurationError) {
     ASSERT_EQ(result.code, 1);
     EXPECT_EQ(nlohmann::json::parse(result.error)["error"]["type"], "ConfigurationError");
 }
-TEST(Application, ShellCommandsAndSqlRejectionWorkWithoutLeakingSql) {
+TEST(Application, ShellCommandsAndSqlExecutionWorkWithoutLeakingSql) {
     test::TempDirectory directory;
     const auto logPath = directory.path() / "logs";
     const auto result = run({"--no-console", "--data", test::utf8(directory.path() / "data"),
         "--wal-dir", test::utf8(directory.path() / "wal"),
         "--catalog-dir", test::utf8(directory.path() / "catalog"), "--log-dir", test::utf8(logPath)},
-        ".help\n.version\n.config\nSELECT 'secret-password';\n.quit\n");
+        ".help\n.version\n.config\nCREATE TABLE secret(value VARCHAR);\nINSERT INTO secret VALUES('secret-password');\nSELECT * FROM secret;\n.quit\n");
     ASSERT_EQ(result.code, 0) << result.error;
     EXPECT_NE(result.output.find(".help  .version"), std::string::npos);
     EXPECT_NE(result.output.find("buffer_pool_size"), std::string::npos);
-    EXPECT_NE(result.error.find("NotImplementedError"), std::string::npos);
+    EXPECT_NE(result.output.find("secret-password"), std::string::npos);
     EXPECT_EQ(test::read(logPath / "sql.log").find("secret-password"), std::string::npos);
     EXPECT_NE(test::read(logPath / "server.log").find("stopped"), std::string::npos);
 }

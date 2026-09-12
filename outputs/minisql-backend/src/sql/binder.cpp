@@ -133,6 +133,11 @@ private:
             if (!statement.table.empty()) {
                 result_.statements[statementIndex].target = bindBaseRelation(statement.table, {}, scope, statement.location, action);
             }
+        } else if (statement.fromSubquery && (statement.kind == "Update" || statement.kind == "Delete")) {
+            bindFrom(statement, scope, depth);
+            const auto* level = result_.scopes.scope(scope);
+            if (level && !level->relations.empty()) result_.statements[statementIndex].target = level->relations.front();
+            if (!statement.fromSubquery->table.empty()) addObject(statement.fromSubquery->table, statementActionFor(statement.kind));
         } else {
             // Insert / Update / Delete：目标关系承担写动作。
             const auto action = statementActionFor(statement.kind);

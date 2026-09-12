@@ -3,7 +3,14 @@
 #include <vector>
 #include <functional>
 namespace minisql::sql {
-struct Token { std::string type; std::string lexeme; SourceLocation location; SourceLocation endLocation{}; };
+struct Token {
+    std::string type;
+    std::string lexeme;
+    SourceLocation location;
+    SourceLocation endLocation{};
+    std::size_t byteStart = 0;
+    std::size_t byteEnd = 0;
+};
 std::vector<Token> tokenize(const std::string& source);
 void scanTokens(const std::string& source, const std::function<void(const Token&)>& consume);
 // Recovery-mode tokenizer: instead of throwing on the first lexical error it

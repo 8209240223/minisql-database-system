@@ -4,6 +4,7 @@
 #include "minisql/common/cast.hpp"
 #include "minisql/common/decimal.hpp"
 #include "minisql/common/float.hpp"
+#include "minisql/common/filesystem.hpp"
 #include "minisql/storage/bplus_tree.hpp"
 #include "minisql/storage/page_bplus_tree.hpp"
 #include "minisql/storage/heap.hpp"
@@ -55,13 +56,6 @@ std::string joinProblems(const std::vector<std::string>& problems) {
         message += problem;
     }
     return message;
-}
-// 路径必须以 UTF-8 暴露给 JSON：Windows 上 path::string() 返回本地 ANSI 窄编码，
-// 含非 ASCII 的路径（例如中文用户名下的临时目录）会产生非法 UTF-8 字节，
-// 使 JSON 序列化抛 type_error.316，整个响应随之丢失。
-std::string pathUtf8(const std::filesystem::path& path) {
-    const auto value = path.generic_u8string();
-    return {reinterpret_cast<const char*>(value.data()), value.size()};
 }
 // 第十七章 REQ-CORE-001：批量语句上限 10000。compile 整批进入 Parser::all()，
 // 而 execute/diagnostics 自己按分号切分，因此两者共用同一常量与消息，
@@ -133,6 +127,12 @@ ExactDecimal decimalValue(const json& value, const std::string& type) {
 // 文本（与解析器产出的 Literal 一致），随后绑定进已缓存的结构化 AST，取代原
 // 先“文本重解析 + 字面量改写”的路径。
 using OuterBinding = std::unordered_map<std::string, std::pair<std::size_t, std::string>>;
+using OuterValues = std::unordered_map<std::string, std::pair<json, std::string>>;
+thread_local std::vector<OuterValues> activeOuterValues;
+struct ActiveOuterScope {
+    explicit ActiveOuterScope(OuterValues values) { activeOuterValues.push_back(std::move(values)); }
+    ~ActiveOuterScope() { activeOuterValues.pop_back(); }
+};
 std::string parameterLiteral(const json& value, const std::string& type) {
     if (value.is_null()) return "NULL";
     if (type == "bool") return value.get<bool>() ? "TRUE" : "FALSE";
@@ -156,6 +156,15 @@ std::shared_ptr<sql::Expr> bindOuter(const std::shared_ptr<sql::Expr>& expressio
             auto literal = std::make_shared<sql::Expr>();
             literal->kind = "Literal";
             literal->value = parameterLiteral(row.at(columnId), found->second.second);
+            literal->location = expression->location;
+            return literal;
+        }
+        for (auto frame = activeOuterValues.rbegin(); frame != activeOuterValues.rend(); ++frame) {
+            const auto inherited = frame->find(key(expression->value));
+            if (inherited == frame->end()) continue;
+            auto literal = std::make_shared<sql::Expr>();
+            literal->kind = "Literal";
+            literal->value = parameterLiteral(inherited->second.first, inherited->second.second);
             literal->location = expression->location;
             return literal;
         }
@@ -516,14 +525,24 @@ void Database::checkCancelled() const {
     if (error) throw MiniSqlError(ErrorCode::Storage, "Cannot inspect cancellation token");
     if (cancelled) throw MiniSqlError(ErrorCode::Cancelled, "Query cancelled");
 }
-nlohmann::json Database::compile(const std::string& source) const {
+optimizer::Options Database::optimizerOptions() {
+    optimizer::Options options;
+    options.memoryBudgetBytes = queryMemoryBytes_;
+    for (const auto& table : catalog_.tables()) {
+        double rows = 0;
+        heap_.scan(table.id, rowSchema(table.definition), [&](storage::RowRef, const storage::Row&) { ++rows; });
+        options.tableRows[key(table.definition.table)] = rows;
+    }
+    return options;
+}
+nlohmann::json Database::compile(const std::string& source) {
     std::lock_guard<std::recursive_mutex> guard(mu_);
     requireAvailable();
     if (transaction_ == TransactionState::Aborted) throw MiniSqlError(ErrorCode::Transaction, "Transaction aborted; ROLLBACK required");
     const auto tokens = sql::tokenize(source);
     const auto ast = sql::parse(tokens);
     const auto plans = sql::compilePlans(ast, catalog_.view());
-    const auto optimized = optimizer::optimize(plans);
+    const auto optimized = optimizer::optimize(plans, optimizerOptions());
     return {{"success", true}, {"plan", sql::serializePlans(plans)}, {"optimizedPlan", sql::serializePlans(optimized.plans)},
             {"optimizationRules", optimized.changes}, {"statements", ast.size()},
             {"optimizer", {{"iterations", optimized.iterations}, {"converged", optimized.converged},
@@ -737,7 +756,7 @@ nlohmann::json Database::createSnapshot(const std::filesystem::path& target) {
     requireAvailable();
     file_->copyTo(target);
     const auto& record = file_->checkpointRecord();
-    return {{"success", true}, {"kind", "Snapshot"}, {"target", pathUtf8(target)},
+    return {{"success", true}, {"kind", "Snapshot"}, {"target", pathToUtf8(target)},
         {"walBytes", file_->walBytes()}, {"walCutoffBytes", record.walCutoffBytes},
         {"committedSequence", record.committedSequence}, {"catalogVersion", record.catalogVersion},
         {"indexVersion", record.indexVersion}};
@@ -2352,19 +2371,28 @@ nlohmann::json Database::runNode(const sql::LogicalPlan& plan) {
         }
     }
     const auto* input = &plan.children.front();
-    const json* predicate = nullptr;
-    if (input->kind == "Filter" || input->kind == "SemiJoin" || input->kind == "AntiJoin" || input->kind == "Apply") {
-        predicate = &input->predicate;
+    std::vector<const json*> predicates;
+    while (input->kind == "Filter") {
+        predicates.push_back(&input->predicate);
         if (input->children.size() != 1) fail("Filter requires one child");
         input = &input->children.front();
     }
+    if (input->kind == "SemiJoin" || input->kind == "AntiJoin" || input->kind == "Apply") {
+        predicates.push_back(&input->predicate);
+        if (input->children.size() != 1) fail("Filter requires one child");
+        input = &input->children.front();
+    }
+    const auto acceptsPredicates = [&](const auto& row) {
+        for (const auto* predicate : predicates) if (!accepted(evaluate(*predicate, row))) return false;
+        return true;
+    };
     const bool joined = (input->kind == "NestedLoopJoin" || input->kind == "HashJoin" || input->kind == "LeftJoin" || input->kind == "RightJoin" || input->kind == "FullJoin") && plan.kind == "Project";
     if (!joined && ((input->kind != "SeqScan" && input->kind != "IndexScan") || key(input->table) != key(plan.table))) fail("Unsupported scan plan");
     for (const auto& column : plan.output) result["columns"].push_back(column.name);
     if (input->kind == "IndexScan" && plan.kind == "Project") {
         const auto indexed = run(*input);
         for (const auto& row : indexed.at("rows")) {
-            if (predicate && !accepted(evaluate(*predicate, row))) continue;
+            if (!acceptsPredicates(row)) continue;
             json projected = json::array();
             if (!plan.projections.empty()) for (const auto& expression : plan.projections) projected.push_back(evaluate(expression, row));
             else for (const auto& column : plan.output) projected.push_back(row.at(column.columnId));
@@ -2383,7 +2411,7 @@ nlohmann::json Database::runNode(const sql::LogicalPlan& plan) {
     std::vector<storage::Row> finalRows;
     const auto consume = [&](storage::RowRef ref, const storage::Row& row) {
         checkCancelled();
-        if (predicate && !accepted(evaluate(*predicate, row))) {
+        if (!acceptsPredicates(row)) {
             if (plan.kind == "Update") checkUnique(row);
             if (inspectSelfReferences) finalRows.push_back(row);
             return;
@@ -2739,6 +2767,11 @@ nlohmann::json Database::runCorrelatedSubquery(const json& expression, const jso
         outer.emplace(it.key(),
                       std::make_pair(it.value().at("columnId").get<std::size_t>(),
                                      it.value().at("type").get<std::string>()));
+    OuterValues currentValues;
+    for (const auto& [name, binding] : outer) {
+        if (binding.first >= row.size()) fail("Correlated subquery outer column outside row");
+        currentValues.emplace(name, std::make_pair(row.at(binding.first), binding.second));
+    }
     // 缓存按 subquerySql 解析的结构化 AST，执行时以 by-value 参数绑定替换外层列，
     // 避免逐行文本重解析与字面量改写；仍以当前 catalog 编译，保证 schema 变更生效。
     auto& ast = correlatedAstCache_[sql];
@@ -2761,12 +2794,18 @@ nlohmann::json Database::runCorrelatedSubquery(const json& expression, const jso
         if (id >= row.size()) fail("Correlated subquery outer column outside row");
         tuple.push_back(row.at(id));
     }
+    std::map<std::string, json> inheritedTuple;
+    for (const auto& frame : activeOuterValues)
+        for (const auto& [name, value] : frame) inheritedTuple[name] = value.first;
+    for (const auto& [name, value] : inheritedTuple) tuple.push_back({{"name", name}, {"value", value}});
     const std::string fullKey = prepKey + "\x1f" + tuple.dump();
     const auto cached = correlatedRowsCache_.find(fullKey);
     if (cached != correlatedRowsCache_.end()) return cached->second;
 
     sql::Statement bound = bindOuterStatement(ast.front(), outer, row);
-    const auto subplans = sql::compilePlans({std::move(bound)}, catalog_.view());
+    ActiveOuterScope outerScope(std::move(currentValues));
+    auto subplans = sql::compilePlans({std::move(bound)}, catalog_.view());
+    materializeSubqueries(subplans);
     const auto result = run(subplans.front());
     auto rows = result.at("rows");
     correlatedRowsCache_.emplace(std::move(fullKey), rows);
@@ -2774,6 +2813,7 @@ nlohmann::json Database::runCorrelatedSubquery(const json& expression, const jso
 }
 void Database::materializeSubqueries(std::vector<sql::LogicalPlan>& plans) {
     const auto isCorrelated = [&](const json& expression) {
+        if (!activeOuterValues.empty()) return true;
         if (!expression.contains("outerColumns") || !expression.at("outerColumns").is_object()) return false;
         const auto tokens = sql::tokenize(expression.at("subquerySql").get<std::string>());
         for (std::size_t index = 0; index + 2 < tokens.size(); ++index)
@@ -2892,7 +2932,7 @@ nlohmann::json Database::execute(const std::string& source, bool optimize) {
                 const auto rawPlans = sql::compilePlans(target, catalog_.view());
                 if (analyze && target.front().kind != "Select")
                     throw MiniSqlError(ErrorCode::Semantic, "EXPLAIN ANALYZE permits only SELECT", location);
-                const auto optimized = optimizer::optimize(rawPlans);
+                const auto optimized = optimizer::optimize(rawPlans, optimizerOptions());
                 const auto raw = sql::serializePlans(rawPlans);
                 const auto optimizedJson = sql::serializePlans(optimized.plans);
                 const auto tableEstimate = [&](const std::string& name) -> std::pair<double, double> {
@@ -3089,7 +3129,7 @@ nlohmann::json Database::execute(const std::string& source, bool optimize) {
             if (transaction_ == TransactionState::Aborted && ast.front().kind != "Rollback")
                 throw MiniSqlError(ErrorCode::Transaction, "Transaction aborted; ROLLBACK required");
             auto plans = sql::compilePlans(ast, catalog_.view());
-            if (optimize) plans = optimizer::optimize(plans).plans;
+            if (optimize) plans = optimizer::optimize(plans, optimizerOptions()).plans;
             materializeSubqueries(plans);
             for (const auto& plan : plans) {
                 auto result = runStatement(plan);
@@ -3158,6 +3198,8 @@ nlohmann::json Database::executeStreaming(const std::string& source,
         json row;
         while (stream->next(row)) {
             checkCancelled();
+            if (maxResultRows_ > 0 && emitted >= maxResultRows_)
+                throw MiniSqlError(ErrorCode::Execution, "Result row budget exceeded");
             if (emitRow && !emitRow(row)) throw MiniSqlError(ErrorCode::Cancelled, "Streaming client disconnected");
             ++emitted;
         }
@@ -3170,6 +3212,8 @@ nlohmann::json Database::executeStreaming(const std::string& source,
     auto result = run(plan);
     for (auto& row : result.at("rows")) {
         checkCancelled();
+        if (maxResultRows_ > 0 && emitted >= maxResultRows_)
+            throw MiniSqlError(ErrorCode::Execution, "Result row budget exceeded");
         if (emitRow && !emitRow(row)) throw MiniSqlError(ErrorCode::Cancelled, "Streaming client disconnected");
         ++emitted;
     }

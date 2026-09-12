@@ -6,12 +6,12 @@
 namespace minisql {
 std::variant<CommandLineOptions, int> parseCommandLine(int argc, const char* const* argv,
                                                      std::ostream& out, std::ostream& err) {
-    CLI::App app{"MiniSQL foundation: configuration, logging and CLI shell"};
+    CLI::App app{"MiniSQL database command-line client"};
     app.set_version_flag("--version", std::string(kVersion));
     CommandLineOptions options;
     std::string config, sql;
     auto* configOption = app.add_option("-c,--config", config, "JSON config file (explicit paths must exist)");
-    auto* executeOption = app.add_option("-e,--execute", sql, "Submit SQL (engine not implemented yet)");
+    auto* executeOption = app.add_option("-e,--execute", sql, "Execute SQL and exit");
     app.add_flag("--check-config", options.checkConfig, "Validate configuration and exit without writing files");
     app.add_flag("--print-config", options.printConfig, "Print effective JSON configuration and exit without writing files");
 
@@ -26,7 +26,7 @@ std::variant<CommandLineOptions, int> parseCommandLine(int argc, const char* con
             options.overrides[nlohmann::json::json_pointer(pointer)] = value;
         }, description);
     };
-    stringOption("--mode", "/mode", "cli or server (network server is not implemented yet)");
+    stringOption("--mode", "/mode", "cli or server");
     stringOption("--data", "/data_directory", "Data directory");
     stringOption("--wal-dir", "/wal_directory", "WAL directory");
     stringOption("--catalog-dir", "/catalog_directory", "Catalog directory");

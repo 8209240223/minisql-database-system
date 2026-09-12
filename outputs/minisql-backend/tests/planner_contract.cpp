@@ -3,6 +3,7 @@
 #include "minisql/sql/lr_generator.hpp"
 #include <algorithm>
 #include <iostream>
+#include <set>
 #include <stdexcept>
 
 void require(bool condition) {
@@ -31,6 +32,14 @@ int main() {
     require(valid.front().kind == "Project");
     auto structured = minisql::sql::compilePlans(parse("SELECT id FROM existing WHERE id>=1 ORDER BY id DESC LIMIT 2;"), catalog);
     const auto document = minisql::sql::serializePlans(structured);
+    std::set<std::size_t> planIds;
+    for (const auto& node : document) {
+        require(node.at("nodeId") == node.at("id"));
+        require(planIds.insert(node.at("nodeId").get<std::size_t>()).second);
+        require(node.contains("sourceSpan") && node.at("sourceSpan").contains("start") && node.at("sourceSpan").contains("end"));
+        require(node.at("outputSchema") == node.at("output"));
+        for (const auto& child : node.at("children")) require(child.get<std::size_t>() < document.size());
+    }
     const auto restored = minisql::sql::deserializePlans(document);
     require(minisql::sql::serializePlans(restored) == document);
     const auto wrapped = nlohmann::json{{"schemaVersion", 1}, {"planKind", "logical"}, {"plans", document}};
@@ -59,6 +68,20 @@ int main() {
     require(badExpression);
     const auto ast = parse("CREATE TABLE ast_t(id INT PRIMARY KEY,v FLOAT,s VARCHAR(20),CHECK(v IS NULL OR v>0)); INSERT INTO ast_t VALUES(1,1.5,'x'),(2,NULL,'y'); SELECT id,v FROM ast_t WHERE id IN (SELECT id FROM ast_t) ORDER BY id DESC LIMIT 1; UPDATE ast_t SET v=CAST(2 AS FLOAT) WHERE id=1; DELETE FROM ast_t WHERE id=2;");
     const auto astDocument = minisql::sql::serializeAst(ast);
+    std::set<std::size_t> astIds;
+    std::function<void(const nlohmann::json&)> inspectAst = [&](const nlohmann::json& node) {
+        if (node.is_array()) { for (const auto& child : node) inspectAst(child); return; }
+        if (!node.is_object()) return;
+        if (node.contains("kind")) {
+            require(node.contains("nodeId") && node.at("nodeId").is_number_unsigned());
+            require(astIds.insert(node.at("nodeId").get<std::size_t>()).second);
+            require(node.contains("sourceSpan") && node.at("sourceSpan").contains("start") && node.at("sourceSpan").contains("end"));
+            if (node.value("kind", "") == "Select") require(node.contains("outputSchema") && node.at("outputSchema").is_array());
+        }
+        for (const auto& child : node.items())
+            if (child.key() != "sourceSpan" && child.key() != "outputSchema") inspectAst(child.value());
+    };
+    inspectAst(astDocument);
     const auto astRestored = minisql::sql::deserializeAst(astDocument);
     require(minisql::sql::serializeAst(astRestored) == astDocument);
     const auto astWrapped = nlohmann::json{{"schemaVersion", 1}, {"statements", astDocument}};
@@ -73,6 +96,11 @@ int main() {
     try { (void)minisql::sql::deserializeAst(damagedAst); }
     catch (const minisql::MiniSqlError&) { badAstExpression = true; }
     require(badAstExpression);
+    const auto utf8Tokens = minisql::sql::serializeTokens(minisql::sql::tokenize("SELECT '\xE4\xB8\xAD';"));
+    require(utf8Tokens.at(1).at("text") == "'\xE4\xB8\xAD'");
+    require(utf8Tokens.at(1).at("byteStart") == 7 && utf8Tokens.at(1).at("byteEnd") == 12);
+    require(utf8Tokens.at(1).at("line") == 1 && utf8Tokens.at(1).at("column") == 8);
+    require(utf8Tokens.at(1).at("endLine") == 1 && utf8Tokens.at(1).at("endColumn") == 11);
     const auto lr = minisql::sql::buildCanonicalLr0({
         {"S", {"A"}},
         {"A", {"a"}},

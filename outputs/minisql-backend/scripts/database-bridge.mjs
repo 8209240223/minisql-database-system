@@ -692,11 +692,13 @@ const server = http.createServer(async (req, res) => {
     headers['Access-Control-Allow-Methods'] = 'GET, POST, DELETE, OPTIONS';
     res.writeHead(status, headers);
     const write = value => new Promise((resolve, reject) => {
-      if (res.destroyed || res.writableEnded) { reject(httpError(499, 'Stream client disconnected')); return; }
+      // Closing a streaming response is the normal client-cancellation path. The
+      // response close listener signals the engine through its cancel file.
+      if (res.destroyed || res.writableEnded) { resolve(false); return; }
       const finish = error => {
         res.off('drain', onDrain);
         res.off('error', onError);
-        if (error) reject(error); else resolve();
+        if (error) reject(error); else resolve(true);
       };
       const onDrain = () => finish();
       const onError = error => finish(error);
@@ -842,7 +844,7 @@ const server = http.createServer(async (req, res) => {
       autoCheckpointDirtyPages: Number(process.env.MINISQL_AUTO_CHECKPOINT_DIRTY_PAGES ?? 0), autoCheckpointDirtyRatio: Number(process.env.MINISQL_AUTO_CHECKPOINT_DIRTY_RATIO ?? 0),
       autoCheckpointIntervalMs: Number(process.env.MINISQL_AUTO_CHECKPOINT_INTERVAL_MS ?? 0), autoCheckpointWalBasis: 'committed-journal-bytes',
       autoCheckpointEvaluation: 'after-successful-commit', streamingResults: true, streamingFormat: 'ndjson', streamingReadOnly: true,
-      maxResultRows: Number(process.env.MINISQL_MAX_RESULT_ROWS ?? 0),
+      maxResultRows: Number(process.env.MINISQL_MAX_RESULT_ROWS ?? 100000),
       queryMemoryBytes: Number(process.env.MINISQL_QUERY_MEMORY_BYTES ?? 64 * 1024 * 1024),
       tempDiskBytes: Number(process.env.MINISQL_TEMP_DISK_BYTES ?? 1024 * 1024 * 1024),
       externalSort: true, sortSpill: true, sortSpillEncoding: 'jsonl', sortArtifactIdentity: 'session-query-sort', sortChecksum: 'fnv1a64',
@@ -1092,7 +1094,8 @@ const server = http.createServer(async (req, res) => {
     try {
       if (activeOperation?.sessionId === session.id) {
         writeFileSync(activeOperation.cancelFile, 'cancel\n', 'utf8');
-        send(202, { success: false, cancelled: true, commitState: 'unknown', error: { code: 5002, message: 'Cancellation requested' } });
+        send(202, { success: false, cancelled: true, commitState: 'unknown', transactionState: session.transactionState,
+          error: { code: 5002, message: 'Cancellation requested' } });
         return;
       }
       if (session.waiting) {
@@ -1104,7 +1107,8 @@ const server = http.createServer(async (req, res) => {
           clearTimeout(waiter.timer);
           waiter.resolve();
         }
-        send(202, { success: false, cancelled: true, error: { code: 5002, message: 'Cancellation requested' } });
+        send(202, { success: false, cancelled: true, transactionState: session.transactionState,
+          error: { code: 5002, message: 'Cancellation requested' } });
         return;
       }
       send(409, { success: false, error: { code: 409, message: 'No query is running' } });
@@ -1244,7 +1248,7 @@ const server = http.createServer(async (req, res) => {
           else if (frame.type === 'complete') await streamOutput.write({ type: 'complete', success: true,
             rowCount: frame.rows, resourceUsage: frame.resourceUsage, transactionState: session.transactionState });
           else if (frame.type === 'error') await streamOutput.write({ type: 'error', success: false,
-            error: frame.error, commitState: frame.commitState, transactionState: session.transactionState });
+            error: frame.error, transactionState: session.transactionState });
         },
       } : {});
     })();

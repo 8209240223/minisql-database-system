@@ -42,10 +42,18 @@ export async function openSession(executable, database, { timeoutMs = 30000, max
         }
         if (!pending || message.id !== pending.id) throw new Error('Unexpected session response');
         if (pending.stream) {
-          try { pending.onMessage?.(message); }
-          catch (error) { fail(error); return; }
+          const current = pending;
+          current.delivery = current.delivery.then(() => current.onMessage?.(message)).catch(error => {
+            current.deliveryError ??= error;
+          });
           if (message.type === 'complete' || message.type === 'error') {
-            const current = pending; pending = undefined; clearTimeout(current.timer); current.resolve(message);
+            pending = undefined;
+            clearTimeout(current.timer);
+            current.delivery.then(() => {
+              if (!current.deliveryError) { current.resolve(message); return; }
+              current.reject(current.deliveryError);
+              fail(current.deliveryError);
+            });
           }
           continue;
         }
@@ -101,7 +109,7 @@ export async function openSession(executable, database, { timeoutMs = 30000, max
       if (terminal) throw terminal;
       return new Promise((resolve, reject) => {
         const timer = setTimeout(() => fail(new Error('Session streaming request timed out; commit state may be unknown')), timeoutMs);
-        pending = { id, timer, resolve, reject, stream: true, onMessage };
+        pending = { id, timer, resolve, reject, stream: true, onMessage, delivery: Promise.resolve() };
         child.stdin.write(frame + '\n');
       });
     });

@@ -13,6 +13,7 @@
 #include "minisql/catalog/persistent_catalog.hpp"
 #include "minisql/security/access_catalog.hpp"
 #include "minisql/sql/planner.hpp"
+#include "minisql/optimizer/optimizer.hpp"
 #include "minisql/storage/bplus_tree.hpp"
 #include "minisql/execution/executor.hpp"
 
@@ -31,7 +32,7 @@ public:
                                     const std::function<void(const nlohmann::json&)>& emitMeta,
                                     const std::function<bool(const nlohmann::json&)>& emitRow);
     const char* transactionState() const;
-    nlohmann::json compile(const std::string& sql) const;
+    nlohmann::json compile(const std::string& sql);
     // X25：把 SQL 绑定成权限层可直接消费的请求。别名、派生表别名和 CTE 名是
     // 作用域名，不会被当成持久化对象；绑定不闭合时返回 bound == false，
     // 入口层据此 fail-closed 拒绝，不存在文本扫描兜底。
@@ -77,6 +78,7 @@ private:
     nlohmann::json executionFailure(const MiniSqlError& error, nlohmann::json results);
     void requireAvailable() const;
     void checkCancelled() const;
+    optimizer::Options optimizerOptions();
     nlohmann::json runStatement(const sql::LogicalPlan& plan);
     nlohmann::json run(const sql::LogicalPlan& plan);
     nlohmann::json runNode(const sql::LogicalPlan& plan);
@@ -104,7 +106,7 @@ private:
     std::size_t autoCheckpointDirtyPages_ = 0;
     double autoCheckpointDirtyRatio_ = 0.0;
     std::uint64_t autoCheckpointIntervalMs_ = 0;
-    std::size_t maxResultRows_ = 0;
+    std::size_t maxResultRows_ = 100000;
     std::size_t pendingAutoCheckpointWrites_ = 0;
     std::uint64_t pendingAutoCheckpointWalBytes_ = 0;
     std::size_t checkpointCount_ = 0;

@@ -59,17 +59,18 @@ export function TokenStream({ result, onSelect }: { result: QueryResult | null; 
     <div className="token-summary">
       <strong>词法分析结果</strong>
       <span>共 {tokens.length} 个 Token</span>
-      <span>格式：[种别码，词素值，行号，列号]</span>
+      <span>范围采用 UTF-8 字节右开区间</span>
     </div>
     <div className="table-scroll">
       <table aria-label="Token 流">
-        <thead><tr><th>#</th><th>种别码</th><th>词素值</th><th>行号</th><th>列号</th></tr></thead>
+        <thead><tr><th>#</th><th>种别码</th><th>词素值</th><th>起点</th><th>终点</th><th>字节范围</th></tr></thead>
         <tbody>{tokens.map((token, index) => <tr className="token-row" key={`${token.line}-${token.column}-${index}`} tabIndex={0} title="点击定位到 SQL 源码" onClick={() => onSelect?.(token)} onKeyDown={event => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); onSelect?.(token); } }}>
           <td>{index + 1}</td>
           <td><span className={`token-type token-${token.type.toLowerCase().replace(/[^a-z0-9_-]/g, '')}`}>{token.type}</span></td>
           <td className="token-lexeme">{token.text || '<空>'}</td>
-          <td>{token.line}</td>
-          <td>{token.column}</td>
+          <td>{token.line}:{token.column}</td>
+          <td>{token.endLine ?? token.line}:{token.endColumn ?? token.column + token.text.length}</td>
+          <td>[{token.byteStart ?? '—'}, {token.byteEnd ?? '—'})</td>
         </tr>)}</tbody>
       </table>
     </div>

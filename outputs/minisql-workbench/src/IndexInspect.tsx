@@ -1,3 +1,4 @@
+import { RefreshCw, ShieldCheck } from 'lucide-react';
 import type { IndexInspect } from './client';
 
 function ref(value: { id: number; generation: number } | undefined): string {
@@ -5,7 +6,12 @@ function ref(value: { id: number; generation: number } | undefined): string {
   return `${value.id}.${value.generation}`;
 }
 
-export function IndexInspectView({ info }: { info: IndexInspect | undefined }) {
+export function IndexInspectView({ info, busy, onVerify, onRebuild }: {
+  info: IndexInspect | undefined;
+  busy?: boolean;
+  onVerify?: () => Promise<void>;
+  onRebuild?: () => Promise<void>;
+}) {
   if (!info) return <p className="inspect-empty">选择一个真实数据库会话中的索引执行页级结构检查。本地演示引擎不提供页级索引结构。</p>;
   if (info.storage === 'memory' || info.present === false) {
     return <section className="inspect-info" aria-label="索引检查">
@@ -15,7 +21,11 @@ export function IndexInspectView({ info }: { info: IndexInspect | undefined }) {
     </section>;
   }
   return <section className="inspect-info" aria-label="索引检查">
-    <header><strong>{info.table}.{info.index}</strong><span className="inspect-mode">页级索引</span></header>
+    <header><strong>{info.table}.{info.index}</strong><span className="inspect-mode">页级索引</span><div className="output-spacer"/>
+      <button className="icon-btn" title="校验索引与堆表一致性" aria-label="校验索引" disabled={busy || !onVerify} onClick={() => void onVerify?.()}><ShieldCheck size={15}/></button>
+      <button className="icon-btn" title="在线重建索引" aria-label="重建索引" disabled={busy || !onRebuild} onClick={() => void onRebuild?.()}><RefreshCw size={15}/></button>
+    </header>
+    {info.message && <p role="status">{info.message}</p>}
     <div className="inspect-summary">
       <dl><dt>树高</dt><dd>{info.height}</dd><dt>节点页</dt><dd>{info.nodeCount}</dd><dt>叶节点</dt><dd>{info.leafCount}</dd><dt>行数</dt><dd>{info.rowCount}</dd><dt>叶链长度</dt><dd>{info.leafChainLength}</dd><dt>根</dt><dd>{ref(info.root)}</dd></dl>
     </div>

@@ -535,9 +535,18 @@ void validate(const std::vector<sql::Statement>& statements, Catalog& catalog) {
         // X09 3.3: 派生表基座。内层 select 仍在真实 catalog 上校验；外层列绑定、
         // 类型与 WHERE 校验交由 planner 的 Scope 链完成（catalog 未知派生别名）。
         if (statement.fromSubquery != nullptr) {
-            // 第十九章 REQ-UI-010：能力未实现与 SQL 检查失败必须区分，前者走 501。
-            if (statement.kind != "Select") throw MiniSqlError(ErrorCode::NotImplemented, "DELETE/UPDATE is not supported over a derived table", statement.location);
             validate({*statement.fromSubquery}, catalog);
+            if (statement.kind == "Update" || statement.kind == "Delete") {
+                const auto& source = *statement.fromSubquery;
+                const bool wildcard = source.selectItems.size() == 1 && source.selectItems.front().expression &&
+                    source.selectItems.front().expression->kind == "Wildcard" && source.selectItems.front().expression->value == "*";
+                const bool updatable = wildcard && !source.fromSubquery && source.joins.empty() && !source.distinct &&
+                    source.groupBy.empty() && !source.having && source.orderBy.empty() && !source.limit && source.offset == 0 && statement.joins.empty();
+                if (!updatable) fail("Derived table is not updatable; use a single base-table SELECT * without JOIN, DISTINCT, grouping, ordering or pagination", statement.location);
+                const auto* target = catalog.find(source.table);
+                if (!target) fail("Table does not exist: " + source.table, statement.location);
+                for (const auto& assignment : statement.assignments) (void)column(*target, assignment.column, statement.location);
+            }
             continue;
         }
         auto binding = queryScope(statement, catalog);

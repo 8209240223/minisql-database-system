@@ -5,6 +5,7 @@ export interface Diagnostic { code?: number; message: string; suggestion?: strin
 export interface PlanColumn { name: string; type: string; columnId?: number; identity?: string; nullable?: boolean; primaryKey?: boolean; unique?: boolean; defaultValue?: string | null }
 export interface PlanRow {
   id: number;
+  nodeId?: number;
   parent: number;
   detail: string;
   depth?: number;
@@ -18,6 +19,8 @@ export interface PlanRow {
   aggregates?: unknown[];
   estimatedRows?: number;
   actualRows?: number;
+  sourceSpan?: { start: { line: number; column: number }; end: { line: number; column: number } };
+  outputSchema?: PlanColumn[];
 }
 export interface QueryResult {
   protocolVersion?: number;
@@ -29,6 +32,8 @@ export interface QueryResult {
   columnTypes?: string[];
   integerEncoding?: 'safe-number-or-decimal-string';
   rows: Cell[][];
+  rowCount?: number;
+  truncated?: boolean;
   affectedRows: number;
   durationMs: number;
   ast?: unknown;
@@ -60,9 +65,19 @@ export interface ConnectionProfile {
   url: string;
   user: string;
 }
-export interface QueryTab { id: string; name: string; sql: string; dirty?: boolean }
+export interface QueryTab {
+  id: string;
+  name: string;
+  sql: string;
+  dirty?: boolean;
+  editVersion: number;
+  connection?: Connection;
+  sessionId?: string;
+  transactionState: string;
+  running: boolean;
+}
 export interface HistoryItem { id: string; sql: string; at: number; durationMs: number; rows: number; error?: string; mode: Connection['mode']; connection: string; action: 'compile' | 'execute' }
-export interface SqlToken { type: string; text: string; line: number; column: number }
+export interface SqlToken { type: string; text: string; line: number; column: number; endLine?: number; endColumn?: number; byteStart?: number; byteEnd?: number }
 
 // X24 / C2 权限与审计
 export interface AccessGrant { object: string; permissions: string[] }

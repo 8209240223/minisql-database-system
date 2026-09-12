@@ -85,7 +85,7 @@ if(WIN32)
 endif()
 
 add_library(minisql_server STATIC src/server/command_line.cpp src/server/application.cpp)
-target_link_libraries(minisql_server PUBLIC minisql_common PRIVATE CLI11::CLI11)
+target_link_libraries(minisql_server PUBLIC minisql_common minisql_execution PRIVATE CLI11::CLI11)
 add_executable(minisql src/main.cpp)
 target_link_libraries(minisql PRIVATE minisql_server)
 

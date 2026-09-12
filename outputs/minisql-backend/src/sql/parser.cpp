@@ -190,7 +190,9 @@ private:
         semicolon();return s;
     }
     Statement update() {
-        Statement s{"Update"};expect("UPDATE");s.table=identifier();expect("SET");
+        Statement s{"Update"};expect("UPDATE");
+        if(at("(")) derivedTarget(s); else s.table=identifier();
+        expect("SET");
         do {auto name=identifier();expect("=");s.assignments.push_back({std::move(name),writeValue()});}
         while(at(",")&&(++i,true));
         if(keyword("WHERE")){++i;s.where=expression();}
@@ -433,7 +435,18 @@ private:
         if(parsed.ec!=std::errc{}||parsed.ptr!=token.lexeme.data()+token.lexeme.size()) fail(ErrorCode::Syntax, "Pagination count exceeds UINT64 range", token.location);
         return value;
     }
-    Statement remove(){Statement s{"Delete"};expect("DELETE");expect("FROM");s.table=identifier();if(keyword("WHERE")){++i;s.where=expression();}semicolon();return s;}
+    void derivedTarget(Statement& s) {
+        expect("(");
+        auto derived=select(false);
+        expect(")");
+        std::string alias;
+        if(keyword("AS")){++i;alias=identifier();}
+        else if(i<t.size()&&t[i].type=="IDENTIFIER")alias=identifier();
+        if(alias.empty()) fail(ErrorCode::Semantic, "A derived table must have an explicit alias", t[i].location);
+        s.fromSubquery=std::make_shared<Statement>(std::move(derived));
+        s.tableAlias=alias;s.table=alias;
+    }
+    Statement remove(){Statement s{"Delete"};expect("DELETE");expect("FROM");if(at("("))derivedTarget(s);else s.table=identifier();if(keyword("WHERE")){++i;s.where=expression();}semicolon();return s;}
     std::shared_ptr<Expr> expression(){auto left=conjunction();while(keyword("OR")){++i;left=std::make_shared<Expr>(Expr{"Binary","OR",left,conjunction()});}return left;}
     std::shared_ptr<Expr> conjunction(){auto left=negation();while(keyword("AND")){++i;left=std::make_shared<Expr>(Expr{"Binary","AND",left,negation()});}return left;}
     std::size_t depth=0;
