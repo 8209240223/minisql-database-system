@@ -157,8 +157,13 @@ WAL 采用记录级格式（扩展头记录 `txId`、逻辑 LSN、`prevLsn` 链�
 两个稳定符号错误码：`SEM_INTEGER_OUT_OF_RANGE`（字面量超出 INT64，或能装进 BIGINT 但装不进
 INT 列时的窄化转换）与 `PLAN_STALE_SCHEMA`（计划绑定的 Catalog 指纹已失效）。
 
-HTTP 状态映射：`400` 请求格式不合法，`403` 权限拒绝或绑定不闭合（fail-closed），
-`413` 资源超限，`422` SQL 检查失败，`501` 能力未实现（`NotImplemented`），`503` 后端不可用。
+HTTP 状态映射：`400` 请求格式不合法，`403` 权限拒绝（含身份校验失败），
+`413` 资源超限，`422` SQL 检查失败（含绑定失败：对象不存在等），
+`501` 能力未实现（`NotImplemented`），`503` 后端不可用。
+
+无法绑定的语句**一律不执行**（fail-closed，不存在基于 SQL 文本的兜底扫描），但错误码回报
+真实原因，因此同一句 SQL 在是否配置权限目录两种情况下得到相同的状态码；身份校验在对象
+授权之前完成，未授权调用方拿到的依旧是 `403`。
 
 ## 启动工作台
 
@@ -191,12 +196,10 @@ powershell -ExecutionPolicy Bypass -File .\stop-minisql-workbench.ps1
 - 第十七章 REQ-CORE-001/002 工程基线：标识符/批量语句/诊断数量上限，`SEM_INTEGER_OUT_OF_RANGE` 与 `PLAN_STALE_SCHEMA` 稳定错误码，以及序列化计划执行入口。
 - 第十九章 REQ-UI-010：`GET /api/storage/stats` 别名、未实现能力返回 501、资源超限返回 413 的完整状态映射。
 - 第十七章 §7.2 极端嵌套：表达式嵌套上限 256 现在真正可用（257 起报 `SyntaxError 2002`）；派生表与标量子查询的递归补上了缺失的深度保护；嵌套标量子查询（含非相关多层）可正常执行。
+- Windows 非 ASCII 路径（中文用户名等）：`snapshot` 会话操作不再把 UTF-8 字符串隐式窄转成 `std::filesystem::path`，快照响应也不再回显 `path::string()` 的 ANSI 字节，因此含中文路径的在线备份不再返回 503；`emit` 的序列化失败也不再逃逸成没有 `id` 的错误帧。
+- WAL 重做校验：损坏的日志页在写入数据文件**之前**就按页自校验和被拒绝（此前会先改数据文件再以误导性的 `file header` 报错）。
 
-已知失败（均已在当前 `main` 上复现同样的失败模式，与嵌套深度修复无关，如实列出）：
-
-- `tests/transaction-savepoint.mjs`：`SELECT * FROM v`（表不存在）经 bridge 得到 `403`，期望 `422`。原因是 X25 fail-closed 鉴权在绑定不闭合时统一返回 403，而该测试写于 X25 之前。
-- `tests/backup-online-smoke.mjs`：在线快照请求返回 `503`，期望 `200`。
-- `tests/journal-process.mjs`：预置 `bin/journal_probe.exe` 与新构建产物不一致（环境问题）。
+全量回归当前状态：**105/105 通过**（`tests/*.mjs` 102 项 + 3 项慢用例）。
 
 仍待继续（不把专项测试通过等同于全量验收）：
 

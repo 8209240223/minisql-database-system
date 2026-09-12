@@ -61,12 +61,8 @@ if (Test-Path -LiteralPath $releaseDir) {
         Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $binDir $_.Name) -Force
         $synced++
     }
-    # journal_probe.exe 是 tests/journal-process.mjs 期望的文件名。
-    $journalProbe = Join-Path $releaseDir 'minisql_journal_probe.exe'
-    if (Test-Path -LiteralPath $journalProbe) {
-        Copy-Item -LiteralPath $journalProbe -Destination (Join-Path $binDir 'journal_probe.exe') -Force
-        $synced++
-    }
+    # 测试引用的是构建产物原名（minisql_journal_probe.exe 等），这里不做任何别名映射，
+    # 保证 bin/ 是构建输出的忠实镜像，避免出现“测试找不到可执行体”的静默 ENOENT。
     Write-Host "`n>>> synced $synced build artifacts into bin/" -ForegroundColor Cyan
 } else {
     Write-Host "`n>>> build/windows/Release not found; using existing bin/ artifacts" -ForegroundColor Yellow

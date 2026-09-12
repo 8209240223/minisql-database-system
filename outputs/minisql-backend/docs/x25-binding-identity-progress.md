@@ -72,7 +72,14 @@ DELETE FROM a WHERE id IN (SELECT id FROM b)
   `resolveAccessObjects` 变成 `bindAccess` 的薄封装。
 - `AccessCatalog::authorize` 的签名从 `(user, operation, sql, table, index,
   resolvedObjects)` 变为 `(user, operation, AccessRequest, table, index)`。
-  **`request.bound == false` 一律拒绝**，错误信息带绑定失败原因。
+  **`request.bound == false` 一律拒绝执行**，不存在基于 SQL 文本的兜底扫描。
+  拒绝与「回报什么错误」是两件事：`AccessRequest::failureCode/failureLocation`
+  让拒绝抛出绑定失败的**真实**错误码（对象不存在 → `Catalog 3001`，解析期未实现
+  构造 → `NotImplemented 9001`），只有拿不到失败原因时（例如序列化计划文档形状
+  不合法）才回落到 `Permission 7001`。这样「表不存在」按第十九章映射成 422，
+  而不是按授权失败报成 403；也消除了同一句 SQL 在是否配置权限目录两种情况下
+  状态码不一致的问题。身份校验（`authorizeIdentity`）仍在对象授权之前完成，
+  未授权调用方拿到的依旧是权限错误。
 
 入口动作（`catalog` / `statistics` / `buffer` / `close` / `indexinspect` /
 `snapshot` / `restore`）不携带 SQL，权限仍只由入口决定；`compile` /

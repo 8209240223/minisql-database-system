@@ -56,6 +56,13 @@ std::string joinProblems(const std::vector<std::string>& problems) {
     }
     return message;
 }
+// 路径必须以 UTF-8 暴露给 JSON：Windows 上 path::string() 返回本地 ANSI 窄编码，
+// 含非 ASCII 的路径（例如中文用户名下的临时目录）会产生非法 UTF-8 字节，
+// 使 JSON 序列化抛 type_error.316，整个响应随之丢失。
+std::string pathUtf8(const std::filesystem::path& path) {
+    const auto value = path.generic_u8string();
+    return {reinterpret_cast<const char*>(value.data()), value.size()};
+}
 // 第十七章 REQ-CORE-001：批量语句上限 10000。compile 整批进入 Parser::all()，
 // 而 execute/diagnostics 自己按分号切分，因此两者共用同一常量与消息，
 // 消息含 "budget exceeded" 以便 HTTP 适配层映射到 413。
@@ -730,7 +737,7 @@ nlohmann::json Database::createSnapshot(const std::filesystem::path& target) {
     requireAvailable();
     file_->copyTo(target);
     const auto& record = file_->checkpointRecord();
-    return {{"success", true}, {"kind", "Snapshot"}, {"target", target.string()},
+    return {{"success", true}, {"kind", "Snapshot"}, {"target", pathUtf8(target)},
         {"walBytes", file_->walBytes()}, {"walCutoffBytes", record.walCutoffBytes},
         {"committedSequence", record.committedSequence}, {"catalogVersion", record.catalogVersion},
         {"indexVersion", record.indexVersion}};

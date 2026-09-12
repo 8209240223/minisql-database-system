@@ -35,3 +35,6 @@ outputs/minisql-workbench/*.tsbuildinfo
 # Course reference materials (not part of the repository deliverable)
 *.pptx
 *.pdf
+
+# 本地临时工作区（探针脚本产物，不应入库）
+/tmp/

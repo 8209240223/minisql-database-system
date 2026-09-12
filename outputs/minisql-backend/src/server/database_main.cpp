@@ -18,7 +18,42 @@ std::string displayPath(const std::filesystem::path& path) {
     const auto value = path.generic_u8string();
     return {reinterpret_cast<const char*>(value.data()), value.size()};
 }
+// 过滤为非 ASCII 可打印字符：确保兜底帧一定是合法 UTF-8。
+std::string asciiOnly(const std::string& text) {
+    std::string out;
+    for (const unsigned char byte : text)
+        if (byte >= 0x20 && byte < 0x7f) out.push_back(static_cast<char>(byte));
+    return out;
+}
+// 会话帧里的路径必须是合法 UTF-8：非法字节会在序列化响应时抛 json 异常，
+// 也会把未校验的字节直接带进文件系统调用。
+bool validUtf8(const std::string& text) {
+    std::size_t index = 0;
+    while (index < text.size()) {
+        const auto lead = static_cast<unsigned char>(text[index]);
+        std::size_t width = 0;
+        std::uint32_t point = 0;
+        if (lead < 0x80) { ++index; continue; }
+        else if ((lead & 0xe0) == 0xc0) { width = 1; point = lead & 0x1f; }
+        else if ((lead & 0xf0) == 0xe0) { width = 2; point = lead & 0x0f; }
+        else if ((lead & 0xf8) == 0xf0) { width = 3; point = lead & 0x07; }
+        else return false;
+        if (index + width >= text.size()) return false;
+        for (std::size_t step = 1; step <= width; ++step) {
+            const auto byte = static_cast<unsigned char>(text[index + step]);
+            if ((byte & 0xc0) != 0x80) return false;
+            point = (point << 6) | (byte & 0x3f);
+        }
+        if ((width == 1 && point < 0x80) || (width == 2 && point < 0x800) ||
+            (width == 3 && (point < 0x10000 || point > 0x10ffff)) ||
+            (point >= 0xd800 && point <= 0xdfff)) return false;
+        index += width + 1;
+    }
+    return true;
+}
 std::filesystem::path pathFromUtf8(const std::string& value) {
+    if (!validUtf8(value))
+        throw minisql::MiniSqlError(minisql::ErrorCode::InvalidArgument, "Path is not valid UTF-8");
     return std::filesystem::path(std::u8string(
         reinterpret_cast<const char8_t*>(value.data()), value.size()));
 }
@@ -155,7 +190,25 @@ int session(minisql::execution::Database& database, minisql::security::AccessCat
             const std::filesystem::path& databasePath) {
     const auto emit = [](json value) {
         value["integerEncoding"] = "safe-number-or-decimal-string";
-        std::cout << minisql::wireJson(std::move(value)).dump() << '\n' << std::flush;
+        // 序列化前先留住帧身份：若 dump 抛异常而外层又没接住，对端只能报出
+        // 无意义的 "Unexpected session response"，真实错误被吞掉。
+        std::string identity;
+        if (value.contains("id") && value.at("id").is_string())
+            identity = asciiOnly(value.at("id").get<std::string>());
+        try {
+            std::cout << minisql::wireJson(std::move(value)).dump() << '\n' << std::flush;
+            return;
+        } catch (const std::exception& error) {
+            json fallback = {{"success", false},
+                {"error", {{"type", "InternalError"}, {"code", 9999},
+                           {"message", std::string("Response serialization failed: ") + asciiOnly(error.what())}}}};
+            if (!identity.empty()) fallback["id"] = identity;
+            fallback["integerEncoding"] = "safe-number-or-decimal-string";
+            std::cout << fallback.dump() << '\n' << std::flush;
+        } catch (...) {
+            std::cout << "{\"success\":false,\"error\":{\"type\":\"InternalError\",\"code\":9999,"
+                         "\"message\":\"Response serialization failed\"}}\n" << std::flush;
+        }
     };
     emit({{"type", "ready"}, {"protocolVersion", 1}, {"transactionState", database.transactionState()}});
     constexpr std::size_t maxFrameBytes = 8 * 1024 * 1024;
@@ -284,7 +337,7 @@ int session(minisql::execution::Database& database, minisql::security::AccessCat
                 if (!request.contains("target") || !request["target"].is_string())
                     throw minisql::MiniSqlError(minisql::ErrorCode::InvalidArgument, "Expected snapshot target string");
                 authorizeRequest(database, access, request, operation);
-                result = database.createSnapshot(request["target"].get<std::string>());
+                result = database.createSnapshot(pathFromUtf8(request["target"].get<std::string>()));
             } else if (operation == "close") {
                 authorizeRequest(database, access, request, operation);
                 close = true;

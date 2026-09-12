@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import assert from 'node:assert/strict';
-const executable = fileURLToPath(new URL('../bin/write_batch_contract.exe', import.meta.url));
+const executable = fileURLToPath(new URL('../bin/minisql_write_batch_contract.exe', import.meta.url));
 const run = args => spawnSync(executable, args, {encoding:'utf8', windowsHide:true, timeout:10000});
 const fixture = run([]);
 assert.equal(fixture.status, 0, fixture.stderr);
