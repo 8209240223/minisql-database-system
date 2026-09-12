@@ -1,6 +1,7 @@
 #include "minisql/execution/database.hpp"
 #include "minisql/common/wire_json.hpp"
 #include "minisql/security/access_catalog.hpp"
+#include <algorithm>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -59,6 +60,52 @@ minisql::security::AccessRequest authorizeRequest(minisql::execution::Database& 
     const auto& user = request["user"].get_ref<const std::string&>();
     access.authorize(user, operation, binding, table, index);
     return binding;
+}
+
+// 序列化计划路径没有 SQL 文本可绑定，受权对象与动作完全由已解析的计划节点推导。
+// 文档形状不合法时返回 bound == false，授权层据此 fail-closed 拒绝。
+minisql::security::AccessRequest planAccessRequest(const json& document) {
+    using minisql::security::AccessAction;
+    const auto actionFor = [](const std::string& kind) {
+        if (kind == "Insert") return AccessAction::Insert;
+        if (kind == "Update") return AccessAction::Update;
+        if (kind == "Delete") return AccessAction::Delete;
+        if (kind == "CreateTable" || kind == "CreateIndex") return AccessAction::Create;
+        if (kind == "DropIndex") return AccessAction::Drop;
+        if (kind == "Checkpoint") return AccessAction::Checkpoint;
+        if (kind == "Begin" || kind == "Commit" || kind == "Rollback" || kind == "Savepoint")
+            return AccessAction::Transaction;
+        return AccessAction::Select;
+    };
+    minisql::security::AccessRequest request;
+    const json* rows = nullptr;
+    if (document.is_array()) rows = &document;
+    else if (document.is_object() && document.contains("plans") && document.at("plans").is_array()) rows = &document.at("plans");
+    if (rows == nullptr) return request;   // bound 保持 false
+    std::vector<std::string> seen;
+    for (const auto& row : *rows) {
+        if (!row.is_object() || !row.contains("kind") || !row.at("kind").is_string() ||
+            !row.contains("parent") || !row.at("parent").is_number_integer() ||
+            !row.contains("table") || !row.at("table").is_string())
+            return minisql::security::AccessRequest{};   // 形状不合法 → fail-closed
+        const auto action = actionFor(row.at("kind").get<std::string>());
+        if (row.at("parent").get<std::int64_t>() == -1) request.statementAction = action;
+        const auto table = row.at("table").get<std::string>();
+        if (table.empty()) continue;
+        const auto key = table + "\x1f" + std::to_string(static_cast<int>(action));
+        if (std::find(seen.begin(), seen.end(), key) != seen.end()) continue;
+        seen.push_back(key);
+        request.objects.push_back({table, action});
+    }
+    request.bound = true;
+    return request;
+}
+
+void authorizeBinding(const minisql::security::AccessCatalog& access, const json& request,
+                      const std::string& operation, const minisql::security::AccessRequest& binding) {
+    if (!access.enabled()) return;
+    authorizeIdentity(access, request);
+    access.authorize(request["user"].get_ref<const std::string&>(), operation, binding);
 }
 
 void authorizeDirect(minisql::execution::Database& database, const minisql::security::AccessCatalog& access, const std::string& operation,
@@ -140,7 +187,7 @@ int session(minisql::execution::Database& database, minisql::security::AccessCat
             id = request["id"];
             for (const auto& [name, value] : request.items()) {
                 (void)value;
-                    if (name != "id" && name != "operation" && name != "sql" && name != "sessionId" && name != "cancelFile" && name != "table" && name != "index" && name != "target" && name != "user" && name != "password")
+                    if (name != "id" && name != "operation" && name != "sql" && name != "sessionId" && name != "cancelFile" && name != "table" && name != "index" && name != "target" && name != "plan" && name != "user" && name != "password")
                     throw minisql::MiniSqlError(minisql::ErrorCode::InvalidArgument, "Unknown session request field");
             }
             const auto operation = request["operation"].get<std::string>();
@@ -225,6 +272,14 @@ int session(minisql::execution::Database& database, minisql::security::AccessCat
                 result = {{"success", true}, {"bound", binding.bound},
                           {"statementAction", minisql::security::permissionName(binding.statementAction)},
                           {"objects", std::move(objects)}, {"diagnostic", binding.diagnostic}};
+            } else if (operation == "executePlan") {
+                if (!request.contains("plan"))
+                    throw minisql::MiniSqlError(minisql::ErrorCode::InvalidArgument, "Expected a serialized plan document");
+                // 第十七章 REQ-CORE-002：计划携带编译期 Catalog 指纹，执行前重新校验。
+                const auto binding = planAccessRequest(request["plan"]);
+                authorizeBinding(access, request, operation, binding);
+                result = database.executeSerializedPlan(request["plan"]);
+                attachAccessObjects(result, binding);
             } else if (operation == "snapshot") {
                 if (!request.contains("target") || !request["target"].is_string())
                     throw minisql::MiniSqlError(minisql::ErrorCode::InvalidArgument, "Expected snapshot target string");
@@ -278,9 +333,9 @@ int main(int argc, char** argv) {
             positional.push_back(argument);
         }
         if (positional.size() != 2) throw minisql::MiniSqlError(minisql::ErrorCode::InvalidArgument,
-            "Usage: minisql_database <database.pages> <execute|compile|diagnostics|statistics|catalog|session|bindAccess> [--file <query.sql>]");
+            "Usage: minisql_database <database.pages> <execute|compile|diagnostics|statistics|catalog|session|bindAccess|executePlan> [--file <query.sql>]");
         const std::string mode = positional[1];
-        if (mode != "execute" && mode != "compile" && mode != "diagnostics" && mode != "statistics" && mode != "catalog" && mode != "session" && mode != "bindAccess")
+        if (mode != "execute" && mode != "compile" && mode != "diagnostics" && mode != "statistics" && mode != "catalog" && mode != "session" && mode != "bindAccess" && mode != "executePlan")
             throw minisql::MiniSqlError(minisql::ErrorCode::InvalidArgument, "Unknown database command");
         std::filesystem::path path;
 #ifdef _WIN32
@@ -321,6 +376,31 @@ int main(int argc, char** argv) {
             result["integerEncoding"] = "safe-number-or-decimal-string";
             std::cout << minisql::wireJson(result).dump() << '\n';
             return 0;
+        }
+        if (mode == "executePlan") {
+            // 计划文档来自 stdin/--file（JSON），受权对象由计划节点推导。
+            const std::string source = sqlFile.empty() ? std::string{std::istreambuf_iterator<char>(std::cin), {}} : readSqlFile(sqlFile);
+            json document;
+            try { document = json::parse(source); }
+            catch (const std::exception& error) {
+                throw minisql::MiniSqlError(minisql::ErrorCode::InvalidArgument,
+                    std::string("Plan document is not valid JSON: ") + error.what());
+            }
+            const auto binding = planAccessRequest(document);
+            const auto* bypass = std::getenv("MINISQL_AUTH_BYPASS");
+            if (access.enabled() && !(bypass && std::string(bypass) == "1")) {
+                const auto* configuredUser = std::getenv("MINISQL_USER");
+                const auto* configuredPassword = std::getenv("MINISQL_PASSWORD");
+                const std::string user = configuredUser ? configuredUser : "";
+                if (!access.verify(user, configuredPassword ? configuredPassword : ""))
+                    throw minisql::MiniSqlError(minisql::ErrorCode::Permission, "Permission denied");
+                access.authorize(user, "executePlan", binding);
+            }
+            result = database.executeSerializedPlan(document);
+            attachAccessObjects(result, binding);
+            result["integerEncoding"] = "safe-number-or-decimal-string";
+            std::cout << minisql::wireJson(result).dump() << '\n';
+            return result.value("success", true) ? 0 : 1;
         }
         if (mode == "catalog") { authorizeDirect(database, access, mode); result = database.catalog(); }
         else {

@@ -10,6 +10,8 @@ std::string errorType(ErrorCode code) {
     case ErrorCode::Lexical: return "LexicalError";
     case ErrorCode::Syntax: return "SyntaxError";
     case ErrorCode::Semantic: return "SemanticError";
+    case ErrorCode::IntegerOutOfRange: return "SEM_INTEGER_OUT_OF_RANGE";
+    case ErrorCode::PlanStaleSchema: return "PLAN_STALE_SCHEMA";
     case ErrorCode::Catalog: return "CatalogError";
     case ErrorCode::Storage: return "StorageError";
     case ErrorCode::Execution: return "ExecutionError";

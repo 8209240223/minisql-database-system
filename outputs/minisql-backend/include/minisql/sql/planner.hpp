@@ -53,6 +53,8 @@ struct LogicalPlan {
     nlohmann::json indexValues = nlohmann::json::array();
     std::string indexRangeOperator{};
     nlohmann::json indexRangeValue = nullptr;
+    // 编译期 Catalog 指纹；执行时与当前 Catalog 不一致即 PLAN_STALE_SCHEMA。
+    std::string catalogFingerprint{};
 };
 
 std::vector<LogicalPlan> compilePlans(const std::vector<Statement>& statements,

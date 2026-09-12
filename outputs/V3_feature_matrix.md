@@ -1,6 +1,6 @@
 # MiniSQL V3 Feature Matrix
 
-日期：2026-09-10
+日期：2026-09-12（新增 REQ-CORE-001/002 与 §19.11 闭环及偏离登记，见文末）
 
 本矩阵按当前代码和本轮实际验证结果填写。`部分实现` 表示主路径已经存在，但仍有需求边界、跨模块组合或验收条件没有闭合；不把配置字段、演示数据或单独的前端展示计为完整实现。
 
@@ -33,6 +33,26 @@
 | X25 | EXT-SYS-006 外部排序、取消、资源 | 已实现（基础版） | 外部排序/聚合、NDJSON、drain 背压、会话取消、结果预算、工作台字段；执行器 `RowStream`、`Scan/Filter/Project/LimitRowStream`、`MaterializedRowStream`、HTTP resourceUsage、会话级 C++ 多帧 `meta/row/complete`，x25 流式 HTTP 18 项、session stream 9 项通过 | 排序/聚合完全逐行生产和完整压力验收为后续增强 |
 | X26 | EXT-SYS-007 备份恢复与迁移 | 已实现（基础版） | v2 全量备份、v1 迁移、v3 增量链、v4 在线一致性快照、活动事务未提交时快照隔离、非零 WAL 截止位置重做、恢复回滚目录与失败自动还原、备份链深度、逐页 materialize 恢复、页文件校验和原子恢复；备份 smoke 56 项、在线快照 22 项检查通过 | 在线恢复超高并发压力为后续增强，不纳入基础版 |
 | X27 | EXT-QA-001 Fuzz 与长期回归 | 部分实现 | SELECT 差分 500 项、DDL/DML 状态机、3 种固定种子 96 步回归、2 种固定种子 512 步长跑、固定持续时间/轮次可配置重复 soak、逐文件语料复现、失败 artifact 重放入口、失败分类、DATE/BOOL 回归、五阶段跨进程崩溃恢复组合、4 种子 × 512 步 × 4096 条压力数据的溢写/资源回归、CI 入口 | 多小时长期运行资源趋势仍需在长期环境执行 |
+
+## 与需求规格书的偏离登记
+
+下表记录实现与《MiniSQL数据库管理系统_完整详细需求规格说明书_V3》之间的**有意识偏离**。偏离方向均为“实现超集”，即比规格书默认要求做得更多；此处逐项列明，不当作“已按规格书实现”。
+
+| 规格条款 | 规格书要求 | 当前实现 | 判定 |
+| --- | --- | --- | --- |
+| §3.4 表达式、Q05 双等号 | 基础版仅接受 `=`/`!=`；完整的 `==` 应返回 `LEX_UNSUPPORTED_OPERATOR` | `src/sql/lexer.cpp` 把 `==` 与 `<>` 识别为运算符，`src/sql/parser.cpp` 分别规范化为 `=` 与 `!=` | 超集偏离。规格书注明该项“待确认”且“不影响 P2”；若课程口径要求拒绝，须按 §20.4 补独立变更记录 |
+| §13.9 EXT-SQL-008 | RIGHT/FULL/NATURAL/USING 不在精确语法清单内，必须明确拒绝 | NATURAL/USING/CROSS 均已明确拒绝；RIGHT/FULL JOIN 已实现，证据 `tests/outer-join-smoke.mjs` | 超集偏离。§20.2 说明 RIGHT/FULL“不自动追加为目标”，因此属额外能力，不计入 X08 的验收依据 |
+| §16.3、§18.4 完成判据 | 完成证据包含 X01-X27 全量组合验收 | 本矩阵 X01-X08、X10、X11、X14-X17、X19、X24、X27 仍为“部分实现” | **未达成**。新增闭环不改变此项判定 |
+
+## 已知失败案例（如实列出）
+
+下表是当前本机 Windows Release 回归中**确实失败**的用例。三者已在改动前的基线（`d2dc852`）上用 `git stash` 复现出**完全相同的失败模式**，因此不是本轮新增缺口；列出是为了满足 §8.4-7“已知失败案例如实列出”的要求，不把它们隐藏成“全部通过”。
+
+| 用例 | 现象 | 基线复现 | 说明 |
+| --- | --- | --- | --- |
+| `tests/cast-process.mjs` | 第 52 项（`CAST(` 重复 260 层的嵌套表达式应返回语法错误 `2002`）触发子进程崩溃 `0xC00000FD`（栈溢出） | 是，失败模式一致 | 表达式深度上限未能在深层 CAST 嵌套上生效；需要单独排查解析/绑定/优化链路的递归深度，与本轮 REQ-CORE-001/002 改动无关 |
+| `tests/backup-online-smoke.mjs` | 第 63 行断言 `503 !== 200`，在线快照请求被判为后端不可用 | 是，失败模式一致 | 与本轮 §19.11 / REQ-CORE 改动无关 |
+| `tests/journal-process.mjs` | 依赖仓库预置 `bin/journal_probe.exe`（SHA256 `80A69871...`），与本机构建产物（`A4B5ACDF...`）不一致 | 是（历史已知） | 本机环境问题；本轮未改动该探针使用的代码路径 |
 
 ## C4 证据索引
 
@@ -74,6 +94,11 @@ C4 的交付物已经具备：X01-X27 均有负责人、代码路径、验证命
 
 ## 本轮新增闭环
 
+- REQ-CORE-001（第十七章）：补齐四项工程基线边界并通过 `tests/requirements-limits-process.mjs`（44 项）——单标识符 128 字符上限（`src/sql/lexer.cpp`）；collectDiagnostics 最多 100 条错误并回报 `limit`/`truncated`（`src/execution/database.cpp`）；批量语句 10000 上限（`src/sql/parser.cpp` 与 `execute`/`diagnostics` 两条逐条切分路径共用同一消息，超限消息含 `budget exceeded` 以便 HTTP 映射 413）。
+- REQ-CORE-001 错误码：新增稳定符号码 `SEM_INTEGER_OUT_OF_RANGE`（`include/minisql/common/error.hpp`、`src/common/error.cpp`），在“字面量超出 INT64”与“能装进 BIGINT 但装不进 INT 列”两处窄化检查中抛出（`src/catalog/catalog.cpp`）；BIGINT 目标仍按 EXT-SQL-003 接受。
+- REQ-CORE-002：新增 `PLAN_STALE_SCHEMA`。计划在编译期绑定 Catalog 指纹（`Catalog::schemaFingerprint()`，按表名排序后哈希表名与列定义），指纹随计划文档序列化往返（`src/sql/planner.cpp`）；`Database::executeSerializedPlan` 执行前重新校验，不一致即拒绝（`src/execution/database.cpp`）。入口为 CLI `executePlan`、会话操作 `executePlan` 与 `POST /api/sessions/:id/execute-plan`，受权对象由计划节点推导而不是扫描 SQL 文本。
+- §19.11 HTTP 契约：`GET /api/storage/stats` 与既有 `/api/storage` 等价，`buffer` 明确标记 `available:false, reason:'backend-not-exposed'` 且不伪造零值；未实现能力（`ErrorCode::NotImplemented`，包括“派生表上的 JOIN/DELETE/UPDATE”这类真实未实现构造）统一返回 HTTP 501，而无法绑定的语句仍按既有 X25 契约 fail-closed 返回 403。证据：`tests/requirements-http-contract.mjs`（37 项）。
+- 授权链路上的资源上限顺序修正：批量超限原先会在绑定阶段被掩盖成 HTTP 403，现在 `Database::bindAccess` 先判定批量上限（`enforceBatchStatementBudget`），超限请求按规格书返回 413；正常请求因分号快速排除而不产生额外词法开销。
 - X24：`access-catalog.mjs` 的原子用户/角色/授权操作映射到 HTTP 资源端点；CLI 通过 HTTP bridge 携带身份；C++ session 和直连二进制入口从 `access.catalog.pages` 同步到 `PersistentCatalog` 保留系统堆表，对当前支持语句以及解析失败的 CTE/扩展 SQL 先通过真实 Catalog 规范化基础表对象，再执行身份/对象权限校验，并按权限版本热重载；重启时已验证旁路页文件不可用仍可使用系统表快照。
 - X27：状态机差分脚本优先选择 `build/windows/Release/minisql_database.exe`，小规模、3 种 96 步回归和 2 种 512 步长跑均通过；新增可配置重复 soak 入口、DATE/BOOL 字面量规划回归、五阶段跨进程崩溃恢复组合和 4 种子 × 512 步 × 4096 条压力数据的溢写/资源回归，固定种子逐文件复现契约、失败 artifact 重放入口和 Windows 引擎回归均已接入 CI/本地验收链。
 - 全套分组回归：迁移 `join-process.mjs`、`aggregate-process.mjs`、`null-process.mjs` 的参考引擎到 Node 24 `node:sqlite`，移除对已删除 `sql.js`/Demo Worker 的依赖；`run-minisql-tests.ps1 -Suite all` 的编译、执行、存储、HTTP 和工作台基础回归全部通过。

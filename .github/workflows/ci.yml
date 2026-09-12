@@ -121,6 +121,14 @@ jobs:
           node tests/journal-process.mjs
           node tests/auto-checkpoint-smoke.mjs
           node tests/x22-fault-injection.mjs
+          node tests/wal-metadata-process.mjs
+          node tests/wal-group-commit.mjs
+          node tests/doublewrite-torn-page.mjs
+        working-directory: outputs/minisql-backend
+      - name: 需求契约回归（REQ-CORE-001/002、REQ-UI-010）
+        run: |
+          node tests/requirements-limits-process.mjs
+          node tests/requirements-http-contract.mjs
         working-directory: outputs/minisql-backend
       - name: 索引规模回归（1000 行）
         env:

@@ -75,6 +75,7 @@ $groups = @{
         'tests/transaction-process.mjs'
         'tests/transaction-savepoint.mjs'
         'tests/transaction-overflow.mjs'
+        'tests/requirements-limits-process.mjs'
     )
     storage = @(
         'tests/checkpoint-smoke.mjs',
@@ -101,6 +102,7 @@ $groups = @{
         'tests/multi-session-http.mjs',
         'tests/access-control-http.mjs',
         'tests/access-binding-process.mjs',
+        'tests/requirements-http-contract.mjs',
         'tests/observability-http.mjs',
         'tests/cancel-smoke.mjs',
         'tests/result-budget-smoke.mjs',

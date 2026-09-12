@@ -13,6 +13,9 @@ namespace minisql {
 enum class ErrorCode {
     Ok = 0, InvalidArgument = 1001, Configuration = 1002,
     Lexical = 2001, Syntax = 2002, Semantic = 2003,
+    // 第十七章规定的稳定符号错误码，errorType() 返回其符号名便于测试统计。
+    IntegerOutOfRange = 2004,   // SEM_INTEGER_OUT_OF_RANGE
+    PlanStaleSchema = 2005,     // PLAN_STALE_SCHEMA
     Catalog = 3001, Storage = 4001, Execution = 5001, Cancelled = 5002,
     Transaction = 6001, Permission = 7001, Network = 8001,
     NotImplemented = 9001, Internal = 9999

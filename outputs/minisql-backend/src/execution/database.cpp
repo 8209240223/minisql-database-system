@@ -56,6 +56,24 @@ std::string joinProblems(const std::vector<std::string>& problems) {
     }
     return message;
 }
+// 第十七章 REQ-CORE-001：批量语句上限 10000。compile 整批进入 Parser::all()，
+// 而 execute/diagnostics 自己按分号切分，因此两者共用同一常量与消息，
+// 消息含 "budget exceeded" 以便 HTTP 适配层映射到 413。
+constexpr std::size_t kMaxBatchStatements = 10000;
+const char* const kBatchBudgetMessage = "Statement budget exceeded: batch input exceeds 10000 statements";
+// 授权链路会在绑定前先判定批量上限：否则超限请求会被绑定失败掩盖成权限错误
+// （HTTP 403），而不是规格书要求的资源超限（HTTP 413）。
+// 用分号总数做快速排除，正常请求不产生额外词法开销；异常大输入才用
+// recovery 词法器精确计数（它不对词法错误抛异常，不影响既有的 fail-closed 契约）。
+void enforceBatchStatementBudget(const std::string& source) {
+    if (std::count(source.begin(), source.end(), ';') <= static_cast<std::ptrdiff_t>(kMaxBatchStatements)) return;
+    std::vector<MiniSqlError> ignored;
+    const auto tokens = sql::tokenizeRecoverable(source, ignored);
+    std::size_t statements = 0;
+    for (const auto& token : tokens)
+        if (token.type == "DELIMITER" && token.lexeme == ";") ++statements;
+    if (statements > kMaxBatchStatements) throw MiniSqlError(ErrorCode::Execution, kBatchBudgetMessage);
+}
 // 缓冲池帧数：默认取构造参数，MINISQL_BUFFER_FRAMES 可覆盖（用于观察命中率与替换日志）。
 std::size_t resolveBufferFrames(std::size_t frames) {
     if (const char* configured = std::getenv("MINISQL_BUFFER_FRAMES")) {
@@ -506,6 +524,8 @@ nlohmann::json Database::compile(const std::string& source) const {
 security::AccessRequest Database::bindAccess(const std::string& source) const {
     std::lock_guard<std::recursive_mutex> guard(mu_);
     requireAvailable();
+    // 资源上限先于授权：超限的批量输入应报资源超限，而不是权限失败。
+    enforceBatchStatementBudget(source);
     // 名称解析只发生在绑定器里。别名、派生表别名、CTE 名都是作用域名，
     // 不会产生受权对象；任何无法闭合的引用都让 bound 保持 false。
     return sql::bindSource(source, catalog_.view()).accessRequest();
@@ -2551,6 +2571,12 @@ nlohmann::json Database::diagnostics(const std::string& source) const {
         return "internal";
     };
     std::size_t statementIndex = 0;
+    // 第十七章 REQ-CORE-001：collectDiagnostics 最多 100 条错误。
+    // 超出后不再追加错误，但仍在结果里明确报告已截断。
+    constexpr std::size_t kMaxDiagnosticErrors = 100;
+    std::size_t errorCount = 0;
+    bool truncated = false;
+    bool budgetReported = false;
     const auto sourceLine = [&](std::size_t line) {
         if (line == 0) return std::string{};
         std::size_t current = 1, begin = 0;
@@ -2593,6 +2619,8 @@ nlohmann::json Database::diagnostics(const std::string& source) const {
         return bestDistance <= limit ? best : std::string{};
     };
     const auto append = [&](const MiniSqlError& error) {
+        if (errorCount >= kMaxDiagnosticErrors) { truncated = true; return; }
+        ++errorCount;
         const auto& loc = error.location();
         std::string suggestion = error.suggestion();
         if (suggestion.empty()) {
@@ -2642,13 +2670,23 @@ nlohmann::json Database::diagnostics(const std::string& source) const {
     const auto tokens = sql::tokenizeRecoverable(source, lexicalErrors);
     for (const auto& error : lexicalErrors) append(error);
     if (!lexicalErrors.empty() && tokens.size() <= 1) {
-        return {{"success", false}, {"diagnostics", items}, {"count", items.size()}};
+        return {{"success", false}, {"diagnostics", items}, {"count", items.size()},
+                {"limit", kMaxDiagnosticErrors}, {"truncated", truncated}};
     }
 
     catalog::Catalog snapshot = catalog_.view();
     std::vector<sql::Token> statement;
     const auto process = [&]() {
         if (statement.empty()) return;
+        // 第十七章 REQ-CORE-001：批量语句上限 10000，只报一次预算诊断后停止解析。
+        if (statementIndex >= kMaxBatchStatements) {
+            if (!budgetReported) {
+                budgetReported = true;
+                append(MiniSqlError(ErrorCode::Execution, kBatchBudgetMessage, statement.front().location));
+            }
+            statement.clear();
+            return;
+        }
         std::vector<MiniSqlError> syntaxErrors;
         const auto ast = sql::parseRecoverable(statement, syntaxErrors);
         for (const auto& error : syntaxErrors) append(error);
@@ -2675,7 +2713,8 @@ nlohmann::json Database::diagnostics(const std::string& source) const {
         if (token.type == "DELIMITER" && token.lexeme == ";") process();
     }
     const bool success = std::all_of(items.begin(), items.end(), [](const json& item) { return item.value("success", false); });
-    return {{"success", success}, {"diagnostics", items}, {"count", items.size()}};
+    return {{"success", success}, {"diagnostics", items}, {"count", items.size()},
+            {"limit", kMaxDiagnosticErrors}, {"truncated", truncated}};
 }
 nlohmann::json Database::runCorrelatedSubquery(const json& expression, const json& row) {
     std::lock_guard<std::recursive_mutex> guard(mu_);
@@ -2810,6 +2849,7 @@ nlohmann::json Database::execute(const std::string& source, bool optimize) {
         ActiveDatabaseScope active(this);
         // 按词法语句边界逐条分析，保留已成功语句的提交结果。
         std::vector<sql::Token> statement;
+        std::size_t batchStatements = 0;
         sql::scanTokens(source, [&](const sql::Token& token) {
             if (token.type == "END") {
                 if (!statement.empty()) {
@@ -2820,6 +2860,8 @@ nlohmann::json Database::execute(const std::string& source, bool optimize) {
             }
             statement.push_back(token);
             if (token.lexeme != ";" || token.type != "DELIMITER") return;
+            if (++batchStatements > kMaxBatchStatements)
+                throw MiniSqlError(ErrorCode::Execution, kBatchBudgetMessage, statement.front().location);
             if (key(statement.front().lexeme) == "explain") {
                 const auto location = statement.front().location;
                 if (transaction_ == TransactionState::Aborted)
@@ -3131,5 +3173,53 @@ nlohmann::json Database::executeScript(const std::string& source, bool optimize)
         response["transactionRolledBack"] = true;
     }
     return response;
+}
+
+nlohmann::json Database::executeSerializedPlan(const nlohmann::json& document) {
+    std::lock_guard<std::recursive_mutex> guard(mu_);
+    json results = json::array();
+    currentQueryId_ = ++querySequence_;
+    QueryResourcesScope resources(activeResources_, std::make_shared<QueryResourceManager>(queryMemoryBytes_, tempDiskBytes_));
+    try {
+        requireAvailable();
+        checkCancelled();
+        ActiveDatabaseScope active(this);
+        if (transaction_ == TransactionState::Aborted)
+            throw MiniSqlError(ErrorCode::Transaction, "Transaction aborted; ROLLBACK required");
+        const auto plans = sql::deserializePlans(document);
+        if (plans.empty())
+            throw MiniSqlError(ErrorCode::InvalidArgument, "Serialized plan document contains no plan nodes");
+        // 第十七章 REQ-CORE-002：计划绑定编译期的 Catalog 指纹，执行前重新校验。
+        // 不一致时拒绝执行并返回 PLAN_STALE_SCHEMA，绝不按旧列偏移访问新数据。
+        const auto current = catalog_.view().schemaFingerprint();
+        const auto verify = [&](const sql::LogicalPlan& plan) {
+            std::vector<const sql::LogicalPlan*> pending{&plan};
+            while (!pending.empty()) {
+                const auto* node = pending.back();
+                pending.pop_back();
+                if (!node->catalogFingerprint.empty() && node->catalogFingerprint != current)
+                    throw MiniSqlError(ErrorCode::PlanStaleSchema,
+                        "PLAN_STALE_SCHEMA: plan was compiled against catalog fingerprint " + node->catalogFingerprint +
+                        ", but the current catalog fingerprint is " + current + "; recompile the statement");
+                for (const auto& child : node->children) pending.push_back(&child);
+            }
+        };
+        for (const auto& plan : plans) verify(plan);
+        for (const auto& plan : plans) {
+            checkCancelled();
+            auto result = runStatement(plan);
+            if (!result.contains("commitState")) result["commitState"] = transaction_ == TransactionState::Active ? "pending" : "committed";
+            result["columnTypes"] = json::array();
+            for (const auto& column : plan.output) result["columnTypes"].push_back(column.type);
+            if (maxResultRows_ > 0 && result.contains("rows") && result.at("rows").is_array() && result.at("rows").size() > maxResultRows_)
+                throw MiniSqlError(ErrorCode::Execution, "Result row budget exceeded");
+            results.push_back(std::move(result));
+        }
+        return {{"success", true}, {"results", results}, {"statements", results.size()}, {"transactionState", transactionState()}};
+    } catch (const MiniSqlError& error) {
+        return executionFailure(error, std::move(results));
+    } catch (const std::exception& error) {
+        return executionFailure(MiniSqlError(ErrorCode::Internal, std::string("Execution failed: ") + error.what()), std::move(results));
+    }
 }
 }

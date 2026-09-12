@@ -23,6 +23,10 @@ public:
                       storage::PageFile::CommitObserver observer = {});
     nlohmann::json execute(const std::string& sql, bool optimize = true);
     nlohmann::json executeScript(const std::string& sql, bool optimize = true);
+    // 第十七章 REQ-CORE-002：执行已序列化的逻辑计划文档。计划携带编译期
+    // Catalog 指纹；与当前 Catalog 不一致时拒绝执行并返回 PLAN_STALE_SCHEMA，
+    // 绝不按旧列偏移访问新数据（调用方应重新编译）。
+    nlohmann::json executeSerializedPlan(const nlohmann::json& document);
     nlohmann::json executeStreaming(const std::string& sql,
                                     const std::function<void(const nlohmann::json&)>& emitMeta,
                                     const std::function<bool(const nlohmann::json&)>& emitRow);
