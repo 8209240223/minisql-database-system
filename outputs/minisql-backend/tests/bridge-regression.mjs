@@ -1,9 +1,15 @@
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { once } from 'node:events';
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import assert from 'node:assert/strict';
+const directory = mkdtempSync(join(tmpdir(), 'minisql-legacy-bridge-'));
+const executable = process.env.MINISQL_DATABASE_EXE ?? fileURLToPath(new URL('../build/verification/Release/minisql_database.exe', import.meta.url));
 const server = spawn(process.execPath, [fileURLToPath(new URL('../scripts/bridge.mjs', import.meta.url))], {
-  env: { ...process.env, PORT: '0' }, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'],
+  env: { ...process.env, PORT: '0', MINISQL_DATABASE_EXE: executable, MINISQL_DB: join(directory, 'database.pages') },
+  windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'],
 });
 const closed = once(server, 'exit');
 let log = '';
@@ -26,19 +32,19 @@ try {
   });
   const capabilities = await (await fetch(url + '/capabilities')).json();
   assert.equal(capabilities.engine, 'minisql-cpp');
-  assert.equal(capabilities.execution, false);
-  assert.ok(capabilities.capabilities.includes('logicalPlan'));
-  const result = await post('/compile', { sql: "CREATE TABLE t(id INT,name VARCHAR); INSERT INTO t(name,id) VALUES('中文测试',1); SELECT name FROM t WHERE id=1;" });
+  assert.equal(capabilities.execution, true);
+  assert.equal(capabilities.persistence, true);
+  assert.ok(capabilities.capabilities.includes('planRoundTrip'));
+  const result = await post('/execute', { sql: "CREATE TABLE t(id INT,name VARCHAR); INSERT INTO t(name,id) VALUES('中文测试',1); SELECT name FROM t WHERE id=1;" });
   assert.equal(result.status, 200);
   const data = await result.json();
-  assert.equal(data.stages.planner, 'passed');
-  assert.deepEqual(data.plan.find(p => p.kind === 'Insert').values, [1, '中文测试']);
-  assert.deepEqual((await (await fetch(url + '/catalog')).json()).tables, []);
-  assert.equal((await post('/compile', { sql: 'SELECT name FROM t;' })).status, 422);
-  assert.equal((await post('/execute', { sql: 'DELETE FROM t;' })).status, 501);
+  assert.deepEqual(data.rows, [['中文测试']]);
+  assert.equal((await (await fetch(url + '/catalog')).json()).tables[0].name, 't');
+  assert.equal((await post('/compile', { sql: 'SELECT name FROM t;' })).status, 200);
+  assert.equal((await post('/execute', { sql: 'DELETE FROM t;' })).status, 200);
   assert.equal((await post('/compile', { sql: 42 })).status, 400);
   assert.equal((await fetch(url + '/catalog', { headers: { Origin: 'https://untrusted.example' } })).status, 403);
-  console.log('7 bridge integration scenarios passed');
+  console.log('8 legacy bridge forwarding scenarios passed');
 } finally {
   clearTimeout(timeout);
   server.kill();

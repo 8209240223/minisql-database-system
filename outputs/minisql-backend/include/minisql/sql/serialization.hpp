@@ -16,7 +16,7 @@ namespace minisql::sql {
 inline constexpr std::uint32_t AST_SCHEMA_VERSION = 1;      // AST document schemaVersion
 inline constexpr std::uint32_t PLAN_SCHEMA_VERSION = 1;     // logical plan schemaVersion
 inline constexpr std::uint32_t PRODUCER_VERSION = 1;        // this binary's producer version
-inline constexpr std::uint32_t CATALOG_SCHEMA_VERSION = 5;  // newest table/column descriptor
+inline constexpr std::uint32_t CATALOG_SCHEMA_VERSION = 6;  // numeric persisted column typeId
 inline nlohmann::json serializeReference(const std::optional<std::pair<std::string,std::string>>& reference) {
     return reference ? nlohmann::json{{"table", reference->first}, {"column", reference->second}} : nlohmann::json(nullptr);
 }

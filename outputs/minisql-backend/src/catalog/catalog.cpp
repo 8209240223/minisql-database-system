@@ -466,6 +466,14 @@ const Table* Catalog::find(const std::string& name) const {
     return it == tables_.end() ? nullptr : &it->second;
 }
 
+const Table* Catalog::findIndexTable(const std::string& indexName) const {
+    for (const auto& [_, table] : tables_)
+        if (std::any_of(table.indexes.begin(), table.indexes.end(), [&](const Index& index) {
+                return key(index.name) == key(indexName);
+            })) return &table;
+    return nullptr;
+}
+
 std::string Catalog::schemaFingerprint() const {
     // 表遍历顺序取决于 unordered_map，必须先按名字排序才能得到稳定指纹。
     std::vector<const Table*> ordered;

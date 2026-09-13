@@ -19,6 +19,74 @@ const RowSchema accessSchema{ColumnType::Bigint, ColumnType::Int, ColumnType::Va
 constexpr std::size_t accessChunkBytes = 3800;
 constexpr std::size_t accessMaxChunks = 4096;
 [[noreturn]] void corrupt() { throw MiniSqlError(ErrorCode::Storage, "STORAGE_CORRUPTION: system catalog"); }
+
+// Stable on-disk SQL type identities. These values are part of the catalog
+// format and must never be renumbered; parameters live beside the base id.
+enum class PersistedTypeId : std::uint32_t {
+    Int = 1,
+    Bigint = 2,
+    Float = 3,
+    Bool = 4,
+    Date = 5,
+    Varchar = 6,
+    Decimal = 7,
+};
+
+nlohmann::json encodeType(const std::string& type) {
+    if (type == "int") return {{"typeId", PersistedTypeId::Int}, {"typeParameters", nullptr}};
+    if (type == "bigint") return {{"typeId", PersistedTypeId::Bigint}, {"typeParameters", nullptr}};
+    if (type == "float") return {{"typeId", PersistedTypeId::Float}, {"typeParameters", nullptr}};
+    if (type == "bool") return {{"typeId", PersistedTypeId::Bool}, {"typeParameters", nullptr}};
+    if (type == "date") return {{"typeId", PersistedTypeId::Date}, {"typeParameters", nullptr}};
+    if (type == "varchar") return {{"typeId", PersistedTypeId::Varchar}, {"typeParameters", nullptr}};
+    if (const auto length = varcharLength(type))
+        return {{"typeId", PersistedTypeId::Varchar}, {"typeParameters", {{"length", *length}}}};
+    if (const auto decimal = decimalType(type))
+        return {{"typeId", PersistedTypeId::Decimal},
+            {"typeParameters", {{"precision", decimal->precision}, {"scale", decimal->scale}}}};
+    throw MiniSqlError(ErrorCode::Catalog, "Unsupported column type");
+}
+
+std::string decodeType(const nlohmann::json& encoded) {
+    if (!encoded.contains("typeId") || !encoded.at("typeId").is_number_unsigned() ||
+        !encoded.contains("typeParameters")) corrupt();
+    const auto id = encoded.at("typeId").get<std::uint32_t>();
+    const auto& parameters = encoded.at("typeParameters");
+    const auto parameterless = [&] { if (!parameters.is_null()) corrupt(); };
+    switch (static_cast<PersistedTypeId>(id)) {
+        case PersistedTypeId::Int: parameterless(); return "int";
+        case PersistedTypeId::Bigint: parameterless(); return "bigint";
+        case PersistedTypeId::Float: parameterless(); return "float";
+        case PersistedTypeId::Bool: parameterless(); return "bool";
+        case PersistedTypeId::Date: parameterless(); return "date";
+        case PersistedTypeId::Varchar:
+            if (parameters.is_null()) return "varchar";
+            if (!parameters.is_object() || parameters.size() != 1 || !parameters.at("length").is_number_unsigned()) corrupt();
+            if (const auto length = parameters.at("length").get<std::uint32_t>(); length >= 1 && length <= 65535)
+                return "varchar(" + std::to_string(length) + ")";
+            corrupt();
+        case PersistedTypeId::Decimal:
+            if (!parameters.is_object() || parameters.size() != 2 ||
+                !parameters.at("precision").is_number_unsigned() || !parameters.at("scale").is_number_unsigned()) corrupt();
+            if (const DecimalType decimal{parameters.at("precision").get<std::uint32_t>(), parameters.at("scale").get<std::uint32_t>()};
+                decimal.precision >= 1 && decimal.precision <= 38 && decimal.scale <= decimal.precision)
+                return decimal.name();
+            corrupt();
+    }
+    corrupt();
+}
+
+template <typename ColumnLike>
+std::string encodeColumnDescriptor(const ColumnLike& column) {
+    auto descriptor = encodeType(column.type);
+    descriptor["version"] = 5;
+    descriptor["nullable"] = column.nullable;
+    descriptor["defaultValue"] = column.defaultValue ? nlohmann::json(*column.defaultValue) : nlohmann::json(nullptr);
+    descriptor["primaryKey"] = column.primaryKey;
+    descriptor["unique"] = column.unique;
+    descriptor["references"] = sql::serializeReference(column.references);
+    return descriptor.dump();
+}
 }
 PersistentCatalog::PersistentCatalog(storage::HeapStore& heap) : heap_(heap) {
     // --- X13 catalog metadata header (schemaVersion 落盘 + 未知主版本拒绝) ---
@@ -61,7 +129,10 @@ PersistentCatalog::PersistentCatalog(storage::HeapStore& heap) : heap_(heap) {
                 const auto encoded = nlohmann::json::parse(column.type);
                 const auto version = encoded.at("version");
                 if (!encoded.is_object() || !encoded.at("nullable").is_boolean()) corrupt();
-                if (version == 1) { if (encoded.size() != 3) corrupt(); }
+                if (version == 1) {
+                    if (encoded.size() != 3) corrupt();
+                    column.type = encoded.at("type").get<std::string>();
+                }
                 else if (version == 2 || version == 3 || version == 4) {
                     if (encoded.size() != (version == 2 ? 4u : version == 3 ? 6u : 7u) || !encoded.contains("defaultValue")) corrupt();
                     if (!encoded.at("defaultValue").is_null()) column.defaultValue = encoded.at("defaultValue").get<std::string>();
@@ -74,8 +145,20 @@ PersistentCatalog::PersistentCatalog(storage::HeapStore& heap) : heap_(heap) {
                         if (!reference.is_object() || reference.size() != 2) corrupt();
                         column.references = std::make_pair(reference.at("table").get<std::string>(), reference.at("column").get<std::string>());
                     }
+                    column.type = encoded.at("type").get<std::string>();
+                } else if (version == 5) {
+                    if (encoded.size() != 8 || !encoded.contains("defaultValue") ||
+                        !encoded.at("primaryKey").is_boolean() || !encoded.at("unique").is_boolean()) corrupt();
+                    if (!encoded.at("defaultValue").is_null()) column.defaultValue = encoded.at("defaultValue").get<std::string>();
+                    column.primaryKey = encoded.at("primaryKey").get<bool>();
+                    column.unique = encoded.at("unique").get<bool>();
+                    if (!encoded.at("references").is_null()) {
+                        const auto& reference = encoded.at("references");
+                        if (!reference.is_object() || reference.size() != 2) corrupt();
+                        column.references = std::make_pair(reference.at("table").get<std::string>(), reference.at("column").get<std::string>());
+                    }
+                    column.type = decodeType(encoded);
                 } else corrupt();
-                column.type = encoded.at("type").get<std::string>();
                 column.nullable = encoded.at("nullable").get<bool>();
             } catch (const nlohmann::json::exception&) { corrupt(); }
         }
@@ -338,9 +421,7 @@ std::int32_t PersistentCatalog::create(const sql::Statement& definition) {
     for (std::size_t i = 0; i < table->columns.size(); ++i) {
         const auto& column = table->columns[i];
         if (column.type != "int" && !stringType(column.type) && column.type != "bigint" && column.type != "float" && column.type != "bool" && column.type != "date" && !decimalType(column.type)) throw MiniSqlError(ErrorCode::Catalog, "Unsupported column type");
-        const auto descriptor = nlohmann::json{{"version", 4}, {"type", column.type}, {"nullable", column.nullable},
-            {"defaultValue", column.defaultValue ? nlohmann::json(*column.defaultValue) : nlohmann::json(nullptr)},
-            {"primaryKey", column.primaryKey}, {"unique", column.unique}, {"references", sql::serializeReference(column.references)}}.dump();
+        const auto descriptor = encodeColumnDescriptor(column);
         rows.push_back({id, static_cast<std::int32_t>(i), column.name, descriptor});
         (void)storage::encodeRow(rows.back(), columnSchema);
     }

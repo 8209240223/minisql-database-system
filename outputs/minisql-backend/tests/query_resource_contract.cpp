@@ -122,6 +122,8 @@ int main() {
             stream.close();
             require(actual == std::vector<json>{json::array({2, 2}), json::array({2, 2}), json::array({4, 4})}, "join output");
             require(stream.resourceUsage().at("external") == true, "join must spill");
+            require(stream.resourceUsage().at("strategy") == "partitioned-hash", "spilled hash join strategy");
+            require(stream.resourceUsage().at("partitions").get<std::size_t>() > 1, "hash partitions retained after close");
         }
         require(emptyDirectory(directory), "join left temporary files");
 

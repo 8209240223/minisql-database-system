@@ -21,6 +21,7 @@ struct PlanColumn {
     std::optional<std::pair<std::string,std::string>> references{};
     std::uint32_t binding = 0;   // sql::ColumnId
     std::uint32_t relation = 0;  // sql::RelationId：该列来自哪个 FROM 项
+    std::uint32_t expression = 0; // sql::ExpressionId for computed output columns
 };
 
 struct LogicalPlan {

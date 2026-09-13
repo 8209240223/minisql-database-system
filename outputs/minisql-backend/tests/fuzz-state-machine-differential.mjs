@@ -38,7 +38,8 @@ const report = {
 };
 
 const replay = replayPath ? JSON.parse(readFileSync(replayPath, 'utf8')) : null;
-if (replay && !Array.isArray(replay.program)) throw new Error('FUZZ_STATE_REPLAY must point to a failure artifact containing program');
+if (replay && !Array.isArray(replay.program) && !Array.isArray(replay.minimized?.program))
+  throw new Error('FUZZ_STATE_REPLAY must point to a failure artifact containing program');
 
 function classifyError(error) {
   const message = error instanceof Error ? error.message : String(error);
@@ -52,11 +53,11 @@ function expectedSelect(step) {
 }
 
 // 一个程序对应一个新的数据库文件和 session 进程；SQLite 在内存中同步重放。
-async function evaluate(program) {
+async function evaluate(program, countStats = true) {
   const validation = validateProgram(program);
   if (!validation.valid) return { category: 'harnessError', detail: `invalid generated program at ${validation.index}: ${validation.reason}` };
   const root = mkdtempSync(join(directory, 'program-'));
-  const database = join(root, 'database.pages');
+  const database = join(root, `database-${++evaluationSequence}.pages`);
   const reference = new DatabaseSync(':memory:');
   let session;
   try {
@@ -74,7 +75,7 @@ async function evaluate(program) {
         if (actual.error?.type !== expected.errorType) return { category: 'wrongReject', detail: { chunk, actual, expected } };
         if (actual.error?.line !== expected.errorLine || actual.error?.column !== expected.errorColumn)
           return { category: 'errorLocation', detail: { chunk, actual, expected } };
-        ++stats.passed;
+        if (countStats) ++stats.passed;
         break;
       }
       if (actual.success === false) return { category: 'wrongReject', detail: { chunk, actual } };
@@ -84,7 +85,7 @@ async function evaluate(program) {
         const step = chunk.steps[index];
         let referenceResult;
         if (step.referenceSql === null) {
-          ++stats.passed;
+          if (countStats) ++stats.passed;
           continue;
         }
         try {
@@ -97,12 +98,12 @@ async function evaluate(program) {
         } catch (error) {
           return { category: 'harnessError', detail: { message: `reference engine rejected generated SQL: ${error.message}`, step } };
         }
-        if (!expectedSelect(step)) { ++stats.passed; continue; }
+        if (!expectedSelect(step)) { if (countStats) ++stats.passed; continue; }
         const obtained = results[index];
         const wanted = { columns: referenceResult.columns, rows: referenceResult.rows };
         const got = { columns: obtained?.columns ?? [], rows: obtained?.rows ?? [] };
         if (!isDeepStrictEqual(wanted, got)) return { category: 'wrongResult', detail: { chunk, index, step, wanted, got } };
-        ++stats.passed;
+        if (countStats) ++stats.passed;
       }
     }
     return { category: 'passed' };
@@ -114,11 +115,14 @@ async function evaluate(program) {
   }
 }
 
+let evaluationSequence = 0;
+
 const reference = new DatabaseSync(':memory:');
 report.referenceVersion = reference.prepare('SELECT sqlite_version() AS version').get().version;
 reference.close();
 
-const cases = replay ? [{ seed: replay.seed ?? 'replay', program: replay.program, replayExpected: replay.category ?? replay.expectedCategory }] : seeds.map(seed => ({ seed, program: generateProgram(seed, steps, { probeUnsupportedDdl }) }));
+const cases = replay ? [{ seed: replay.seed ?? 'replay', program: replay.minimized?.program ?? replay.program,
+  replayExpected: replay.category ?? replay.expectedCategory }] : seeds.map(seed => ({ seed, program: generateProgram(seed, steps, { probeUnsupportedDdl }) }));
 for (const testCase of cases) {
   const seed = testCase.seed;
   const program = testCase.program;
@@ -136,9 +140,12 @@ for (const testCase of cases) {
   if (outcome.category !== 'passed') {
     ++stats[outcome.category];
     let minimized;
-    if (outcome.category === 'wrongResult' || outcome.category === 'wrongReject') {
-      const reduced = minimizeProgram(program, candidate => evaluate(candidate).category === outcome.category, 64);
-      minimized = { attempts: reduced.attempts, sql: renderProgram(reduced.program), outcome: await evaluate(reduced.program) };
+    if (outcome.category !== 'harnessError') {
+      const reduced = await minimizeProgram(program, async candidate => (await evaluate(candidate, false)).category === outcome.category, 64);
+      const confirmed = await evaluate(reduced.program, false);
+      minimized = { attempts: reduced.attempts, confirmed: confirmed.category === outcome.category,
+        originalSql: renderProgram(program), minimizedSql: renderProgram(reduced.program), program: reduced.program,
+        outcome: confirmed, replay: { command: 'FUZZ_STATE_REPLAY=<failure.json> node tests/fuzz-state-machine-differential.mjs', category: outcome.category } };
     }
     const failure = { seed, category: outcome.category, detail: outcome.detail, program, minimized };
     report.failures.push(failure);

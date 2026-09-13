@@ -703,7 +703,7 @@ export function validateProgram(program) {
 
 // 逐步删除语句做 delta debugging。任何让程序变得非法的候选都直接丢弃，
 // 否则真实缺陷会被伪装成「非法 SQL」样本。
-export function minimizeProgram(program, stillFails, budget = 128) {
+export async function minimizeProgram(program, stillFails, budget = 128) {
   let current = structuredClone(program), attempts = 0;
   if (!validateProgram(current).valid) return { program: current, attempts: 0 };
   let changed = true;
@@ -714,7 +714,7 @@ export function minimizeProgram(program, stillFails, budget = 128) {
         if (attempts >= budget) break;
         if (!validateProgram(candidate).valid) continue;
         ++attempts;
-        if (!stillFails(candidate)) continue;
+        if (!await stillFails(candidate)) continue;
         current = candidate;
         changed = true;
         break;

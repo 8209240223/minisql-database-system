@@ -42,6 +42,26 @@ int main() {
     }
     const auto restored = minisql::sql::deserializePlans(document);
     require(minisql::sql::serializePlans(restored) == document);
+    minisql::catalog::Catalog identityCatalog;
+    minisql::catalog::validate(parse("CREATE TABLE existing(id INT);"), identityCatalog);
+    minisql::catalog::validate(parse("CREATE TABLE identity_source(id INT);"), identityCatalog);
+    const auto identityPlans = minisql::sql::compilePlans(
+        parse("SELECT d.expr_1,d.expr_2 FROM (SELECT id+1,id+2 FROM identity_source) AS d;"), identityCatalog);
+    const auto identityDocument = minisql::sql::serializePlans(identityPlans);
+    std::set<std::uint32_t> expressionIds;
+    bool foundComputedProjection = false;
+    for (const auto& plan : identityDocument) {
+        if (plan.value("kind", "") != "Project" || plan.value("table", "") != "identity_source") continue;
+        for (const auto& column : plan.at("output")) {
+            const auto name = column.at("name").get<std::string>();
+            if (name != "expr_1" && name != "expr_2") continue;
+            foundComputedProjection = true;
+            require(column.contains("expressionId") && column.at("expressionId").get<std::uint32_t>() != 0);
+            require(expressionIds.insert(column.at("expressionId").get<std::uint32_t>()).second);
+        }
+    }
+    require(foundComputedProjection && expressionIds.size() == 2);
+    require(minisql::sql::serializePlans(minisql::sql::deserializePlans(identityDocument)) == identityDocument);
     const auto wrapped = nlohmann::json{{"schemaVersion", 1}, {"planKind", "logical"}, {"plans", document}};
     require(minisql::sql::serializePlans(minisql::sql::deserializePlans(wrapped)) == document);
     bool badVersion = false;

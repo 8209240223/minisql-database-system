@@ -133,6 +133,7 @@ nlohmann::json bindExpression(const Expr& expression, const catalog::Table& tabl
     if (depth > 256) invalid("expression depth exceeded");
     nlohmann::json result = {{"kind", expression.kind}, {"line", expression.location.line},
                              {"column", expression.location.column}};
+    if (context.bound) result["expressionId"] = rawId(context.bound->idFor(&expression));
     if (expression.kind == "Identifier") {
         const auto index = columnIndex(table, expression.value);
         // columnId 是运行时槽位；binding/relation 是稳定身份。两者分开之后，
@@ -601,6 +602,7 @@ LogicalPlan build(const Statement& statement, const catalog::Catalog& catalog, c
                     // 投影列继承被投影标识符的稳定身份；表达式列没有身份（0）。
                     projected.binding = bound.value("binding", std::uint32_t{0});
                     projected.relation = bound.value("relation", std::uint32_t{0});
+                    projected.expression = bound.value("expressionId", std::uint32_t{0});
                     plan.output.push_back(std::move(projected));
                     plan.projections.push_back(std::move(bound));
                 }
@@ -724,7 +726,7 @@ nlohmann::json serializePlans(const std::vector<LogicalPlan>& plans) {
         const auto rowIndex = rows.size();
         nlohmann::json output = nlohmann::json::array();
         for (const auto& column : plan.output) {
-            output.push_back({{"name", column.name}, {"type", column.type}, {"columnId", column.columnId}, {"binding", column.binding}, {"relation", column.relation}, {"nullable", column.nullable},
+            output.push_back({{"name", column.name}, {"type", column.type}, {"columnId", column.columnId}, {"binding", column.binding}, {"relation", column.relation}, {"expressionId", column.expression}, {"nullable", column.nullable},
                 {"defaultValue", column.defaultValue ? nlohmann::json(*column.defaultValue) : nlohmann::json(nullptr)}, {"primaryKey", column.primaryKey}, {"unique", column.unique}, {"references", serializeReference(column.references)}});
         }
         const auto endLine = plan.sourceSpan.endLine ? plan.sourceSpan.endLine : plan.sourceSpan.line;
@@ -823,6 +825,7 @@ std::vector<LogicalPlan> deserializePlans(const nlohmann::json& document) {
             // X25：同 major 内的宽松读取——旧文档没有 binding/relation，缺失即无身份。
             value.binding = column.value("binding", std::uint32_t{0});
             value.relation = column.value("relation", std::uint32_t{0});
+            value.expression = column.value("expressionId", std::uint32_t{0});
             if (column.contains("defaultValue") && !column.at("defaultValue").is_null()) value.defaultValue = column.at("defaultValue").get<std::string>();
             value.primaryKey = column.value("primaryKey", false);
             value.unique = column.value("unique", false);

@@ -448,6 +448,9 @@ struct JoinRowStream::Implementation {
     std::unordered_map<std::string, std::vector<std::size_t>> buckets;
     std::unique_ptr<QueryResourceManager::TempArtifact> spool;
     std::ifstream spoolInput;
+    std::vector<std::unique_ptr<QueryResourceManager::TempArtifact>> hashPartitions;
+    std::size_t hashPartitionCount = 0;
+    std::size_t activeHashPartition = std::numeric_limits<std::size_t>::max();
     json leftRow;
     const std::vector<std::size_t>* matches = nullptr;
     std::size_t matchCursor = 0;
@@ -477,11 +480,75 @@ struct JoinRowStream::Implementation {
         if (cancelled) throw MiniSqlError(ErrorCode::Cancelled, "Query cancelled");
         if (checkCancelled) checkCancelled();
     }
-    void writeSpoolRow(std::ofstream& output, const json& row) {
+    void writeArtifactRow(QueryResourceManager::TempArtifact& artifact, std::ofstream& output, const json& row) {
         const auto line = row.dump();
-        spool->account(line.size() + 1);
+        artifact.account(line.size() + 1);
         output << line << '\n';
         if (!output) throw MiniSqlError(ErrorCode::Storage, "Cannot write join spill file");
+    }
+    void writeSpoolRow(std::ofstream& output, const json& row) { writeArtifactRow(*spool, output, row); }
+    std::size_t partitionFor(const json& value) const {
+        return std::hash<std::string>{}(value.dump()) % hashPartitions.size();
+    }
+    void partitionSpilledHash() {
+        const auto memoryTarget = std::max<std::size_t>(1, resources->memoryLimitBytes() / 2);
+        const auto spilledBytes = resources->usage().at("tempDiskCurrentBytes").get<std::uint64_t>();
+        const auto estimated = static_cast<std::size_t>(std::max<std::uint64_t>(2, (spilledBytes + memoryTarget - 1) / memoryTarget));
+        const auto count = std::clamp<std::size_t>(estimated * 2, 2, 256);
+        hashPartitionCount = count;
+        hashPartitions.reserve(count);
+        std::vector<std::ofstream> outputs(count);
+        for (std::size_t index = 0; index < count; ++index) {
+            auto artifact = resources->createTempArtifact(directory / ("query-" + operationId + "-hash-" + std::to_string(index) + ".jsonl"));
+            outputs[index].open(artifact->path(), std::ios::binary | std::ios::trunc);
+            if (!outputs[index]) throw MiniSqlError(ErrorCode::Storage, "Cannot create hash join partition");
+            hashPartitions.push_back(std::move(artifact));
+        }
+        std::ifstream input(spool->path(), std::ios::binary);
+        if (!input) throw MiniSqlError(ErrorCode::Storage, "Cannot read join spill file");
+        std::string line;
+        while (std::getline(input, line)) {
+            check();
+            const auto row = parseRunRow(line);
+            const auto keyIndex = hashKeys->second;
+            if (keyIndex >= row.size()) throw MiniSqlError(ErrorCode::Execution, "HashJoin right key outside row");
+            const auto& value = row.at(keyIndex);
+            if (value.is_null()) continue;
+            const auto partition = partitionFor(value);
+            writeArtifactRow(*hashPartitions[partition], outputs[partition], row);
+        }
+        for (auto& output : outputs) {
+            output.close();
+            if (!output) throw MiniSqlError(ErrorCode::Storage, "Cannot close hash join partition");
+        }
+        input.close();
+        spool->cleanup();
+        spool.reset();
+    }
+    void loadHashPartition(std::size_t partition) {
+        if (activeHashPartition == partition) return;
+        buckets.clear();
+        hashReservations.clear();
+        rightRows.clear();
+        rightReservations.clear();
+        std::ifstream input(hashPartitions.at(partition)->path(), std::ios::binary);
+        if (!input) throw MiniSqlError(ErrorCode::Storage, "Cannot read hash join partition");
+        std::string line;
+        while (std::getline(input, line)) {
+            check();
+            auto row = parseRunRow(line);
+            const auto bytes = rowBytes(row);
+            rightReservations.push_back(resources->reserveMemory(bytes));
+            rightRows.push_back(std::move(row));
+            const auto index = rightRows.size() - 1;
+            const auto& value = rightRows.back().at(hashKeys->second);
+            const auto serialized = value.dump();
+            const auto found = buckets.find(serialized);
+            const auto bucketBytes = sizeof(std::size_t) + (found == buckets.end() ? serialized.size() + 64 : 0);
+            hashReservations.push_back(resources->reserveMemory(bucketBytes));
+            buckets[serialized].push_back(index);
+        }
+        activeHashPartition = partition;
     }
     void prepare() {
         if (prepared) return;
@@ -536,6 +603,8 @@ struct JoinRowStream::Implementation {
                     buckets[serialized].push_back(index);
                 }
             }
+        } else if (spilled && hashKeys) {
+            partitionSpilledHash();
         }
     }
     bool startLeft() {
@@ -546,7 +615,7 @@ struct JoinRowStream::Implementation {
         rightCursor = 0;
         matchCursor = 0;
         matches = nullptr;
-        if (spilled) {
+        if (spilled && !hashKeys) {
             spoolInput.close();
             spoolInput.open(spool->path(), std::ios::binary);
             if (!spoolInput) throw MiniSqlError(ErrorCode::Storage, "Cannot read join spill file");
@@ -555,6 +624,7 @@ struct JoinRowStream::Implementation {
             if (keyIndex >= leftRow.size()) throw MiniSqlError(ErrorCode::Execution, "HashJoin left key outside row");
             const auto& value = leftRow.at(keyIndex);
             if (!value.is_null()) {
+                if (spilled) loadHashPartition(partitionFor(value));
                 const auto found = buckets.find(value.dump());
                 if (found != buckets.end()) matches = &found->second;
             }
@@ -575,7 +645,7 @@ struct JoinRowStream::Implementation {
         for (;;) {
             check();
             if (!leftActive && !startLeft()) return false;
-            if (spilled) {
+            if (spilled && !hashKeys) {
                 std::string line;
                 while (std::getline(spoolInput, line)) {
                     check();
@@ -615,6 +685,8 @@ struct JoinRowStream::Implementation {
         rightRows.clear();
         rightReservations.clear();
         if (spool) spool->cleanup();
+        for (auto& partition : hashPartitions) if (partition) partition->cleanup();
+        hashPartitions.clear();
         closed = true;
     }
     json usage() const {
@@ -624,7 +696,8 @@ struct JoinRowStream::Implementation {
         usage["leftRows"] = leftRows;
         usage["rightRows"] = rightRowCount;
         usage["external"] = spilled;
-        usage["strategy"] = spilled ? "spilled-nested-loop" : hashKeys ? "in-memory-hash" : "in-memory-nested-loop";
+        usage["strategy"] = spilled && hashKeys ? "partitioned-hash" : spilled ? "spilled-nested-loop" : hashKeys ? "in-memory-hash" : "in-memory-nested-loop";
+        if (spilled && hashKeys) usage["partitions"] = hashPartitionCount;
         usage["left"] = left->resourceUsage();
         usage["right"] = right->resourceUsage();
         return usage;
