@@ -7,7 +7,7 @@ import { openSession } from '../scripts/session-process.mjs';
 // X25：受权对象、动作与只读判定都来自 C++ 绑定结果，取代旧的 SQL 文本扫描。
 // 本契约直接对会话 bindAccess 操作断言，覆盖字符串字面量、别名、派生表、CTE、
 // 自连接与按对象动作。
-const executable = './build/windows/Release/minisql_database.exe';
+const executable = process.env.MINISQL_DATABASE_EXE ?? './build/verification/Release/minisql_database.exe';
 const root = mkdtempSync(join(tmpdir(), 'minisql-binding-access-'));
 let checks = 0;
 
@@ -22,7 +22,7 @@ function objects(binding) {
 const session = await openSession(executable, join(root, 'db.pages'));
 try {
   equal((await session.request('execute',
-    'CREATE TABLE a(id INT, x INT); CREATE TABLE b(id INT, y INT);')).success, true, 'fixtures created');
+    'CREATE TABLE a(id INT, x INT); CREATE TABLE b(id INT, y INT); CREATE INDEX ix_a_id ON a(id);')).success, true, 'fixtures created');
 
   // 字符串字面量里的 FROM/JOIN 不会生成对象（旧的文本扫描会误判）。
   const literal = await session.request('bindAccess', "SELECT id FROM a WHERE 'FROM b' = 'x';");
@@ -57,6 +57,22 @@ try {
   equal(select.statementAction, 'select', 'select statement action');
   const explain = await session.request('bindAccess', 'EXPLAIN SELECT * FROM a;');
   equal(explain.statementAction, 'select', 'EXPLAIN keeps the read action');
+
+  const statementCases = [
+    ['UPDATE a SET x=1 WHERE id IN (SELECT id FROM b);', 'update', [['a', 'update'], ['b', 'select']]],
+    ['CREATE TABLE child(id INT REFERENCES a(id));', 'create', [['a', 'create'], ['child', 'create']]],
+    ['CREATE INDEX ix_b_id ON b(id);', 'create', [['b', 'create']]],
+    ['DROP INDEX ix_a_id;', 'drop', [['a', 'drop']]],
+    ['BEGIN;', null, []], ['COMMIT;', null, []], ['ROLLBACK;', null, []],
+    ['SAVEPOINT s;', null, []], ['RELEASE SAVEPOINT s;', null, []],
+    ['ROLLBACK TO SAVEPOINT s;', null, []], ['CHECKPOINT;', null, []],
+  ];
+  for (const [sql, action, expectedObjects] of statementCases) {
+    const binding = await session.request('bindAccess', sql);
+    equal(binding.bound, true, `${sql} binds`);
+    if (action) equal(binding.statementAction, action, `${sql} action`);
+    equal(objects(binding).sort(), expectedObjects.sort(), `${sql} objects`);
+  }
 
   // 无法闭合的绑定必须 fail-closed（bound=false），调用方据此拒绝。
   const unbound = await session.request('bindAccess', 'SELECT id FROM missing_table;');

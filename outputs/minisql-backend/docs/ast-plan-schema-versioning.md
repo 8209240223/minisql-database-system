@@ -14,7 +14,7 @@
 | `PLAN_SCHEMA_MINOR` | 0 | 本二进制写出的最新计划次版本 |
 | `PLAN_VERSION` | 1（主） | 计划节点契约 `planVersion` |
 | `PRODUCER_VERSION` | 1 | 写出方二进制版本 |
-| `CATALOG_SCHEMA_VERSION` | 5 | 最新表/列描述符版本 |
+| `CATALOG_SCHEMA_VERSION` | 6 | 最新表/列描述符版本；列类型使用稳定数值 `typeId` |
 
 ## 二、读端闸门（统一规则）
 

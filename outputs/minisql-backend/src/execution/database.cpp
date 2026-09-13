@@ -2505,11 +2505,25 @@ void Database::rollbackBatch() {
 }
 nlohmann::json Database::run(const sql::LogicalPlan& plan) {
     checkCancelled();
+    const auto bufferBefore = buffer_.stats();
+    const auto fileBefore = file_->ioStats();
     const auto started = std::chrono::steady_clock::now();
     auto result = runNode(plan);
     if (nodeStats_) {
         const auto elapsed = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
-        nodeStats_->push_back({{"kind", plan.kind}, {"table", plan.table}, {"actualRows", result.value("rows", json::array()).size()}, {"durationMs", elapsed}, {"loops", 1}});
+        const auto bufferAfter = buffer_.stats();
+        const auto fileAfter = file_->ioStats();
+        const json io{{"available", true}, {"scope", "inclusive-subtree"},
+            {"hits", bufferAfter.hits - bufferBefore.hits}, {"misses", bufferAfter.misses - bufferBefore.misses},
+            {"pageReads", bufferAfter.pageReads - bufferBefore.pageReads},
+            {"pageWrites", bufferAfter.pageWrites - bufferBefore.pageWrites},
+            {"stagedPageReads", bufferAfter.stagedPageReads - bufferBefore.stagedPageReads},
+            {"stagedPageWrites", bufferAfter.stagedPageWrites - bufferBefore.stagedPageWrites},
+            {"diskReads", fileAfter.reads - fileBefore.reads}, {"diskWrites", fileAfter.writes - fileBefore.writes},
+            {"ioErrors", fileAfter.errors - fileBefore.errors}};
+        nodeStats_->push_back({{"kind", plan.kind}, {"table", plan.table},
+            {"actualRows", result.value("rows", json::array()).size()}, {"durationMs", elapsed}, {"loops", 1},
+            {"io", std::move(io)}});
     }
     return result;
 }

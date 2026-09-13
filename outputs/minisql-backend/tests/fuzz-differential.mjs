@@ -1,4 +1,4 @@
-import { mkdtempSync, writeFileSync, readFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, writeFileSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
@@ -13,11 +13,16 @@ if (!Number.isInteger(seed) || seed < 0 || seed > 0xffffffff || !Number.isIntege
   throw new Error('FUZZ_SEED must be UINT32 and FUZZ_CASES must be 1..1000');
 const directory = mkdtempSync(fileURLToPath(new URL('./artifacts/fuzz-', import.meta.url)));
 const database = join(directory, 'database.pages');
-const executable = fileURLToPath(new URL('../bin/minisql_database.exe', import.meta.url));
+const releaseExecutable = fileURLToPath(new URL('../build/verification/Release/minisql_database.exe', import.meta.url));
+const fallbackExecutable = fileURLToPath(new URL('../bin/minisql_database.exe', import.meta.url));
+const executable = process.env.MINISQL_DATABASE_EXE ?? (existsSync(releaseExecutable) ? releaseExecutable : fallbackExecutable);
+const replayPath = process.env.FUZZ_REPLAY;
 const digest = bytes => createHash('sha256').update(bytes).digest('hex');
 const reference = new DatabaseSync(':memory:');
 const stats = { passed: 0, wrongResult: 0, wrongAccept: 0, wrongReject: 0, errorLocation: 0, crash: 0, timeout: 0, resourceLimit: 0, harnessError: 0 };
-const cases = generate(seed, count);
+const replay = replayPath ? JSON.parse(readFileSync(replayPath, 'utf8')) : null;
+if (replay && !replay.minimization?.minimizedSql) throw new Error('FUZZ_REPLAY must point to a failure artifact containing minimizedSql');
+const cases = replay ? [] : generate(seed, count);
 const report = { seed, count, timeoutMs: 5000, outputBytes: 8388608, executableSha256: digest(readFileSync(executable)),
   corpusSha256: digest(cases.map(render).join('\n')), generatorSha256: digest(readFileSync(new URL('./fuzz-model.mjs', import.meta.url))),
   referenceVersion: reference.prepare('SELECT sqlite_version() AS version').get().version,
@@ -46,20 +51,79 @@ function compare(model) {
   const obtained = { columns: last.columns, rows: last.rows };
   return isDeepStrictEqual(wanted, obtained) ? { category: 'passed' } : { category: 'wrongResult', detail: { wanted, obtained } };
 }
+function minimizeSql(sql, stillFails, budget = 64) {
+  let current = sql, attempts = 0, granularity = 2;
+  while (current.length > 1 && attempts < budget) {
+    const width = Math.max(1, Math.ceil(current.length / granularity));
+    let changed = false;
+    for (let start = 0; start < current.length && attempts < budget; start += width) {
+      const candidate = current.slice(0, start) + current.slice(start + width);
+      if (!candidate.trim()) continue;
+      ++attempts;
+      if (!stillFails(candidate)) continue;
+      current = candidate;
+      granularity = Math.max(2, granularity - 1);
+      changed = true;
+      break;
+    }
+    if (!changed) {
+      if (granularity >= current.length) break;
+      granularity = Math.min(current.length, granularity * 2);
+    }
+  }
+  return { sql: current, attempts };
+}
 function saveFailure(index, model, outcome) {
   const failure = { index, sql: render(model), ...outcome };
-  if (outcome.category === 'wrongResult' || outcome.category === 'wrongReject') {
+  if (outcome.category !== 'harnessError') {
     const reduced = minimize(model, candidate => compare(candidate).category === outcome.category);
     const confirmed = compare(reduced.model);
-    failure.minimization = { attempts: reduced.attempts, confirmed: confirmed.category === outcome.category, sql: render(reduced.model), outcome: confirmed };
+    failure.minimization = { attempts: reduced.attempts, confirmed: confirmed.category === outcome.category,
+      originalSql: failure.sql, minimizedSql: render(reduced.model), outcome: confirmed,
+      replay: { command: 'FUZZ_REPLAY=<failure.json> node tests/fuzz-differential.mjs', category: outcome.category } };
   }
   report.failures.push(failure);
   writeFileSync(join(directory, `failure-${index}.json`), JSON.stringify({ seed, fixture, ...failure }, null, 2));
+}
+function saveMutationFailure(index, mutation, category, actual) {
+  const classify = sql => {
+    const candidate = { ...mutation, sql };
+    const result = run(sql);
+    let outcome = result.category;
+    if (!outcome) {
+      if (candidate.valid) outcome = result.data.success ? 'passed' : 'wrongReject';
+      else if (result.data.success) outcome = 'wrongAccept';
+      else if (result.data.error?.type !== candidate.type) outcome = 'wrongReject';
+      else if (!Number.isInteger(result.data.error.line) || result.data.error.line < 1 ||
+        !Number.isInteger(result.data.error.column) || result.data.error.column < 1 ||
+        (candidate.line && (result.data.error.line !== candidate.line || result.data.error.column !== candidate.column))) outcome = 'errorLocation';
+      else outcome = 'passed';
+    }
+    return { category: outcome, actual: result };
+  };
+  const failure = { index, mutation, category, actual };
+  if (category !== 'harnessError') {
+    const reduced = minimizeSql(mutation.sql, sql => classify(sql).category === category);
+    const confirmed = classify(reduced.sql);
+    failure.minimization = { attempts: reduced.attempts, confirmed: confirmed.category === category,
+      originalSql: mutation.sql, minimizedSql: reduced.sql, outcome: confirmed,
+      replay: { command: 'FUZZ_REPLAY=<failure.json> node tests/fuzz-differential.mjs', category } };
+  }
+  report.failures.push(failure);
+  writeFileSync(join(directory, `failure-${index}-mutation.json`), JSON.stringify({ seed, fixture, ...failure }, null, 2));
 }
 try {
   reference.exec(fixture);
   const setup = run(fixture);
   if (!setup.data?.success) throw new Error(`Fixture failed: ${JSON.stringify(setup)}`);
+  if (replay) {
+    const sql = replay.minimization.minimizedSql;
+    const actual = run(sql);
+    const category = actual.category ?? (actual.data?.success ? 'passed' : 'wrongReject');
+    ++stats[category];
+    if (category !== (replay.category ?? replay.minimization.replay?.category))
+      report.failures.push({ category: 'replayMismatch', expected: replay.category ?? replay.minimization.replay?.category, actual: category, sql });
+  }
   for (let i = 0; i < cases.length; ++i) {
     const outcome = compare(cases[i]);
     ++stats[outcome.category];
@@ -83,7 +147,7 @@ try {
         else category = 'passed';
       }
       ++stats[category];
-      if (category !== 'passed') report.failures.push({ index: i, mutation, category, actual });
+      if (category !== 'passed') saveMutationFailure(i, mutation, category, actual);
     }
     if (report.failures.length) break;
   }

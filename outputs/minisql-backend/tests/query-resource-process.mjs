@@ -83,7 +83,8 @@ const joined = query('SELECT l.id FROM l JOIN r ON l.id=r.id ORDER BY l.id;');
 assert.deepEqual(joined.rows, Array.from({ length: 30 }, (_, index) => [index])); ++checks;
 const joinUsage = findUsage(joined.resourceUsage, 'HashJoin');
 assert.equal(joinUsage?.external, true); ++checks;
-assert.equal(joinUsage?.strategy, 'spilled-nested-loop'); ++checks;
+assert.equal(joinUsage?.strategy, 'partitioned-hash'); ++checks;
+assert.ok(joinUsage?.partitions > 1); ++checks;
 assert.equal(noSpillFiles(), true); ++checks;
 
 const exhausted = run('SELECT id FROM l ORDER BY id;', { MINISQL_TEMP_DISK_BYTES: '8' });

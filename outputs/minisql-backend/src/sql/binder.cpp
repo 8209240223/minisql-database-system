@@ -130,9 +130,14 @@ private:
                 if (column.references) addObject(column.references->first, AccessAction::Create);
         } else if (statement.kind == "CreateIndex" || statement.kind == "DropIndex") {
             const auto action = statement.kind == "CreateIndex" ? AccessAction::Create : AccessAction::Drop;
-            if (!statement.table.empty()) {
-                result_.statements[statementIndex].target = bindBaseRelation(statement.table, {}, scope, statement.location, action);
+            auto table = statement.table;
+            if (table.empty() && statement.kind == "DropIndex") {
+                const auto* owner = catalog_.findIndexTable(statement.indexName);
+                if (!owner) failBind("index does not exist: " + statement.indexName, ErrorCode::Catalog, statement.location);
+                table = owner->name;
             }
+            if (table.empty()) failBind("index statement has no target relation");
+            result_.statements[statementIndex].target = bindBaseRelation(table, {}, scope, statement.location, action);
         } else if (statement.fromSubquery && (statement.kind == "Update" || statement.kind == "Delete")) {
             bindFrom(statement, scope, depth);
             const auto* level = result_.scopes.scope(scope);
@@ -271,7 +276,10 @@ private:
                 if (const auto reference = result_.scopes.resolveColumn(qualifier, column, innerScope))
                     if (const auto* bound = result_.scopes.column(reference->column)) { type = bound->type; nullable = bound->nullable; }
             }
-            if (name.empty()) { ++ordinal; continue; }
+            // Derived-table expressions without an explicit alias use the same
+            // deterministic name as the planner, so every output column obtains
+            // a stable ColumnId even across nested derived scopes.
+            if (name.empty()) name = "expr_" + std::to_string(ordinal + 1);
             result_.scopes.addColumn(target, BoundColumn{{}, target, ordinal++, name, type, nullable});
         }
     }

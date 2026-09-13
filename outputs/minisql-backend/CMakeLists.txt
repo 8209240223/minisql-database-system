@@ -46,12 +46,6 @@ target_include_directories(minisql_common PUBLIC include "${CMAKE_CURRENT_BINARY
 target_link_libraries(minisql_common PUBLIC minisql_options fmt::fmt
     spdlog::spdlog nlohmann_json::nlohmann_json Boost::multiprecision)
 
-# Reserved module targets: these contain no database implementation yet.
-foreach(module IN ITEMS transaction)
-    add_library(minisql_${module} INTERFACE)
-    target_link_libraries(minisql_${module} INTERFACE minisql_common)
-endforeach()
-
 add_library(minisql_storage STATIC src/storage/page.cpp src/storage/file_io.cpp src/storage/page_file.cpp src/storage/buffer_pool.cpp src/storage/heap.cpp src/storage/bplus_tree.cpp src/storage/page_bplus_tree.cpp)
 target_link_libraries(minisql_storage PUBLIC minisql_common)
 
