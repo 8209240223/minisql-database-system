@@ -698,6 +698,11 @@ void rewritePlan(sql::LogicalPlan& plan, const Options& options, json& changes, 
     // 删除恒真过滤：谓词是布尔字面量 true，且只有一个输入。
         const auto& input = plan.children.front();
         // 取出输入算子。
+        // 孩子是连接时保留这层恒真过滤：Filter 携带的 table/output 是"合并前左侧表"的
+        // 视角，而连接算子携带的是"合并后完整结果"的视角；若在此处替换，替换后的
+        // plan.children 会从一个变成两个，破坏上层 Project 单孩子假设，导致执行失败。
+        if (input.kind == "NestedLoopJoin" || input.kind == "HashJoin" ||
+            input.kind == "LeftJoin" || input.kind == "RightJoin" || input.kind == "FullJoin") return;
         if (plan.table != input.table || plan.preservesRowId != input.preservesRowId || plan.output.size() != input.output.size()) return;
         // 只有当过滤器的表名、行号保持性与输出列数都和输入完全一致时才允许删除。
         for (std::size_t i = 0; i < plan.output.size(); ++i) {
