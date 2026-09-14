@@ -82,4 +82,28 @@ assert.equal(run("SELECT * FROM guarded2;").success, true);
 // 重新打开数据库：这一步会从磁盘反序列化 CHECK 里的 Like 表达式。
 assert.deepEqual(rows("SELECT v FROM guarded2;"), [['apple']]);
 // 表内容正确，且带 LIKE 的 CHECK 在重启后依然生效。
-console.log('22 LIKE smoke checks passed');
+// ---- 计划序列化往返：LIKE 必须能在计划文档里存活 ----
+// 计划的 predicate 会被 validateExpression（planner 的计划反序列化校验）检查，
+// 那里同样有一份节点种类白名单；漏掉 Like 会让带 LIKE 的查询在计划往返后
+// 被判为非法计划。这里通过 executePlan 走完整往返路径。
+const roundTripSource = "SELECT id FROM t WHERE note LIKE 'a%' ORDER BY id;";
+const roundTripCompiled = run(roundTripSource, 'compile');
+// 先编译出计划文档。
+assert.equal(roundTripCompiled.success, true);
+// 编译必须成功。
+const planDocument = JSON.stringify(roundTripCompiled.plan);
+// 取计划文档用于回灌。
+const viaDirect = rows(roundTripSource);
+// 直接执行的结果。
+const viaPlanRun = (() => {
+// 用 executePlan 执行计划文档：这条路径会走计划的序列化/反序列化。
+  const result = run(planDocument, 'executePlan');
+// 执行计划文档。
+  assert.equal(result.success, true, JSON.stringify(result.error ?? result));
+// 往返后执行必须成功，否则说明 Like 在计划往返中丢失。
+  return result.results.at(-1).rows;
+// 取结果行。
+})();
+assert.deepEqual(viaPlanRun, viaDirect);
+// 往返前后的结果必须完全一致。
+console.log('24 LIKE smoke checks passed');

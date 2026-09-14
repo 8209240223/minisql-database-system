@@ -1329,8 +1329,10 @@ std::vector<LogicalPlan> deserializePlans(const nlohmann::json& document) {
         // 取节点种类。
         if (kind != "Literal" && kind != "Identifier" && kind != "Cast" &&
             // 只允许这几种节点：
-            kind != "Unary" && kind != "Binary" && kind != "AggregateExpr") invalid();
-            // 字面量、列引用、类型转换、一元、二元、聚合。其它一律拒绝。
+            kind != "Unary" && kind != "Binary" && kind != "Like" && kind != "AggregateExpr") invalid();
+            // 字面量、列引用、类型转换、一元、二元、LIKE、聚合。其它一律拒绝。
+            // Like 必须列入白名单：它出现在 WHERE 谓词里，而这一层是计划反序列化
+            // 的结构校验，漏掉它会让带 LIKE 的查询在计划往返后被误判为非法计划。
         if (expression.contains("left") && !expression.at("left").is_null()) validateExpression(expression.at("left"), depth + 1);
         // 递归校验左子树。
         if (expression.contains("right") && !expression.at("right").is_null()) validateExpression(expression.at("right"), depth + 1);
