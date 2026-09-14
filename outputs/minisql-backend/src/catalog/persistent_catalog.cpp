@@ -2,6 +2,7 @@
 #include "minisql/sql/serialization.hpp"
 #include <algorithm>
 #include <cctype>
+#include <functional>
 #include <limits>
 #include <map>
 #include <nlohmann/json.hpp>
@@ -73,7 +74,11 @@ std::string decodeType(const nlohmann::json& encoded) {
         case PersistedTypeId::Varchar:
             if (parameters.is_null()) return "varchar";
             if (!parameters.is_object() || parameters.size() != 1 || !parameters.at("length").is_number_unsigned()) corrupt();
-            if (const auto length = parameters.at("length").get<std::uint32_t>(); length >= 1 && length <= 65535)
+            // 长度下界必须与编码侧 varcharLength（varchar.hpp）一致：那里只要求非零，
+            // 类型名里的 n 用 std::uint32_t 承载，合法范围是 1..4294967295。
+            // 这里若额外收紧到 65535，会出现"建表成功、重新打开就判损坏"的
+            // 静默数据丢失：VARCHAR(4294967295) 写得进去，读不回来。
+            if (const auto length = parameters.at("length").get<std::uint32_t>(); length >= 1)
                 return "varchar(" + std::to_string(length) + ")";
             corrupt();
         case PersistedTypeId::Decimal:
@@ -235,6 +240,8 @@ PersistentCatalog::PersistentCatalog(storage::HeapStore& heap) : heap_(heap) {
     // 列目录扫描结束。
     std::map<std::int32_t, bool> seen;
     // 记录已经出现过的表编号，用于检测重复。
+    std::vector<StoredTable> loaded;
+    // 先把所有表定义收集起来，暂不创建。原因见循环之后的依赖排序。
     heap_.scan(0, tableSchema, [&](storage::RowRef, const storage::Row& row) {
     // 扫描表目录堆关系（编号 0）。
         for (const auto& value : row) if (std::holds_alternative<std::monostate>(value)) corrupt();
@@ -339,14 +346,52 @@ PersistentCatalog::PersistentCatalog(storage::HeapStore& heap) : heap_(heap) {
             // 按序号顺序把列挂到建表语句上，保持与建表时的顺序一致。
         }
         // 列装配结束。
-        try { view_.create(definition); for (const auto& index : definition.indexes) { sql::Statement createIndex{"CreateIndex"};createIndex.indexName=index.name;createIndex.table=definition.table;createIndex.indexColumns=index.columns;createIndex.uniqueIndex=index.unique;view_.createIndex(createIndex); } } catch (const MiniSqlError&) { corrupt(); }
+        loaded.push_back({id, std::move(definition)});
+        // 只收集，不在这里创建：创建顺序稍后按外键依赖重排。
+    });
+    // 表目录扫描结束，全部表定义已收齐。
+
+    // 按外键依赖排序后再创建任何一张表。
+    //
+    // 为什么必须排序：Catalog::create 在遇到外键时要求被引用的父表已经存在
+    // （catalog.cpp 的 "Referenced table does not exist"），而表目录的物理槽位顺序
+    // 会随 catalog 的增删改写而改变。例如 CREATE INDEX 走的是 replace（先 insert
+    // 后 erase），会把被建索引的表搬到页尾，于是下次打开时这张父表可能排在子表之后。
+    // 原来的实现按槽位顺序边扫边建，一旦父表落在子表后面就把整个库判成
+    // STORAGE_CORRUPTION，导致库再也打不开——一个无害的建索引操作会造成永久损坏。
+    // 这里改成先拓扑排序，保证父表先建；自引用与循环引用交给 Catalog::create 自身校验。
+    std::vector<std::size_t> creationOrder;
+    creationOrder.reserve(loaded.size());
+    {
+        std::vector<char> placed(loaded.size(), 0);
+        std::function<void(std::size_t)> place = [&](std::size_t index) {
+            if (placed[index]) return;
+            placed[index] = 1;
+            // 先递归放置本表引用的所有父表。
+            for (const auto& reference : sql::allForeignKeys(loaded[index].definition)) {
+                for (std::size_t candidate = 0; candidate < loaded.size(); ++candidate) {
+                    if (candidate == index) continue;
+                    if (!key(loaded[candidate].definition.table).empty() &&
+                        key(loaded[candidate].definition.table) == key(reference.table)) {
+                        place(candidate);
+                        break;
+                    }
+                }
+            }
+            creationOrder.push_back(index);
+        };
+        for (std::size_t index = 0; index < loaded.size(); ++index) place(index);
+    }
+
+    for (const auto index : creationOrder) {
+        auto& entry = loaded[index];
+        try { view_.create(entry.definition); for (const auto& idx : entry.definition.indexes) { sql::Statement createIndex{"CreateIndex"};createIndex.indexName=idx.name;createIndex.table=entry.definition.table;createIndex.indexColumns=idx.columns;createIndex.uniqueIndex=idx.unique;view_.createIndex(createIndex); } } catch (const MiniSqlError&) { corrupt(); }
         // 把重建出的建表语句交给内存目录重新校验并登记，然后把这个表的内联索引也逐条重建。
         // 这里刻意复用 Catalog::create 与 createIndex：加载路径与建表路径共用同一套校验，
         // 一旦两者不一致（说明磁盘内容非法）就按目录损坏上报，而不是把坏定义放进内存。
-        tables_.push_back({id, std::move(definition)});
+        tables_.push_back(std::move(entry));
         // 记录这张表的编号与定义，供导目录、快照与索引重建使用。
-    });
-    // 表目录扫描结束。
+    }
     // 读取权限系统堆表时按 permissionVersion 组成候选快照，允许崩溃留下旧快照和新快照的混合尾部。
     // 解释：写权限目录的顺序是"先插入新版本的分片，再删除旧版本的分片"，
     // 中途崩溃会同时留下两代分片，所以这里按版本分组，并优先使用分片齐全且版本最高的那一代。

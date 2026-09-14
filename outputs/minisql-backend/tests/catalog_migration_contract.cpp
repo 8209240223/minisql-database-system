@@ -37,6 +37,7 @@ void setHeader(const std::filesystem::path& path, std::int32_t version, const st
     heap.flush();
 }
 int main() {
+try {
     const auto directory = std::filesystem::path("tests/artifacts") /
         ("catalog-migration-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
     std::filesystem::create_directories(directory);
@@ -96,8 +97,12 @@ int main() {
     }
 
     // --- interrupted migration (header set to pendingMigration 5): recovery point completes ---
-    setHeader(path, static_cast<std::int32_t>(sql::CATALOG_SCHEMA_VERSION - 1),
-        R"({"producerVersion":1,"migratedFrom":4,"recovered":false,"pendingMigration":5})");
+    // pendingMigration 的语义是"上次中断时正在迁移到哪个版本"。要构造"迁移中途崩过"的场景，
+    // 它必须 >= 当前的 CATALOG_SCHEMA_VERSION。这里跟随版本常量而不是写死数字，
+    // 否则每次提升 CATALOG_SCHEMA_VERSION 都会让这条用例悄悄失效。
+    const auto pendingMigrationJson = std::string("{\"producerVersion\":1,\"migratedFrom\":4,\"recovered\":false,\"pendingMigration\":") +
+        std::to_string(sql::CATALOG_SCHEMA_VERSION) + "}";
+    setHeader(path, static_cast<std::int32_t>(sql::CATALOG_SCHEMA_VERSION - 1), pendingMigrationJson);
     {
         auto file = std::make_shared<PageFile>(path);
         BufferPool buffer(file, 2, ReplacementPolicy::LRU);
@@ -143,4 +148,14 @@ int main() {
     }
 
     std::cout << checks << " catalog migration/version checks passed\nEvidence: " << directory.string() << '\n';
+    return 0;
+} catch (const std::exception& error) {
+    // 断言或产品异常都必须在这里被接住：逃逸出 main 会触发 std::terminate，
+    // 在 Windows 上表现为 0xC0000409（__fastfail），失败原因会被整块吞掉。
+    std::cerr << "catalog migration contract failed after " << checks << " checks: " << error.what() << '\n';
+    return 1;
+} catch (...) {
+    std::cerr << "catalog migration contract failed after " << checks << " checks with an unknown exception\n";
+    return 1;
+}
 }

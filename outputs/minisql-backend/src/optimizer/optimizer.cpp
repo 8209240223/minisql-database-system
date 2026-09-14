@@ -53,6 +53,16 @@ json rewrite(json expression, const Options& options, json& changes, std::size_t
         return expression;
         // 返回改写后的节点。
     }
+    if (kind == "Like") {
+    // LIKE 模式匹配：两侧都是普通表达式，只需递归改写，不参与常量折叠
+    // （通配符匹配不是代数运算，折叠它没有收益，反而会增加规则复杂度）。
+        expression["left"] = rewrite(expression.at("left"), options, changes, statement, depth + 1);
+    // 改写左操作数。
+        expression["right"] = rewrite(expression.at("right"), options, changes, statement, depth + 1);
+    // 改写右操作数（模式串）。
+        return expression;
+    // 原样返回改写后的节点。
+    }
     if (kind != "Unary" && kind != "Binary") throw MiniSqlError(ErrorCode::Internal, "Unsupported optimizer expression");
     // 到这里只可能是单目或双目运算；其它种类说明表达式结构不符合预期，按内部错误拒绝。
     expression["left"] = rewrite(expression.at("left"), options, changes, statement, depth + 1);

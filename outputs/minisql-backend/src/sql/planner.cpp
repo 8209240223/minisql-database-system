@@ -311,16 +311,16 @@ nlohmann::json bindExpression(const Expr& expression, const catalog::Table& tabl
         result["left"] = bindExpression(*expression.left, table, context, depth + 1);
         result["nullable"] = result["left"].value("nullable", true);
         // 转换不会改变可空性，沿用源表达式的。
-    } else if (expression.kind == "Unary" || expression.kind == "Binary") {
-    // 一元或二元运算。
+    } else if (expression.kind == "Unary" || expression.kind == "Binary" || expression.kind == "Like") {
+    // 一元、二元或 LIKE 模式匹配。
         result["operator"] = expression.value;
-        // 记下运算符。
+        // 记下运算符（LIKE 的 operator 取值是 LIKE / NOT LIKE）。
         result["type"] = isArithmetic(expression.value) ? "int" : "bool";
-        // 先粗判类型：算术运算给 int，其余（比较、逻辑）给 bool；下面再细化。
+        // 先粗判类型：算术运算给 int，其余（比较、逻辑、LIKE）给 bool；下面再细化。
         if (!expression.left) invalid("missing left operand");
         // 必须有左操作数。
         result["left"] = bindExpression(*expression.left, table, context, depth + 1);
-        if (expression.kind == "Binary") {
+        if (expression.kind == "Binary" || expression.kind == "Like") {
         // 二元运算还有右操作数。
             if (!expression.right) invalid("missing right operand");
             // 必须存在。
@@ -329,7 +329,7 @@ nlohmann::json bindExpression(const Expr& expression, const catalog::Table& tabl
         // 右操作数处理结束。
         result["nullable"] = expression.value != "IS NULL" && expression.value != "IS NOT NULL" &&
             // IS NULL / IS NOT NULL 的结果一定非空，其余运算要看操作数。
-            (result["left"].value("nullable", true) || (expression.kind == "Binary" && result["right"].value("nullable", true)));
+            (result["left"].value("nullable", true) || ((expression.kind == "Binary" || expression.kind == "Like") && result["right"].value("nullable", true)));
             // 只要任一操作数可空，结果就可空。
         if (isArithmetic(expression.value) && (result["left"].at("type") == "bigint" || (expression.kind == "Binary" && result["right"].at("type") == "bigint"))) result["type"] = "bigint";
         // 算术运算只要有一侧是 bigint，结果就按 bigint 算，避免溢出。
@@ -379,11 +379,16 @@ std::vector<PlanColumn> schema(const catalog::Table& table, const SlotMap& slots
 }
 
 nlohmann::json expressionIdentity(nlohmann::json value) {
-// 计算表达式的"结构身份"：抹掉源位置后剩下的内容，用于判断两个表达式是否等价。
+// 计算表达式的"结构身份"：抹掉源位置与来源 id 后剩下的内容，用于判断两个表达式是否等价。
     if (!value.is_object()) return value;
     // 非对象（例如 null 常量）直接返回。
     value.erase("line"); value.erase("column");
     // 去掉行号列号，这样同一表达式在不同位置也视为相同。
+    value.erase("expressionId");
+    // 再去掉 expressionId：它由绑定器按 AST 节点指针分配（binder.cpp 的 expressionIds 表），
+    // 同一次书写出现在 SELECT 列表与 ORDER BY 中会是两个不同节点、拿到两个不同 id。
+    // 它属于跨阶段追踪用的来源标记，不是结构身份；留在里面会让"同一个列的两处引用"
+    // 被判成不同表达式，进而误报 DISTINCT ORDER BY must match a projected expression。
     if (value.contains("left")) value["left"] = expressionIdentity(value["left"]);
     // 递归规范化左子树。
     if (value.contains("right")) value["right"] = expressionIdentity(value["right"]);
@@ -677,6 +682,11 @@ LogicalPlan build(const Statement& statement, const catalog::Catalog& catalog, c
         plan.kind = "CreateTable";
         // 计划种类。
         plan.checkDefinitions = serializeChecks(statement.checks);
+    // 与 ast.checks 对齐：编译响应里的两处 CHECK 表达式必须逐节点相等
+    // （tests/check-process.mjs 的 checkDefinitions == ast.checks 断言依赖这一点）。
+    // planner 在 ast 标注（annotateAst）之前运行，这里先放未标注的副本；
+    // 最终响应组装处（database.cpp / compile_main.cpp）会用与 ast 相同的标注流程
+    // 重新为 plan 侧补齐 nodeId/sourceSpan，因此两边逐节点一致。
         // CHECK 的原始定义（约束名与目标绑定）要落库，这里序列化保存。
         plan.keys = table->keys;
         // 主键/唯一键约束取自校验后的目录。
@@ -897,7 +907,19 @@ LogicalPlan build(const Statement& statement, const catalog::Catalog& catalog, c
             auto rightOutput = rightScan.output;
             if (source.left) for (auto& column : rightOutput) column.nullable = true;
             join.output.insert(join.output.end(), rightOutput.begin(), rightOutput.end());
-            join.predicate = bindExpression(*source.on, prefix, context);
+            if (source.cross) {
+            // CROSS JOIN 与逗号连接没有 ON 条件，语义是笛卡尔积：
+            // 用一个恒真谓词表示"左右两侧的每一对组合都保留"。
+            // 执行器的 NestedLoopJoin 会对每一对左右行求值该谓词，恒真即全部保留。
+                join.predicate = nlohmann::json{{"kind", "Literal"}, {"value", true},
+                    {"type", "bool"}, {"nullable", false},
+                    {"line", static_cast<std::size_t>(0)}, {"column", static_cast<std::size_t>(0)}};
+            } else {
+                if (!source.on) invalid("missing join condition");
+                // 非 CROSS 连接必须带 ON，否则解析阶段就已经报错，这里属于内部不变量兜底。
+                join.predicate = bindExpression(*source.on, prefix, context);
+                // 把 ON 表达式在"左侧输出 + 右侧列"的作用域上绑定。
+            }
             join.children.push_back(std::move(input));join.children.push_back(std::move(rightScan));
             // 左边挂当前输入，右边挂右表扫描。
             input = std::move(join);

@@ -662,12 +662,20 @@ private:
             else if(i<t.size()&&t[i].type=="IDENTIFIER")s.tableAlias=identifier();
             // 不带 AS 的隐式别名。
         }
-        while(keyword("JOIN")||keyword("INNER")||keyword("LEFT")||keyword("RIGHT")||keyword("FULL")) {
-        // 循环解析所有 JOIN 子句。
+        while(keyword("JOIN")||keyword("INNER")||keyword("LEFT")||keyword("RIGHT")||keyword("FULL")||keyword("CROSS")||at(",")) {
+        // 循环解析所有连接子句，包括 CROSS JOIN 与逗号连接。
             if(s.joins.size()>=32) fail(ErrorCode::Syntax, "Join count exceeds 32", t[i].location);
             // 连接个数设上限 32，避免计划规模失控。
             Join join;
             // 准备一个连接子句。
+            if(at(",")){++i;join.cross=true;}
+            // 逗号连接：SQL-92 之前的写法，语义与 CROSS JOIN 完全相同（笛卡尔积）。
+            else if(keyword("CROSS")){
+            // CROSS JOIN：显式笛卡尔积写法，不允许带 ON 条件。
+                ++i;expect("JOIN");join.cross=true;
+            }
+            // CROSS 分支结束。
+            else {
             if(keyword("LEFT")){++i;join.left=true;if(keyword("OUTER"))++i;}
             // 左外连接，OUTER 可选。
             else if(keyword("RIGHT")){++i;join.right=true;if(keyword("OUTER"))++i;}
@@ -676,14 +684,26 @@ private:
             // 全外连接同时置左、右两个标记，因为它两侧都可能补 NULL。
             else if(keyword("INNER"))++i;
             // 内连接，只需跳过 INNER。
-            expect("JOIN");join.table=identifier();
-            // 消费 JOIN 并读被连接的表名。
+            expect("JOIN");
+            // 消费 JOIN。
+            }
+            // 非 CROSS 分支结束。
+            join.table=identifier();
+            // 读被连接的表名。
             if(keyword("AS")){++i;join.alias=identifier();}
             // 带 AS 的右表别名。
             else if(i<t.size()&&t[i].type=="IDENTIFIER")join.alias=identifier();
             // 隐式别名。
-            expect("ON");join.on=expression();s.joins.push_back(std::move(join));
-            // 必须带 ON 条件，解析后把整个连接子句收进列表。
+            if(join.cross){
+            // CROSS JOIN 与逗号连接不带 ON；写成 ON 属于语法错误，明确报出来而不是静默忽略。
+                if(keyword("ON")) fail(ErrorCode::Syntax, "CROSS JOIN does not accept an ON clause", t[i].location);
+                // 拒绝多余的 ON。
+            } else {
+            expect("ON");join.on=expression();
+            // 其余连接形式必须带 ON 条件。
+            }
+            s.joins.push_back(std::move(join));
+            // 把连接子句收进列表。
         }
         bool clauseRecovered = false;
         // 记录本条 SELECT 是否发生过子句级错误恢复。
@@ -776,9 +796,19 @@ private:
         auto left=addition();
         // 先解析左边的算术表达式。
         if(keyword("IN")||keyword("NOT")){
-        // 后面可能是 IN(...) 或 NOT IN(...)。
+        // 后面可能是 IN(...)、NOT IN(...) 或 NOT LIKE。
             const bool negate=keyword("NOT");const auto op=take();
             // 记下是不是取反形式，并消费掉 NOT 或 IN 这个 token（位置信息留着报错用）。
+            if(negate&&keyword("LIKE")){
+            // NOT LIKE：按与 LIKE 相同的通配符规则处理，只是最终取反。
+                ++i;
+                // 关键：消费掉 LIKE 这个 token。上面 take() 只吃掉了 NOT，
+                // 若不消费 LIKE，下面 addition() 会把 LIKE 当成表达式起点而报语法错误。
+                const auto pattern=addition();
+                // 解析右侧模式表达式。
+                return std::make_shared<Expr>(Expr{"Like","NOT LIKE",left,pattern,op.location});
+                // 返回 NOT LIKE 节点，operator 字段标记为 NOT LIKE。
+            }
             if(negate)expect("IN");
             // 如果是 NOT，则后面必须紧跟 IN，否则这个 NOT 用在了不支持的位置。
             if(++depth>256) fail(ErrorCode::Syntax, "Expression depth exceeded", op.location);
@@ -832,6 +862,19 @@ private:
             // NOT IN 时把整棵 OR 树取反；否则直接返回 OR 树。
         }
         if(keyword("IS")){auto op=take();bool negate=keyword("NOT");if(negate)++i;expect("NULL");return std::make_shared<Expr>(Expr{"Unary",negate?"IS NOT NULL":"IS NULL",left,{},op.location});}
+        // LIKE / NOT LIKE：字符串模式匹配。右操作数必须是字符串字面量，
+        // 通配符 % 匹配任意长度子串、_ 匹配单个字符，其余字符按字面比较。
+        if(keyword("LIKE")){
+        // LIKE 模式匹配（NOT LIKE 已在上面 IN/NOT 分支里处理）。
+            const bool negate=false;const auto op=take();
+            // LIKE 不需要取反。
+            const auto pattern=addition();
+            // 解析右侧模式表达式。
+            auto node=std::make_shared<Expr>(Expr{"Like",negate?"NOT LIKE":"LIKE",left,pattern,op.location});
+            // 构造 Like 节点，operator 字段区分是否取反。
+            return node;
+            // 返回 Like 节点，语义与执行阶段按通配符规则求值。
+        }
         // IS NULL / IS NOT NULL：消费 IS，看有没有 NOT，再要求必须有 NULL，
         // 最后按是否取反生成 Unary 节点，节点种类名直接写成可读的 IS NULL / IS NOT NULL。
         // 方言归一：`==` 等价 `=`，`<>` 等价 `!=`。词素保持源码原文，语义统一按规范算子处理。

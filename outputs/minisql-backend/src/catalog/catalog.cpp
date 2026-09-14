@@ -492,8 +492,11 @@ Table queryScope(const sql::Statement& statement, const Catalog& catalog, std::s
         // RIGHT JOIN 时左表整侧都可能补 NULL，所以把左侧现有列全部标记为可空。
         for (auto column : right->columns) { column.qualifier = qualifier;if (join.left) column.nullable = true;scope.columns.push_back(std::move(column)); }
         // 逐列拷贝右表列：打上右表限定名；LEFT JOIN 时右表可能补 NULL，标记可空；然后并入视图表。
+        if (join.cross) continue;
+        // CROSS JOIN 与逗号连接没有 ON 条件，语义是笛卡尔积，
+        // 直接跳过 ON 的存在性与类型校验（上一行已经把它并入作用域）。
         if (!join.on) fail("JOIN ON requires a BOOL expression", statement.location);
-        // JOIN 必须带 ON 条件。
+        // 其余连接形式必须带 ON 条件。
         const auto type = expressionType(*join.on, scope, statement.location);
         // 用"已经合并了前面若干表"的视图表来推导 ON 条件类型。
         if (type != "bool" && type != "null")

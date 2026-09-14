@@ -69,10 +69,20 @@ try {
   ok(typeof buffer.hits === 'number' && typeof buffer.misses === 'number', 'session buffer reports hit/miss counters');
   ok(['LRU', 'FIFO'].includes(buffer.policy), 'session buffer reports the active policy');
 
-  // ---- 未实现的能力返回 501，不伪装成功 ----
+  // ---- 派生表 JOIN 已接通：返回真实结果，不再报未实现 ----
   {
-    // 派生表上的 JOIN 是引擎明确未实现的构造：绑定成功、规划阶段报 NotImplemented。
-    const unsupported = await request(session + '/execute', { sql: 'SELECT * FROM (SELECT id FROM t) x JOIN t y ON x.id = y.id;' });
+    // 这条用例原先断言"派生表上的 JOIN 未实现，返回 501"。执行器补上 joinRows 的
+    // Project 输入分支后，该构造已经可以真正执行（P1「派生表 JOIN/UPDATE/DELETE」），
+    // 因此这里改为验证真实结果：HTTP 200、返回行、与底层引擎一致。
+    const derived = await request(session + '/execute', { sql: 'SELECT * FROM (SELECT id FROM t) x JOIN t y ON x.id = y.id;' });
+    equal(derived.status, 200, 'derived-table join now executes instead of reporting 501');
+    equal(derived.data.success, true, 'derived-table join is reported as success');
+    equal(derived.data.results.at(-1).rows.length, 2, 'derived-table join returns the joined rows');
+  }
+  // ---- 真正未实现的能力仍返回 501，不伪装成功 ----
+  {
+    // 递归 CTE 是引擎明确未实现的构造：绑定成功、规划阶段报 NotImplemented。
+    const unsupported = await request(session + '/execute', { sql: 'WITH RECURSIVE r(n) AS (SELECT 1) SELECT * FROM r;' });
     equal(unsupported.status, 501, 'unimplemented capability maps to 501');
     equal(unsupported.data.success, false, 'unimplemented capability is not reported as success');
     equal(unsupported.data.error.code, 9001, 'unimplemented capability keeps the NotImplemented code');

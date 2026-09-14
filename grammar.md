@@ -43,7 +43,7 @@ block_comment     ::= "/*" { character } "*/" ;
 ```text
 SELECT DISTINCT FROM AS WHERE GROUP BY HAVING ORDER ASC DESC NULLS FIRST LAST
 LIMIT OFFSET CREATE TABLE INDEX UNIQUE INSERT INTO VALUES DEFAULT DELETE UPDATE SET
-JOIN INNER LEFT RIGHT FULL OUTER ON AND OR NOT IN IS NULL TRUE FALSE EXISTS CAST
+JOIN INNER LEFT RIGHT FULL OUTER CROSS ON AND OR NOT IN IS LIKE NULL TRUE FALSE EXISTS CAST
 BEGIN TRANSACTION COMMIT ROLLBACK SAVEPOINT RELEASE CHECKPOINT DROP
 INT BIGINT FLOAT VARCHAR DECIMAL BOOL DATE
 PRIMARY KEY FOREIGN REFERENCES CHECK CONSTRAINT
@@ -217,8 +217,12 @@ table_reference   ::= identifier [ [ "AS" ] identifier ]
 
 join_clause       ::= [ "INNER" | "LEFT" [ "OUTER" ] | "RIGHT" [ "OUTER" ] | "FULL" [ "OUTER" ] ]
                       "JOIN" identifier [ [ "AS" ] identifier ]
-                      "ON" expression ;
--- JOIN 必须提供 ON 条件，最多支持 32 个 JOIN。
+                      "ON" expression
+                    | "CROSS" "JOIN" identifier [ [ "AS" ] identifier ]
+                    | "," identifier [ [ "AS" ] identifier ] ;
+-- 带 ON 的连接最多支持 32 个。
+-- CROSS JOIN 与逗号连接是笛卡尔积，**不接受** ON 条件；写成 ON 属语法错误。
+-- 逗号连接是 SQL-92 之前的简写，语义与 CROSS JOIN 相同。
 
 order_item        ::= expression [ "ASC" | "DESC" ]
                       [ "NULLS" ( "FIRST" | "LAST" ) ] ;
@@ -245,8 +249,12 @@ negation          ::= "NOT" negation | comparison ;
 comparison        ::= addition
                       [ ( "=" | "==" | "!=" | "<>" | "<" | "<=" | ">" | ">=" ) addition
                       | [ "NOT" ] "IN" "(" in_operand ")"
+                      | [ "NOT" ] "LIKE" addition
                       | "IS" [ "NOT" ] "NULL" ] ;
--- 比较运算包括等值、范围和 IN，IS NULL 用于空值判断。
+-- 比较运算包括等值、范围、IN、LIKE 模式匹配，IS NULL 用于空值判断。
+-- LIKE 的通配符：% 匹配任意长度子串（含空串），_ 匹配恰好一个字符，其余字符按字面比较。
+-- 两侧必须是字符串；任一侧为 NULL 时结果按三值逻辑为 NULL。LIKE 大小写敏感。
+-- NOT LIKE 与 NOT IN 一样按取反处理，可在 WHERE / HAVING / UPDATE / DELETE 中通用。
 -- `==` 与 `=` 等价，`<>` 与 `!=` 等价；Token 词素保留源码原文，语义按规范算子（`=` / `!=`）处理。
 
 in_operand        ::= expression { "," expression } | select_stmt_without_semicolon ;
@@ -310,7 +318,6 @@ OR
 
 - 通用函数调用，例如 `unknown(v)`。
 - CTE，例如 `WITH ... AS (...)`。
-- `CROSS JOIN`。
 - 窗口函数。
 - 带引号的标识符。
 - 连续比较表达式，例如 `a = b = c`。
