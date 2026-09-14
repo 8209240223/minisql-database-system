@@ -62,4 +62,24 @@ const compiled = run("SELECT id FROM t WHERE note LIKE 'a%';", 'compile');
 // 编译模式验证 LIKE 能生成计划而不是只靠执行期兜底。
 assert.equal(compiled.success, true);
 // 编译必须成功。
-console.log('14 LIKE smoke checks passed');
+assert.equal(compiled.ast.where.kind, 'Like');
+// WHERE 里的 LIKE 应被解析成 Like 节点。
+const checkCompiled = run("CREATE TABLE guarded(v VARCHAR, CHECK(v LIKE 'a%'));", 'compile');
+// CHECK 约束里的 LIKE：这条路径会走表达式的序列化/反序列化，
+// 早期实现只覆盖了执行求值、漏了序列化，导致带 LIKE 的 CHECK 直接报
+// "Invalid serialized CHECK expression"。
+assert.equal(checkCompiled.success, true);
+// 编译必须成功。
+assert.equal(checkCompiled.ast.checks[0].kind, 'Like');
+// CHECK 表达式应被解析成 Like 节点。
+assert.equal(run("CREATE TABLE guarded2(v VARCHAR, CHECK(v LIKE 'a%'));").success, true);
+// 真正落盘建表。
+assert.equal(run("INSERT INTO guarded2 VALUES('apple');").success, true);
+// 满足 CHECK 的值可以插入。
+assert.equal(run("INSERT INTO guarded2 VALUES('zzz');").success, false);
+// 违反 CHECK 的值必须被拒绝。
+assert.equal(run("SELECT * FROM guarded2;").success, true);
+// 重新打开数据库：这一步会从磁盘反序列化 CHECK 里的 Like 表达式。
+assert.deepEqual(rows("SELECT v FROM guarded2;"), [['apple']]);
+// 表内容正确，且带 LIKE 的 CHECK 在重启后依然生效。
+console.log('22 LIKE smoke checks passed');

@@ -117,11 +117,13 @@ inline std::shared_ptr<Expr> readCheckExpression(const nlohmann::json& node, std
     // 把小写字母整体转大写，用于与规范化的运算符/函数名比较。
     const bool binary = kind == "Binary";
     // 是不是二元运算节点。
+    const bool like = kind == "Like";
+    // 是不是 LIKE 模式匹配节点：结构同二元（左边是被匹配值，右边是模式串）。
     const bool unary = kind == "Unary" || kind == "Cast";
     // 是不是一元运算或类型转换节点（两者结构都是"一个子节点"）。
-    if ((binary || kind == "Unary") && expression->value != value) invalid();
-    // 二元与 Unary 节点的 value 必须已经是大写规范形式，否则说明产物被人手改过。
-    if (!binary && !unary && kind != "Literal" && kind != "Identifier" && !subqueryKind) invalid();
+    if ((binary || like || kind == "Unary") && expression->value != value) invalid();
+    // 二元、Like 与 Unary 节点的 value 必须已经是大写规范形式，否则说明产物被人手改过。
+    if (!binary && !like && !unary && kind != "Literal" && kind != "Identifier" && !subqueryKind) invalid();
     // 种类白名单：只允许这几种，别的种类名一律拒绝。
     if (subqueryKind) {
     // 子查询类节点的专属校验。
@@ -132,11 +134,12 @@ inline std::shared_ptr<Expr> readCheckExpression(const nlohmann::json& node, std
         if (expression->subquerySql.empty() || expression->subquerySql.size() > 1048576) invalid();
         // 原文也不能为空或超长。
     }
-    const std::size_t expectedSize = binary ? 6u : unary ? 5u : subqueryKind ? (kind == "InSubquery" ? 6u : 5u) : 4u;
+    const std::size_t expectedSize = (binary || like) ? 6u : unary ? 5u : subqueryKind ? (kind == "InSubquery" ? 6u : 5u) : 4u;
     // 按节点种类算出"这个 JSON 对象应该恰好有几个字段"，多一个少一个都说明产物不合法。
+    // Like 与 Binary 同为六字段：kind/value/line/column/left/right。
     const auto metadataSize = static_cast<std::size_t>(node.contains("nodeId")) + static_cast<std::size_t>(node.contains("sourceSpan"));
     if (node.size() != expectedSize + metadataSize ||
-        node.contains("left") != (binary || unary || kind == "InSubquery") || node.contains("right") != binary) invalid();
+        node.contains("left") != (binary || like || unary || kind == "InSubquery") || node.contains("right") != (binary || like)) invalid();
     // 字段个数要精确匹配；而且"有 left/right 字段"这件事本身也要和节点结构一致。
     if (node.contains("nodeId") && !node.at("nodeId").is_number_unsigned()) invalid();
     if (node.contains("sourceSpan") && (!node.at("sourceSpan").is_object() ||
@@ -145,6 +148,8 @@ inline std::shared_ptr<Expr> readCheckExpression(const nlohmann::json& node, std
         value != "<" && value != "<=" && value != ">" && value != ">=" &&
         value != "+" && value != "-" && value != "*" && value != "/") invalid();
     // 二元运算符白名单：逻辑运算、六种比较运算、四种算术运算。
+    if (like && value != "LIKE" && value != "NOT LIKE") invalid();
+    // LIKE 节点的运算符只允许 LIKE 与 NOT LIKE 两种。
     if (kind == "Unary" && value != "NOT" && value != "IS NULL" && value != "IS NOT NULL" && value != "+" && value != "-") invalid();
     // 一元运算符白名单。
     if (kind == "Cast" && value != "INT" && value != "BIGINT" && value != "FLOAT" && value != "VARCHAR" && value != "BOOL" && value != "DATE") {
@@ -156,8 +161,9 @@ inline std::shared_ptr<Expr> readCheckExpression(const nlohmann::json& node, std
         if (!minisql::decimalType(type) && !minisql::varcharLength(type)) invalid();
         // 既不是定点数也不是变长字符串，说明类型名不合法。
     }
-    if (!binary && !unary && !subqueryKind) {
+    if (!binary && !like && !unary && !subqueryKind) {
     // 剩下的是 Literal 与 Identifier 两种叶子节点，要用词法分析器反向核对文本。
+    // 必须排除 like：它是二元结构而非叶子，若误入此分支会把模式串当字面量核对而失败。
         const auto tokens = tokenize(expression->value);
         // 把文本值重新切 token。
         std::string joined;
@@ -185,10 +191,10 @@ inline std::shared_ptr<Expr> readCheckExpression(const nlohmann::json& node, std
             // 三种形态都不满足，判为非法字面量。
         }
     }
-    if (binary || unary || kind == "InSubquery") expression->left = readCheckExpression(node.at("left"), depth + 1, remaining);
+    if (binary || like || unary || kind == "InSubquery") expression->left = readCheckExpression(node.at("left"), depth + 1, remaining);
     // 需要左子节点的种类就递归还原左子树；因为前面已校验 left 字段存在，这里可以放心取。
-    if (binary) expression->right = readCheckExpression(node.at("right"), depth + 1, remaining);
-    // 二元节点还要还原右子树。
+    if (binary || like) expression->right = readCheckExpression(node.at("right"), depth + 1, remaining);
+    // 二元与 Like 节点还要还原右子树（Like 的右侧是模式串）。
     return expression;
     // 返回完整还原并校验过的表达式。
 }
