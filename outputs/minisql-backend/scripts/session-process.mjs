@@ -88,14 +88,19 @@ export async function openSession(executable, database, { timeoutMs = 30000, max
         // 响应必须能对应上"正在等的那个请求"，否则说明协议错乱。
         if (pending.stream) {
         // 流式请求：一条请求会收到多条消息。
-          try { pending.onMessage?.(message); }
-          // 把每条消息交给调用方的回调。
-          catch (error) { fail(error); return; }
-          // 回调抛错就整体失败。
+          const current = pending;
+          current.delivery = current.delivery.then(() => current.onMessage?.(message)).catch(error => {
+            current.deliveryError ??= error;
+          });
           if (message.type === 'complete' || message.type === 'error') {
           // 收到 complete 或 error 说明本次流结束。
-            const current = pending; pending = undefined; clearTimeout(current.timer); current.resolve(message);
-            // 取出当前请求、清空 pending、清掉定时器并兑现它。
+            pending = undefined;
+            clearTimeout(current.timer);
+            current.delivery.then(() => {
+              if (!current.deliveryError) { current.resolve(message); return; }
+              current.reject(current.deliveryError);
+              fail(current.deliveryError);
+            });
           }
           // 结束判断结束。
           continue;
@@ -135,6 +140,7 @@ export async function openSession(executable, database, { timeoutMs = 30000, max
       // 目标索引名。
       ...(context.target === undefined ? {} : { target: context.target }),
       // 快照目标路径。
+      ...(context.plan === undefined ? {} : { plan: context.plan }),
       ...(context.user === undefined ? {} : { user: context.user }),
       // 用户名。
       ...(context.password === undefined ? {} : { password: context.password }),
@@ -203,8 +209,7 @@ export async function openSession(executable, database, { timeoutMs = 30000, max
       // 发请求。
         const timer = setTimeout(() => fail(new Error('Session streaming request timed out; commit state may be unknown')), timeoutMs);
         // 超时保护；同样提示提交状态可能未知。
-        pending = { id, timer, resolve, reject, stream: true, onMessage };
-        // 登记 pending 并打上 stream 标记，让解析逻辑知道要调回调而不是直接兑现。
+        pending = { id, timer, resolve, reject, stream: true, onMessage, delivery: Promise.resolve() };
         child.stdin.write(frame + '\n');
         // 写出这一帧。
       });

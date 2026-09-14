@@ -3,7 +3,7 @@ import { mkdtempSync, readFileSync } from 'node:fs';
 import { join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import assert from 'node:assert/strict';
-const executable=fileURLToPath(new URL('../bin/journal_probe.exe',import.meta.url));
+const executable=fileURLToPath(new URL('../bin/minisql_journal_probe.exe',import.meta.url));
 const type=process.argv[2] ?? 'decimal';
 assert.ok(['decimal','bool','date','varchar'].includes(type));
 const root=relative(process.cwd(),mkdtempSync(fileURLToPath(new URL(`./artifacts/${type}-journal-`,import.meta.url))));

@@ -18,6 +18,8 @@ std::string errorType(ErrorCode code) {
     // 2002：语法分析阶段报错。
     case ErrorCode::Semantic: return "SemanticError";
     // 2003：语义检查阶段报错。
+    case ErrorCode::IntegerOutOfRange: return "SEM_INTEGER_OUT_OF_RANGE";
+    case ErrorCode::PlanStaleSchema: return "PLAN_STALE_SCHEMA";
     case ErrorCode::Catalog: return "CatalogError";
     // 3001：目录层报错，例如表不存在。
     case ErrorCode::Storage: return "StorageError";

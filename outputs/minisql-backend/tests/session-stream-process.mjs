@@ -35,6 +35,18 @@ try {
   assert.ok(String(invalid.error?.message ?? '').includes('one SELECT or EXPLAIN')); ++checks;
   assert.deepEqual(invalidFrames.map(frame => frame.type), ['error']); ++checks;
 
+  await session.close();
+  session = await openSession(executable, join(root, 'limited.pages'), {
+    timeoutMs: 30000, env: { MINISQL_MAX_RESULT_ROWS: '2' },
+  });
+  assert.equal((await session.request('execute', 'CREATE TABLE limited(id INT); INSERT INTO limited VALUES(1),(2),(3);')).success, true); ++checks;
+  const limitedFrames = [];
+  const limited = await session.requestStream('executeStream', 'SELECT * FROM limited ORDER BY id;', {}, frame => limitedFrames.push(frame));
+  assert.equal(limited.type, 'error'); ++checks;
+  assert.equal(limited.error?.code, 5001); ++checks;
+  assert.match(limited.error?.message ?? '', /row budget exceeded/i); ++checks;
+  assert.deepEqual(limitedFrames.filter(frame => frame.type === 'row').map(frame => frame.row), [[1], [2]]); ++checks;
+
   console.log(`${checks} session stream checks passed`);
 } finally {
   if (session) await session.close().catch(() => {});

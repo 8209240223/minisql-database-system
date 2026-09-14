@@ -3,18 +3,13 @@
 #include "minisql/common/error.hpp"
 #include "minisql/common/logger.hpp"
 #include "minisql/common/version.hpp"
+#include "minisql/common/wire_json.hpp"
+#include "minisql/execution/database.hpp"
 #include <iostream>
 #include <fmt/format.h>
 
 namespace minisql {
 namespace {
-MiniSqlError unavailable(const std::string& feature) {
-// 构造"该功能尚未实现"的统一错误对象。
-    return {ErrorCode::NotImplemented, feature + " is not implemented in the foundation stage", {},
-            // 错误码取 NotImplemented，消息里带上具体功能名，便于用户定位。
-            "Use --check-config, --print-config, or .help in CLI mode."};
-            // 提示用户在基础阶段可以先用哪些命令，而不是直接卡死。
-}
 std::string trim(const std::string& text) {
 // 去掉字符串首尾的空白字符，用于判断交互式输入是否为空命令。
     const auto first = text.find_first_not_of(" \t\r\n");
@@ -23,6 +18,13 @@ std::string trim(const std::string& text) {
     // 整个串都是空白，返回空串。
     return text.substr(first, text.find_last_not_of(" \t\r\n") - first + 1);
     // 从第一个非空白字符开始，截到最后一个非空白字符（含）为止。
+}
+std::filesystem::path databasePath(const Config& config) {
+    return pathFromUtf8(config.dataDirectory) / "minisql.pages";
+}
+void writeResult(std::ostream& output, nlohmann::json result) {
+    result["integerEncoding"] = "safe-number-or-decimal-string";
+    output << wireJson(std::move(result)).dump() << '\n';
 }
 } // namespace
 
@@ -51,19 +53,23 @@ int runApplication(int argc, const char* const* argv, std::istream& input,
         // --print-config：打印最终生效的配置后退出，不写任何文件。
         if (options.checkConfig) { output << "Configuration valid\n"; return 0; }
         // --check-config：只做校验，打印结论后退出。
-        if (options.execute) { throw unavailable("SQL execution"); }
-        // -e/--execute：当前阶段还不能执行 SQL，按"未实现"报错。
-        if (config.mode == "server") { throw unavailable("HTTP/WebSocket server"); }
-        // server 模式尚未实现，同样按"未实现"报错，避免假装启动成功。
-
         prepareRuntimeDirectories(config);
         // 创建数据、WAL、日志等运行目录，保证后续写入不会因为目录缺失失败。
         LogManager logs(config.logging);
         // 按配置初始化日志管理器。
-        logs.log("server", spdlog::level::info, "MiniSQL foundation starting", {"startup", "-"});
-        // 记录启动日志。
-        output << fmt::format("MiniSQL {} | mode=cli | SQL engine: not implemented\n", kVersion);
-        // 打印启动横幅，明确当前 SQL 引擎尚未实现。
+        logs.log("server", spdlog::level::info, "MiniSQL starting", {"startup", "-"});
+        if (config.mode == "server") {
+            throw MiniSqlError(ErrorCode::NotImplemented,
+                "Native HTTP/WebSocket server is not available; use scripts/database-bridge.mjs");
+        }
+        execution::Database database(databasePath(config), config.bufferPoolSize);
+        if (options.execute) {
+            const auto result = database.executeScript(*options.execute);
+            writeResult(output, result);
+            return result.value("success", false) ? 0 : 1;
+        }
+
+        output << fmt::format("MiniSQL {} | mode=cli\n", kVersion);
         output << "Type .help for commands; .quit to exit.\n";
         // 给用户一行最小提示。
         std::string line;
@@ -76,8 +82,7 @@ int runApplication(int argc, const char* const* argv, std::istream& input,
             // 空行直接忽略，不报错。
             if (command == ".quit" || command == ".exit") { break; }
             // 退出命令：跳出循环，走正常关闭流程。
-            if (command == ".help") { output << ".help  .version  .config  .quit  .exit\nSQL execution is not implemented yet.\n"; }
-            // .help：列出当前可用的点命令。
+            if (command == ".help") { output << ".help  .version  .config  .quit  .exit\nEnter SQL terminated by a semicolon to execute it.\n"; }
             else if (command == ".version") { output << kVersion << '\n'; }
             // .version：打印版本号。
             else if (command == ".config") { output << config.toJson().dump(2) << '\n'; }
@@ -86,10 +91,8 @@ int runApplication(int argc, const char* const* argv, std::istream& input,
             // 其余输入一律当成 SQL，但当前阶段还没有 SQL 引擎。
                 // Do not log raw SQL: it can contain passwords and user data.
                 // 不要把原始 SQL 写进日志：它可能包含口令与用户数据。
-                logs.log("sql", spdlog::level::warn, "Query rejected: SQL engine unavailable");
-                // 只记录"查询被拒"这一事实与原因。
-                error << unavailable("SQL execution").toJson().dump() << '\n';
-                // 把结构化错误写到错误流，前端可以按 JSON 解析。
+                const auto result = database.execute(command);
+                writeResult(result.value("success", false) ? output : error, result);
             }
         }
         if (input.bad() || (input.fail() && !input.eof())) {
@@ -113,6 +116,7 @@ int runApplication(int argc, const char* const* argv, std::istream& input,
     // 未预料到的异常。
         // Avoid leaking implementation details or sensitive exception payloads.
         // 不要把实现细节或可能含敏感数据的异常内容泄露出去。
+        // Avoid leaking implementation details or sensitive exception payloads.
         error << MiniSqlError(ErrorCode::Internal, "Unexpected internal failure").toJson().dump() << '\n';
         // 统一改写成一条内部错误。
         return 1;

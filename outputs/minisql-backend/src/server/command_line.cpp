@@ -8,8 +8,7 @@ std::variant<CommandLineOptions, int> parseCommandLine(int argc, const char* con
 // 解析命令行：正常返回选项结构，需要提前退出时返回退出码。
                                                      std::ostream& out, std::ostream& err) {
 // out 用于打印帮助与版本，err 用于打印解析错误。
-    CLI::App app{"MiniSQL foundation: configuration, logging and CLI shell"};
-    // 创建解析器，括号里是程序描述，会出现在 --help 顶部。
+    CLI::App app{"MiniSQL database command-line client"};
     app.set_version_flag("--version", std::string(kVersion));
     // 注册 --version；命中后 CLI11 直接打印版本并退出。
     CommandLineOptions options;
@@ -18,16 +17,16 @@ std::variant<CommandLineOptions, int> parseCommandLine(int argc, const char* con
     // 两个原始字符串缓冲，等解析成功后再决定是否写入 options。
     auto* configOption = app.add_option("-c,--config", config, "JSON config file (explicit paths must exist)");
     // 配置文件路径。显式给出的路径必须存在，否则由后续配置加载阶段报错。
-    auto* executeOption = app.add_option("-e,--execute", sql, "Submit SQL (engine not implemented yet)");
-    // 启动时直接执行一条 SQL；当前阶段会以"未实现"返回。
+    auto* executeOption = app.add_option("-e,--execute", sql, "Execute SQL and exit");
     app.add_flag("--check-config", options.checkConfig, "Validate configuration and exit without writing files");
     // 只校验配置：不写文件、不建目录。
     app.add_flag("--print-config", options.printConfig, "Print effective JSON configuration and exit without writing files");
     // 打印最终生效的配置：同样不写文件，方便排查优先级问题。
-
     // The callback only runs for supplied options, preserving lower priority values.
     // 回调只在"用户真的给了这个选项"时才执行，因此没给的项不会被写入覆盖表，
     // 这样低优先级的来源（配置文件、环境变量、默认值）才有机会生效。
+
+    // The callback only runs for supplied options, preserving lower priority values.
     auto stringOption = [&](const char* flags, const char* pointer, const char* description) {
     // 注册一个字符串选项。pointer 是 JSON 指针，指明这个值写进配置的哪个位置。
         app.add_option_function<std::string>(flags, [&, pointer](const std::string& value) {
@@ -48,8 +47,7 @@ std::variant<CommandLineOptions, int> parseCommandLine(int argc, const char* con
         // 注册结束。
     };
     // 整数选项工厂结束。
-    stringOption("--mode", "/mode", "cli or server (network server is not implemented yet)");
-    // 运行模式：cli 或 server；server 尚未实现。
+    stringOption("--mode", "/mode", "cli or server");
     stringOption("--data", "/data_directory", "Data directory");
     // 数据目录。
     stringOption("--wal-dir", "/wal_directory", "WAL directory");

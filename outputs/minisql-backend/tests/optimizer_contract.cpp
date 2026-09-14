@@ -86,11 +86,34 @@ try {
     auto hashed = optimizer::optimize(sql::compilePlans(parse("SELECT t.id FROM t JOIN t e ON t.id=e.id;"), catalog));
     require(hashed.plans[0].children[0].kind == "HashJoin", "equality inner join becomes hash join");
     require(std::any_of(hashed.changes.begin(), hashed.changes.end(), [](const auto& change) { return change.at("ruleId") == "hash-join"; }), "hash join rule recorded");
+    require(hashed.plans[0].children[0].optimizerDecision.at("candidates").size() == 2 &&
+        hashed.plans[0].children[0].optimizerDecision.at("selected") == "HashJoin", "join candidates and cost choice exposed");
+    optimizer::Options tinyJoin;
+    tinyJoin.tableRows["t"] = 1;
+    auto nestedChoice = optimizer::optimize(sql::compilePlans(parse("SELECT t.id FROM t JOIN t e ON t.id=e.id;"), catalog), tinyJoin);
+    require(nestedChoice.plans[0].children[0].kind == "NestedLoopJoin" &&
+        nestedChoice.plans[0].children[0].optimizerDecision.at("selected") == "NestedLoopJoin", "small inputs choose nested loop by cost");
+    optimizer::Options constrainedJoin;
+    constrainedJoin.tableRows["t"] = 1000;
+    constrainedJoin.memoryBudgetBytes = 1;
+    auto spillAware = optimizer::optimize(sql::compilePlans(parse("SELECT t.id FROM t JOIN t e ON t.id=e.id;"), catalog), constrainedJoin);
+    require(spillAware.plans[0].children[0].kind == "NestedLoopJoin" &&
+        spillAware.plans[0].children[0].optimizerDecision.at("estimatedBuildBytes").get<double>() > 1.0, "join cost accounts for memory spill budget");
     auto pruned = optimizer::optimize(sql::compilePlans(parse("SELECT name FROM t;"), catalog));
     require(pruned.plans[0].children[0].kind == "SeqScan" && pruned.plans[0].children[0].output.size() == 1 && pruned.plans[0].children[0].output[0].columnId == 1, "unused scan columns pruned");
     require(std::any_of(pruned.changes.begin(), pruned.changes.end(), [](const auto& change) { return change.at("ruleId") == "prune-columns"; }), "column pruning rule recorded");
     auto literalOnly = optimizer::optimize(sql::compilePlans(parse("SELECT 1 FROM t;"), catalog));
     require(literalOnly.plans[0].children[0].output.empty(), "literal-only projection prunes all scan columns");
+    auto aggregatePruned = optimizer::optimize(sql::compilePlans(parse("SELECT COUNT(id) FROM t;"), catalog));
+    require(aggregatePruned.plans[0].children[0].children[0].output.size() == 1 &&
+        aggregatePruned.plans[0].children[0].children[0].output[0].name == "id", "required columns propagate through aggregate");
+    auto aggregateStar = optimizer::optimize(sql::compilePlans(parse("SELECT COUNT(*) FROM t;"), catalog));
+    require(aggregateStar.plans[0].children[0].children[0].output.empty(), "COUNT star prunes unused aggregate input columns");
+    auto joinedColumns = optimizer::optimize(sql::compilePlans(parse("SELECT t.id FROM t JOIN t e ON t.id=e.id;"), catalog));
+    require(joinedColumns.plans[0].children[0].children[0].output.size() == 2 && joinedColumns.plans[0].children[0].children[1].output.size() == 2,
+        "join key and physical row boundaries are protected during pruning");
+    auto dmlColumns = optimizer::optimize(sql::compilePlans(parse("UPDATE t SET name='x' WHERE id=1;"), catalog));
+    require(dmlColumns.plans[0].children[0].children[0].output.size() == 2, "DML scan retains RowId and constraint columns");
     const std::vector<std::pair<std::string, nlohmann::json>> truthValues = {
         {"TRUE", true}, {"FALSE", false}, {"NULL", nullptr}
     };

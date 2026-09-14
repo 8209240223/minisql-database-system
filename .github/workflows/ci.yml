@@ -30,8 +30,8 @@ jobs:
         run: node tests/access-catalog-atomic-contract.mjs
       - name: 权限原子 HTTP 端点（X24）
         run: node tests/access-atomic-http.mjs
-      - name: SQL 对象引用扫描契约（X24）
-        run: node tests/sql-object-references-contract.mjs
+      - name: 绑定结果驱动鉴权契约（X25）
+        run: node tests/access-binding-process.mjs
       - name: Fuzz 生成器/缩减器契约（X27）
         run: node tests/fuzz-model-contract.mjs
       - name: 固定种子状态机语料（X27）
@@ -51,13 +51,17 @@ jobs:
         with:
           node-version: '24'
       - name: 安装依赖
-        run: npm ci || npm install
+        run: npm ci
       - name: 变更安全（整表变异提示）
         run: npm run test:safety
       - name: 查询历史
         run: npm run test:history
       - name: CSV 导出
         run: npm run test:csv
+      - name: SQL 格式化
+        run: npm run test:format
+      - name: 结果虚拟窗口
+        run: npm run test:virtual
       - name: 类型与构建
         run: npm run build
 
@@ -73,10 +77,31 @@ jobs:
         shell: pwsh
         working-directory: outputs/minisql-backend
         run: |
-          cmake --preset windows -DBUILD_TESTING=OFF
+          cmake --preset windows --fresh -DBUILD_TESTING=ON
           if ($LASTEXITCODE -ne 0) { throw 'CMake configuration failed.' }
           cmake --build --preset windows-release --parallel
           if ($LASTEXITCODE -ne 0) { throw 'CMake Release build failed.' }
+      - name: 同步构建产物到 bin（进程测试的约定位置）
+        shell: pwsh
+        working-directory: outputs/minisql-backend
+        run: |
+          # bin/ 被 .gitignore 忽略，43 个进程测试却从它读取可执行体。
+          # 不同步会让 CI 直接报"文件不存在"，或更糟——静默验证过时的预置副本。
+          New-Item -ItemType Directory -Force -Path bin | Out-Null
+          Copy-Item build/windows/Release/*.exe -Destination bin -Force
+          Copy-Item build/windows/Release/*.dll -Destination bin -Force -ErrorAction SilentlyContinue
+          # 测试引用的是构建产物原名，不做别名映射，避免静默 ENOENT。
+          $missing = Get-ChildItem tests -Recurse -Filter *.mjs | ForEach-Object {
+            $text = Get-Content -Raw -LiteralPath $_.FullName
+            [regex]::Matches($text, "'\.\./bin/([^']+)'") | ForEach-Object { $_.Groups[1].Value }
+          } | Sort-Object -Unique | Where-Object { -not (Test-Path -LiteralPath (Join-Path bin $_)) }
+          if ($missing) { throw "Tests reference binaries missing from bin/: $($missing -join ', ')" }
+      - name: C++ 注册测试
+        shell: pwsh
+        working-directory: outputs/minisql-backend
+        run: |
+          ctest --preset windows-release --no-tests=error
+          if ($LASTEXITCODE -ne 0) { throw 'CTest Release regression failed.' }
       - name: 安装工作台浏览器回归依赖
         run: npm ci
         working-directory: outputs/minisql-workbench
@@ -111,6 +136,15 @@ jobs:
           node tests/journal-process.mjs
           node tests/auto-checkpoint-smoke.mjs
           node tests/x22-fault-injection.mjs
+          node tests/wal-metadata-process.mjs
+          node tests/wal-group-commit.mjs
+          node tests/doublewrite-torn-page.mjs
+        working-directory: outputs/minisql-backend
+      - name: 需求契约回归（REQ-CORE-001/002、REQ-UI-010）
+        run: |
+          node tests/requirements-limits-process.mjs
+          node tests/requirements-http-contract.mjs
+          node tests/nesting-depth-process.mjs
         working-directory: outputs/minisql-backend
       - name: 索引规模回归（1000 行）
         env:
@@ -130,6 +164,7 @@ jobs:
           node tests/cancel-smoke.mjs
           node tests/x25-stream-http.mjs
           node tests/session-stream-process.mjs
+          node tests/query-resource-process.mjs
           node tests/backup-smoke.mjs
           node tests/backup-online-smoke.mjs
           node tests/x25-row-stream-contract.mjs

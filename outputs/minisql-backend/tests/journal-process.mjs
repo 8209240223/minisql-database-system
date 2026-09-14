@@ -3,7 +3,7 @@ import { mkdtempSync, readFileSync, writeFileSync, statSync, linkSync, unlinkSyn
 import { join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import assert from 'node:assert/strict';
-const executable = fileURLToPath(new URL('../bin/journal_probe.exe', import.meta.url));
+const executable = fileURLToPath(new URL('../bin/minisql_journal_probe.exe', import.meta.url));
 const directory = relative(process.cwd(), mkdtempSync(fileURLToPath(new URL('./artifacts/journal-', import.meta.url))));
 let checks = 0;
 function equal(actual, expected) { assert.deepEqual(actual, expected); ++checks; }

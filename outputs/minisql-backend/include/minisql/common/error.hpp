@@ -16,6 +16,9 @@ enum class ErrorCode {
     // 0 表示成功；1001 是调用参数不合法，1002 是配置文件有问题。
     Lexical = 2001, Syntax = 2002, Semantic = 2003,
     // 2001、2002、2003 分别对应编译器三阶段：词法、语法、语义。
+    // 第十七章规定的稳定符号错误码，errorType() 返回其符号名便于测试统计。
+    IntegerOutOfRange = 2004,   // SEM_INTEGER_OUT_OF_RANGE
+    PlanStaleSchema = 2005,     // PLAN_STALE_SCHEMA
     Catalog = 3001, Storage = 4001, Execution = 5001, Cancelled = 5002,
     // 3001 目录错误，4001 存储错误，5001 执行错误，5002 用户主动取消。
     Transaction = 6001, Permission = 7001, Network = 8001,

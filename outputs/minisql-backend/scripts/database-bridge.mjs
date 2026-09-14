@@ -12,8 +12,6 @@ import { createHash, randomUUID } from 'node:crypto';
 // 会话标识用随机 UUID；取消令牌用哈希。
 import { openSession } from './session-process.mjs';
 // 会话客户端：负责与数据库进程通信。
-import { firstKeyword, tableReferences } from './sql-object-references.mjs';
-// SQL 取对象名（词法兜底）。
 import { can, canConnect, defaultAccess, normalizeAccess, publicAccess,
   // 权限判定与权限目录的读取。
   createUser, dropUser, createRole, dropRole, setPassword, addRole, removeRole, grant, revoke } from './access-catalog.mjs';
@@ -115,44 +113,28 @@ const transactionWaiters = [];
 // 等待事务释放的排队者。
 const turnWaiters = [];
 // 等待执行权释放的排队者。
-function sqlPermissionChecks(mode, sql) {
-// 把"操作 + SQL"翻译成待检查的权限项（与 authorizer.mjs 里的映射保持一致）。
-  if (mode === 'catalog' || mode === 'statistics' || mode === 'buffer') return [{ permission: 'READ', object: '*' }];
-  // 目录、统计、缓冲池状态：只读且不针对具体对象。
-  if (mode === 'health' || mode === 'audit' || mode === 'capabilities') return [{ permission: 'READ', object: '*' }];
-  // 健康检查、审计、能力查询同样只读。
-  if (mode === 'close') return [{ permission: 'CONNECT', object: '*' }];
-  // 关闭会话需要连接权限。
-  const keyword = firstKeyword(sql);
-  // 取 SQL 的第一个关键字。
-  const objects = tableReferences(sql, keyword);
-  // 保守抽出涉及的表名。
-  let permission = 'COMPILE';
-  // 默认按"只编译"处理。
-  if (keyword === 'BEGIN' || keyword === 'COMMIT' || keyword === 'ROLLBACK' || keyword === 'CHECKPOINT') permission = 'TRANSACTION';
-  // 事务控制。
-  else if (keyword === 'CREATE') permission = 'CREATE';
-  // 建对象。
-  else if (keyword === 'DROP') permission = 'DROP';
-  // 删对象。
-  else if (keyword === 'SELECT' || keyword === 'INSERT' || keyword === 'UPDATE' || keyword === 'DELETE') permission = keyword;
-  // 四种数据语句用同名权限（这里关键字本身就是大写，直接可用）。
-  if (!objects.length) return [{ permission, object: '*' }];
-  // 识别不出对象时退化成检查通配对象，只会更严。
-  return objects.map(object => ({ permission, object }));
-  // 每个对象生成一条待检查项。
-}
-function authorizeSql(user, mode, sql) {
-// 按 SQL 做鉴权：任一项不通过就抛 403。
-  for (const check of sqlPermissionChecks(mode, sql)) {
-  // 逐项检查。
-    if (!can(access, user, check.permission, check.object)) {
-    // 缺权限。
-      throw httpError(403, 'Permission denied');
-      // 统一返回同一条错误信息，不透露具体缺什么。
-    }
+// 授权判定完全交给 C++ 绑定结果：bridge 不再读取或扫描 SQL 文本。
+// 会话内取绑定供只读判定与审计用（不用于授权决策）。
+async function bindAccessForSql(sql, sessionRoute, user, password) {
+  if (sessionRoute) {
+    const session = sessions.get(sessionRoute[1]);
+    if (!session) throw httpError(404, 'Session not found or expired');
+    if (session.user !== user) throw httpError(403, 'Permission denied');
+    return enqueue(async () => {
+      const currentEngine = await ensureEngine();
+      return currentEngine.worker.request('bindAccess', sql, { sessionId: session.id, cancelFile: session.cancelFile, user: session.user, password: session.password ?? '' });
+    });
   }
-  // 全部通过。
+  return callDatabase('bindAccess', sql, {}, { user, password });
+}
+const READ_ONLY_ACTIONS = new Set(['select', 'read', 'compile']);
+// 流式入口只读兜底：同样只看绑定结果，不看 SQL 文本。
+function readOnlyBinding(binding) {
+  if (!binding || binding.success === false) return { allowed: false, message: binding?.error?.message ?? 'Permission denied' };
+  const allowed = binding.bound === true && READ_ONLY_ACTIONS.has(String(binding.statementAction ?? '').toLowerCase()) &&
+    (binding.objects ?? []).every(object => READ_ONLY_ACTIONS.has(String(object.action ?? '').toLowerCase()));
+  if (!allowed) return { allowed: false, message: 'Streaming endpoint accepts read-only SELECT or EXPLAIN SQL' };
+  return { allowed: true, objects: [...new Set((binding.objects ?? []).map(object => String(object.object).toLowerCase()))] };
 }
 const backupDirectory = resolve(process.env.MINISQL_BACKUP_DIR ?? resolve(dirname(database), 'backups'));
 // 备份目录：环境变量可覆盖，默认放在数据库文件旁边的 backups 子目录。
@@ -164,6 +146,16 @@ mkdirSync(cancelDirectory, { recursive: true });
 // 确保目录存在。
 function sessionCancelFile(id) { return resolve(cancelDirectory, `${id}.cancel`); }
 // 由会话编号推出它的取消令牌文件路径。
+// 序列化计划的受权对象来自已解析的计划节点本身，不做任何 SQL 文本扫描。
+function collectPlanTables(document) {
+  const rows = Array.isArray(document) ? document
+    : document && typeof document === 'object' && Array.isArray(document.plans) ? document.plans : [];
+  const tables = new Set();
+  for (const row of rows) {
+    if (row && typeof row === 'object' && typeof row.table === 'string' && row.table) tables.add(row.table.toLowerCase());
+  }
+  return [...tables];
+}
 function clearCancelFile(file) { if (file) { try { unlinkSync(file); } catch { /* The token may already be absent. */ } } }
 // 删除取消令牌文件；文件本来就不存在不算错误（注释里写明了这一点）。
 function backupName(raw) {
@@ -929,6 +921,7 @@ function touchSession(session) {
     // 长请求、锁等待和当前轮次都不能被空闲回收中断；事务持有者则由 closeSession 回滚后回收。
     // 这条注释说明了下面这个判断的理由：正在干活的会话不能因为"看起来空闲"被回收，
     // 否则一个跑了两分钟的查询会被误杀。
+    // 长请求、锁等待和当前轮次都不能被空闲回收中断；事务持有者则由 closeSession 回滚后回收。
     if (session.activeRequest || session.waiting || turnOwner === session.id) {
     // 三种"其实很忙"的状态。
       touchSession(session);
@@ -944,13 +937,19 @@ function touchSession(session) {
   // 空闲时长取配置值。
 }
 
-function callDatabase(mode, sql = '', extraEnv = {}) {
-// 以一次性子进程的方式调用数据库（用于不需要保持会话的短操作）。
+function callDatabase(mode, sql = '', extraEnv = {}, authorization = null) {
   return new Promise((resolveResult, reject) => {
   // 返回 Promise，由子进程结果决定兑现或拒绝。
-    const child = spawn(executable, [database, mode], { windowsHide: true, env: { ...process.env, ...extraEnv, MINISQL_AUTH_BYPASS: '1' } });
-    // 启动子进程；MINISQL_AUTH_BYPASS=1 是因为鉴权已在本层完成，
-    // 再让子进程按环境变量做一次认证只会重复且拿不到凭据。
+    // authorization 为空表示 bridge 内部调用（备份/恢复/健康检查）自己承担授权；
+    // 否则把身份透传给引擎，由引擎按绑定结果判定对象权限。
+    const env = { ...process.env, ...extraEnv, MINISQL_ACCESS_FILE: accessPagesFile };
+    if (authorization) {
+      env.MINISQL_USER = authorization.user ?? '';
+      env.MINISQL_PASSWORD = authorization.password ?? '';
+    } else {
+      env.MINISQL_AUTH_BYPASS = '1';
+    }
+    const child = spawn(executable, [database, mode], { windowsHide: true, env });
     const output = [];
     // 累积标准输出。
     let length = 0, stopped = false;
@@ -1004,10 +1003,11 @@ function callDatabase(mode, sql = '', extraEnv = {}) {
   });
   // Promise 构造结束。
 }
-
 // 所有读写共用队列；无事务锁时禁止多个进程同时打开同一数据库。
 // 这句话是下面这个队列存在的核心理由：同一个数据库文件不允许被两个进程同时打开，
 // 所以任何会碰到文件的操作用一条全局队列串起来。
+
+// 所有读写共用队列；无事务锁时禁止多个进程同时打开同一数据库。
 function enqueue(operation, allowQuarantined = false) {
 // 把操作排进全局队列。
   if (queued >= 64) return Promise.reject(new Error('Request queue full'));
@@ -1280,16 +1280,16 @@ const server = http.createServer(async (req, res) => {
     // 写响应头。
     const write = value => new Promise((resolve, reject) => {
     // 写一条消息，返回 Promise 以便调用方 await（实现背压控制）。
-      if (res.destroyed || res.writableEnded) { reject(httpError(499, 'Stream client disconnected')); return; }
-      // 客户端已断开就拒绝，让上游停止继续计算。
+      // Closing a streaming response is the normal client-cancellation path. The
+      // response close listener signals the engine through its cancel file.
+      if (res.destroyed || res.writableEnded) { resolve(false); return; }
       const finish = error => {
       // 本次写入结束的收尾：摘掉监听器。
         res.off('drain', onDrain);
         // 摘掉 drain 监听。
         res.off('error', onError);
         // 摘掉 error 监听。
-        if (error) reject(error); else resolve();
-        // 有错就拒绝，否则兑现。
+        if (error) reject(error); else resolve(true);
       };
       const onDrain = () => finish();
       // 缓冲区排空时算写完。
@@ -1387,6 +1387,7 @@ const server = http.createServer(async (req, res) => {
     // 任何失败（JSON 非法、目录不合法）都回 400 并带上原因。
     return;
   }
+  // X24 原子权限资源接口：每个端点对应一次原子变更，失败不产生部分状态。
 
   // X24 原子权限资源接口：每个端点对应一次原子变更，失败不产生部分状态。
   const readJson = async () => {
@@ -1536,8 +1537,12 @@ const server = http.createServer(async (req, res) => {
       // 时间间隔阈值，以及"WAL 以已提交日志字节数计"这一口径说明。
       autoCheckpointEvaluation: 'after-successful-commit', streamingResults: true, streamingFormat: 'ndjson', streamingReadOnly: true,
       // 自动检查点的评估时机（成功提交之后），以及流式结果的格式与"只读"约束。
-      maxResultRows: Number(process.env.MINISQL_MAX_RESULT_ROWS ?? 0), externalSort: true, sortSpill: true, sortSpillEncoding: 'jsonl', sortArtifactIdentity: 'session-query-sort', sortChecksum: 'fnv1a64', externalAggregate: true, aggregateSpill: true, aggregateSpillEncoding: 'jsonl',
-      // 结果行数上限；外部排序与其落盘编码、临时文件标识、校验算法；外部聚合与其落盘编码。
+      maxResultRows: Number(process.env.MINISQL_MAX_RESULT_ROWS ?? 100000),
+      queryMemoryBytes: Number(process.env.MINISQL_QUERY_MEMORY_BYTES ?? 64 * 1024 * 1024),
+      tempDiskBytes: Number(process.env.MINISQL_TEMP_DISK_BYTES ?? 1024 * 1024 * 1024),
+      externalSort: true, sortSpill: true, sortSpillEncoding: 'jsonl', sortArtifactIdentity: 'session-query-sort', sortChecksum: 'fnv1a64',
+      externalAggregate: true, aggregateSpill: true, aggregateSpillEncoding: 'jsonl',
+      distinctSpill: true, joinSpill: true, queryResourceManager: true,
       integerEncoding: 'safe-number-or-decimal-string',
       // 大整数编码约定：安全范围内用 JSON number，超出则用十进制字符串。
       decimalExpressions: true, decimalColumns: true, decimalEncoding: 'fixed-scale-string',
@@ -1568,20 +1573,22 @@ const server = http.createServer(async (req, res) => {
       // 口令方案、审计过滤、会话身份绑定。
       indexPageStorage: true,
       // 索引页级存储。
-      capabilities: ['backupRestore', 'backupIncremental', 'backupChain', 'backupMigration', 'permissions', 'audit', 'create', 'insert', 'multiRowInsert', 'select', 'delete', 'update', 'arithmetic', 'projection', 'tableAlias', 'innerJoin', 'leftJoin', 'null', 'notNull', 'bigint', 'float', 'default', 'primaryKey', 'unique', 'compositeKey', 'distinct', 'orderBy', 'limit', 'groupBy', 'having', 'count', 'sum', 'min', 'max', 'avg', 'compile', 'diagnostics', 'inSubquery', 'existsSubquery', 'scalarSubquery', 'correlatedSubquery', 'astRoundTrip', 'planRoundTrip', 'hashJoin', 'predicatePushdown', 'pruneColumns', 'statistics', 'createIndex', 'indexScan', 'uniqueIndex', 'indexPersistence', 'indexSnapshots', 'indexPageStorage', 'checkpoint', 'nodeStatistics', 'optimizer', 'storageStats', 'externalSort', 'sortSpill', 'externalAggregate', 'aggregateSpill', 'cancellation', 'streamingResults', 'autoCheckpoint', 'multiSession', 'sessionRegistry', 'health'] });
-      // 一份扁平的能力清单：备份、权限、增删改查、各类类型与约束、
-      // 子查询四种形态、AST/计划往返、优化规则、索引、检查点、排序聚合落盘、取消、流式与健康检查。
+      indexVerify: true, indexRebuild: true, indexConsistencyCheck: true,
+      uniqueIndexBuildPhases: ['build', 'validate', 'publish'], indexIncrementalMaintenance: true,
+      capabilities: ['backupRestore', 'backupIncremental', 'backupChain', 'backupMigration', 'permissions', 'audit', 'create', 'insert', 'multiRowInsert', 'select', 'delete', 'update', 'arithmetic', 'projection', 'tableAlias', 'innerJoin', 'leftJoin', 'null', 'notNull', 'bigint', 'float', 'default', 'primaryKey', 'unique', 'compositeKey', 'distinct', 'orderBy', 'limit', 'groupBy', 'having', 'count', 'sum', 'min', 'max', 'avg', 'compile', 'diagnostics', 'inSubquery', 'existsSubquery', 'scalarSubquery', 'correlatedSubquery', 'astRoundTrip', 'planRoundTrip', 'hashJoin', 'predicatePushdown', 'pruneColumns', 'statistics', 'createIndex', 'indexScan', 'uniqueIndex', 'indexPersistence', 'indexSnapshots', 'indexPageStorage', 'checkpoint', 'nodeStatistics', 'optimizer', 'storageStats', 'externalSort', 'sortSpill', 'externalAggregate', 'aggregateSpill', 'distinctSpill', 'joinSpill', 'queryResourceManager', 'cancellation', 'streamingResults', 'autoCheckpoint', 'multiSession', 'sessionRegistry', 'health'] });
     return;
   }
   // /api/capabilities 分支结束。
-  if (req.method === 'GET' && req.url === '/api/storage') {
-  // 存储信息：直接读数据库文件大小并折算页数。
+  // 第十九章 REQ-UI-010 列出的是 GET /api/storage/stats；/api/storage 为既有兼容路径。
+  if (req.method === 'GET' && (req.url === '/api/storage' || req.url === '/api/storage/stats')) {
     try {
     // 文件可能不存在。
       const bytes = statSync(database).size;
       // 取文件字节数。
-      send(200, { pageSize: 4096, fileBytes: bytes, allocatedPages: Math.ceil(bytes / 4096), buffer: { available: false }, policy: 'backend-not-exposed' });
-      // 返回页大小、字节数、折算页数；缓冲池明细不暴露给前端（policy 字段说明原因）。
+      // 未接通的能力明确标记不可用，不伪造零值；缓存明细走 /api/sessions/:id/buffer。
+      send(200, { pageSize: 4096, fileBytes: bytes, allocatedPages: Math.ceil(bytes / 4096),
+        buffer: { available: false, reason: 'backend-not-exposed', endpoint: '/api/sessions/:id/buffer' },
+        policy: 'backend-not-exposed' });
     } catch (error) { send(503, { error: { message: error instanceof Error ? error.message : String(error) } }); }
     // 读不到文件时回 503（服务暂时无法提供该信息）。
     return;
@@ -1997,9 +2004,8 @@ const server = http.createServer(async (req, res) => {
       // 这个会话正好有操作在跑。
         writeFileSync(activeOperation.cancelFile, 'cancel\n', 'utf8');
         // 写取消令牌：数据库进程会轮询到它并主动停止当前语句。
-        send(202, { success: false, cancelled: true, commitState: 'unknown', error: { code: 5002, message: 'Cancellation requested' } });
-        // 202 表示"已接受取消请求"；commitState 明确标成 unknown，
-        // 因为语句被中断时它有没有提交完是不知道的，调用方必须据此谨慎处理。
+        send(202, { success: false, cancelled: true, commitState: 'unknown', transactionState: session.transactionState,
+          error: { code: 5002, message: 'Cancellation requested' } });
         return;
       }
       // 运行中分支结束。
@@ -2021,8 +2027,8 @@ const server = http.createServer(async (req, res) => {
           // 立刻唤醒，让它重新走 acquireTurn 从而看到取消标记。
         }
         // 队列处理结束。
-        send(202, { success: false, cancelled: true, error: { code: 5002, message: 'Cancellation requested' } });
-        // 这一种取消是干净的：语句还没开始执行，所以不涉及提交状态未知。
+        send(202, { success: false, cancelled: true, transactionState: session.transactionState,
+          error: { code: 5002, message: 'Cancellation requested' } });
         return;
       }
       // 等待分支结束。
@@ -2033,16 +2039,13 @@ const server = http.createServer(async (req, res) => {
     return;
   }
   // 取消路由分支结束。
-  const inspectRoute = req.url?.match(/^\/api\/sessions\/([a-zA-Z0-9-]+)\/index-inspect$/);
-  // 匹配索引结构检查路由。
-  if (inspectRoute) {
-  // 索引检查处理。
+  const indexRoute = req.url?.match(/^\/api\/sessions\/([a-zA-Z0-9-]+)\/index-(inspect|verify|rebuild)$/);
+  if (indexRoute) {
     req.resume();
     // 先把请求流读掉再检查方法，避免连接因为未消费的流而挂住。
-    if (req.method !== 'POST') { send(405, { success: false, error: { code: 405, message: 'Index inspection requires POST' } }); return; }
-    // 必须用 POST。
-    const session = sessions.get(inspectRoute[1]);
-    // 找会话。
+    const action = indexRoute[2];
+    if (req.method !== 'POST') { send(405, { success: false, error: { code: 405, message: `Index ${action} requires POST` } }); return; }
+    const session = sessions.get(indexRoute[1]);
     if (!session) { send(404, { success: false, error: { code: 404, message: 'Session not found or expired' } }); return; }
     // 会话不存在。
     if (session.user !== requestUser) { send(403, { success: false, error: { code: 7001, message: 'Permission denied' } }); return; }
@@ -2057,16 +2060,52 @@ const server = http.createServer(async (req, res) => {
       // 严格解码后解析。
       if (typeof body.table !== 'string' || typeof body.index !== 'string') throw httpError(400, 'Expected table and index strings');
       // 表和索引都必须是字符串。
-      if (!can(access, requestUser, 'READ', body.table)) throw httpError(403, 'Permission denied');
-      // 针对具体表检查 READ 权限（索引结构属于表的信息）。
-      auditSql = `INDEX INSPECT ${body.table}.${body.index}`;
-      // 审计里记一个可读的操作描述（而不是空的 SQL）。
+      // 结构检查只读；在线重建改写索引页，按对象写权限（UPDATE）收紧。
+      const permission = action === 'rebuild' ? 'UPDATE' : 'READ';
+      if (!can(access, requestUser, permission, body.table)) throw httpError(403, 'Permission denied');
+      auditSql = `INDEX ${action.toUpperCase()} ${body.table}.${body.index}`;
       auditObjects = [body.table.toLowerCase()];
       // 记下访问的对象（统一小写，便于按对象过滤审计）。
-      const data = await runSessionOperation(session, 'indexInspect', '', res, { table: body.table, index: body.index });
-      // 通过会话通道执行检查。
-      send(data.success === false ? (quarantined ? 503 : 422) : 200, data);
-      // 成功回 200；失败时按"是否隔离"区分 503 与 422。
+      const operation = action === 'inspect' ? 'indexInspect' : action === 'verify' ? 'indexVerify' : 'indexRebuild';
+      const data = await runSessionOperation(session, operation, '', res, { table: body.table, index: body.index });
+      send(data.success === false ? (data.error?.code === 7001 ? 403 : quarantined ? 503 : 422) : 200, data);
+    } catch (error) { send(error.status ?? 400, { success: false, error: { message: error instanceof Error ? error.message : String(error) } }); }
+    return;
+  }
+  // 第十七章 REQ-CORE-002：执行已序列化的计划文档；指纹失效由引擎返回 PLAN_STALE_SCHEMA。
+  const planRoute = req.url?.match(/^\/api\/sessions\/([a-zA-Z0-9-]+)\/execute-plan$/);
+  if (planRoute) {
+    if (req.method !== 'POST') { send(405, { success: false, error: { code: 405, message: 'Plan execution requires POST' } }); return; }
+    const session = sessions.get(planRoute[1]);
+    if (!session) { send(404, { success: false, error: { code: 404, message: 'Session not found or expired' } }); return; }
+    if (session.user !== requestUser) { send(403, { success: false, error: { code: 7001, message: 'Permission denied' } }); return; }
+    try {
+      const chunks = [];
+      let length = 0;
+      for await (const chunk of req) {
+        length += chunk.length;
+        if (length > 8 * 1024 * 1024) { send(413, { error: { message: 'Request exceeds 8 MiB' } }); return; }
+        chunks.push(chunk);
+      }
+      let body;
+      try { body = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks))); }
+      catch { send(400, { success: false, error: { code: 400, message: 'Invalid JSON body' } }); return; }
+      if (!body || body.plan === undefined || body.plan === null) {
+        send(400, { success: false, error: { code: 400, message: 'Expected a serialized plan document' } }); return;
+      }
+      // 形状先在这里判为请求不合法（400）；引擎侧仍会 fail-closed 兜底。
+      const planArray = Array.isArray(body.plan);
+      const planWrapped = !planArray && typeof body.plan === 'object' && Array.isArray(body.plan.plans);
+      if (!planArray && !planWrapped) {
+        send(400, { success: false, error: { code: 400, message: 'Expected a serialized plan document (node array or { plans: [...] })' } }); return;
+      }
+      auditSql = 'EXECUTE PLAN';
+      const tables = collectPlanTables(body.plan);
+      if (tables.length) auditObjects = tables;
+      const data = await runSessionOperation(session, 'executePlan', '', res, { plan: body.plan });
+      send(data.success === false
+        ? (data.error?.code === 7001 ? 403 : data.error?.code === 9001 ? 501 : quarantined ? 503 : 422)
+        : 200, data);
     } catch (error) { send(error.status ?? 400, { success: false, error: { message: error instanceof Error ? error.message : String(error) } }); }
     // 异常时用错误自带状态码，默认 400。
     return;
@@ -2126,27 +2165,19 @@ const server = http.createServer(async (req, res) => {
         // 记下 SQL。
         auditSql = sql.slice(0, 4096);
         // 审计里只记前 4096 个字符（防止超长 SQL 把审计撑爆）。
-        auditObjects = tableReferences(sql, firstKeyword(sql));
-        // 解析出涉及的对象，写进审计。
-        if (streamed && firstKeyword(sql) !== 'SELECT' && firstKeyword(sql) !== 'EXPLAIN') {
-        // 流式接口只允许只读语句。
-          send(400, { success: false, error: { code: 400, message: 'Streaming endpoint accepts read-only SELECT or EXPLAIN SQL' } }); return;
-          // 拒绝并说明原因——这条限制在 capabilities 里也标明了 streamingReadOnly: true。
-        }
-        // 只读检查结束。
-        try { authorizeSql(requestUser, mode, sql); }
-        // 按 SQL 鉴权。
-        catch (error) { send(403, { success: false, error: { code: 7001, message: 'Permission denied' } }); return; }
-        // 失败统一回 7001。
       } catch { send(400, { error: { message: 'Expected UTF-8 JSON with a sql string' } }); return; }
       // 解析失败回 400。
+      if (streamed) {
+        // 只读兜底也只看绑定结果：一旦出现写动作，就在开始分帧前拒绝。
+        let binding;
+        try { binding = await bindAccessForSql(sql, sessionRoute, requestUser, requestPassword); }
+        catch (error) { send(error.status ?? 400, { success: false, error: { message: error.message } }); return; }
+        const readOnly = readOnlyBinding(binding);
+        if (!readOnly.allowed) { send(400, { success: false, error: { code: 400, message: readOnly.message } }); return; }
+        if (readOnly.objects.length) auditObjects = readOnly.objects;
+      }
     }
     // 读体分支结束。
-    try { authorizeSql(requestUser, mode, sql); }
-    // 对不需要 SQL 的模式（catalog/statistics/close）在这个位置统一鉴权；
-    // 需要 SQL 的模式上面已经鉴过一次，这里重复调用是幂等的。
-    catch (error) { send(403, { success: false, error: { code: 7001, message: 'Permission denied' } }); return; }
-    // 失败统一回 7001。
     const started = performance.now();
     // 记下开始时间，用于回报耗时。
     const data = await (async () => {
@@ -2175,8 +2206,7 @@ const server = http.createServer(async (req, res) => {
           // disconnected 定义结束。
           res.once('close', disconnected);
           // 监听断开。
-          try { return await callDatabase(mode, sql, { MINISQL_CANCEL_FILE: cancelFile }); }
-          // 把取消文件路径通过环境变量传给子进程，然后执行。
+          try { return await callDatabase(mode, sql, { MINISQL_CANCEL_FILE: cancelFile }, { user: requestUser, password: requestPassword ?? '' }); }
           finally { res.off('close', disconnected); clearCancelFile(cancelFile); }
           // 收尾：摘掉监听并删掉令牌文件。
         });
@@ -2214,8 +2244,7 @@ const server = http.createServer(async (req, res) => {
             // 带上总行数、资源用量与当前事务状态。
           else if (frame.type === 'error') await streamOutput.write({ type: 'error', success: false,
             // 错误帧。
-            error: frame.error, commitState: frame.commitState, transactionState: session.transactionState });
-            // 带上错误、提交状态与事务状态——commitState 是调用方判断"要不要人工检查"的关键。
+            error: frame.error, transactionState: session.transactionState });
         },
         // 回调结束。
       } : {});
@@ -2228,8 +2257,17 @@ const server = http.createServer(async (req, res) => {
       // 没有 SELECT 权限的表不出现在列表里——连"库里有这张表"都不让看到。
     }
     // 过滤结束。
-    const status = data.success === false ? (quarantined ? 503 : 422) : 200;
-    // 成功回 200；失败时按"是否隔离"区分 503 与 422。
+    const resourceLimited = data.error?.code === 5001 && /budget exceeded/i.test(data.error?.message ?? '');
+    // 审计对象来自引擎绑定结果；权限/只读错误按语义映射到 403/400。
+    if (Array.isArray(data?.accessObjects) && data.accessObjects.length)
+      auditObjects = data.accessObjects.map(object => String(object).toLowerCase());
+    const permissionDenied = data.error?.code === 7001;
+    const readOnlyViolation = !permissionDenied && /read-?only/i.test(data.error?.message ?? '');
+    // 第十七章：未实现的能力不得伪装成成功，统一按 501 返回。
+    const notImplemented = !permissionDenied && data.error?.code === 9001;
+    const status = data.success === false
+      ? (permissionDenied ? 403 : readOnlyViolation ? 400 : notImplemented ? 501 : quarantined ? 503 : resourceLimited ? 413 : 422)
+      : 200;
     const response = mode === 'catalog' || mode === 'buffer' || mode === 'diagnostics' || mode === 'statistics' ? data : queryResult(data, performance.now() - started);
     // 这四种模式的结果本身就是最终形态；其余模式要经过 queryResult 整理。
     if (data.success === false && data.completedStatements > 0) {
@@ -2276,6 +2314,9 @@ const server = http.createServer(async (req, res) => {
 // 即使失败也只进入降级模式（健康检查报 degraded、引擎相关路由返回 503），
 // 不依赖引擎的管理端点保持可用（供管理员恢复）。
 // 这样 access/audit/capabilities 这些不依赖引擎的管理端点仍然可用，管理员才有机会修复。
+// 启动预热：尝试加载一次引擎 Catalog。若引擎二进制缺失或损坏，服务器仍进入降级
+// 模式（健康检查报 degraded、引擎路由返回 503），使 access/audit/capabilities 等
+// 不依赖引擎的管理端点保持可用（供管理员恢复）。
 try { await callDatabase('catalog'); }
 // 试读目录。
 catch { quarantined = true; }

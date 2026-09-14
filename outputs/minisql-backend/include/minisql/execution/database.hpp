@@ -11,7 +11,9 @@
 #include <unordered_map>
 #include <vector>
 #include "minisql/catalog/persistent_catalog.hpp"
+#include "minisql/security/access_catalog.hpp"
 #include "minisql/sql/planner.hpp"
+#include "minisql/optimizer/optimizer.hpp"
 #include "minisql/storage/bplus_tree.hpp"
 #include "minisql/execution/executor.hpp"
 
@@ -27,6 +29,10 @@ public:
     // 执行一条 SQL 并返回完整结果（JSON）。
     nlohmann::json executeScript(const std::string& sql, bool optimize = true);
     // 执行一段包含多条语句的脚本。
+    // 第十七章 REQ-CORE-002：执行已序列化的逻辑计划文档。计划携带编译期
+    // Catalog 指纹；与当前 Catalog 不一致时拒绝执行并返回 PLAN_STALE_SCHEMA，
+    // 绝不按旧列偏移访问新数据（调用方应重新编译）。
+    nlohmann::json executeSerializedPlan(const nlohmann::json& document);
     nlohmann::json executeStreaming(const std::string& sql,
     // 流式执行：先回调元数据，再对每一行回调一次。
                                     const std::function<void(const nlohmann::json&)>& emitMeta,
@@ -35,12 +41,12 @@ public:
                                     // （承接上一行）emitRow 每行调用一次，回调返回 false 即中止执行并释放资源。
     const char* transactionState() const;
     // 返回当前事务状态（Idle / Active / Aborted），供会话层展示。
-    nlohmann::json compile(const std::string& sql) const;
-    // 只做编译（解析、语义校验、生成计划）而不执行，用于 EXPLAIN 与测试。
-    // 解析并通过当前 Catalog 规范化 SQL 实际访问的基础表对象。
-    // 解析并借助当前目录，把 SQL 实际访问的基础表对象名规范化出来。
-    // 该结果供入口层权限校验使用，别名和派生表作用域不会被当成持久化对象。
-    // （承接上一行）该结果供入口层做权限校验；别名与派生表作用域不会被当成持久化对象。
+    nlohmann::json compile(const std::string& sql);
+    // X25：把 SQL 绑定成权限层可直接消费的请求。别名、派生表别名和 CTE 名是
+    // 作用域名，不会被当成持久化对象；绑定不闭合时返回 bound == false，
+    // 入口层据此 fail-closed 拒绝，不存在文本扫描兜底。
+    security::AccessRequest bindAccess(const std::string& sql) const;
+    // 兼容既有契约：按出现顺序去重的物理表名；绑定失败时为空。
     std::vector<std::string> resolveAccessObjects(const std::string& sql) const;
     // 返回实际访问的表对象列表。
     nlohmann::json diagnostics(const std::string& sql) const;
@@ -57,6 +63,11 @@ public:
     // 页级索引结构校验（页类型、height、keyCount、兄弟指针、叶链、根可达）。
     // 将已由入口层校验的权限快照同步到 PersistentCatalog 的保留系统表。
     // 把已经由入口层校验过的权限快照同步到目录的保留系统表。
+    // 堆表与索引的双向一致性检查：结构、行数、每行条目可达、每条目指向存活行。
+    nlohmann::json indexVerify(const std::string& table, const std::string& index);
+    // 在线重建单个索引：build → validate → publish，全程在写批次内，随事务原子提交/回滚。
+    nlohmann::json indexRebuild(const std::string& table, const std::string& index);
+    // 将已由入口层校验的权限快照同步到 PersistentCatalog 的保留系统表。
     void synchronizeAccessCatalog(const nlohmann::json& document, std::uint32_t permissionVersion);
     // （承接上一行）document 是权限目录本体，permissionVersion 是版本号。
     const std::optional<catalog::AccessCatalogRecord>& accessCatalogRecord() const { return catalog_.accessCatalogRecord(); }
@@ -73,10 +84,12 @@ private:
     nlohmann::json bufferStatus() const;
     // 返回缓冲池状态（帧数、命中率、淘汰记录等）。
     // X18: 实时单遍扫描的表/列/索引统计；ANALYZE 用它生成快照，statistics() 无快照时回退到它。
+    // X18: 实时单遍扫描的表/列/索引统计；ANALYZE 用它生成快照，statistics() 无快照时回退到它。
     nlohmann::json liveTableStatistics();
     // X18：实时单遍扫描得到的表、列、索引统计。
     // ANALYZE 快照旁路文件（<db>.analyze.json）：读、写路径与失效删除。
     // （承接上文）ANALYZE 用它生成快照；没有快照时 statistics() 回退到它。
+    // ANALYZE 快照旁路文件（<db>.analyze.json）：读、写路径与失效删除。
     std::filesystem::path analyzeMetadataPath() const;
     // ANALYZE 快照旁路文件（<db>.analyze.json）的路径。
     std::optional<nlohmann::json> loadAnalyzeMetadata() const;
@@ -111,6 +124,7 @@ private:
     // 若数据库不可用则直接报错。
     void checkCancelled() const;
     // 检查是否收到取消请求，收到就抛出取消错误。
+    optimizer::Options optimizerOptions();
     nlohmann::json runStatement(const sql::LogicalPlan& plan);
     // 执行一条语句对应的计划。
     nlohmann::json run(const sql::LogicalPlan& plan);
@@ -124,6 +138,8 @@ private:
     // X09 3.5: 相关子查询按 subquerySql 缓存已解析 AST，执行时以 by-value 参数
     // 绑定替换外层列（不再逐行文本重解析）。值会在 run 时以当前 catalog 重新编译。
     // X09 3.5：相关子查询按 subquerySql 缓存已经解析好的 AST。
+    // X09 3.5: 相关子查询按 subquerySql 缓存已解析 AST，执行时以 by-value 参数
+    // 绑定替换外层列（不再逐行文本重解析）。值会在 run 时以当前 catalog 重新编译。
     std::unordered_map<std::string, std::vector<sql::Statement>> correlatedAstCache_;
     // （承接上文）执行时以按值参数绑定替换外层列，不再逐行重新做文本解析。
     // X09 3.4: 相关子查询「保守执行优化」——等值/确定性相关的 EXISTS/IN/标量按绑定
@@ -134,6 +150,10 @@ private:
     // 以 (subquerySql|scope) 为形状缓存外层列引用。
     // 缓存生命周期仅在单条语句内（runStatement/EXPLAIN ANALYZE 入口清空）。
     // 以 (shape|绑定值) 缓存结果行；缓存生命周期仅在单条语句内，入口处清空。
+    // X09 3.4: 相关子查询「保守执行优化」——等值/确定性相关的 EXISTS/IN/标量按绑定
+    // 参数分组，对每个不同参数物化子查询一次（collection 语义半连接），避免重复执行。
+    // 以 (subquerySql|scope) 为形缓存外层列引用，以 (shape|绑定值) 缓存结果行；
+    // 缓存生命周期仅在单条语句内（runStatement/EXPLAIN ANALYZE 入口清空）。
     std::unordered_map<std::string, std::vector<std::size_t>> correlatedColumnsCache_;
     // 缓存：形状到外层列下标列表的映射。
     std::unordered_map<std::string, nlohmann::json> correlatedRowsCache_;
@@ -144,6 +164,11 @@ private:
     // 排序算子的内存行数上限，超过就溢出到磁盘。
     std::size_t aggregateMemoryRows_ = 10000;
     // 聚合算子的内存行数上限。
+    std::size_t distinctMemoryRows_ = 10000;
+    std::size_t joinMemoryRows_ = 10000;
+    std::size_t queryMemoryBytes_ = 64 * 1024 * 1024;
+    std::uint64_t tempDiskBytes_ = 1024ull * 1024ull * 1024ull;
+    std::shared_ptr<QueryResourceManager> activeResources_;
     std::size_t autoCheckpointWrites_ = 0;
     // 已提交写语句计数，用于触发自动检查点。
     std::uint64_t autoCheckpointWalBytes_ = 0;
@@ -154,8 +179,7 @@ private:
     // 脏页比例阈值。
     std::uint64_t autoCheckpointIntervalMs_ = 0;
     // 自动检查点的时间间隔（毫秒）。
-    std::size_t maxResultRows_ = 0;
-    // 单条语句最多返回多少行，0 表示不限制。
+    std::size_t maxResultRows_ = 100000;
     std::size_t pendingAutoCheckpointWrites_ = 0;
     // 待处理的自动检查点写语句数。
     std::uint64_t pendingAutoCheckpointWalBytes_ = 0;
@@ -218,6 +242,7 @@ private:
     // 排序临时文件名序号。
     std::uint64_t aggregateSequence_ = 0;
     // 聚合临时文件名序号。
+    std::uint64_t joinSequence_ = 0;
     struct RuntimeIndex;
     // 运行期索引句柄的前置声明。
     bool pageFileIndexes_ = true;   // 索引主路径引擎：true=页级 PageBPlusTree，false=内存 BPlusTree（MINISQL_INDEX_ENGINE=memory 时关闭）
@@ -226,6 +251,18 @@ private:
     // 已经打开的运行期索引。
     void rebuildIndexes(std::uint64_t tableId);
     // 重建某张表的全部索引。
+    void initializeIndexes(std::uint64_t tableId, bool forceRebuild, bool allowRebuild);
+    // 三阶段索引建造：build 从堆表全量构建条目，validate 校验结构与条目数；
+    // 通过后由调用方 publish（登记进 indexes_ 或目录）。返回校验问题，空表示通过。
+    std::vector<std::string> buildIndexEntries(RuntimeIndex& index, std::uint64_t tableId,
+                                               const storage::RowSchema& schema, std::size_t* entries);
+    // 堆与索引双向一致性检查（结构/条目数/缺失条目/悬挂条目）。
+    nlohmann::json verifyIndexConsistency(RuntimeIndex& index, std::uint64_t tableId,
+                                          const storage::RowSchema& schema);
+    void reloadIndexRuntimes();
+    void insertIndexEntries(std::uint64_t tableId, const storage::Row& row, storage::RowRef ref);
+    void eraseIndexEntries(std::uint64_t tableId, const storage::Row& row, storage::RowRef ref);
+    void persistMemoryIndexes(std::uint64_t tableId);
     std::string tableFingerprint(std::uint64_t tableId);
     // 计算表指纹，用于判断索引是否仍然匹配当前数据。
     std::uint64_t indexOwnerId(const std::string& table, const std::string& index) const;
@@ -234,10 +271,16 @@ private:
     // 清空属于该所有者的索引页。
     void persistIndexPages(storage::BPlusTree& tree, std::uint64_t owner, const std::string& fingerprint);
     // 把 B+ 树索引页持久化到页文件。
-    bool loadIndexPages(storage::BPlusTree& tree, std::uint64_t owner, const std::string& fingerprint);
-    // 从页文件加载 B+ 树索引页；指纹不匹配则放弃加载。
+    bool loadIndexPages(storage::BPlusTree& tree, std::uint64_t owner, const std::string& fingerprint,
+                        std::string* failure = nullptr);
     void validateUniqueIndexes(std::uint64_t tableId, const storage::Row& row, const std::optional<storage::RowRef>& ignored = std::nullopt);
     // 校验唯一索引约束；ignored 用于 UPDATE 时忽略被更新的行自身。
+    std::uint64_t indexFullRebuilds_ = 0;
+    std::uint64_t indexRuntimeReloads_ = 0;
+    std::uint64_t indexEntriesInserted_ = 0;
+    std::uint64_t indexEntriesErased_ = 0;
+    std::uint64_t indexOnlineRebuilds_ = 0;
+    std::uint64_t indexVerifications_ = 0;
     std::vector<storage::Row> joinRows(const sql::LogicalPlan& plan);
     // 执行连接算子，返回连接结果行。
     nlohmann::json aggregateRows(const sql::LogicalPlan& plan);

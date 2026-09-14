@@ -22,8 +22,20 @@ execute_process(COMMAND "${PROGRAM}" --check-config --page-size 3000
 if(code EQUAL 0 OR NOT error MATCHES "ConfigurationError")
     message(FATAL_ERROR "Invalid page size was not rejected")
 endif()
-execute_process(COMMAND "${PROGRAM}" --execute "SELECT 1;"
+string(RANDOM LENGTH 12 ALPHABET 0123456789abcdef run_id)
+set(run_root "${CMAKE_CURRENT_BINARY_DIR}/cli-smoke-${run_id}")
+execute_process(COMMAND "${PROGRAM}" --no-console
+    --data "${run_root}/data"
+    --wal-dir "${run_root}/wal"
+    --catalog-dir "${run_root}/catalog"
+    --log-dir "${run_root}/logs"
+    --execute "CREATE TABLE t(id INT); INSERT INTO t VALUES(7); SELECT * FROM t;"
     RESULT_VARIABLE code OUTPUT_VARIABLE output ERROR_VARIABLE error)
-if(code EQUAL 0 OR NOT error MATCHES "NotImplementedError")
-    message(FATAL_ERROR "Unimplemented SQL was not rejected")
+if(NOT code EQUAL 0)
+    message(FATAL_ERROR "SQL execution failed: ${code}: ${output} ${error}")
+endif()
+string(JSON succeeded GET "${output}" success)
+string(JSON selected GET "${output}" results 2 rows 0 0)
+if(NOT succeeded OR NOT selected EQUAL 7)
+    message(FATAL_ERROR "SQL execution returned an unexpected result: ${output}")
 endif()

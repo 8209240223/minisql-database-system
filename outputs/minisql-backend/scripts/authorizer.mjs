@@ -17,11 +17,6 @@ import {
 // 权限模型的唯一来源。
 import { openStore, pagesPathFor, readHeader, writeStore } from './access-store.mjs';
 // 页式持久化层的入口。
-import { firstKeyword, tableReferences } from './sql-object-references.mjs';
-// SQL 取对象名（词法兜底）的两个函数，用于把 SQL 映射成待检查的对象。
-
-export { firstKeyword, tableReferences };
-// 原样再导出，方便调用方只依赖本模块即可拿到这两件事。
 
 export const PERMISSION_DENIED_CODE = 7001;
 // 统一的权限拒绝错误码。调用方（CLI/HTTP）按它判断"这是权限问题"。
@@ -40,6 +35,7 @@ export class AccessDeniedError extends Error {
     // 业务错误码。
     // reason 只写审计日志，不回传给调用方。
     // 也就是说：外面看到"没有权限"就够，不需要知道是哪个对象导致的。
+    // reason 只写审计日志，不回传给调用方。
     this.reason = reason;
     // 内部原因挂在这里，仅供服务端自己使用。
   }
@@ -84,10 +80,11 @@ function requireObject(value) {
   return object;
   // 返回规范对象名。
 }
-
 /** 显式 GRANT/REVOKE 必须拒绝未知权限，不能像批量导入那样静默丢弃。 */
 // 这里的行为刻意与 normalizeAccess 不同：导入历史数据时可以宽容，
 // 但用户在命令行显式敲了一个不存在的权限名，必须报错而不是当作没写。
+
+/** 显式 GRANT/REVOKE 必须拒绝未知权限，不能像批量导入那样静默丢弃。 */
 function requirePermissions(raw) {
 // 把入参整理成合法的权限数组。
   const list = Array.isArray(raw) ? raw : [raw];
@@ -108,39 +105,38 @@ function requirePermissions(raw) {
   return permissions;
   // 返回权限列表。
 }
-
 // ---------------------------------------------------------------------------
 // SQL → 权限检查项映射（CLI 与 HTTP 共用，保证两条路径判定完全一致）
 // ---------------------------------------------------------------------------
 
-export function sqlPermissionChecks(mode, sql) {
-// 把"操作 + SQL"翻译成一串待检查的权限项，CLI 与 HTTP 两条路径共用这一份映射。
+// ---------------------------------------------------------------------------
+// 绑定结果 → 权限检查项映射（CLI 与 HTTP 共用，保证两条路径判定完全一致）
+//
+// 输入是 C++ 绑定器给出的 AccessRequest：statementAction 与每个对象的 action。
+// 本模块不再读取、不解析、也不扫描 SQL 文本；未绑定的语句一律 fail-closed。
+// ---------------------------------------------------------------------------
+
+export function permissionChecksFromBinding(binding, mode) {
   if (mode === 'catalog' || mode === 'statistics' || mode === 'buffer') return [{ permission: 'read', object: '*' }];
   // 目录、统计、缓冲池状态：只读，且不针对具体对象。
   if (mode === 'health' || mode === 'audit' || mode === 'capabilities') return [{ permission: 'read', object: '*' }];
   // 健康检查、审计查询、能力查询同样是只读。
   if (mode === 'close') return [{ permission: 'connect', object: '*' }];
   // 关闭会话需要连接权限。
-  const keyword = firstKeyword(sql);
-  // 取出 SQL 的第一个关键字（跳过注释与空白）。
-  const objects = tableReferences(sql, keyword);
-  // 保守地抽出这条语句涉及的表名。
-  let permission = 'compile';
-  // 默认权限是 compile：只编译不执行的路径按它算。
-  if (keyword === 'BEGIN' || keyword === 'COMMIT' || keyword === 'ROLLBACK' || keyword === 'CHECKPOINT') permission = 'transaction';
-  // 事务控制语句需要事务权限。
-  else if (keyword === 'CREATE') permission = 'create';
-  // 建对象需要 create 权限。
-  else if (keyword === 'DROP') permission = 'drop';
-  // 删对象需要 drop 权限。
-  else if (keyword === 'SELECT' || keyword === 'INSERT' || keyword === 'UPDATE' || keyword === 'DELETE') permission = keyword.toLowerCase();
-  // 四种数据语句各自对应同名权限（关键字本来就是大写，转小写后与权限名一致）。
-  if (!objects.length) return [{ permission, object: '*' }];
-  // 一个对象都没识别出来时退化成对通配对象的检查，
-  // 这样"解析不出来"只会更严格，不会绕过鉴权。
-  return objects.map(object => ({ permission, object }));
-  // 否则对每个对象分别生成一条待检查项。
+  if (!binding || binding.bound !== true) throw new AccessDeniedError('unbound-statement');
+  const compileOnly = mode === 'compile' || mode === 'diagnostics';
+  const permissionFor = action => {
+    const name = String(action ?? '').toLowerCase();
+    if (compileOnly && (name === 'select' || name === 'read')) return 'compile';
+    return name;
+  };
+  const objects = Array.isArray(binding.objects) ? binding.objects : [];
+  if (!objects.length) return [{ permission: permissionFor(binding.statementAction), object: '*' }];
+  return objects.map(object => ({ permission: permissionFor(object.action), object: String(object.object) }));
 }
+// ---------------------------------------------------------------------------
+// 审计脱敏
+// ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
 // 审计脱敏
@@ -148,9 +144,10 @@ export function sqlPermissionChecks(mode, sql) {
 
 const SENSITIVE_KEYS = /^(password|newPassword|oldPassword|hash|digest|salt|secret|token)$/i;
 // 需要脱敏的字段名（大小写不敏感）：各种口令、哈希、摘要、盐、密钥与令牌。
-
 /** 把 SQL 或请求体里的口令字面量替换掉，审计日志永远不落明文口令或散列。 */
 // 注意这里处理的是"文本里出现的口令字面量"，与下面按字段名脱敏是两种不同场景。
+
+/** 把 SQL 或请求体里的口令字面量替换掉，审计日志永远不落明文口令或散列。 */
 export function redactSql(sql) {
 // 对 SQL 文本做脱敏。
   return String(sql ?? '')
@@ -180,12 +177,19 @@ export function redactValue(value, depth = 0) {
   return output;
   // 返回脱敏后的对象。
 }
+// ---------------------------------------------------------------------------
+// Authorizer
+// ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
 // Authorizer
 // ---------------------------------------------------------------------------
 
 export class Authorizer {
+  /**
+   * @param {string} accessPath 旧 JSON 路径；页式文件由 pagesPathFor 推导
+   * @param {{ onChange?: (state) => void }} [options]
+   */
   /**
    * @param {string} accessPath 旧 JSON 路径；页式文件由 pagesPathFor 推导
    * @param {{ onChange?: (state) => void }} [options]
@@ -211,6 +215,7 @@ export class Authorizer {
     this.onChange = options.onChange;
     // 变更回调：每次权限变更后由调用方决定如何处理（例如通知会话重新鉴权）。
   }
+  /** 供 capabilities/诊断使用的存储描述。 */
 
   /** 供 capabilities/诊断使用的存储描述。 */
   describeStore() {
@@ -233,6 +238,7 @@ export class Authorizer {
       // 数据来源。
     };
   }
+  /** 从磁盘 META 页读取版本号，用于多进程（CLI 与 bridge 并存）时检测外部改动。 */
 
   /** 从磁盘 META 页读取版本号，用于多进程（CLI 与 bridge 并存）时检测外部改动。 */
   reloadIfStale() {
@@ -256,6 +262,7 @@ export class Authorizer {
     return true;
     // 告诉调用方"确实发生了外部改动"。
   }
+  // -- 判定 ---------------------------------------------------------------
 
   // -- 判定 ---------------------------------------------------------------
 
@@ -272,6 +279,7 @@ export class Authorizer {
     return { ok: true, user: name, permissionVersion: this.permissionVersion };
     // 通过时把规范用户名与当时的权限版本一起带出去。
   }
+  /** 认证失败时抛出与授权失败完全相同的错误，避免区分"用户不存在"与"口令错误"。 */
 
   /** 认证失败时抛出与授权失败完全相同的错误，避免区分"用户不存在"与"口令错误"。 */
   requireIdentity(user, password) {
@@ -289,6 +297,7 @@ export class Authorizer {
     return can(this.access, user, permission, object);
     // 直接转给权限目录模块的判定函数。
   }
+  /** @param {{permission: string, object?: string}[]} checks 全部通过才算通过。 */
 
   /** @param {{permission: string, object?: string}[]} checks 全部通过才算通过。 */
   authorize(user, checks) {
@@ -306,11 +315,10 @@ export class Authorizer {
     // 返回"本次鉴权所依据的权限版本"，调用方执行前要拿它再比一次。
   }
 
-  authorizeSql(user, mode, sql) {
-  // 按操作与 SQL 做鉴权（内部先用 sqlPermissionChecks 生成待查项）。
-    return this.authorize(user, sqlPermissionChecks(mode, sql));
-    // 返回权限版本。
+  authorizeBinding(user, mode, binding) {
+    return this.authorize(user, permissionChecksFromBinding(binding, mode));
   }
+  /** 目录/统计响应过滤：无 SELECT 权限的表不得出现在任何面向用户的列表里。 */
 
   /** 目录/统计响应过滤：无 SELECT 权限的表不得出现在任何面向用户的列表里。 */
   visibleTables(user, tables) {
@@ -330,6 +338,7 @@ export class Authorizer {
     return { ...publicAccess(this.access), permissionVersion: this.permissionVersion, store: this.describeStore().model };
     // publicAccess 已经保证不会泄露口令哈希，这里再补上版本与存储模型标识。
   }
+  /** 单个主体的有效权限视图，供工作台"为什么被拒绝"面板使用。 */
 
   /** 单个主体的有效权限视图，供工作台"为什么被拒绝"面板使用。 */
   describeSubject(user) {
@@ -354,6 +363,11 @@ export class Authorizer {
       // 这份视图对应的权限版本，便于前端判断是否需要刷新。
     };
   }
+  // -- 原子变更 -----------------------------------------------------------
+  /**
+   * 在克隆上应用变更，规范化（含角色环检测）后再落盘。
+   * 落盘失败时回滚内存状态，保证内存与页文件始终一致。
+   */
 
   // -- 原子变更 -----------------------------------------------------------
 
@@ -373,6 +387,7 @@ export class Authorizer {
     // 保底检查：任何变更都不允许把数据库改成"没有人能再管理权限"的状态。
     // 这是防止把自己锁在门外：例如把最后一个管理员的 GRANT 权限收掉之后，
     // 就再也没有任何人能改权限了，这种变更必须拒绝。
+    // 保底检查：任何变更都不允许把数据库改成"没有人能再管理权限"的状态。
     const administrators = Object.keys(normalized.users)
       // 遍历所有用户名，
       .filter(name => can(normalized, name, 'GRANT') && can(normalized, name, 'CONNECT'));
@@ -465,6 +480,7 @@ export class Authorizer {
     // 校验目标用户名格式。
     // 用户可以改自己的口令；改别人的口令需要 GRANT。
     // 这条规则的具体实现就在下面这一行。
+    // 用户可以改自己的口令；改别人的口令需要 GRANT。
     if (user !== normalizeName(actor)) this.authorize(actor, [{ permission: 'grant' }]);
     // 目标不是自己时才鉴权。
     if (!this.access.users[user]) throw new AccessRequestError(`Unknown user ${user}`, 404);
@@ -587,6 +603,7 @@ export class Authorizer {
     // 返回角色定义。
   }
   // #subject 结束。
+  /** 逐项 GRANT：合并到 (主体, 对象) 现有权限集合，不覆盖其他对象的授权。 */
 
   /** 逐项 GRANT：合并到 (主体, 对象) 现有权限集合，不覆盖其他对象的授权。 */
   grant(actor, { subject = 'user', name, object, permissions }) {
@@ -618,6 +635,7 @@ export class Authorizer {
       subject: kind, name: target, object: objectName, permissions: list,
     };
   }
+  /** 逐项 REVOKE：只移除指定权限；集合清空后删除该对象条目。 */
 
   /** 逐项 REVOKE：只移除指定权限；集合清空后删除该对象条目。 */
   revoke(actor, { subject = 'user', name, object, permissions }) {
@@ -651,9 +669,10 @@ export class Authorizer {
       subject: kind, name: target, object: objectName, permissions: list,
     };
   }
-
   /** 整表替换（保留旧的 PUT /api/access 语义），同样走版本自增和管理员保底检查。 */
   // 即：即使是一次性整体替换，也受"不能把最后的管理员删掉"这条约束保护。
+
+  /** 整表替换（保留旧的 PUT /api/access 语义），同样走版本自增和管理员保底检查。 */
   replace(actor, raw) {
   // 整体替换权限目录。
     this.authorize(actor, [{ permission: 'grant' }]);

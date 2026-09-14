@@ -1,6 +1,7 @@
 #include "minisql/execution/database.hpp"
 #include "minisql/common/wire_json.hpp"
 #include "minisql/security/access_catalog.hpp"
+#include <algorithm>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -16,12 +17,55 @@ using json = nlohmann::json;
 // 简写 JSON 命名空间。
 // 从 SQL 文件读取源码：显式失败优于静默空输入，并去掉 UTF-8 BOM。
 // （承接上一行）"显式失败"指打不开文件就直接报错，而不是当成空脚本继续跑。
+std::string displayPath(const std::filesystem::path& path) {
+    const auto value = path.generic_u8string();
+    return {reinterpret_cast<const char*>(value.data()), value.size()};
+}
+// 过滤为非 ASCII 可打印字符：确保兜底帧一定是合法 UTF-8。
+std::string asciiOnly(const std::string& text) {
+    std::string out;
+    for (const unsigned char byte : text)
+        if (byte >= 0x20 && byte < 0x7f) out.push_back(static_cast<char>(byte));
+    return out;
+}
+// 会话帧里的路径必须是合法 UTF-8：非法字节会在序列化响应时抛 json 异常，
+// 也会把未校验的字节直接带进文件系统调用。
+bool validUtf8(const std::string& text) {
+    std::size_t index = 0;
+    while (index < text.size()) {
+        const auto lead = static_cast<unsigned char>(text[index]);
+        std::size_t width = 0;
+        std::uint32_t point = 0;
+        if (lead < 0x80) { ++index; continue; }
+        else if ((lead & 0xe0) == 0xc0) { width = 1; point = lead & 0x1f; }
+        else if ((lead & 0xf0) == 0xe0) { width = 2; point = lead & 0x0f; }
+        else if ((lead & 0xf8) == 0xf0) { width = 3; point = lead & 0x07; }
+        else return false;
+        if (index + width >= text.size()) return false;
+        for (std::size_t step = 1; step <= width; ++step) {
+            const auto byte = static_cast<unsigned char>(text[index + step]);
+            if ((byte & 0xc0) != 0x80) return false;
+            point = (point << 6) | (byte & 0x3f);
+        }
+        if ((width == 1 && point < 0x80) || (width == 2 && point < 0x800) ||
+            (width == 3 && (point < 0x10000 || point > 0x10ffff)) ||
+            (point >= 0xd800 && point <= 0xdfff)) return false;
+        index += width + 1;
+    }
+    return true;
+}
+std::filesystem::path pathFromUtf8(const std::string& value) {
+    if (!validUtf8(value))
+        throw minisql::MiniSqlError(minisql::ErrorCode::InvalidArgument, "Path is not valid UTF-8");
+    return std::filesystem::path(std::u8string(
+        reinterpret_cast<const char8_t*>(value.data()), value.size()));
+}
+// 从 SQL 文件读取源码：显式失败优于静默空输入，并去掉 UTF-8 BOM。
 std::string readSqlFile(const std::filesystem::path& path) {
 // 读取 SQL 文件内容。
     std::ifstream stream(path, std::ios::binary);
     // 以二进制方式打开，避免平台做换行转换。
-    if (!stream) throw minisql::MiniSqlError(minisql::ErrorCode::InvalidArgument, "Cannot open SQL file: " + path.string());
-    // 打不开就按参数错误抛出。
+    if (!stream) throw minisql::MiniSqlError(minisql::ErrorCode::InvalidArgument, "Cannot open SQL file: " + displayPath(path));
     std::string source{std::istreambuf_iterator<char>(stream), {}};
     // 一次性把文件内容读进字符串。
     if (source.size() >= 3 && static_cast<unsigned char>(source[0]) == 0xEF &&
@@ -34,12 +78,14 @@ std::string readSqlFile(const std::filesystem::path& path) {
     // 返回纯文本源码。
 }
 // 读取函数结束。
-void authorizeRequest(minisql::execution::Database& database, const minisql::security::AccessCatalog& access, const json& request,
-// 对一条会话请求做认证与鉴权：先从请求里取用户名口令，再判断有没有权限。
-                      const std::string& operation, const std::string& sql = {},
-                      // operation 是操作名；sql 可选，用于解析出实际访问的对象。
-                      const std::string& table = {}, const std::string& index = {}) {
-                      // table / index 用于 indexInspect 这类针对具体对象的操作。
+// 把绑定阶段确定的受权对象附到响应上，供审计使用（不参与授权判定）。
+void attachAccessObjects(json& result, const minisql::security::AccessRequest& binding) {
+    if (binding.objects.empty()) return;
+    json objects = json::array();
+    for (const auto& object : binding.objects) objects.push_back(object.object);
+    result["accessObjects"] = std::move(objects);
+}
+void authorizeIdentity(const minisql::security::AccessCatalog& access, const json& request) {
     if (!access.enabled()) return;
     // 权限控制没启用时一律放行，保持与旧行为兼容。
     if (!request.contains("user") || !request["user"].is_string() ||
@@ -58,10 +104,63 @@ void authorizeRequest(minisql::execution::Database& database, const minisql::sec
     // 取出口令。
     if (!access.verify(user, password)) throw minisql::MiniSqlError(minisql::ErrorCode::Permission, "Permission denied");
     // 认证失败同样统一报"权限不足"。
-    const auto resolvedObjects = database.resolveAccessObjects(sql);
-    // 用当前目录把 SQL 里实际访问的基础表解析成规范对象名，作为鉴权依据。
-    access.authorize(user, operation, sql, table, index, resolvedObjects);
-    // 执行鉴权：不通过时由 authorize 内部抛出权限错误。
+}
+minisql::security::AccessRequest authorizeRequest(minisql::execution::Database& database, const minisql::security::AccessCatalog& access, const json& request,
+                      const std::string& operation, const std::string& sql = {},
+                      const std::string& table = {}, const std::string& index = {}) {
+    // 权限判定只消费绑定结果；返回它供审计记录受权对象，不再扫描 SQL 文本。
+    auto binding = sql.empty() ? minisql::security::AccessRequest{} : database.bindAccess(sql);
+    if (!access.enabled()) return binding;
+    authorizeIdentity(access, request);
+    const auto& user = request["user"].get_ref<const std::string&>();
+    access.authorize(user, operation, binding, table, index);
+    return binding;
+}
+
+// 序列化计划路径没有 SQL 文本可绑定，受权对象与动作完全由已解析的计划节点推导。
+// 文档形状不合法时返回 bound == false，授权层据此 fail-closed 拒绝。
+minisql::security::AccessRequest planAccessRequest(const json& document) {
+    using minisql::security::AccessAction;
+    const auto actionFor = [](const std::string& kind) {
+        if (kind == "Insert") return AccessAction::Insert;
+        if (kind == "Update") return AccessAction::Update;
+        if (kind == "Delete") return AccessAction::Delete;
+        if (kind == "CreateTable" || kind == "CreateIndex") return AccessAction::Create;
+        if (kind == "DropIndex") return AccessAction::Drop;
+        if (kind == "Checkpoint") return AccessAction::Checkpoint;
+        if (kind == "Begin" || kind == "Commit" || kind == "Rollback" || kind == "Savepoint")
+            return AccessAction::Transaction;
+        return AccessAction::Select;
+    };
+    minisql::security::AccessRequest request;
+    const json* rows = nullptr;
+    if (document.is_array()) rows = &document;
+    else if (document.is_object() && document.contains("plans") && document.at("plans").is_array()) rows = &document.at("plans");
+    if (rows == nullptr) return request;   // bound 保持 false
+    std::vector<std::string> seen;
+    for (const auto& row : *rows) {
+        if (!row.is_object() || !row.contains("kind") || !row.at("kind").is_string() ||
+            !row.contains("parent") || !row.at("parent").is_number_integer() ||
+            !row.contains("table") || !row.at("table").is_string())
+            return minisql::security::AccessRequest{};   // 形状不合法 → fail-closed
+        const auto action = actionFor(row.at("kind").get<std::string>());
+        if (row.at("parent").get<std::int64_t>() == -1) request.statementAction = action;
+        const auto table = row.at("table").get<std::string>();
+        if (table.empty()) continue;
+        const auto key = table + "\x1f" + std::to_string(static_cast<int>(action));
+        if (std::find(seen.begin(), seen.end(), key) != seen.end()) continue;
+        seen.push_back(key);
+        request.objects.push_back({table, action});
+    }
+    request.bound = true;
+    return request;
+}
+
+void authorizeBinding(const minisql::security::AccessCatalog& access, const json& request,
+                      const std::string& operation, const minisql::security::AccessRequest& binding) {
+    if (!access.enabled()) return;
+    authorizeIdentity(access, request);
+    access.authorize(request["user"].get_ref<const std::string&>(), operation, binding);
 }
 // 请求鉴权函数结束。
 
@@ -83,10 +182,14 @@ void authorizeDirect(minisql::execution::Database& database, const minisql::secu
     // 同上。
     if (!access.verify(user, password)) throw minisql::MiniSqlError(minisql::ErrorCode::Permission, "Permission denied");
     // 认证失败按权限错误上报。
-    const auto resolvedObjects = database.resolveAccessObjects(sql);
-    // 解析实际访问对象。
-    access.authorize(user, operation, sql, {}, {}, resolvedObjects);
-    // 直连模式没有表/索引参数，所以中间两个参数留空。
+    access.authorize(user, operation, sql.empty() ? minisql::security::AccessRequest{} : database.bindAccess(sql));
+}
+// 直接入口（CLI）返回绑定结果，供 main 把受权对象附到响应上。
+minisql::security::AccessRequest directAccessRequest(minisql::execution::Database& database, const minisql::security::AccessCatalog& access,
+                                                   const std::string& operation, const std::string& sql) {
+    auto binding = sql.empty() ? minisql::security::AccessRequest{} : database.bindAccess(sql);
+    authorizeDirect(database, access, operation, sql);
+    return binding;
 }
 // 直连鉴权函数结束。
 
@@ -119,6 +222,7 @@ minisql::security::AccessCatalog reconcileAccessCatalog(minisql::execution::Data
             // 活动事务不被目录同步写入打断；本次请求仍使用已校验的新页，事务结束后再固化到系统表。
             // 解释：本次请求照常使用刚校验过的新权限，等事务结束后再落到系统表，
             // 这样既不打断事务，也不会用旧权限放行。
+            // 活动事务不被目录同步写入打断；本次请求仍使用已校验的新页，事务结束后再固化到系统表。
             return external;
             // 直接返回外部目录供本次使用。
         }
@@ -144,8 +248,25 @@ int session(minisql::execution::Database& database, minisql::security::AccessCat
     // 局部工具：把一条响应写到标准输出。
         value["integerEncoding"] = "safe-number-or-decimal-string";
         // 统一标注大整数编码规则，前端据此决定怎么解析大整数。
-        std::cout << minisql::wireJson(std::move(value)).dump() << '\n' << std::flush;
-        // 输出一行 JSON 并立即刷新，保证交互式调用方立刻收到响应。
+        // 序列化前先留住帧身份：若 dump 抛异常而外层又没接住，对端只能报出
+        // 无意义的 "Unexpected session response"，真实错误被吞掉。
+        std::string identity;
+        if (value.contains("id") && value.at("id").is_string())
+            identity = asciiOnly(value.at("id").get<std::string>());
+        try {
+            std::cout << minisql::wireJson(std::move(value)).dump() << '\n' << std::flush;
+            return;
+        } catch (const std::exception& error) {
+            json fallback = {{"success", false},
+                {"error", {{"type", "InternalError"}, {"code", 9999},
+                           {"message", std::string("Response serialization failed: ") + asciiOnly(error.what())}}}};
+            if (!identity.empty()) fallback["id"] = identity;
+            fallback["integerEncoding"] = "safe-number-or-decimal-string";
+            std::cout << fallback.dump() << '\n' << std::flush;
+        } catch (...) {
+            std::cout << "{\"success\":false,\"error\":{\"type\":\"InternalError\",\"code\":9999,"
+                         "\"message\":\"Response serialization failed\"}}\n" << std::flush;
+        }
     };
     // emit 定义结束。
     emit({{"type", "ready"}, {"protocolVersion", 1}, {"transactionState", database.transactionState()}});
@@ -207,8 +328,7 @@ int session(minisql::execution::Database& database, minisql::security::AccessCat
             // 遍历请求的全部字段，做字段白名单校验。
                 (void)value;
                 // 只看字段名，值不使用，显式标记忽略以免告警。
-                    if (name != "id" && name != "operation" && name != "sql" && name != "sessionId" && name != "cancelFile" && name != "table" && name != "index" && name != "target" && name != "user" && name != "password")
-                    // 只允许这些字段名。
+                    if (name != "id" && name != "operation" && name != "sql" && name != "sessionId" && name != "cancelFile" && name != "table" && name != "index" && name != "target" && name != "plan" && name != "user" && name != "password")
                     throw minisql::MiniSqlError(minisql::ErrorCode::InvalidArgument, "Unknown session request field");
                     // 出现未知字段就拒绝，避免拼错字段名却被静默忽略。
             }
@@ -237,8 +357,7 @@ int session(minisql::execution::Database& database, minisql::security::AccessCat
                     // 否则拒绝。
                 database.setSessionContext(request["sessionId"].get<std::string>(),
                     // 把会话号交给数据库。
-                    request.contains("cancelFile") ? std::filesystem::path(request["cancelFile"].get<std::string>()) : std::filesystem::path{});
-                    // 取消标记文件给了就用它，没给就传空路径表示不启用取消。
+                    request.contains("cancelFile") ? pathFromUtf8(request["cancelFile"].get<std::string>()) : std::filesystem::path{});
             }
             // 会话上下文处理结束。
             if (operation == "execute" || operation == "compile") {
@@ -249,10 +368,10 @@ int session(minisql::execution::Database& database, minisql::security::AccessCat
                     // 缺失就拒绝。
                 const auto source = request["sql"].get<std::string>();
                 // 取出 SQL 文本。
-                authorizeRequest(database, access, request, operation, source);
-                // 先鉴权，再执行；未授权时不会走到下一步。
+                const auto binding = authorizeRequest(database, access, request, operation, source);
                 result = operation == "execute" ? database.execute(source) : database.compile(source);
                 // execute 真正执行，compile 只编译并返回计划。
+                attachAccessObjects(result, binding);
             } else if (operation == "executeStream") {
             // 流式执行：边算边推，适合大结果集。
                 if (!request.contains("sql") || !request["sql"].is_string())
@@ -304,9 +423,10 @@ int session(minisql::execution::Database& database, minisql::security::AccessCat
                 // 要求 sql 字段。
                     throw minisql::MiniSqlError(minisql::ErrorCode::InvalidArgument, "Expected SQL string");
                     // 缺失就拒绝。
-                authorizeRequest(database, access, request, operation, request["sql"].get<std::string>());
+                const auto binding = authorizeRequest(database, access, request, operation, request["sql"].get<std::string>());
                 result = database.diagnostics(request["sql"].get<std::string>());
                 // 生成诊断信息。
+                attachAccessObjects(result, binding);
             } else if (operation == "statistics") { authorizeRequest(database, access, request, operation); result = database.statistics(); }
             // 统计信息：只读操作，无需 SQL 参数。
             else if (operation == "catalog") { authorizeRequest(database, access, request, operation); result = database.catalog(); }
@@ -323,6 +443,38 @@ int session(minisql::execution::Database& database, minisql::security::AccessCat
                 // 鉴权时把表名与索引名一起交给权限层，便于按对象判断权限。
                 result = database.indexInspect(request["table"].get<std::string>(), request["index"].get<std::string>());
                 // 执行索引结构检查。
+            } else if (operation == "indexVerify") {
+                if (!request.contains("table") || !request["table"].is_string() ||
+                    !request.contains("index") || !request["index"].is_string())
+                    throw minisql::MiniSqlError(minisql::ErrorCode::InvalidArgument, "Expected table and index strings");
+                authorizeRequest(database, access, request, operation, {}, request["table"].get<std::string>(), request["index"].get<std::string>());
+                result = database.indexVerify(request["table"].get<std::string>(), request["index"].get<std::string>());
+            } else if (operation == "indexRebuild") {
+                if (!request.contains("table") || !request["table"].is_string() ||
+                    !request.contains("index") || !request["index"].is_string())
+                    throw minisql::MiniSqlError(minisql::ErrorCode::InvalidArgument, "Expected table and index strings");
+                authorizeRequest(database, access, request, operation, {}, request["table"].get<std::string>(), request["index"].get<std::string>());
+                result = database.indexRebuild(request["table"].get<std::string>(), request["index"].get<std::string>());
+            } else if (operation == "bindAccess") {
+                if (!request.contains("sql") || !request["sql"].is_string())
+                    throw minisql::MiniSqlError(minisql::ErrorCode::InvalidArgument, "Expected SQL string");
+                // 只验证身份：调用方用返回的绑定结果自行决定对象权限，避免再次扫描 SQL 文本。
+                authorizeIdentity(access, request);
+                const auto binding = database.bindAccess(request["sql"].get<std::string>());
+                json objects = json::array();
+                for (const auto& object : binding.objects)
+                    objects.push_back({{"object", object.object}, {"action", minisql::security::permissionName(object.action)}});
+                result = {{"success", true}, {"bound", binding.bound},
+                          {"statementAction", minisql::security::permissionName(binding.statementAction)},
+                          {"objects", std::move(objects)}, {"diagnostic", binding.diagnostic}};
+            } else if (operation == "executePlan") {
+                if (!request.contains("plan"))
+                    throw minisql::MiniSqlError(minisql::ErrorCode::InvalidArgument, "Expected a serialized plan document");
+                // 第十七章 REQ-CORE-002：计划携带编译期 Catalog 指纹，执行前重新校验。
+                const auto binding = planAccessRequest(request["plan"]);
+                authorizeBinding(access, request, operation, binding);
+                result = database.executeSerializedPlan(request["plan"]);
+                attachAccessObjects(result, binding);
             } else if (operation == "snapshot") {
             // 快照：把当前数据库复制到目标目录。
                 if (!request.contains("target") || !request["target"].is_string())
@@ -330,8 +482,7 @@ int session(minisql::execution::Database& database, minisql::security::AccessCat
                     throw minisql::MiniSqlError(minisql::ErrorCode::InvalidArgument, "Expected snapshot target string");
                     // 缺失就拒绝。
                 authorizeRequest(database, access, request, operation);
-                result = database.createSnapshot(request["target"].get<std::string>());
-                // 创建快照。
+                result = database.createSnapshot(pathFromUtf8(request["target"].get<std::string>()));
             } else if (operation == "close") {
             // 关闭会话。
                 authorizeRequest(database, access, request, operation);
@@ -390,12 +541,14 @@ int main(int argc, char** argv) {
     // 所有错误统一在这里转成 JSON 输出。
         // 位置参数：<database.pages> <mode>；可选 `--file/-f <query.sql>` 从文件读 SQL（默认标准输入）。
         // （承接上一行）mode 可取 execute、compile、diagnostics、statistics、catalog、session。
+        // 位置参数：<database.pages> <mode>；可选 `--file/-f <query.sql>` 从文件读 SQL（默认标准输入）。
         std::filesystem::path sqlFile;
         // --file 指定的 SQL 文件；为空表示从标准输入读。
         std::vector<std::string> positional;
         // 收集所有位置参数。
         int databaseArgIndex = -1;
         // 记录第一个位置参数在 argv 里的下标，Windows 下需要用它取回原始 Unicode 路径。
+        int sqlFileArgIndex = -1;
         for (int index = 1; index < argc; ++index) {
         // 遍历命令行参数。
             const std::string argument = argv[index];
@@ -404,8 +557,8 @@ int main(int argc, char** argv) {
             // 命中文件选项。
                 if (index + 1 >= argc) throw minisql::MiniSqlError(minisql::ErrorCode::InvalidArgument, "--file requires a path");
                 // 后面没跟路径就报参数错误。
-                sqlFile = argv[++index];
-                // 取下一个参数作为路径并跳过它。
+                sqlFileArgIndex = ++index;
+                sqlFile = argv[index];
                 continue;
                 // 继续处理后续参数。
             }
@@ -416,12 +569,10 @@ int main(int argc, char** argv) {
         }
         if (positional.size() != 2) throw minisql::MiniSqlError(minisql::ErrorCode::InvalidArgument,
         // 位置参数必须恰好两个：数据库路径与模式。
-            "Usage: minisql_database <database.pages> <execute|compile|diagnostics|statistics|catalog|session> [--file <query.sql>]");
-            // 数量不对时打印用法提示。
+            "Usage: minisql_database <database.pages> <execute|compile|diagnostics|statistics|catalog|session|bindAccess|executePlan> [--file <query.sql>]");
         const std::string mode = positional[1];
         // 取出模式。
-        if (mode != "execute" && mode != "compile" && mode != "diagnostics" && mode != "statistics" && mode != "catalog" && mode != "session")
-        // 模式必须在白名单内。
+        if (mode != "execute" && mode != "compile" && mode != "diagnostics" && mode != "statistics" && mode != "catalog" && mode != "session" && mode != "bindAccess" && mode != "executePlan")
             throw minisql::MiniSqlError(minisql::ErrorCode::InvalidArgument, "Unknown database command");
             // 未知模式直接拒绝，避免误以为执行成功。
         std::filesystem::path path;
@@ -440,6 +591,7 @@ int main(int argc, char** argv) {
         }
         path = wideArgs[databaseArgIndex];
         // 用宽字符版本的同一位置参数作为数据库路径，从而正确支持中文等非 ASCII 路径。
+        if (sqlFileArgIndex >= 0) sqlFile = wideArgs[sqlFileArgIndex];
         LocalFree(wideArgs);
         // 释放宽字符数组。
 #else
@@ -454,16 +606,63 @@ int main(int argc, char** argv) {
         // session 模式交给会话循环处理，它自己负责输出协议。
         nlohmann::json result;
         // 单次调用模式的统一结果对象。
+        // bindAccess：只做名称解析（对象、动作、是否闭合），供入口在授权/只读判定与
+        // 审计中消费，取代任何基于 SQL 文本的扫描。启用权限目录时先校验身份。
+        if (mode == "bindAccess") {
+            const std::string source = sqlFile.empty() ? std::string{std::istreambuf_iterator<char>(std::cin), {}} : readSqlFile(sqlFile);
+            const auto* bypass = std::getenv("MINISQL_AUTH_BYPASS");
+            if (access.enabled() && !(bypass && std::string(bypass) == "1")) {
+                const auto* configuredUser = std::getenv("MINISQL_USER");
+                const auto* configuredPassword = std::getenv("MINISQL_PASSWORD");
+                if (!access.verify(configuredUser ? configuredUser : "", configuredPassword ? configuredPassword : ""))
+                    throw minisql::MiniSqlError(minisql::ErrorCode::Permission, "Permission denied");
+            }
+            const auto binding = database.bindAccess(source);
+            json objects = json::array();
+            for (const auto& object : binding.objects)
+                objects.push_back({{"object", object.object}, {"action", minisql::security::permissionName(object.action)}});
+            result = {{"success", true}, {"bound", binding.bound},
+                      {"statementAction", minisql::security::permissionName(binding.statementAction)},
+                      {"objects", std::move(objects)}, {"diagnostic", binding.diagnostic}};
+            result["integerEncoding"] = "safe-number-or-decimal-string";
+            std::cout << minisql::wireJson(result).dump() << '\n';
+            return 0;
+        }
+        if (mode == "executePlan") {
+            // 计划文档来自 stdin/--file（JSON），受权对象由计划节点推导。
+            const std::string source = sqlFile.empty() ? std::string{std::istreambuf_iterator<char>(std::cin), {}} : readSqlFile(sqlFile);
+            json document;
+            try { document = json::parse(source); }
+            catch (const std::exception& error) {
+                throw minisql::MiniSqlError(minisql::ErrorCode::InvalidArgument,
+                    std::string("Plan document is not valid JSON: ") + error.what());
+            }
+            const auto binding = planAccessRequest(document);
+            const auto* bypass = std::getenv("MINISQL_AUTH_BYPASS");
+            if (access.enabled() && !(bypass && std::string(bypass) == "1")) {
+                const auto* configuredUser = std::getenv("MINISQL_USER");
+                const auto* configuredPassword = std::getenv("MINISQL_PASSWORD");
+                const std::string user = configuredUser ? configuredUser : "";
+                if (!access.verify(user, configuredPassword ? configuredPassword : ""))
+                    throw minisql::MiniSqlError(minisql::ErrorCode::Permission, "Permission denied");
+                access.authorize(user, "executePlan", binding);
+            }
+            result = database.executeSerializedPlan(document);
+            attachAccessObjects(result, binding);
+            result["integerEncoding"] = "safe-number-or-decimal-string";
+            std::cout << minisql::wireJson(result).dump() << '\n';
+            return result.value("success", true) ? 0 : 1;
+        }
         if (mode == "catalog") { authorizeDirect(database, access, mode); result = database.catalog(); }
         // catalog 模式只需要导出目录，不需要读 SQL。
         else {
         // 其余模式都要 SQL 文本。
             const std::string source = sqlFile.empty() ? std::string{std::istreambuf_iterator<char>(std::cin), {}} : readSqlFile(sqlFile);
             // 没给文件就读标准输入，否则读文件。
-            authorizeDirect(database, access, mode, source);
-            // 带上 SQL 做鉴权，这样权限层能解析出实际访问的对象。
+            const auto binding = directAccessRequest(database, access, mode, source);
             result = mode == "execute" ? database.executeScript(source) : mode == "diagnostics" ? database.diagnostics(source) : mode == "statistics" ? database.statistics() : database.compile(source);
             // 依次分派：execute 执行脚本、diagnostics 出诊断、statistics 出统计、compile 只编译。
+            attachAccessObjects(result, binding);
         }
         result["integerEncoding"] = "safe-number-or-decimal-string";
         // 标注大整数编码规则。

@@ -11,6 +11,10 @@ struct Statement;
 // X09：Expr 既可以携带原始 SQL 文本（subquerySql，过渡期产物），也可以携带
 // 结构化的查询节点（subquery）。向"结构化对象标识"的迁移正在进行中；
 // subquerySql 会一直保留到 planner 与执行层（任务 3.3-3.5）真正消费结构化节点为止，之后删除。
+// X09: Expr carries either the raw SQL text (subquerySql, interim) or a
+// structured query node (subquery). Migration to structured object identity is
+// underway; subquerySql stays until planner/execution (3.3-3.5) consume the
+// structured node, then it is removed.
 struct Expr { std::string kind; std::string value; std::shared_ptr<Expr> left; std::shared_ptr<Expr> right; SourceLocation location{}; std::string subquerySql{}; std::shared_ptr<Statement> subquery{}; };
 // 表达式节点，语法树里所有"算得出来的东西"都用它表示。
 // kind 是节点种类，如 Literal、Identifier、BinaryExpr、AggregateExpr、Default。
@@ -49,6 +53,10 @@ struct ConstraintName { std::string name; std::string kind; std::size_t index; }
 // kind 取值如 key / check / foreignKey / primaryKey / unique / references / notNull。
 struct IndexDef { std::string name; std::vector<std::string> columns; bool unique = false; };
 // 一条索引定义：索引名、索引列、是否唯一索引。
+// X25: `WITH name [(columns)] AS ( SELECT ... )`. A CTE name is a scope name, not a
+// database object: the binder resolves references to it inside the statement scope and
+// never emits an access object for it. Recursive CTEs are rejected by the parser.
+struct CommonTableExpr { std::string name; std::vector<std::string> columns{}; std::shared_ptr<Statement> query{}; SourceLocation location{}; };
 struct Statement {
 // 一条语句的完整语法树，整个解析阶段产出的元素都是它。
     std::string kind{};
@@ -84,8 +92,11 @@ struct Statement {
     std::vector<Join> joins{};
     // 本条语句里所有 JOIN 子句，按书写顺序排列。
     // X09：FROM 派生表 `( SELECT ... ) AS alias` —— 结构化子查询节点 + 显式别名。
+    // X09: FROM 派生表 `( SELECT ... ) AS alias` —— 结构化子查询节点 + 显式别名。
     std::shared_ptr<Statement> fromSubquery{};
     // FROM 位置写的是子查询时，这里保存内层 SELECT 的语法树；为空表示 FROM 是普通表。
+    // X25: WITH 子句引入的公共表表达式，按书写顺序；后一个可以引用前一个。
+    std::vector<CommonTableExpr> ctes{};
     std::vector<std::shared_ptr<Expr>> valueExpressions{};
     // 表达式形式的值列表，配合 INSERT 使用，支持 DEFAULT、表达式等非字面量形式。
     bool defaultValues = false;
@@ -161,6 +172,11 @@ std::vector<Statement> parse(const std::vector<Token>& tokens);
 // 收集进 errors（带 endLine/endColumn 区间），随后同步到下一条语句的边界，
 // 并把出错的 Statement 标记为 invalid，让调用方可以单独拒绝这条语句而不
 // 影响整批；合法的语句照常返回。
+// Recovery-mode parser: instead of throwing on the first syntax error it
+// collects every recoverable syntax error into `errors` (with
+// endLine/endColumn spans), synchronizes to the next statement boundary, and
+// marks the offending Statement invalid so callers can reject it without
+// aborting the whole batch. Valid statements still come back.
 std::vector<Statement> parseRecoverable(const std::vector<Token>& tokens, std::vector<MiniSqlError>& errors);
 // 容错模式入口：返回全部能解析出的语句，错误集中放在 errors 里。
 }

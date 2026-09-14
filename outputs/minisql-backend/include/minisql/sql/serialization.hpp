@@ -4,6 +4,7 @@
 #include "minisql/common/date.hpp"
 #include "minisql/common/varchar.hpp"
 #include <nlohmann/json.hpp>
+#include <algorithm>
 #include <charconv>
 #include <cstdint>
 #include <limits>
@@ -12,14 +13,16 @@ namespace minisql::sql {
 // X13 版本契约。下面这些是线上传输与落盘序列化产物的权威版本常量。
 // 读取时如果主版本号不认识就直接拒绝；主版本相同但次版本更高的产物，
 // 在字段存在的前提下要按宽容策略读取。
-inline constexpr std::uint32_t AST_SCHEMA_VERSION = 1;      // AST 文档的 schemaVersion
+// X13 version contract. These are the authoritative constants for on-wire and
+// on-disk serialized artifacts. Unknown major versions are rejected on read;
+// same major, higher minor must be read leniently where fields are present.
+inline constexpr std::uint32_t AST_SCHEMA_VERSION = 1;      // AST document schemaVersion
 // 语法树文档的架构版本号，改动 AST 字段含义时必须提升它。
-inline constexpr std::uint32_t PLAN_SCHEMA_VERSION = 1;     // 逻辑计划的 schemaVersion
+inline constexpr std::uint32_t PLAN_SCHEMA_VERSION = 1;     // logical plan schemaVersion
 // 逻辑计划文档的架构版本号。
-inline constexpr std::uint32_t PRODUCER_VERSION = 1;        // 本二进制的生产者版本
+inline constexpr std::uint32_t PRODUCER_VERSION = 1;        // this binary's producer version
 // 生成这些产物的程序版本，便于排查"是哪个版本写出来的"。
-inline constexpr std::uint32_t CATALOG_SCHEMA_VERSION = 5;  // 最新的表/列描述符版本
-// 目录元数据的架构版本，迁移代码会按它判断是否需要升级旧文件。
+inline constexpr std::uint32_t CATALOG_SCHEMA_VERSION = 6;  // numeric persisted column typeId
 inline nlohmann::json serializeReference(const std::optional<std::pair<std::string,std::string>>& reference) {
 // 把列级外键（父表名，父列名）序列化成 JSON。
     return reference ? nlohmann::json{{"table", reference->first}, {"column", reference->second}} : nlohmann::json(nullptr);
@@ -131,9 +134,13 @@ inline std::shared_ptr<Expr> readCheckExpression(const nlohmann::json& node, std
     }
     const std::size_t expectedSize = binary ? 6u : unary ? 5u : subqueryKind ? (kind == "InSubquery" ? 6u : 5u) : 4u;
     // 按节点种类算出"这个 JSON 对象应该恰好有几个字段"，多一个少一个都说明产物不合法。
-    if (node.size() != expectedSize ||
+    const auto metadataSize = static_cast<std::size_t>(node.contains("nodeId")) + static_cast<std::size_t>(node.contains("sourceSpan"));
+    if (node.size() != expectedSize + metadataSize ||
         node.contains("left") != (binary || unary || kind == "InSubquery") || node.contains("right") != binary) invalid();
     // 字段个数要精确匹配；而且"有 left/right 字段"这件事本身也要和节点结构一致。
+    if (node.contains("nodeId") && !node.at("nodeId").is_number_unsigned()) invalid();
+    if (node.contains("sourceSpan") && (!node.at("sourceSpan").is_object() ||
+        !node.at("sourceSpan").contains("start") || !node.at("sourceSpan").contains("end"))) invalid();
     if (binary && value != "AND" && value != "OR" && value != "=" && value != "!=" &&
         value != "<" && value != "<=" && value != ">" && value != ">=" &&
         value != "+" && value != "-" && value != "*" && value != "/") invalid();
@@ -284,6 +291,36 @@ inline nlohmann::json serializeStatement(const Statement& statement) {
     // 返回整条语句的 JSON 表示。
 }
 namespace detail {
+inline nlohmann::json astSourceSpan(const nlohmann::json& node) {
+    const auto line = node.value("line", std::size_t{0});
+    const auto column = node.value("column", std::size_t{0});
+    const auto endLine = node.value("endLine", line);
+    auto endColumn = node.value("endColumn", column);
+    if (endColumn == column && node.contains("value") && node.at("value").is_string())
+        endColumn += std::max<std::size_t>(1, node.at("value").get_ref<const std::string&>().size());
+    if (endColumn == column && line != 0) ++endColumn;
+    return {{"start", {{"line", line}, {"column", column}}},
+            {"end", {{"line", endLine}, {"column", endColumn}}}};
+}
+inline void annotateAst(nlohmann::json& node, std::size_t& nextId) {
+    if (node.is_array()) {
+        for (auto& child : node) annotateAst(child, nextId);
+        return;
+    }
+    if (!node.is_object()) return;
+    if (node.contains("kind") && node.at("kind").is_string()) {
+        node["nodeId"] = nextId++;
+        node["sourceSpan"] = astSourceSpan(node);
+        if (node.contains("selectItems")) {
+            auto schema = nlohmann::json::array();
+            for (const auto& item : node.at("selectItems"))
+                schema.push_back({{"name", item.value("alias", std::string{})}, {"type", "unknown"}});
+            node["outputSchema"] = std::move(schema);
+        }
+    }
+    for (auto& child : node.items())
+        if (child.key() != "sourceSpan" && child.key() != "outputSchema") annotateAst(child.value(), nextId);
+}
 inline Statement readStatement(const nlohmann::json& node, std::size_t depth = 0) {
 // 把一个 JSON 对象严格还原成 Statement；depth 用于限制嵌套深度。
     auto invalid = []() -> void { throw MiniSqlError(ErrorCode::Storage, "Invalid serialized AST statement"); };
@@ -512,12 +549,16 @@ inline std::vector<Statement> deserializeAst(const nlohmann::json& document) {
 }
 // 把一批 AST 序列化成带版本号的文档（schemaVersion + producerVersion），
 // 这样读取方可以拒绝不认识的主版本，同时保留 statements 负载本身。
+// Serialize an AST batch as a versioned document (schemaVersion + producerVersion)
+// so reads can reject unknown schema versions while keeping the statements payload.
 inline nlohmann::json serializeAstDocument(const std::vector<Statement>& statements) {
 // 生成"带版本外壳"的 AST 文档，是落盘与跨进程传输的推荐形态。
     auto nodes = nlohmann::json::array();
     // 语句负载数组。
     for (const auto& statement : statements) nodes.push_back(serializeStatement(statement));
     // 逐条序列化语句。
+    std::size_t nextId = 0;
+    detail::annotateAst(nodes, nextId);
     return {{"schemaVersion", AST_SCHEMA_VERSION}, {"producerVersion", PRODUCER_VERSION}, {"statements", std::move(nodes)}};
     // 组装成"版本号 + 生产者版本 + 语句负载"三段式文档。
 }
@@ -527,6 +568,8 @@ inline nlohmann::json serializeAst(const std::vector<Statement>& statements) {
     // 语句数组。
     for (const auto& statement : statements) nodes.push_back(serializeStatement(statement));
     // 逐条序列化。
+    std::size_t nextId = 0;
+    detail::annotateAst(nodes, nextId);
     return nodes.size() == 1 ? nodes[0] : nodes;
     // 只有一条语句时退回成"裸对象"，方便调用方直接按单条语句使用。
 }
@@ -535,9 +578,9 @@ inline nlohmann::json serializeTokens(const std::vector<Token>& tokens) {
     auto nodes = nlohmann::json::array();
     // 结果数组。
     for (const auto& token : tokens) nodes.push_back({{"type", token.type}, {"text", token.lexeme},
-        {"line", token.location.line}, {"column", token.location.column}});
-    // 每个 token 只输出四个字段：种别码、词素值、行号、列号。
-    // 这正是词法验收要求"每个 Token 输出 [种别码，词素值，行号，列号]"的落点。
+        {"line", token.location.line}, {"column", token.location.column},
+        {"endLine", token.endLocation.line}, {"endColumn", token.endLocation.column},
+        {"byteStart", token.byteStart}, {"byteEnd", token.byteEnd}});
     return nodes;
     // 返回数组。
 }

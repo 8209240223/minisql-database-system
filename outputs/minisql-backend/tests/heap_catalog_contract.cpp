@@ -269,6 +269,46 @@ int main() {
         catch (const MiniSqlError& error) { storageError = error.code() == ErrorCode::Storage; }
         require(storageError, "reopened catalog rejects malformed CHECK with valid page checksums");
     }
+    const auto typeIdPath = directory / "type-id.pages";
+    {
+        auto file = std::make_shared<PageFile>(typeIdPath);BufferPool buffer(file, 2, ReplacementPolicy::LRU);HeapStore heap(file, buffer);
+        catalog::PersistentCatalog catalog(heap);
+        catalog.create(sql::parse(sql::tokenize("CREATE TABLE typed(i INT,v VARCHAR(12),d DECIMAL(8,2));"))[0]);
+        std::size_t seen = 0;
+        heap.scan(1, {ColumnType::Int, ColumnType::Int, ColumnType::Varchar, ColumnType::Varchar}, [&](RowRef, const Row& row) {
+            if (std::get<std::int32_t>(row[0]) != 2) return;
+            const auto ordinal = std::get<std::int32_t>(row[1]);
+            const auto descriptor = nlohmann::json::parse(std::get<std::string>(row[3]));
+            require(descriptor.at("version") == 5, "new catalog column descriptor version");
+            require(descriptor.contains("typeId") && descriptor.at("typeId").is_number_unsigned(), "catalog type identity is numeric");
+            require(!descriptor.contains("type"), "new catalog descriptor omits legacy type string");
+            if (ordinal == 0) require(descriptor.at("typeId") == 1 && descriptor.at("typeParameters").is_null(), "INT stable type id");
+            if (ordinal == 1) require(descriptor.at("typeId") == 6 && descriptor.at("typeParameters").at("length") == 12, "VARCHAR stable type id and length");
+            if (ordinal == 2) require(descriptor.at("typeId") == 7 && descriptor.at("typeParameters") == nlohmann::json{{"precision", 8}, {"scale", 2}}, "DECIMAL stable type id and parameters");
+            ++seen;
+        });
+        require(seen == 3, "all type-id descriptors inspected");
+    }
+    const auto unknownTypeIdPath = directory / "unknown-type-id.pages";
+    {
+        auto file = std::make_shared<PageFile>(unknownTypeIdPath);BufferPool buffer(file, 2, ReplacementPolicy::LRU);HeapStore heap(file, buffer);
+        const auto column = nlohmann::json{{"version", 5}, {"typeId", 999}, {"typeParameters", nullptr}, {"nullable", true},
+            {"defaultValue", nullptr}, {"primaryKey", false}, {"unique", false}, {"references", nullptr}}.dump();
+        heap.insert(1, {ColumnType::Int, ColumnType::Int, ColumnType::Varchar, ColumnType::Varchar},
+            {std::int32_t(2), std::int32_t(0), std::string("id"), column});
+        const auto table = nlohmann::json{{"version", 5}, {"name", "unknown_type"}, {"keys", nlohmann::json::array()},
+            {"checks", nlohmann::json::array()}, {"foreignKeys", nlohmann::json::array()}, {"constraintNames", nlohmann::json::array()},
+            {"indexes", nlohmann::json::array()}}.dump();
+        heap.insert(0, {ColumnType::Int, ColumnType::Varchar, ColumnType::Int}, {std::int32_t(2), table, std::int32_t(1)});
+        heap.flush();
+    }
+    {
+        auto file = std::make_shared<PageFile>(unknownTypeIdPath);BufferPool buffer(file, 2, ReplacementPolicy::LRU);HeapStore heap(file, buffer);
+        bool storageError = false;
+        try { catalog::PersistentCatalog damaged(heap); }
+        catch (const MiniSqlError& error) { storageError = error.code() == ErrorCode::Storage; }
+        require(storageError, "unknown persisted type id rejected as corruption");
+    }
     const auto legacyPath = directory / "legacy.pages";
     {
         auto file = std::make_shared<PageFile>(legacyPath);BufferPool buffer(file, 2, ReplacementPolicy::LRU);HeapStore heap(file, buffer);

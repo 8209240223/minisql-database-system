@@ -1,8 +1,15 @@
 #pragma once
 #include "minisql/catalog/catalog.hpp"
+#include "minisql/sql/binding.hpp"
 #include <nlohmann/json.hpp>
 
 namespace minisql::sql {
+// X25：columnId 与 binding 是两件事，此前被同一个字段兼任。
+//   columnId —— 运行时槽位：执行器用它索引子节点产出的行（row.at(columnId)）。
+//               JOIN 会把左右两侧的槽位拼接，谓词下推因此需要重基。
+//   binding  —— 稳定身份（sql::ColumnId 的原始值，0 表示没有绑定身份，
+//               例如表达式列、聚合输出、排序临时列）。裁剪、下推、计划对比
+//               都应当看它，因为它不随槽位变化。
 struct PlanColumn {
 // 计划里描述"输出列"的结构，决定结果集元数据与列绑定。
     std::string name;
@@ -21,8 +28,9 @@ struct PlanColumn {
     // 是否带唯一约束。
     std::optional<std::pair<std::string,std::string>> references{};
     // 列级外键（父表名，父列名），没有则为空。
-    std::string identity{};
-    // 该列在计划内部的稳定身份标识，用来做去重、分组键与排序键的等值比较。
+    std::uint32_t binding = 0;   // sql::ColumnId
+    std::uint32_t relation = 0;  // sql::RelationId：该列来自哪个 FROM 项
+    std::uint32_t expression = 0; // sql::ExpressionId for computed output columns
 };
 
 struct LogicalPlan {
@@ -85,6 +93,11 @@ struct LogicalPlan {
     // 索引范围扫描的比较运算符（如 >、>=、<、<=），空表示等值或整表扫描。
     nlohmann::json indexRangeValue = nullptr;
     // 索引范围扫描的边界值，与 indexRangeOperator 配对使用。
+    // 编译期 Catalog 指纹；执行时与当前 Catalog 不一致即 PLAN_STALE_SCHEMA。
+    std::string catalogFingerprint{};
+    SourceLocation sourceSpan{};
+    // Optimizer candidate costs and deterministic choice, exposed by plan JSON/EXPLAIN.
+    nlohmann::json optimizerDecision = nullptr;
 };
 
 std::vector<LogicalPlan> compilePlans(const std::vector<Statement>& statements,

@@ -476,8 +476,18 @@ PageRef PageBPlusTree::liftLeaf(PageRef root, const IndexKey& key) const {
         // 读当前节点。
         if (node.leaf) return current;
         // 是叶子就返回。
-        current = node.children[childIndex(node.keys, key)];
-        // 按比较结果选择子节点。
+        current = node.children[lowerBound(node.keys, key)];
+    }
+}
+IndexKey PageBPlusTree::minimumKey(PageRef node) const {
+    for (;;) {
+        const auto current = readNode(node);
+        if (current.leaf) {
+            if (current.keys.empty()) fail("Index child has no minimum key");
+            return current.keys.front();
+        }
+        if (current.children.empty()) fail("Index internal node has no children");
+        node = current.children.front();
     }
 }
 
@@ -493,6 +503,7 @@ bool PageBPlusTree::insert(IndexKey key, RowRef row) {
     requireMeta(root, size);
     if (root.id == kInvalidPageId) {
     // 空树：第一次插入直接建一个叶子当根。
+        // 空树首插入：直接建一个叶节点作为根
         auto ref = buffer_.allocate(owner_);
         // 分配页。
         Node leaf;
@@ -547,6 +558,7 @@ void PageBPlusTree::insertInto(PageRef node, const IndexKey& key, RowRef row, bo
         if (current.keys.size() <= maxKeys_) { replaceNode(node, current); return; }
         // 未超上限，写回即可。
         // Leaf split：左保留 [0, mid)，右为 [mid..)
+        // Leaf split：左保留 [0, mid)，右为 [mid..)
         const auto middle = current.keys.size() / 2;
         // 分裂点。
         Node right;
@@ -572,6 +584,7 @@ void PageBPlusTree::insertInto(PageRef node, const IndexKey& key, RowRef row, bo
         auto rightRef = buffer_.allocate(owner_);
         // 为右兄弟分配页。
         // 让原右兄弟的左指针指向新的右节点。
+        // 让原右兄弟的左指针指向新的右叶
         if (current.rightId != 0) {
         // 原来有右兄弟才需要改它的左指针。
             mutateNode({current.rightId, current.rightGen}, [&](Node& sibling) {
@@ -591,6 +604,7 @@ void PageBPlusTree::insertInto(PageRef node, const IndexKey& key, RowRef row, bo
             // 叶子分裂时把右兄弟第一个键复制上去做分隔键。
         } else {
         // 根叶子分裂 → 新建内部节点根，两个叶子的父指针都指向新根。
+            // 根叶分裂 → 新建内节点根，两个叶的父指针都指向新根
             const auto oldRoot = readNode(node);
             // 重新读一遍左节点。
             Node root;
@@ -631,7 +645,7 @@ void PageBPlusTree::insertInto(PageRef node, const IndexKey& key, RowRef row, bo
     // 先清空本层结果。
     rootReplace.reset();
     // 同上。
-    if (!childSplit) return;  // 子树全量接收，无需传播
+    if (!childSplit) return;  // 子树全量接受，无需传播
     // 子节点没分裂，本层无需改动。
     const auto& promoted = childSplit->first;
     // 子层提升上来的分隔键。
@@ -684,6 +698,7 @@ void PageBPlusTree::insertInto(PageRef node, const IndexKey& key, RowRef row, bo
         // 内部节点分裂是把中间键提升（而不是复制）。
     } else {
     // 根内节点分裂 → 新建内部节点根，promotedKey 上提
+        // 根内节点分裂 → 新建内节点根，promotedKey 上提
         const auto oldRootHeight = current.height;
         // 原根高度。
         Node root;
@@ -727,6 +742,7 @@ bool PageBPlusTree::erase(IndexKey key, RowRef row) {
     // 递归删除。
     if (!found) return false;
     // 没删到就原样返回。
+    // 若根内节点只剩单个子节点，则收缩根（高度减一）
     // 若根内节点只剩单个子节点，则收缩根（高度减一）
     if (!rootReplace) {
     // 递归过程中没有换根时才需要考虑收缩。
@@ -788,26 +804,23 @@ bool PageBPlusTree::eraseInto(PageRef node, const IndexKey& key, RowRef row, con
         return true;
         // 删除成功。
     }
-    const auto position = childIndex(current.keys, key);
-    // 决定下钻的子节点。
-    const auto child = current.children[position];
-    // 子页引用。
-    bool childUnderflow = false;
-    // 子节点的下溢标记。
-    const bool found = eraseInto(child, key, row, root, rootReplace, childUnderflow);
-    // 递归删除。
-    if (!found) { underflow = false; return false; }
-    // 下层没删到，本层也不变。
-    if (childUnderflow) rebalanceChild(current, position, child, samePage(node, root));
-    // 子节点下溢时做借位或合并，可能修改 current 的键与子指针。
-    replaceNode(node, current);
-    // 写回当前节点。
+    const auto first = lowerBound(current.keys, key);
+    const auto upper = static_cast<std::size_t>(std::upper_bound(current.keys.begin(), current.keys.end(), key,
+        [](const IndexKey& value, const IndexKey& separator) { return compareKey(value, separator) < 0; }) - current.keys.begin());
+    for (std::size_t position = first; position <= upper && position < current.children.size(); ++position) {
+        const auto child = current.children[position];
+        bool childUnderflow = false;
+        if (!eraseInto(child, key, row, root, rootReplace, childUnderflow)) continue;
+        if (childUnderflow) rebalanceChild(current, position, child, samePage(node, root));
+        for (std::size_t index = 0; index < current.keys.size(); ++index)
+            current.keys[index] = minimumKey(current.children[index + 1]);
+        replaceNode(node, current);
+        underflow = !samePage(node, root) && current.keys.size() < minKeys_;
+        return true;
+    }
     underflow = false;
     // 默认不下溢。
-    if (!samePage(node, root) && current.keys.size() < minKeys_) underflow = true;
-    // 非根节点键数不足则上报下溢。
-    return true;
-    // 删除成功。
+    return false;
 }
 
 bool PageBPlusTree::rebalanceChild(Node& n, std::size_t childIdx, PageRef childRef, bool nodeIsRoot) {
@@ -816,6 +829,7 @@ bool PageBPlusTree::rebalanceChild(Node& n, std::size_t childIdx, PageRef childR
     // 读出下溢的子节点。
     const std::size_t min = minKeys_;
     // 键数下限。
+    // 1) 向右兄弟借：右兄弟首条目移入本节点末尾
     // 1) 向右兄弟借：右兄弟首条目移入本节点末尾
     if (childIdx + 1 < n.children.size()) {
     // 存在右兄弟。
@@ -863,6 +877,7 @@ bool PageBPlusTree::rebalanceChild(Node& n, std::size_t childIdx, PageRef childR
         }
     }
     // 2) 向左兄弟借：左兄弟末条目移入本节点开头
+    // 2) 向左兄弟借：左兄弟末尾条目移入本节点开头
     if (childIdx > 0) {
     // 存在左兄弟。
         const auto leftRef = n.children[childIdx - 1];
@@ -909,6 +924,7 @@ bool PageBPlusTree::rebalanceChild(Node& n, std::size_t childIdx, PageRef childR
         }
     }
     // 3) 无法借位 → 合并。优先并入左兄弟，否则并入右兄弟。
+    // 3) 无法借位 → 合并。优先并入左兄弟，否则并入右兄弟。
     const bool intoLeft = childIdx > 0;
     // 有左兄弟就并入左边。
     const auto keepRef = intoLeft ? n.children[childIdx - 1] : childRef;
@@ -946,6 +962,7 @@ bool PageBPlusTree::rebalanceChild(Node& n, std::size_t childIdx, PageRef childR
         // 接管右兄弟。
     }
     // 重连叶链：被删页右侧的兄弟左指改为 keep
+    // 重连叶链：被删页右侧的兄弟左指改为 keep
     if (drop.rightId != 0) {
     // 被合并节点还有右兄弟。
         mutateNode({drop.rightId, drop.rightGen}, [&](Node& r) { r.leftId = keepRef.id; r.leftGen = keepRef.generation; });
@@ -974,37 +991,7 @@ bool PageBPlusTree::rebalanceChild(Node& n, std::size_t childIdx, PageRef childR
 
 std::vector<RowRef> PageBPlusTree::search(const IndexKey& key) const {
 // 等值查找：下钻到叶子后收集所有相等项。
-    if (!exists()) return {};
-    // 索引不存在直接返回空。
-    PageRef root;
-    std::size_t size;
-    // 项数。
-    requireMeta(root, size);
-    if (root.id == kInvalidPageId) return {};
-    // 空树返回空。
-    std::vector<RowRef> rows;
-    // 结果。
-    auto current = root;
-    for (;;) {
-    // 循环下钻。
-        auto node = readNode(current);
-        // 读节点。
-        if (node.leaf) {
-        // 到叶子。
-            const auto position = lowerBound(node.keys, key);
-            // 第一个不小于目标键的位置。
-            for (std::size_t i = position; i < node.keys.size(); ++i) {
-            // 从该位置往后收集。
-                if (compareKey(node.keys[i], key) != 0) break;
-                // 不再相等就结束。
-                rows.push_back(node.values[i]);
-                // 收集行引用。
-            }
-            return rows;
-        }
-        current = node.children[childIndex(node.keys, key)];
-        // 继续下钻。
-    }
+    return range(key, true, key, true);
 }
 
 std::vector<RowRef> PageBPlusTree::range(const std::optional<IndexKey>& lower, bool lowerInclusive,
@@ -1101,6 +1088,7 @@ bool PageBPlusTree::validate() const {
     // 记录叶子深度。
     if (!validateNode(root, 1, std::nullopt, std::nullopt, leafDepth)) return false;
     // 递归校验键序、子节点数与平衡性。
+    // 遍历叶链统计行数，校验元数据 size 与叶链完整性
     // 遍历叶链统计行数，校验元数据 size 与叶链完整性
     std::size_t counted = 0;
     // 实际统计到的键数。
@@ -1200,6 +1188,7 @@ IndexInspect PageBPlusTree::inspect() const {
     // 可达性结论。
     result.height = result.pages.empty() ? 0 : static_cast<std::size_t>(readNode(root).height) + 1;
     // 树高。
+    // 叶链：从最左叶沿 right 指针顺数，校验右指成链、左右指互成对、且首尾闭合
 
     // 叶链：从最左叶沿 right 指针顺数，校验右指成链、左右指互成对、且首尾闭合
     bool chainOk = true;
@@ -1266,8 +1255,8 @@ bool PageBPlusTree::validateNode(PageRef ref, std::uint32_t depth, std::optional
     // 键数超上限直接失败。
     for (std::size_t i = 1; i < node.keys.size(); ++i) {
     // 检查节点内键是否严格递增。
-        if (compareKey(node.keys[i - 1], node.keys[i]) >= 0) return false;
-        // 出现相等或逆序即为不合法。
+        const auto order = compareKey(node.keys[i - 1], node.keys[i]);
+        if (order > 0 || (unique_ && order == 0)) return false;
     }
     for (std::size_t i = 0; i < node.keys.size(); ++i) {
     // 检查每个键是否落在父节点给定的区间内。

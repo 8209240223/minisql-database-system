@@ -31,6 +31,8 @@ public:
 
     bool insert(IndexKey key, RowRef row);
     // 插入一个键；唯一索引遇到重复键时返回 false，不再抛异常。
+    bool erase(const IndexKey& key, RowRef row);
+    void reset();   // 清空所有节点，供索引重建复用同一实例
     std::vector<RowRef> search(const IndexKey& key) const;
     // 等值查找，返回所有匹配的行（非唯一索引可能有多行）。
     std::vector<RowRef> range(const std::optional<IndexKey>& lower, bool lowerInclusive,
@@ -82,6 +84,7 @@ private:
     void collect(const Node& node, const std::optional<IndexKey>& lower, bool lowerInclusive,
                  const std::optional<IndexKey>& upper, bool upperInclusive, std::vector<RowRef>& rows) const;
     // 递归收集落在范围内的行。
+    void collectEntries(const Node& node, std::vector<IndexEntry>& entries) const;
     bool validateNode(const Node& node, std::size_t depth, std::size_t& leafDepth) const;
     // 递归校验：键有序、子节点数正确、所有叶子深度一致。
 };

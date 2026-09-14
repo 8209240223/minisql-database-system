@@ -276,6 +276,11 @@ void BufferPool::rollbackWriteBatch() {
     frames_.clear();
     // 清空缓存，避免保留了已撤销内容的页在之后被淘汰时写回磁盘。
 }
+void BufferPool::restoreSavepoint(const PageFileSavepoint& snapshot) {
+    requireUnpinned();
+    file_->restoreSavepoint(snapshot);
+    frames_.clear();
+}
 void BufferPool::commitWriteBatch() {
 // 提交写批次：把改动正式落盘。
     if (!file_->writeBatchActive()) throw MiniSqlError(ErrorCode::Transaction, "No active write batch");

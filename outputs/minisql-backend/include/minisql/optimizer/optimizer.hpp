@@ -1,5 +1,6 @@
 #pragma once
 #include "minisql/sql/planner.hpp"
+#include <unordered_map>
 
 namespace minisql::optimizer {
 struct Options {
@@ -22,6 +23,9 @@ struct Options {
     // 常量算术折叠：把常量参与的算术表达式提前算出来。
     bool decorrelateSubquery = true;
     // 子查询去关联：把相关子查询改写成可独立执行的连接或聚合形式。
+    double defaultTableRows = 1000.0;
+    std::size_t memoryBudgetBytes = 64 * 1024 * 1024;
+    std::unordered_map<std::string, double> tableRows{};
     std::size_t maxIterations = 16;
     // 优化主循环的最大迭代轮数，防止规则互相激发造成死循环。
     std::size_t maxNodes = 65536;

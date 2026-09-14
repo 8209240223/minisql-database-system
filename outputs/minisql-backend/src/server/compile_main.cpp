@@ -11,17 +11,25 @@
 #include <iostream>
 #include <iterator>
 #include <string>
+#ifdef _WIN32
+#include <windows.h>
+#include <shellapi.h>
+#endif
 using json = nlohmann::json;
 // 简写 JSON 命名空间。
 namespace {
 // 从 SQL 文件读取源码：显式失败优于静默空输入，并去掉 UTF-8 BOM。
 // （承接上一行）"显式失败"指打不开文件就直接报错，而不是当成空脚本继续跑。
+std::string displayPath(const std::filesystem::path& path) {
+    const auto value = path.generic_u8string();
+    return {reinterpret_cast<const char*>(value.data()), value.size()};
+}
+// 从 SQL 文件读取源码：显式失败优于静默空输入，并去掉 UTF-8 BOM。
 std::string readSqlFile(const std::filesystem::path& path) {
 // 读取 SQL 文件内容。
     std::ifstream stream(path, std::ios::binary);
     // 以二进制方式打开，避免平台做换行转换。
-    if (!stream) throw minisql::MiniSqlError(minisql::ErrorCode::InvalidArgument, "Cannot open SQL file: " + path.string());
-    // 打不开就按参数错误抛出，消息里带上路径方便定位。
+    if (!stream) throw minisql::MiniSqlError(minisql::ErrorCode::InvalidArgument, "Cannot open SQL file: " + displayPath(path));
     std::string source{std::istreambuf_iterator<char>(stream), {}};
     // 一次性把文件内容读进字符串。
     if (source.size() >= 3 && static_cast<unsigned char>(source[0]) == 0xEF &&
@@ -43,6 +51,7 @@ int main(int argc, char** argv) {
         // 是否只做解析而不生成计划（--parse-only）。
         std::filesystem::path sqlFile;
         // --file 指定的 SQL 文件；为空表示从标准输入读。
+        int sqlFileArgIndex = -1;
         for (int index = 1; index < argc; ++index) {
         // 手写一个很小的参数循环：选项少，不必引入解析库。
             const std::string argument = argv[index];
@@ -53,14 +62,24 @@ int main(int argc, char** argv) {
             // 指定 SQL 文件。
                 if (index + 1 >= argc) throw minisql::MiniSqlError(minisql::ErrorCode::InvalidArgument, "--file requires a path");
                 // 选项后面没跟路径，属于参数错误。
-                sqlFile = argv[++index];
-                // 取下一个参数作为路径，并把游标一起前移。
+                sqlFileArgIndex = ++index;
+                sqlFile = argv[index];
                 continue;
                 // 处理完继续下一个参数。
             }
             throw minisql::MiniSqlError(minisql::ErrorCode::InvalidArgument, "Unknown option: " + argument);
             // 其余参数一律拒绝，避免拼错选项却静默跑错。
         }
+#ifdef _WIN32
+        int wideCount = 0;
+        auto wideArgs = CommandLineToArgvW(GetCommandLineW(), &wideCount);
+        if (!wideArgs || wideCount != argc) {
+            if (wideArgs) LocalFree(wideArgs);
+            throw minisql::MiniSqlError(minisql::ErrorCode::InvalidArgument, "Cannot decode command line");
+        }
+        if (sqlFileArgIndex >= 0) sqlFile = wideArgs[sqlFileArgIndex];
+        LocalFree(wideArgs);
+#endif
         const std::string source = sqlFile.empty() ? std::string{std::istreambuf_iterator<char>(std::cin), {}} : readSqlFile(sqlFile);
         // 没给文件就读标准输入，否则读文件，得到统一的源码字符串。
         auto tok = minisql::sql::tokenize(source);

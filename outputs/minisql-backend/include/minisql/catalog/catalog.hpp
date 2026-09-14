@@ -19,6 +19,10 @@ public:
     // 删除索引。
     const Table* find(const std::string& name) const;
     // 按表名查找；找不到返回空指针（名字比较不区分大小写）。
+    const Table* findIndexTable(const std::string& indexName) const;
+    // 稳定 schema 指纹：表名 + 列名/类型/可空/主键/唯一，按表名排序后哈希。
+    // 计划绑定该指纹；执行时不一致即 PLAN_STALE_SCHEMA（第十七章 REQ-CORE-002）。
+    std::string schemaFingerprint() const;
 private:
     std::unordered_map<std::string, Table> tables_;
     // 表名（已转小写）到表定义的映射。

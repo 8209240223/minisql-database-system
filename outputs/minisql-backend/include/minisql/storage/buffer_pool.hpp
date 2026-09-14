@@ -86,12 +86,14 @@ public:
     // 开始一个写批次：先刷干净缓存，再让页文件进入暂存模式。
     void rollbackWriteBatch();
     // 回滚写批次：撤销暂存并清空缓存，避免旧内容被再次写回。
+    void restoreSavepoint(const PageFileSavepoint& snapshot);
     void commitWriteBatch();
     // 提交写批次：先把缓存刷到暂存区，再让页文件正式提交。
     void setPolicy(ReplacementPolicy policy);
     // 切换淘汰策略，切换时先刷盘并清空缓存。
     void resetStats();
     // 把统计与淘汰记录清零。
+    // 页替换日志输出：非空路径时，每次淘汰都以追加方式写一行文本日志（命中统计仍走 stats()）。
     // 页替换日志输出：非空路径时，每次淘汰都以追加方式写一行文本日志（命中统计仍走 stats()）。
     void setEvictionLog(std::filesystem::path path);
     // 设置替换日志文件路径，空路径表示关闭。

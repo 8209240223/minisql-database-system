@@ -12,6 +12,7 @@ export interface PlanRow {
 // 计划树中的一行节点。
   id: number;
   // 节点编号。
+  nodeId?: number;
   parent: number;
   // 父节点编号；根节点通常为 0。
   detail: string;
@@ -38,6 +39,8 @@ export interface PlanRow {
   // 优化器估算的行数。
   actualRows?: number;
   // 实际执行返回的行数。
+  sourceSpan?: { start: { line: number; column: number }; end: { line: number; column: number } };
+  outputSchema?: PlanColumn[];
 }
 export interface QueryResult {
 // 一次查询/执行返回的完整结果对象。
@@ -59,6 +62,8 @@ export interface QueryResult {
   // 整数编码策略说明。
   rows: Cell[][];
   // 结果行数据。
+  rowCount?: number;
+  truncated?: boolean;
   affectedRows: number;
   // 受影响行数。
   durationMs: number;
@@ -118,12 +123,20 @@ export interface ConnectionProfile {
   user: string;
   // 登录用户名（不保存密码）。
 }
-export interface QueryTab { id: string; name: string; sql: string; dirty?: boolean }
-// 查询标签页：编号、标题、SQL 文本和未保存标记。
+export interface QueryTab {
+  id: string;
+  name: string;
+  sql: string;
+  dirty?: boolean;
+  editVersion: number;
+  connection?: Connection;
+  sessionId?: string;
+  transactionState: string;
+  running: boolean;
+}
 export interface HistoryItem { id: string; sql: string; at: number; durationMs: number; rows: number; error?: string; mode: Connection['mode']; connection: string; action: 'compile' | 'execute' }
 // 查询历史记录。
-export interface SqlToken { type: string; text: string; line: number; column: number }
-// 词法 Token：类型、词素和行列位置。
+export interface SqlToken { type: string; text: string; line: number; column: number; endLine?: number; endColumn?: number; byteStart?: number; byteEnd?: number }
 
 // X24 / C2 权限与审计
 export interface AccessGrant { object: string; permissions: string[] }

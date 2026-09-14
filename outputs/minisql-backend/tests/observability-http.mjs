@@ -44,6 +44,14 @@ try {
   assert.ok(analyzed.data.plan.length > 0);
   assert.equal(analyzed.data.executionStats.nodeStatisticsAvailable, true);
   assert.ok(analyzed.data.executionStats.nodeStatistics.length > 0);
+  for (const node of analyzed.data.executionStats.nodeStatistics) {
+    assert.equal(node.io.available, true);
+    assert.equal(node.io.scope, 'inclusive-subtree');
+    for (const field of ['hits', 'misses', 'pageReads', 'pageWrites', 'stagedPageReads', 'stagedPageWrites',
+      'diskReads', 'diskWrites', 'ioErrors']) {
+      assert.equal(Number.isInteger(node.io[field]) && node.io[field] >= 0, true, `invalid node I/O field ${field}`);
+    }
+  }
   assert.equal((await request(session + '/execute', 'EXPLAIN ANALYZE DELETE FROM t;')).status, 422);
   assert.deepEqual((await request(session + '/execute', 'SELECT * FROM t ORDER BY id;')).data.rows, [[1],[2]]);
   assert.equal((await request(session + '/buffer', 'FIFO')).data.buffer.policy, 'FIFO');

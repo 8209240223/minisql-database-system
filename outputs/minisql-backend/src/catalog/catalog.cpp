@@ -30,6 +30,7 @@ std::string key(std::string value) {
     throw MiniSqlError(ErrorCode::Semantic, message, location);
 }
 // 错误消息里按 SQL 写法展示类型名：int -> INT、varchar(40) -> VARCHAR(40)。
+// 错误消息里按 SQL 写法展示类型名：int -> INT、varchar(40) -> VARCHAR(40)。
 std::string typeLabel(std::string value) {
 // 把内部类型名转成大写形式，用于错误提示。
     std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
@@ -89,10 +90,27 @@ std::string literalType(const std::string& raw, SourceLocation location) {
     // 按 64 位整数解析。
     if (result.ec != std::errc{} || result.ptr != end) {
     // 解析失败或没消费完，说明超出 int64 范围或格式不对。
-        fail("Integer literal is outside INT64 range: " + raw, location);
+        throw MiniSqlError(ErrorCode::IntegerOutOfRange,
+                           "SEM_INTEGER_OUT_OF_RANGE: integer literal is outside INT64 range: " + raw,
+                           location);
     }
     return value < INT32_MIN || value > INT32_MAX ? "bigint" : "int";
     // 按取值范围决定是 BIGINT 还是 INT。
+}
+
+// 第十七章 REQ-CORE-001：语义在任何窄化转换之前检查 INT 范围。
+// 字面量能装进 BIGINT 但装不进 INT（-2147483648..2147483647）而目标列是 INT 时，
+// 报告稳定符号错误码 SEM_INTEGER_OUT_OF_RANGE，而不是笼统的类型不匹配。
+// BIGINT 目标仍按 EXT-SQL-003 扩展接受，这是本项目的超集行为。
+void rejectNarrowedInteger(const std::string& raw, const std::string& sourceType,
+                           const std::string& targetType, SourceLocation location) {
+    if (sourceType != "bigint" || key(targetType) != "int") return;
+    if (raw.empty() || raw.front() == '\'') return;                  // 字符串字面量不参与
+    if (raw.find_first_of("eE.") != std::string::npos) return;       // 小数/浮点不参与
+    throw MiniSqlError(ErrorCode::IntegerOutOfRange,
+        "SEM_INTEGER_OUT_OF_RANGE: " + raw +
+        " does not fit INT (-2147483648..2147483647); use BIGINT or an explicit CAST",
+        location);
 }
 
 std::string expressionType(const sql::Expr& expression, const Table& table,
@@ -446,7 +464,6 @@ std::size_t resolveColumnIndex(const Table& table, const std::string& name, Sour
     return match;
     // 返回唯一的列下标。
 }
-
 Table queryScope(const sql::Statement& statement, const Catalog& catalog, std::size_t joinCount) {
 // 把主表与参与连接的右表合并成一张"视野表"，让后续校验统一按一张表来查列。
     const auto* first = catalog.find(statement.table);
@@ -535,6 +552,7 @@ void Catalog::create(const sql::Statement& statement) {
             // 三种形态都不满足，说明默认值不是单个字面量，拒绝。
             const auto type = literalType(*definition.defaultValue, statement.location);
             // 推导默认值的类型。
+            rejectNarrowedInteger(*definition.defaultValue, type, declared, statement.location);
             if ((type == "null" && !definition.nullable) || !assignable(type, declared))
             // 两种情况非法：给 NOT NULL 列设 NULL 默认值；或者默认值类型无法赋给列类型。
                 fail("DEFAULT type mismatch for column: " + definition.name, statement.location);
@@ -781,6 +799,47 @@ const Table* Catalog::find(const std::string& name) const {
     // 未命中返回 nullptr，命中返回表定义的只读指针。
 }
 
+const Table* Catalog::findIndexTable(const std::string& indexName) const {
+    for (const auto& [_, table] : tables_)
+        if (std::any_of(table.indexes.begin(), table.indexes.end(), [&](const Index& index) {
+                return key(index.name) == key(indexName);
+            })) return &table;
+    return nullptr;
+}
+
+std::string Catalog::schemaFingerprint() const {
+    // 表遍历顺序取决于 unordered_map，必须先按名字排序才能得到稳定指纹。
+    std::vector<const Table*> ordered;
+    ordered.reserve(tables_.size());
+    for (const auto& entry : tables_) ordered.push_back(&entry.second);
+    std::sort(ordered.begin(), ordered.end(), [](const Table* left, const Table* right) {
+        return key(left->name) < key(right->name);
+    });
+    std::uint64_t hash = 0xcbf29ce484222325ULL;
+    const auto mix = [&hash](const std::string& text) {
+        for (const unsigned char byte : text) { hash ^= byte; hash *= 0x100000001b3ULL; }
+        hash ^= 0x1f; hash *= 0x100000001b3ULL;   // 字段分隔符，避免拼接歧义
+    };
+    for (const auto* table : ordered) {
+        mix(key(table->name));
+        for (const auto& column : table->columns) {
+            mix(key(column.name));
+            mix(key(column.type));
+            mix(column.nullable ? "1" : "0");
+            mix(column.primaryKey ? "1" : "0");
+            mix(column.unique ? "1" : "0");
+        }
+        mix("|");   // 表边界
+    }
+    static constexpr char digits[] = "0123456789abcdef";
+    std::string out(16, '0');
+    for (int index = 15; index >= 0; --index) {
+        out[static_cast<std::size_t>(index)] = digits[hash & 0xfULL];
+        hash >>= 4;
+    }
+    return out;
+}
+
 std::vector<std::string> insertColumns(const sql::Statement& statement, const Table& table) {
 // 算出 INSERT 语句实际要写入哪些列。
     if (statement.defaultValues) {
@@ -842,12 +901,23 @@ void validate(const std::vector<sql::Statement>& statements, Catalog& catalog) {
         }
         // X09 3.3: 派生表基座。内层 select 仍在真实 catalog 上校验；外层列绑定、
         // 类型与 WHERE 校验交由 planner 的 Scope 链完成（catalog 未知派生别名）。
+        // X09 3.3: 派生表基座。内层 select 仍在真实 catalog 上校验；外层列绑定、
+        // 类型与 WHERE 校验交由 planner 的 Scope 链完成（catalog 未知派生别名）。
         if (statement.fromSubquery != nullptr) {
         // 这条语句的 FROM 是一个派生表（子查询）。
-            if (statement.kind != "Select") fail("DELETE/UPDATE is not supported over a derived table", statement.location);
-            // 只有 SELECT 允许把派生表当数据源。
             validate({*statement.fromSubquery}, catalog);
             // 先递归校验内层子查询本身；外层校验留给 planner。
+            if (statement.kind == "Update" || statement.kind == "Delete") {
+                const auto& source = *statement.fromSubquery;
+                const bool wildcard = source.selectItems.size() == 1 && source.selectItems.front().expression &&
+                    source.selectItems.front().expression->kind == "Wildcard" && source.selectItems.front().expression->value == "*";
+                const bool updatable = wildcard && !source.fromSubquery && source.joins.empty() && !source.distinct &&
+                    source.groupBy.empty() && !source.having && source.orderBy.empty() && !source.limit && source.offset == 0 && statement.joins.empty();
+                if (!updatable) fail("Derived table is not updatable; use a single base-table SELECT * without JOIN, DISTINCT, grouping, ordering or pagination", statement.location);
+                const auto* target = catalog.find(source.table);
+                if (!target) fail("Table does not exist: " + source.table, statement.location);
+                for (const auto& assignment : statement.assignments) (void)column(*target, assignment.column, statement.location);
+            }
             continue;
             // 跳过常规校验流程。
         }
@@ -884,12 +954,17 @@ void validate(const std::vector<sql::Statement>& statements, Catalog& catalog) {
                     : statement.valueExpressions[i]->kind == "Default" ? literalType(target.defaultValue.value_or("NULL"), statement.location)
                     : expressionType(*statement.valueExpressions[i], Table{"", {}}, statement.location);
                 // 推导这个值的类型：字面量形式直接判类型；DEFAULT 关键字取该列默认值的类型；表达式形式则按空表上下文求类型。
+                if (statement.valueExpressions.empty())
+                    rejectNarrowedInteger(statement.values[i], type, target.type, statement.location);
+                else if (statement.valueExpressions[i]->kind == "Literal")
+                    rejectNarrowedInteger(statement.valueExpressions[i]->value, type, target.type, statement.location);
                 if (type == "null" && !target.nullable)
                 // 往 NOT NULL 列插 NULL。
                     fail("NOT NULL constraint failed" + notNullConstraintSuffix(*catalog.find(statement.table), resolveColumnIndex(*table, name)), statement.location);
                     // 报错并附上可能存在的约束名后缀，方便验收定位。
                 if ((type == "null" && !target.nullable) || !assignable(type, key(target.type))) {
                 // 再次判断是否不可赋值（这里主要是为了收集信息，第一次已单独报过 NOT NULL）。
+                    // 收集全部不匹配的列，一次报告（验收示例要求同时给出 id 与 name 两处）。
                     // 收集全部不匹配的列，一次报告（验收示例要求同时给出 id 与 name 两处）。
                     mismatches.push_back(statement.table + "." + name + " expects " + typeLabel(target.type) +
                         ", but " + typeLabel(type) + " found");
@@ -929,6 +1004,8 @@ void validate(const std::vector<sql::Statement>& statements, Catalog& catalog) {
                 const auto type = item.expression->kind == "Default" ? literalType(target.defaultValue.value_or("NULL"), statement.location)
                     : expressionType(*item.expression, *table, statement.location);
                 // 推导赋值来源类型：DEFAULT 取该列默认值类型，否则在视图表上下文里求表达式类型。
+                if (item.expression->kind == "Literal")
+                    rejectNarrowedInteger(item.expression->value, type, target.type, statement.location);
                 if (type == "null" && !target.nullable)
                 // 往 NOT NULL 列赋 NULL。
                     fail("NOT NULL constraint failed" + notNullConstraintSuffix(*catalog.find(statement.table), resolveColumnIndex(*table, item.column)), statement.location);

@@ -1,7 +1,5 @@
 #include "minisql/security/access_catalog.hpp"
 #include "minisql/common/error.hpp"
-#include "minisql/sql/lexer.hpp"
-#include "minisql/sql/parser.hpp"
 
 #include <algorithm>
 #include <array>
@@ -225,12 +223,18 @@ std::string normalized(std::string value) {
     // 截出有效部分并转小写。
 }
 
+// 与 database.cpp 同因：Windows 上 path::string() 返回本地 ANSI 窄编码，
+// 含非 ASCII 的路径会产生非法 UTF-8，使错误响应序列化失败并丢掉整帧。
+std::string pathUtf8(const std::filesystem::path& path) {
+    const auto value = path.generic_u8string();
+    return {reinterpret_cast<const char*>(value.data()), value.size()};
+}
+
 std::vector<std::uint8_t> readFile(const std::filesystem::path& path) {
 // 把整个权限目录文件读成字节缓冲。
     std::ifstream stream(path, std::ios::binary);
     // 以二进制方式打开，避免换行转换破坏二进制内容。
-    if (!stream) throw MiniSqlError(ErrorCode::Storage, "Cannot open access catalog: " + path.string());
-    // 打不开就按存储错误上报，消息里带路径便于定位。
+    if (!stream) throw MiniSqlError(ErrorCode::Storage, "Cannot open access catalog: " + pathUtf8(path));
     return {std::istreambuf_iterator<char>(stream), std::istreambuf_iterator<char>()};
     // 一次性读完全部字节。
 }
@@ -265,366 +269,6 @@ bool constantTimeEqual(std::string_view actual, std::string_view expected) {
         // 逐字节异或后按位累积。
     return difference == 0;
     // 累积器仍为 0 才说明完全相等。
-}
-
-std::string firstKeyword(std::string_view source) {
-// 跳过前导空白与注释，取出 SQL 的第一个关键字（小写）。
-    std::size_t index = 0;
-    // 扫描游标。
-    for (;;) {
-    // 反复跳过空白与注释，直到遇到真正的第一个词。
-        while (index < source.size() && std::isspace(static_cast<unsigned char>(source[index]))) ++index;
-        // 吃掉所有空白字符。
-        if (index + 1 < source.size() && source[index] == '-' && source[index + 1] == '-') {
-        // 遇到行注释。
-            index = source.find('\n', index + 2);
-            // 跳到行尾。
-            if (index == std::string_view::npos) return {};
-            // 没有换行说明整段都是注释，取不到关键字。
-            continue;
-            // 继续找下一个词。
-        }
-        // 行注释处理结束。
-        if (index + 1 < source.size() && source[index] == '/' && source[index + 1] == '*') {
-        // 遇到块注释。
-            const auto end = source.find("*/", index + 2);
-            // 找结束标记。
-            if (end == std::string_view::npos) return {};
-            // 没闭合说明注释吃到了末尾，同样取不到关键字。
-            index = end + 2;
-            // 跳到注释之后。
-            continue;
-            // 继续找下一个词。
-        }
-        // 块注释处理结束。
-        const auto begin = index;
-        // 记下词的起点。
-        while (index < source.size() && std::isalpha(static_cast<unsigned char>(source[index]))) ++index;
-        // 吃掉连续的字母。
-        return begin == index ? std::string{} : lower(std::string(source.substr(begin, index - begin)));
-        // 一个字母都没吃掉说明当前位置不是标识符，返回空串；否则返回小写关键字。
-    }
-    // 无限循环结束（只能从内部 return 返回）。
-}
-
-std::vector<std::string> sqlWords(std::string_view source) {
-// 把 SQL 文本切成一串"词"，跳过空白与注释，字符串字面量整体丢弃。
-// 用途：后续靠词序列识别 FROM/UPDATE/JOIN 后面的表名，不需要完整语法树。
-    std::vector<std::string> words;
-    // 结果词表。
-    const auto alpha = [](char value) { return std::isalpha(static_cast<unsigned char>(value)) || value == '_'; };
-    // 判断能不能作为标识符首字符。
-    const auto digit = [](char value) { return std::isdigit(static_cast<unsigned char>(value)); };
-    // 判断是不是数字。
-    for (std::size_t index = 0; index < source.size();) {
-    // 逐字符扫描。
-        const char character = source[index];
-        // 当前字符。
-        if (std::isspace(static_cast<unsigned char>(character))) { ++index; continue; }
-        // 空白直接跳过。
-        if (index + 1 < source.size() && source[index] == '-' && source[index + 1] == '-') {
-        // 行注释：跳到行尾。
-            index += 2;
-            // 跳过两个减号。
-            while (index < source.size() && source[index] != '\n' && source[index] != '\r') ++index;
-            // 一路吃到换行。
-            continue;
-            // 注释不产生词。
-        }
-        // 行注释分支结束。
-        if (index + 1 < source.size() && source[index] == '/' && source[index + 1] == '*') {
-        // 块注释：跳到结束标记之后。
-            index += 2;
-            // 跳过 /*。
-            while (index + 1 < source.size() && !(source[index] == '*' && source[index + 1] == '/')) ++index;
-            // 找 */。
-            index = std::min(source.size(), index + 2);
-            // 跳过 */；用 min 防止越过末尾。
-            continue;
-            // 注释不产生词。
-        }
-        // 块注释分支结束。
-        if (character == '\'') {
-        // 字符串字面量：整个跳过，不产生词。
-            ++index;
-            // 跳过起始引号。
-            while (index < source.size()) {
-            // 直到闭合或到末尾。
-                if (source[index] != '\'') { ++index; continue; }
-                // 普通字符继续前进。
-                if (index + 1 < source.size() && source[index + 1] == '\'') { index += 2; continue; }
-                // 连续两个引号是转义，整体跳过。
-                ++index;
-                // 否则是结束引号。
-                break;
-                // 跳出。
-            }
-            // 字符串扫描循环结束。
-            continue;
-            // 字符串整体不产生词，继续扫后面。
-        }
-        // 字符串字面量分支结束。
-        if (alpha(character)) {
-        // 标识符：整段取出并转小写后收进词表。
-            const auto begin = index++;
-            // 记下起点并前进一格。
-            while (index < source.size() && (alpha(source[index]) || digit(source[index]))) ++index;
-            // 吃掉后续字母、数字、下划线。
-            words.push_back(lower(std::string(source.substr(begin, index - begin))));
-            // 转小写后收进词表（表名比较要大小写不敏感）。
-            continue;
-            // 继续扫描。
-        }
-        // 标识符分支结束。
-        words.emplace_back(1, character);
-        // 其它字符（括号、逗号、点号、运算符）各自作为单独一个"词"保留，
-        // 后面识别结构时需要靠它们定位。
-        ++index;
-        // 前进一格。
-    }
-    return words;
-    // 返回词表。
-}
-
-std::vector<std::string> tableReferences(std::string_view source, const std::string& keyword) {
-// 词法兜底路径：源文本解析不出语法树时，靠词序列尽量把被访问的表名抽出来。
-    const auto words = sqlWords(source);
-    // 先把 SQL 切成词。
-    std::vector<std::string> result;
-    // 抽出的表名，保持出现顺序。
-    std::unordered_set<std::string> ctes;
-    // WITH 子句定义的 CTE 名字：它们是作用域名而不是真实对象，必须排除。
-    const auto identifier = [](const std::string& value) {
-    // 判断一个词像不像合法标识符。
-        return !value.empty() && (std::isalpha(static_cast<unsigned char>(value.front())) || value.front() == '_') &&
-            // 首字符必须是字母或下划线，
-            std::all_of(value.begin() + 1, value.end(), [](char character) {
-            // 其余字符逐个检查。
-                return std::isalnum(static_cast<unsigned char>(character)) || character == '_';
-                // 只允许字母、数字、下划线。
-            });
-            // 检查结束。
-    };
-    // identifier 定义结束。
-    const auto add = [&](const std::string& value) {
-    // 把候选词加进结果：必须是标识符、不是 CTE、而且还没出现过。
-        if (identifier(value) && !ctes.contains(value) && std::find(result.begin(), result.end(), value) == result.end()) result.push_back(value);
-        // 三个条件同时满足才收，避免把关键字或重复名字当成对象。
-    };
-    // add 定义结束。
-    const auto addAfter = [&](std::size_t index, bool allowParenthesized) {
-    // 把紧跟在某个关键字后面的词当作表名收进来。
-        auto cursor = index + 1;
-        // 从关键字的下一个词开始看。
-        if (allowParenthesized && cursor < words.size() && words[cursor] == "(") return;
-        // 允许括号时：FROM (SELECT ...) 这种是派生表，本身不是对象，放弃。
-        if (cursor < words.size() && words[cursor] == "lateral") ++cursor;
-        // LATERAL 只是修饰词，跳过它再看真正的表名。
-        if (cursor < words.size()) add(words[cursor]);
-        // 把该词作为候选加进结果。
-    };
-    // addAfter 定义结束。
-    if (!words.empty() && words.front() == "with") {
-    // 语句以 WITH 开头，先把 CTE 名字收集起来。
-        std::size_t cursor = words.size() > 1 && words[1] == "recursive" ? 2 : 1;
-        // WITH RECURSIVE 时从第 3 个词开始，否则从第 2 个词开始。
-        for (;;) {
-        // 逐个处理 CTE 定义。
-            if (cursor >= words.size() || !identifier(words[cursor])) break;
-            // 当前词不是标识符，说明 CTE 列表已经结束。
-            ctes.insert(words[cursor++]);
-            // 记下这个 CTE 名字，并把游标前移。
-            if (cursor + 1 >= words.size() || words[cursor] != "as" || words[cursor + 1] != "(") break;
-            // CTE 定义必须是 AS ( ... )，不符合就结束扫描。
-            cursor += 2;
-            // 跳过 AS 与左括号。
-            std::size_t depth = 1;
-            // 括号深度从 1 开始。
-            while (cursor < words.size() && depth) {
-            // 一直找到与左括号配对的右括号。
-                if (words[cursor] == "(") ++depth;
-                // 遇到左括号加深。
-                else if (words[cursor] == ")") --depth;
-                // 遇到右括号变浅。
-                ++cursor;
-                // 游标前进。
-            }
-            // 配对结束。
-            if (cursor >= words.size() || words[cursor] != ",") break;
-            // 后面没有逗号说明 CTE 列表结束。
-            ++cursor;
-            // 跳过逗号，处理下一个 CTE。
-        }
-        // CTE 收集结束。
-    }
-    // WITH 处理结束。
-    const auto effectiveKeyword = keyword == "explain"
-    // 如果是 EXPLAIN，真正的语句关键字在后面，需要单独找出来。
-        ? std::find_if(words.begin(), words.end(), [](const std::string& value) {
-            // 找到第一个语句关键字。
-            return value == "select" || value == "insert" || value == "update" || value == "delete";
-            // 四种数据语句任一即命中。
-        })
-        // 查找结束。
-        : words.end();
-        // 不是 EXPLAIN 时用 end() 表示"没有额外关键字"。
-    const auto command = keyword == "explain" && effectiveKeyword != words.end() ? *effectiveKeyword : keyword;
-    // 得到后续规则匹配真正使用的命令词。
-    for (std::size_t index = 0; index < words.size(); ++index) {
-    // 从头遍历词序列找对象。
-        const auto& word = words[index];
-        // 当前词。
-        if (word == "from" || word == "join" || word == "into" || word == "update" || word == "references") addAfter(index, true);
-        // FROM/JOIN 是查询来源，INTO 是插入目标，UPDATE 是更新目标，REFERENCES 是外键父表。
-        if (command == "drop" && word == "table") addAfter(index, false);
-        // DROP TABLE 后面的表。
-        if (command == "create" && (word == "table" || word == "on")) addAfter(index, false);
-        // CREATE TABLE 与 CREATE INDEX ... ON 后面的表。
-    }
-    return result;
-    // 返回抽出的表名。
-}
-
-bool sqlIdentifier(std::string_view value) {
-// 判断一个字符串是不是合法 SQL 标识符：首字符是字母或下划线，其余是字母数字下划线。
-    if (value.empty() || !(std::isalpha(static_cast<unsigned char>(value.front())) || value.front() == '_')) return false;
-    // 空串或首字符不合法直接返回假。
-    return std::all_of(value.begin() + 1, value.end(), [](char character) {
-    // 检查剩余字符。
-        return std::isalnum(static_cast<unsigned char>(character)) || character == '_';
-        // 只允许字母、数字、下划线。
-    });
-    // 返回检查结果。
-}
-
-void addAstObject(const std::string& value, std::vector<std::string>& result,
-// 把一个候选对象名规范化后加入结果列表。
-                 std::unordered_set<std::string>& seen) {
-                 // seen 用于去重，保证同一个对象只出现一次。
-    const auto object = normalized(value);
-    // 去掉首尾空白并转小写，得到用于比较的规范名。
-    if (sqlIdentifier(object) && seen.insert(object).second) result.push_back(object);
-    // 名字合法且此前没见过才收进结果。
-}
-
-void collectAstStatementObjects(const sql::Statement& statement, std::vector<std::string>& result,
-// 前置声明：语句级收集与表达式级收集互相递归调用。
-                                std::unordered_set<std::string>& seen);
-                                // 这里只是声明，定义在下面。
-
-void collectAstExpressionObjects(const std::shared_ptr<sql::Expr>& expression,
-// 遍历表达式子树，收集其中出现的数据库对象名。
-                                 std::vector<std::string>& result,
-                                 // 结果列表。
-                                 std::unordered_set<std::string>& seen) {
-                                 // 去重集合。
-    if (!expression) return;
-    // 空节点直接返回。
-    collectAstExpressionObjects(expression->left, result, seen);
-    // 先递归左子树。
-    collectAstExpressionObjects(expression->right, result, seen);
-    // 再递归右子树。
-    if (expression->subquery) collectAstStatementObjects(*expression->subquery, result, seen);
-    // 表达式挂了结构化子查询时，递归收集子查询里的对象。
-    else if (!expression->subquerySql.empty()) {
-    // 否则若只有子查询原文（过渡形态），改走文本解析兜底。
-        try {
-        // 解析可能失败，用 try 包住。
-            auto nestedSql = expression->subquerySql;
-            // 复制一份子查询原文。
-            if (nestedSql.find_last_not_of(" \t\r\n") == std::string::npos ||
-                // 全是空白，
-                nestedSql[nestedSql.find_last_not_of(" \t\r\n")] != ';') nestedSql += ';';
-                // 或者结尾不是分号，就补一个分号，保证能被解析成完整语句。
-            for (const auto& nested : sql::parse(sql::tokenize(nestedSql)))
-            // 先词法切分再语法解析。
-                collectAstStatementObjects(nested, result, seen);
-                // 对解析出的每条语句递归收集对象。
-        } catch (const MiniSqlError&) {
-        // 局部解析失败。
-            // The caller will use the lexical fallback when the complete source cannot be parsed.
-            // 这里故意吞掉异常：调用方会在整体解析失败时改用词法兜底路径，
-            // 局部失败时"少收集一点"比直接报错更合适。
-        }
-    }
-    // 子查询处理结束。
-}
-
-void collectAstStatementObjects(const sql::Statement& statement, std::vector<std::string>& result,
-                                std::unordered_set<std::string>& seen) {
-                                // 语句级收集：把一条语句引用的所有数据库对象名收进结果。
-    // A derived-table alias is a scope name, not a database object. Its nested statement is collected below.
-    // FROM 派生表的别名是作用域名字而不是数据库对象，所以不能当成对象；
-    // 但它内部那条 SELECT 引用到的对象要在下面递归收集。
-    if (!statement.table.empty() && !(statement.kind == "Select" && statement.fromSubquery))
-    // 排除"SELECT 且 FROM 是派生表"的情况。
-        addAstObject(statement.table, result, seen);
-        // 其余情况下主表名就是真实对象。
-    for (const auto& join : statement.joins) addAstObject(join.table, result, seen);
-    // 连接涉及的每一张表。
-    for (const auto& foreignKey : statement.foreignKeys) addAstObject(foreignKey.table, result, seen);
-    // 表级外键引用的父表。
-    for (const auto& column : statement.columns)
-    // 遍历列定义，找列级外键。
-        if (column.references) addAstObject(column.references->first, result, seen);
-        // 有 REFERENCES 就收集父表名。
-    if (statement.fromSubquery) collectAstStatementObjects(*statement.fromSubquery, result, seen);
-    // 派生表内部语句引用的对象。
-    collectAstExpressionObjects(statement.where, result, seen);
-    // WHERE 里的子查询。
-    collectAstExpressionObjects(statement.having, result, seen);
-    // HAVING 里的子查询。
-    for (const auto& item : statement.selectItems) collectAstExpressionObjects(item.expression, result, seen);
-    // 投影表达式里的子查询。
-    for (const auto& item : statement.orderBy) collectAstExpressionObjects(item.expression, result, seen);
-    // 排序键里的子查询。
-    for (const auto& item : statement.assignments) collectAstExpressionObjects(item.expression, result, seen);
-    // UPDATE 赋值里的子查询。
-    for (const auto& item : statement.groupBy) collectAstExpressionObjects(item, result, seen);
-    // 分组键里的子查询。
-    for (const auto& item : statement.checks) collectAstExpressionObjects(item, result, seen);
-    // CHECK 约束里的子查询。
-    for (const auto& item : statement.valueExpressions) collectAstExpressionObjects(item, result, seen);
-    // INSERT 表达式值里的子查询。
-    for (const auto& row : statement.valueRows)
-    // INSERT 多行形式逐行处理。
-        for (const auto& item : row) collectAstExpressionObjects(item, result, seen);
-        // 每行的每个表达式都递归收集。
-}
-
-std::vector<std::string> astTableReferences(std::string_view source, const std::string& keyword) {
-// 首选路径：先尝试把 SQL 真正解析成语法树，从树上精确收集被访问的表；
-// 解析不了再退回上面的词法扫描。
-    try {
-    // 解析可能失败，用 try 包住。
-        auto tokens = sql::tokenize(std::string(source));
-        // 先做词法分析，得到 token 流。
-        if (keyword == "explain" && !tokens.empty()) {
-        // EXPLAIN 本身不是数据语句，需要把前缀剥掉再解析。
-            const auto lowerLexeme = [](const sql::Token& token) { return normalized(token.lexeme); };
-            // 局部工具：取 token 的小写文本。
-            if (lowerLexeme(tokens.front()) == "explain") tokens.erase(tokens.begin());
-            // 去掉开头的 EXPLAIN。
-            if (!tokens.empty() && lowerLexeme(tokens.front()) == "analyze") tokens.erase(tokens.begin());
-            // 再去掉可选的 ANALYZE，剩下的就是真正的语句。
-        }
-        // 前缀处理结束。
-        std::vector<std::string> result;
-        // 收集结果。
-        std::unordered_set<std::string> seen;
-        // 去重集合。
-        for (const auto& statement : sql::parse(tokens)) collectAstStatementObjects(statement, result, seen);
-        // 解析成语句列表后逐条收集对象。
-        return result.empty() ? tableReferences(source, keyword) : result;
-        // 解析成功但一个对象都没收集到（例如纯 SELECT 常量），仍用词法扫描补一次，
-        // 保证不会因为"树上确实没有表"而漏掉本应识别的对象。
-    } catch (const MiniSqlError&) {
-    // 解析失败（语法不支持或语句畸形）。
-        // Unsupported or malformed syntax is still checked by the conservative scanner before execution.
-        // 这部分语句在执行前仍会被保守的词法扫描检查，所以这里退回词法路径而不是直接放行。
-        return tableReferences(source, keyword);
-        // 退回词法兜底。
-    }
 }
 
 bool permissionIn(const nlohmann::json& grants, const std::string& permission, const std::string& object) {
@@ -781,6 +425,7 @@ AccessCatalog AccessCatalog::load(const std::filesystem::path& databasePath) {
     // 用常数时间比较，避免比较耗时泄漏摘要信息。
         // META 中保存的是原始 SHA-256 字节，而密码记录保存的是十六进制文本；这里按字节比较摘要。
         // 注意区分：这里比较的是"原始 32 字节摘要"，而用户口令记录里保存的是十六进制文本。
+        // META 中保存的是原始 SHA-256 字节，而密码记录保存的是十六进制文本；这里按字节比较摘要。
         throw MiniSqlError(ErrorCode::Storage, "Access catalog payload digest mismatch");
         // 摘要不符说明载荷被改过。
     }
@@ -854,54 +499,80 @@ bool AccessCatalog::verify(const std::string& user, const std::string& password)
     // 比较用常数时间实现，避免通过耗时反推口令内容。
 }
 
-void AccessCatalog::authorize(const std::string& user, const std::string& operation, const std::string& sql,
-// 鉴权：把"操作 + SQL"映射成抽象权限，再逐个对象检查该用户是否拥有这个权限。
-                              const std::string& table, const std::string& index,
-                              // table / index 用于针对具体对象的操作（如索引检查）。
-                              const std::vector<std::string>& resolvedObjects) const {
-                              // resolvedObjects 是调用方已经解析好的真实对象列表，可能为空。
+std::string permissionName(AccessAction action) {
+    switch (action) {
+        case AccessAction::Connect: return "connect";
+        case AccessAction::Compile: return "compile";
+        case AccessAction::Read: return "read";
+        case AccessAction::Select: return "select";
+        case AccessAction::Insert: return "insert";
+        case AccessAction::Update: return "update";
+        case AccessAction::Delete: return "delete";
+        case AccessAction::Create: return "create";
+        case AccessAction::Drop: return "drop";
+        case AccessAction::Transaction: return "transaction";
+        case AccessAction::Checkpoint: return "checkpoint";
+    }
+    return "compile";
+}
+
+void AccessCatalog::authorize(const std::string& user, const std::string& operation, const AccessRequest& request,
+                              const std::string& table, const std::string& index) const {
     if (!enabled_) return;
     // 权限控制未启用时直接放行。
     const auto mode = normalized(operation);
     // 规范化操作名，后面按它判断权限类别。
-    const auto keyword = firstKeyword(sql);
-    // 取出 SQL 的第一个关键字，用于区分 select/insert/create 等。
-    std::string permission = "compile";
-    // 默认权限是 compile：只编译不执行的路径（如 EXPLAIN）按它算。
-    if (mode == "snapshot" || mode == "restore") permission = "checkpoint";
-    // 快照与恢复等价于做检查点，需要 checkpoint 权限。
-    if (mode == "catalog" || mode == "statistics" || mode == "buffer") permission = "read";
-    // 目录、统计、缓冲池状态都属于只读操作。
-    else if (mode == "close") permission = "connect";
-    // 关闭会话需要连接权限。
-    else if (mode == "indexinspect") permission = "read";
-    // 索引结构检查同样只读。
-    else if (keyword == "begin" || keyword == "commit" || keyword == "rollback" || keyword == "checkpoint") permission = "transaction";
-    // 事务控制语句需要事务权限。
-    else if (keyword == "create") permission = "create";
-    // 建表建索引需要 create 权限。
-    else if (keyword == "drop") permission = "drop";
-    // 删对象需要 drop 权限。
-    else if (keyword == "select") permission = mode == "compile" || mode == "diagnostics" ? "compile" : "select";
-    // 查询语句：只是编译或诊断时按 compile 算，真正执行才需要 select 权限。
-    else if (keyword == "insert" || keyword == "update" || keyword == "delete") permission = keyword;
-    // 三种写语句各自对应同名权限。
-    std::vector<std::string> objects;
-    // 本次需要检查权限的对象列表。
-    if (mode == "indexinspect" && !table.empty()) objects.push_back(normalized(table));
-    // 索引检查只针对调用方给出的那一张表。
-    else if (!resolvedObjects.empty()) objects = resolvedObjects;
-    // 否则优先使用调用方解析好的对象列表（最准确）。
-    else objects = astTableReferences(sql, keyword);
-    // 都没有就现场解析 SQL 得到对象。
-    if (objects.empty()) objects.push_back("*");
-    // 一个对象都识别不出来时退化成检查 "*"，避免因解析失败而绕过鉴权。
     (void)index;
     // index 参数当前不参与判定，显式标记忽略以免编译告警。
+
+    // 入口动作优先：这些请求不携带 SQL，权限只由入口决定。
+    if (mode == "snapshot" || mode == "restore") return requireAll(user, "checkpoint", {"*"});
+    if (mode == "close") return requireAll(user, "connect", {"*"});
+    if (mode == "catalog" || mode == "statistics" || mode == "buffer") return requireAll(user, "read", {"*"});
+    if (mode == "indexinspect")
+        return requireAll(user, "read", table.empty() ? std::vector<std::string>{"*"} : std::vector<std::string>{normalized(table)});
+    // 索引一致性检查只读；在线重建会改写索引页，按对象写权限（update）收紧。
+    if (mode == "indexverify")
+        return requireAll(user, "read", table.empty() ? std::vector<std::string>{"*"} : std::vector<std::string>{normalized(table)});
+    if (mode == "indexrebuild")
+        return requireAll(user, "update", table.empty() ? std::vector<std::string>{"*"} : std::vector<std::string>{normalized(table)});
+    // diagnostics 是只读错误报告入口：待分析的 SQL 本身可能无法绑定（这正是它要报告
+    // 的错误），因此只要求 compile 权限，不要求对象集合闭合。
+    if (mode == "diagnostics") return requireAll(user, "compile", {"*"});
+
+    // X25 fail-closed：绑定器没有给出闭合的对象集合就一律拒绝执行。此处不存在、
+    // 也不允许存在任何基于 SQL 文本的兜底扫描。拒绝执行与回报原因分开：
+    // 第十九章规定 422 表示「SQL 检查失败」，因此绑定失败（如表不存在）回报
+    // 它自己的错误码与位置，只有真正的授权失败才是权限错误。
+    if (!request.bound) {
+        if (request.failureCode != ErrorCode::Ok)
+            throw MiniSqlError(request.failureCode,
+                               request.diagnostic.empty() ? "Statement could not be bound" : request.diagnostic,
+                               request.failureLocation);
+        throw MiniSqlError(ErrorCode::Permission,
+            request.diagnostic.empty() ? "Permission denied: statement could not be bound"
+                                       : "Permission denied: statement could not be bound (" + request.diagnostic + ")");
+    }
+
+    // 只编译不执行时，读动作降级为 compile 权限；写动作不降级。
+    const bool compileOnly = mode == "compile" || mode == "diagnostics";
+    const auto effective = [&](AccessAction action) {
+        if (compileOnly && (action == AccessAction::Select || action == AccessAction::Read)) return std::string("compile");
+        return permissionName(action);
+    };
+
+    if (request.objects.empty()) return requireAll(user, effective(request.statementAction), {"*"});
+    for (const auto& object : request.objects)
+        if (!canPermission(catalog_, user, effective(object.action), object.object))
+            throw MiniSqlError(ErrorCode::Permission, "Permission denied");
+}
+
+void AccessCatalog::requireAll(const std::string& user, const std::string& permission,
+                               const std::vector<std::string>& objects) const {
     for (const auto& object : objects)
     // 逐个对象检查权限。
-        if (!canPermission(catalog_, user, permission, object)) throw MiniSqlError(ErrorCode::Permission, "Permission denied");
-        // 任意一个对象没权限就整体拒绝；错误信息统一为"权限不足"，不泄露具体是哪一项。
+        if (!canPermission(catalog_, user, permission, object))
+            throw MiniSqlError(ErrorCode::Permission, "Permission denied");
 }
 
 } // namespace minisql::security

@@ -9,7 +9,7 @@
 - **AST / Plan 版本化**：文档写入 `schemaVersion` / `schemaMinor` / `nodeVersion`（AST）或 `planVersion`（Plan）/ `producerVersion`。
 - **读端闸门**：未知主版本拒绝；同主版 `minor <= current` 兼容读；更高次版本拒绝。详见 [ast-plan-schema-versioning.md](ast-plan-schema-versioning.md)。
 - **稳定对象身份**：列以 `columnId` 标识；表/列/约束结构不依赖数组下标。
-- **Catalog 迁移契约**：`CATALOG_SCHEMA_VERSION = 5`；`migrationPlan(fromVersion)` 暴露可检查的迁移步骤；中断恢复（`pendingMigration` / `recovered`）；迁移不静默改变列类型 / NULL / 约束 / 索引。
+- **Catalog 迁移契约**：`CATALOG_SCHEMA_VERSION = 6`；新列描述符使用稳定数值 `typeId` 与参数对象，旧 v1-v4 描述符继续兼容读取，未知 ID 按损坏拒绝；`migrationPlan(fromVersion)` 暴露可检查的迁移步骤和中断恢复。
 - **未知节点拒绝**：新 AST 节点交给旧 Planner 时明确报错，不产出空计划或默认节点。
 
 ## 验证

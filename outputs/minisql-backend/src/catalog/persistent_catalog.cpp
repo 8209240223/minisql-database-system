@@ -30,11 +30,80 @@ constexpr std::size_t accessMaxChunks = 4096;
 [[noreturn]] void corrupt() { throw MiniSqlError(ErrorCode::Storage, "STORAGE_CORRUPTION: system catalog"); }
 // 统一的损坏上报：系统目录一旦自相矛盾就按存储损坏抛出，绝不猜测修复。
 // 消息前缀 STORAGE_CORRUPTION 是测试与运维用来识别该类故障的约定标记。
+
+// Stable on-disk SQL type identities. These values are part of the catalog
+// format and must never be renumbered; parameters live beside the base id.
+enum class PersistedTypeId : std::uint32_t {
+    Int = 1,
+    Bigint = 2,
+    Float = 3,
+    Bool = 4,
+    Date = 5,
+    Varchar = 6,
+    Decimal = 7,
+};
+
+nlohmann::json encodeType(const std::string& type) {
+    if (type == "int") return {{"typeId", PersistedTypeId::Int}, {"typeParameters", nullptr}};
+    if (type == "bigint") return {{"typeId", PersistedTypeId::Bigint}, {"typeParameters", nullptr}};
+    if (type == "float") return {{"typeId", PersistedTypeId::Float}, {"typeParameters", nullptr}};
+    if (type == "bool") return {{"typeId", PersistedTypeId::Bool}, {"typeParameters", nullptr}};
+    if (type == "date") return {{"typeId", PersistedTypeId::Date}, {"typeParameters", nullptr}};
+    if (type == "varchar") return {{"typeId", PersistedTypeId::Varchar}, {"typeParameters", nullptr}};
+    if (const auto length = varcharLength(type))
+        return {{"typeId", PersistedTypeId::Varchar}, {"typeParameters", {{"length", *length}}}};
+    if (const auto decimal = decimalType(type))
+        return {{"typeId", PersistedTypeId::Decimal},
+            {"typeParameters", {{"precision", decimal->precision}, {"scale", decimal->scale}}}};
+    throw MiniSqlError(ErrorCode::Catalog, "Unsupported column type");
+}
+
+std::string decodeType(const nlohmann::json& encoded) {
+    if (!encoded.contains("typeId") || !encoded.at("typeId").is_number_unsigned() ||
+        !encoded.contains("typeParameters")) corrupt();
+    const auto id = encoded.at("typeId").get<std::uint32_t>();
+    const auto& parameters = encoded.at("typeParameters");
+    const auto parameterless = [&] { if (!parameters.is_null()) corrupt(); };
+    switch (static_cast<PersistedTypeId>(id)) {
+        case PersistedTypeId::Int: parameterless(); return "int";
+        case PersistedTypeId::Bigint: parameterless(); return "bigint";
+        case PersistedTypeId::Float: parameterless(); return "float";
+        case PersistedTypeId::Bool: parameterless(); return "bool";
+        case PersistedTypeId::Date: parameterless(); return "date";
+        case PersistedTypeId::Varchar:
+            if (parameters.is_null()) return "varchar";
+            if (!parameters.is_object() || parameters.size() != 1 || !parameters.at("length").is_number_unsigned()) corrupt();
+            if (const auto length = parameters.at("length").get<std::uint32_t>(); length >= 1 && length <= 65535)
+                return "varchar(" + std::to_string(length) + ")";
+            corrupt();
+        case PersistedTypeId::Decimal:
+            if (!parameters.is_object() || parameters.size() != 2 ||
+                !parameters.at("precision").is_number_unsigned() || !parameters.at("scale").is_number_unsigned()) corrupt();
+            if (const DecimalType decimal{parameters.at("precision").get<std::uint32_t>(), parameters.at("scale").get<std::uint32_t>()};
+                decimal.precision >= 1 && decimal.precision <= 38 && decimal.scale <= decimal.precision)
+                return decimal.name();
+            corrupt();
+    }
+    corrupt();
+}
+
+template <typename ColumnLike>
+std::string encodeColumnDescriptor(const ColumnLike& column) {
+    auto descriptor = encodeType(column.type);
+    descriptor["version"] = 5;
+    descriptor["nullable"] = column.nullable;
+    descriptor["defaultValue"] = column.defaultValue ? nlohmann::json(*column.defaultValue) : nlohmann::json(nullptr);
+    descriptor["primaryKey"] = column.primaryKey;
+    descriptor["unique"] = column.unique;
+    descriptor["references"] = sql::serializeReference(column.references);
+    return descriptor.dump();
+}
 }
 PersistentCatalog::PersistentCatalog(storage::HeapStore& heap) : heap_(heap) {
 // 打开目录时执行一次完整加载：读元数据头、读列、读表、读权限，再做版本盖章。
     // --- X13 catalog metadata header (schemaVersion 落盘 + 未知主版本拒绝) ---
     // X13 元数据头：把 schemaVersion 落盘，并在遇到不认识的更高主版本时拒绝打开。
+    // --- X13 catalog metadata header (schemaVersion 落盘 + 未知主版本拒绝) ---
     const storage::RowSchema headerSchema{storage::ColumnType::Int, storage::ColumnType::Varchar};
     // 元数据头的行结构：版本号（整数）、附加信息（JSON 文本）。
     std::uint32_t onDiskVersion = 0;
@@ -113,8 +182,10 @@ PersistentCatalog::PersistentCatalog(storage::HeapStore& heap) : heap_(heap) {
                 // 取出这份描述的格式版本，后面按版本分支解析。
                 if (!encoded.is_object() || !encoded.at("nullable").is_boolean()) corrupt();
                 // 必须是对象，且 nullable 必须是布尔值。
-                if (version == 1) { if (encoded.size() != 3) corrupt(); }
-                // 版本 1：只有 version/type/nullable 三个字段。
+                if (version == 1) {
+                    if (encoded.size() != 3) corrupt();
+                    column.type = encoded.at("type").get<std::string>();
+                }
                 else if (version == 2 || version == 3 || version == 4) {
                 // 版本 2/3/4：逐步加入了默认值、键标记、外键。
                     if (encoded.size() != (version == 2 ? 4u : version == 3 ? 6u : 7u) || !encoded.contains("defaultValue")) corrupt();
@@ -137,10 +208,21 @@ PersistentCatalog::PersistentCatalog(storage::HeapStore& heap) : heap_(heap) {
                         column.references = std::make_pair(reference.at("table").get<std::string>(), reference.at("column").get<std::string>());
                         // 还原成"父表名，父列名"这一对。
                     }
+                    column.type = encoded.at("type").get<std::string>();
+                } else if (version == 5) {
+                    if (encoded.size() != 8 || !encoded.contains("defaultValue") ||
+                        !encoded.at("primaryKey").is_boolean() || !encoded.at("unique").is_boolean()) corrupt();
+                    if (!encoded.at("defaultValue").is_null()) column.defaultValue = encoded.at("defaultValue").get<std::string>();
+                    column.primaryKey = encoded.at("primaryKey").get<bool>();
+                    column.unique = encoded.at("unique").get<bool>();
+                    if (!encoded.at("references").is_null()) {
+                        const auto& reference = encoded.at("references");
+                        if (!reference.is_object() || reference.size() != 2) corrupt();
+                        column.references = std::make_pair(reference.at("table").get<std::string>(), reference.at("column").get<std::string>());
+                    }
+                    column.type = decodeType(encoded);
                 } else corrupt();
                 // 其它版本号一律视为损坏（比当前新却还能解析，说明文件被动过）。
-                column.type = encoded.at("type").get<std::string>();
-                // 真正的列类型从 JSON 的 type 字段取。
                 column.nullable = encoded.at("nullable").get<bool>();
                 // 还原可空性。
             } catch (const nlohmann::json::exception&) { corrupt(); }
@@ -268,13 +350,14 @@ PersistentCatalog::PersistentCatalog(storage::HeapStore& heap) : heap_(heap) {
     // 读取权限系统堆表时按 permissionVersion 组成候选快照，允许崩溃留下旧快照和新快照的混合尾部。
     // 解释：写权限目录的顺序是"先插入新版本的分片，再删除旧版本的分片"，
     // 中途崩溃会同时留下两代分片，所以这里按版本分组，并优先使用分片齐全且版本最高的那一代。
+    // 读取权限系统堆表时按 permissionVersion 组成候选快照，允许崩溃留下旧快照和新快照的混合尾部。
     std::map<std::uint32_t, std::vector<std::pair<std::int32_t, std::string>>> accessChunks;
     // 权限版本 → 该版本的全部分片（分片序号, 分片内容）。
     heap_.scan(AccessCatalogStore, accessSchema, [&](storage::RowRef, const storage::Row& row) {
     // 扫描权限目录堆表。
         if (row.size() != 3 || std::holds_alternative<std::monostate>(row[0]) ||
         // 必须有三列，且版本列非空。
-        std::holds_alternative<std::monostate>(row[1]) || std::holds_alternative<std::monostate>(row[2])) corrupt();
+            std::holds_alternative<std::monostate>(row[1]) || std::holds_alternative<std::monostate>(row[2])) corrupt();
         // 分片序号列与内容列同样不能为空。
         const auto version = std::get<std::int64_t>(row[0]);
         // 取出权限版本。
@@ -284,7 +367,7 @@ PersistentCatalog::PersistentCatalog(storage::HeapStore& heap) : heap_(heap) {
         // 取出分片内容。
         if (version < 1 || version > std::numeric_limits<std::uint32_t>::max() || ordinal < 0 ||
         // 版本与序号都必须在合法范围内。
-        static_cast<std::size_t>(ordinal) >= accessMaxChunks || chunk.empty() || chunk.size() > accessChunkBytes) corrupt();
+            static_cast<std::size_t>(ordinal) >= accessMaxChunks || chunk.empty() || chunk.size() > accessChunkBytes) corrupt();
         // 序号不能超过分片上限，分片也不能为空或超长。
         accessChunks[static_cast<std::uint32_t>(version)].push_back({ordinal, chunk});
         // 把这一片归入对应的版本。
@@ -337,6 +420,10 @@ PersistentCatalog::PersistentCatalog(storage::HeapStore& heap) : heap_(heap) {
     // 绝不会重写列类型、可空性、约束与
     // indexes (satisfying "迁移不得静默改列类型/NULL/约束/索引"). ---
     // 索引，从而满足"迁移不得静默改动列类型、NULL、约束与索引"的要求。
+    // --- X13 migrate / stamp. Table & column rows above were read leniently, so
+    // the in-memory catalog already reflects current features; migration here is
+    // a version stamp and never rewrites column types / NULL / constraints /
+    // indexes (satisfying "迁移不得静默改列类型/NULL/约束/索引"). ---
     if (!headerPresent) {
     // 情况一：没有元数据头。
         // Absent header = brand-new catalog, or a legacy catalog written before
@@ -347,6 +434,10 @@ PersistentCatalog::PersistentCatalog(storage::HeapStore& heap) : heap_(heap) {
         // 但头还没盖章"之间，这一步会把头补上，
         // it and marks recovery.
         // 并在附加信息里标记这次经历过恢复。
+        // Absent header = brand-new catalog, or a legacy catalog written before
+        // metadata existed. Record the current schema version. If a prior crash
+        // left descriptors already upgraded but the header unstamped, this stamps
+        // it and marks recovery.
         nlohmann::json detail{{"producerVersion", sql::PRODUCER_VERSION},
             // 记录当前生产者版本，
             {"migratedFrom", 0}, {"recovered", false}, {"pendingMigration", 0}};
@@ -363,6 +454,8 @@ PersistentCatalog::PersistentCatalog(storage::HeapStore& heap) : heap_(heap) {
         // 升级链是 onDiskVersion 一直到 CATALOG_SCHEMA_VERSION。
         // successful lenient load above; recovery point is the existing header row.
         // 预检就是上面那次成功的宽容加载；恢复点就是现有这一行元数据头。
+        // Upgrade chain: onDiskVersion -> CATALOG_SCHEMA_VERSION. Preflight was the
+        // successful lenient load above; recovery point is the existing header row.
         const bool interrupted = pendingMigration >= sql::CATALOG_SCHEMA_VERSION;
         // 上次记录"正在迁移到不低于当前目标的版本"，说明上次是在迁移中途崩的。
         nlohmann::json detail{{"producerVersion", sql::PRODUCER_VERSION},
@@ -657,12 +750,7 @@ std::int32_t PersistentCatalog::create(const sql::Statement& definition) {
         // 当前列。
         if (column.type != "int" && !stringType(column.type) && column.type != "bigint" && column.type != "float" && column.type != "bool" && column.type != "date" && !decimalType(column.type)) throw MiniSqlError(ErrorCode::Catalog, "Unsupported column type");
         // 类型白名单二次确认：写盘前再挡一次，避免脏类型进入磁盘。
-        const auto descriptor = nlohmann::json{{"version", 4}, {"type", column.type}, {"nullable", column.nullable},
-            // 列描述用第 4 版格式：版本、类型、可空性，
-            {"defaultValue", column.defaultValue ? nlohmann::json(*column.defaultValue) : nlohmann::json(nullptr)},
-            // 默认值（没有就写 null），
-            {"primaryKey", column.primaryKey}, {"unique", column.unique}, {"references", sql::serializeReference(column.references)}}.dump();
-            // 主键标记、唯一标记、列级外键，最后转成文本。
+        const auto descriptor = encodeColumnDescriptor(column);
         rows.push_back({id, static_cast<std::int32_t>(i), column.name, descriptor});
         // 组装这一行：表编号、列序号、列名、列描述。
         (void)storage::encodeRow(rows.back(), columnSchema);

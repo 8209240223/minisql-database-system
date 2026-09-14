@@ -11,8 +11,11 @@
 namespace minisql::storage {
 // 页级 B+ 树（X20）。每个索引 = owner 下一个 INDEX_META 元页 + 若干节点页。
 // 节点页内只有一个二进制节点记录，父/子/兄弟均以 PageRef 指向页。
+// 页级 B+ 树（X20）。每个索引 = owner 下一个 INDEX_META 元页 + 若干节点页。
+// 节点页内只有一个二进制节点记录，父/子/兄弟均以 PageRef 指向页。
 enum IndexPageType : std::uint8_t { IndexMeta = 0x50, IndexInternal = 0x41, IndexLeaf = 0x42 };
 // 页类型标记：0x50 元页、0x41 内部节点页、0x42 叶子页。
+// 页级结构校验输出（每页一条；页类型/height/keyCount/父/兄弟指针，用于工作台诊断命令）。
 
 // 页级结构校验输出（每页一条；页类型/height/keyCount/父/兄弟指针，用于工作台诊断命令）。
 struct IndexPageInfo {
@@ -139,6 +142,7 @@ private:
     // 元页位置缓存；mutable 使 const 方法也能惰性填充。
     std::size_t count_ = 0;
     // 当前索引项数缓存。
+    // 二进制编解码
 
     // 二进制编解码
     static std::vector<std::uint8_t> encodeValue(const Value& value);
@@ -182,6 +186,7 @@ private:
     // 走到最左叶子，范围扫描与校验的起点。
     PageRef liftLeaf(PageRef root, const IndexKey& key) const;
     // 按某个键走到对应的叶子。
+    IndexKey minimumKey(PageRef node) const;
     std::size_t childIndex(const std::vector<IndexKey>& keys, const IndexKey& key) const;
     // 内部节点里应该下钻的子节点下标。
     std::size_t lowerBound(const std::vector<IndexKey>& keys, const IndexKey& key) const;

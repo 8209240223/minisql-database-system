@@ -4,11 +4,13 @@
 #include "minisql/common/cast.hpp"
 #include "minisql/common/decimal.hpp"
 #include "minisql/common/float.hpp"
+#include "minisql/common/filesystem.hpp"
 #include "minisql/storage/bplus_tree.hpp"
 #include "minisql/storage/page_bplus_tree.hpp"
 #include "minisql/storage/heap.hpp"
 #include "minisql/execution/external_sort.hpp"
 #include "minisql/sql/serialization.hpp"
+#include "minisql/sql/binding.hpp"
 #include <filesystem>
 #include <algorithm>
 #include <cctype>
@@ -42,6 +44,14 @@ struct ActiveDatabaseScope {
     Database* previous;
     // 外层作用域的数据库实例（最外层是 nullptr）。
 };
+struct QueryResourcesScope {
+    QueryResourcesScope(std::shared_ptr<QueryResourceManager>& slot,
+                        std::shared_ptr<QueryResourceManager> resources)
+        : slot_(slot), previous_(std::move(slot)) { slot_ = std::move(resources); }
+    ~QueryResourcesScope() { slot_ = std::move(previous_); }
+    std::shared_ptr<QueryResourceManager>& slot_;
+    std::shared_ptr<QueryResourceManager> previous_;
+};
 std::string key(std::string value) {
 // 把名字统一转小写，作为大小写不敏感比较的规范形式。
     std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
@@ -49,8 +59,36 @@ std::string key(std::string value) {
     return value;
     // 返回规范化结果。
 }
+// 把索引建造/校验阶段收集到的问题列表拼成一条诊断消息。
+std::string joinProblems(const std::vector<std::string>& problems) {
+    std::string message;
+    for (const auto& problem : problems) {
+        if (!message.empty()) message += "; ";
+        message += problem;
+    }
+    return message;
+}
+// 第十七章 REQ-CORE-001：批量语句上限 10000。compile 整批进入 Parser::all()，
+// 而 execute/diagnostics 自己按分号切分，因此两者共用同一常量与消息，
+// 消息含 "budget exceeded" 以便 HTTP 适配层映射到 413。
+constexpr std::size_t kMaxBatchStatements = 10000;
+const char* const kBatchBudgetMessage = "Statement budget exceeded: batch input exceeds 10000 statements";
+// 授权链路会在绑定前先判定批量上限：否则超限请求会被绑定失败掩盖成权限错误
+// （HTTP 403），而不是规格书要求的资源超限（HTTP 413）。
+// 用分号总数做快速排除，正常请求不产生额外词法开销；异常大输入才用
+// recovery 词法器精确计数（它不对词法错误抛异常，不影响既有的 fail-closed 契约）。
+void enforceBatchStatementBudget(const std::string& source) {
+    if (std::count(source.begin(), source.end(), ';') <= static_cast<std::ptrdiff_t>(kMaxBatchStatements)) return;
+    std::vector<MiniSqlError> ignored;
+    const auto tokens = sql::tokenizeRecoverable(source, ignored);
+    std::size_t statements = 0;
+    for (const auto& token : tokens)
+        if (token.type == "DELIMITER" && token.lexeme == ";") ++statements;
+    if (statements > kMaxBatchStatements) throw MiniSqlError(ErrorCode::Execution, kBatchBudgetMessage);
+}
 // 缓冲池帧数：默认取构造参数，MINISQL_BUFFER_FRAMES 可覆盖（用于观察命中率与替换日志）。
 // 把它做成可覆盖的，是为了在不改代码的前提下演示不同缓冲池大小对命中率的影响。
+// 缓冲池帧数：默认取构造参数，MINISQL_BUFFER_FRAMES 可覆盖（用于观察命中率与替换日志）。
 std::size_t resolveBufferFrames(std::size_t frames) {
 // 解析最终的缓冲池帧数。
     if (const char* configured = std::getenv("MINISQL_BUFFER_FRAMES")) {
@@ -66,145 +104,13 @@ std::size_t resolveBufferFrames(std::size_t frames) {
     return frames;
     // 返回构造参数给的默认帧数。
 }
-bool sqlIdentifier(const std::string& value) {
-// 判断一个字符串是不是合法 SQL 标识符（首字符字母或下划线，其余字母数字下划线）。
-    if (value.empty() || !(std::isalpha(static_cast<unsigned char>(value.front())) || value.front() == '_')) return false;
-    // 空串或首字符不合法直接否。
-    return std::all_of(value.begin() + 1, value.end(), [](unsigned char c) {
-    // 检查其余字符。
-        return std::isalnum(c) || c == '_';
-        // 只允许字母、数字、下划线。
-    });
-    // 返回检查结果。
-}
-std::vector<std::string> lexicalAccessObjects(const std::vector<sql::Token>& tokens) {
-// 词法兜底：从 token 流里尽量抽出这条语句访问的对象名（解析失败时用）。
-    std::vector<std::string> words;
-    // 把 token 词素收集成"词"序列。
-    words.reserve(tokens.size());
-    // 按 token 数预留，避免边收集边扩容。
-    for (const auto& token : tokens) {
-    // 逐个 token 处理。
-        if (token.type == "END") break;
-        // 遇到结束标记就停止（后面的内容没有意义）。
-        if (token.type == "STRING") continue;
-        // 字符串字面量整体丢掉：里面的内容不是标识符，混进来会产生假对象。
-        words.push_back(key(token.lexeme));
-        // 其它 token 统一转小写后收进词表。
-    }
-    // 收集结束。
-    std::unordered_set<std::string> ctes;
-    // WITH 子句里定义的 CTE 名字：它们是作用域名而不是真实对象。
-    if (!words.empty() && words.front() == "with") {
-    // 语句以 WITH 开头，先把 CTE 名字收集起来。
-        std::size_t cursor = words.size() > 1 && words[1] == "recursive" ? 2 : 1;
-        // WITH RECURSIVE 时从第 3 个词开始，否则从第 2 个词开始。
-        for (;;) {
-        // 逐个 CTE 处理。
-            if (cursor >= words.size() || !sqlIdentifier(words[cursor])) break;
-            // 当前词不是标识符说明 CTE 列表结束。
-            ctes.insert(words[cursor++]);
-            // 记下 CTE 名字并前移。
-            if (cursor < words.size() && words[cursor] == "(") {
-            // 可选的列名清单，形如 cte(a, b)。
-                std::size_t columnDepth = 1;
-                // 括号深度从 1 开始（已经吃掉了左括号）。
-                ++cursor;
-                // 跳过左括号。
-                while (cursor < words.size() && columnDepth > 0) {
-                // 找到配对的右括号。
-                    if (words[cursor] == "(") ++columnDepth;
-                    // 左括号加深。
-                    else if (words[cursor] == ")") --columnDepth;
-                    // 右括号变浅。
-                    ++cursor;
-                    // 前移。
-                }
-                // 列名清单跳过结束。
-            }
-// 表名建议分支结束。
-            // 列名清单处理结束。
-            if (cursor + 1 >= words.size() || words[cursor] != "as" || words[cursor + 1] != "(") break;
-            // CTE 定义必须是 AS ( ... )，否则结束扫描。
-            cursor += 2;
-            // 跳过 AS 与左括号。
-            std::size_t depth = 1;
-            // 深度从 1 开始。
-            while (cursor < words.size() && depth > 0) {
-            // 找到 CTE 主体的配对右括号。
-                if (words[cursor] == "(") ++depth;
-                // 加深。
-                else if (words[cursor] == ")") --depth;
-                // 变浅。
-                ++cursor;
-                // 前移。
-            }
-            // 主体跳过结束。
-            if (cursor >= words.size() || words[cursor] != ",") break;
-            // 没有逗号说明 CTE 列表结束。
-            ++cursor;
-            // 跳过逗号，处理下一个 CTE。
-        }
-        // CTE 收集结束。
-    }
-    // WITH 处理结束。
-    std::string command;
-    // 用于后续规则匹配的命令词。
-    if (!words.empty()) {
-    // 有词才继续。
-        command = words.front();
-        // 默认取第一个词。
-        if (command == "explain") {
-        // EXPLAIN 后面才是真正的语句关键字。
-            const auto found = std::find_if(words.begin(), words.end(), [](const std::string& value) {
-            // 找到第一个数据语句关键字。
-                return value == "select" || value == "insert" || value == "update" || value == "delete";
-                // 四种任一即命中。
-            });
-            // 查找结束。
-            if (found != words.end()) command = *found;
-            // 命中就换成真正的命令词；没命中（例如 EXPLAIN 后面是别的）保持 explain。
-        }
-        // EXPLAIN 处理结束。
-    }
-    // 命令词确定结束。
-    std::vector<std::string> result;
-    // 抽出的对象名。
-    const auto add = [&](const std::string& value) {
-    // 加一个候选对象：必须是标识符、不是 CTE、还没出现过。
-        if (sqlIdentifier(value) && !ctes.contains(value) &&
-            // 前两个条件，
-            std::find(result.begin(), result.end(), value) == result.end()) result.push_back(value);
-            // 再加上"未出现过"。
-    };
-    // add 定义结束。
-    const auto addAfter = [&](std::size_t index, bool allowParenthesized) {
-    // 把紧跟某关键字之后的词当作表名。
-        auto cursor = index + 1;
-        // 从下一个词开始。
-        if (allowParenthesized && cursor < words.size() && words[cursor] == "(") return;
-        // 允许括号时：FROM (SELECT ...) 是派生表，本身不是对象。
-        if (cursor < words.size() && words[cursor] == "lateral") ++cursor;
-        // LATERAL 只是修饰词，跳过再看真正的表名。
-        if (cursor < words.size()) add(words[cursor]);
-        // 收进结果。
-    };
-    // addAfter 定义结束。
-    for (std::size_t index = 0; index < words.size(); ++index) {
-    // 从头遍历词序列找对象。
-        const auto& word = words[index];
-        // 当前词。
-        if (word == "from" || word == "join" || word == "into" || word == "update" || word == "references")
-        // 这五个关键字后面跟的都是表：
-            addAfter(index, true);
-            // FROM/JOIN 是查询来源，INTO 是插入目标，UPDATE 是更新目标，REFERENCES 是外键父表。
-        if (command == "drop" && (word == "table" || word == "on")) addAfter(index, false);
-        // DROP TABLE 后面的表；DROP INDEX ... ON 后面的表。
-        if (command == "create" && (word == "table" || word == "on")) addAfter(index, false);
-        // CREATE TABLE 与 CREATE INDEX ... ON 后面的表。
-    }
-    return result;
-    // 返回抽出的对象名。
+std::optional<std::uint64_t> positiveEnvironmentValue(const char* name, std::uint64_t maximum) {
+    const char* configured = std::getenv(name);
+    if (!configured) return std::nullopt;
+    char* end = nullptr;
+    const auto parsed = std::strtoull(configured, &end, 10);
+    if (!end || *end != '\0' || parsed == 0 || parsed > maximum) return std::nullopt;
+    return parsed;
 }
 json cell(const storage::Value& value) {
 // 把存储层的单元格值（variant）转成 JSON。
@@ -270,8 +176,17 @@ ExactDecimal decimalValue(const json& value, const std::string& type) {
 // 做法是把外层列的当前值序列化成 SQL 字面量文本（与解析器产出的 Literal 一致），
 // 先“文本重解析 + 字面量改写”的路径。
 // 再绑定进已经缓存好的结构化语法树——这样就不必每行都重新做一次文本解析与改写。
+// X09 3.5: 相关子查询 by-value 参数绑定执行。序列化外层列绑定值为 SQL 字面量
+// 文本（与解析器产出的 Literal 一致），随后绑定进已缓存的结构化 AST，取代原
+// 先“文本重解析 + 字面量改写”的路径。
 using OuterBinding = std::unordered_map<std::string, std::pair<std::size_t, std::string>>;
 // 外层列绑定的形状：列名 → (列编号, 类型)。
+using OuterValues = std::unordered_map<std::string, std::pair<json, std::string>>;
+thread_local std::vector<OuterValues> activeOuterValues;
+struct ActiveOuterScope {
+    explicit ActiveOuterScope(OuterValues values) { activeOuterValues.push_back(std::move(values)); }
+    ~ActiveOuterScope() { activeOuterValues.pop_back(); }
+};
 std::string parameterLiteral(const json& value, const std::string& type) {
 // 把一个值按它的类型格式化成 SQL 字面量文本。
     if (value.is_null()) return "NULL";
@@ -319,6 +234,15 @@ std::shared_ptr<sql::Expr> bindOuter(const std::shared_ptr<sql::Expr>& expressio
             // 种类是字面量。
             literal->value = parameterLiteral(row.at(columnId), found->second.second);
             // 值取当前行对应列，并按列类型格式化；这样同一个 AST 就能用不同行的值填充。
+            literal->location = expression->location;
+            return literal;
+        }
+        for (auto frame = activeOuterValues.rbegin(); frame != activeOuterValues.rend(); ++frame) {
+            const auto inherited = frame->find(key(expression->value));
+            if (inherited == frame->end()) continue;
+            auto literal = std::make_shared<sql::Expr>();
+            literal->kind = "Literal";
+            literal->value = parameterLiteral(inherited->second.first, inherited->second.second);
             literal->location = expression->location;
             // 位置沿用原列引用，报错仍指向用户写的那一处。
             return literal;
@@ -375,6 +299,8 @@ sql::Statement bindOuterStatement(const sql::Statement& statement, const OuterBi
     return out;
     // 返回绑定后的语句。
 }
+// X09 3.4: 收集相关子查询 AST 中实际引用到的外层列 columnId（去重、升序），
+// 用于按绑定参数分组建缓存键。遍历字段与 bindOuterStatement 对齐。
 // X09 3.4: 收集相关子查询 AST 中实际引用到的外层列 columnId（去重、升序），
 // 用于按绑定参数分组建缓存键。遍历字段与 bindOuterStatement 对齐。
 void collectOuterReferences(const std::shared_ptr<sql::Expr>& expression, const OuterBinding& outer, std::set<std::size_t>& ids) {
@@ -525,6 +451,12 @@ json evaluate(const json& expression, const Row& row) {
         // 没命中：结果集里有 NULL 就返回 UNKNOWN，否则确定返回假。
     }
     // IN 子查询分支结束。
+    // 未物化的子查询节点没有 left/operator 字段，直接取键会抛出 json 异常。
+    // 这里转成正式诊断，避免把内部异常当成 InternalError 泄露给调用方。
+    if (kind == "ScalarSubquery" || kind == "Exists" || kind == "InSubquery") {
+        const std::string detail = "Subquery was not materialized before evaluation: " + kind;
+        fail(detail.c_str());
+    }
     const json left = evaluate(expression.at("left"), row);
     // 其余节点都至少有一个左操作数，这里统一先求值。
     const SourceLocation location{expression.value("line", std::size_t(0)), expression.value("column", std::size_t(0))};
@@ -716,6 +648,24 @@ struct Database::RuntimeIndex {
     // 内存版 B+ 树实例（内存引擎时使用）。
     std::unique_ptr<storage::PageBPlusTree> pageTree{nullptr};      // page-file 引擎
     // 页级 B+ 树实例（页级引擎时使用）；用智能指针是因为它需要延迟构造。
+    storage::IndexKey keyFor(const storage::Row& row) const {
+        storage::IndexKey result;
+        for (const auto column : columns) result.values.push_back(row.at(column));
+        return result;
+    }
+    static bool indexable(const storage::IndexKey& key) {
+        return std::none_of(key.values.begin(), key.values.end(), [](const storage::Value& value) {
+            return std::holds_alternative<std::monostate>(value);
+        });
+    }
+    bool insert(const storage::IndexKey& key, storage::RowRef row) {
+        if (!indexable(key)) return true;
+        return pageFile ? pageTree->insert(key, row) : tree.insert(key, row);
+    }
+    bool erase(const storage::IndexKey& key, storage::RowRef row) {
+        if (!indexable(key)) return true;
+        return pageFile ? pageTree->erase(key, row) : tree.erase(key, row);
+    }
     std::vector<storage::RowRef> search(const storage::IndexKey& key) const {
     // 按精确键查找。
         return pageFile ? pageTree->search(key) : tree.search(key);
@@ -766,6 +716,15 @@ Database::Database(const std::filesystem::path& path, std::size_t frames, storag
         // 同样做范围校验。
     }
     // 聚合上限处理结束。
+    if (const auto configured = positiveEnvironmentValue("MINISQL_DISTINCT_MEMORY_ROWS", 1000000))
+        distinctMemoryRows_ = static_cast<std::size_t>(*configured);
+    else distinctMemoryRows_ = sortMemoryRows_;
+    if (const auto configured = positiveEnvironmentValue("MINISQL_JOIN_MEMORY_ROWS", 1000000))
+        joinMemoryRows_ = static_cast<std::size_t>(*configured);
+    if (const auto configured = positiveEnvironmentValue("MINISQL_QUERY_MEMORY_BYTES", 16ull * 1024ull * 1024ull * 1024ull))
+        queryMemoryBytes_ = static_cast<std::size_t>(*configured);
+    if (const auto configured = positiveEnvironmentValue("MINISQL_TEMP_DISK_BYTES", 1024ull * 1024ull * 1024ull * 1024ull))
+        tempDiskBytes_ = *configured;
     if (const char* configured = std::getenv("MINISQL_AUTO_CHECKPOINT_WRITES")) {
     // 自动检查点的"写语句数"阈值。
         char* end = nullptr;const auto parsed = std::strtoull(configured, &end, 10);
@@ -817,6 +776,7 @@ Database::Database(const std::filesystem::path& path, std::size_t frames, storag
     // 取消令牌文件路径，同样是宿主传入。
     // 页替换日志（指导书"替换日志输出"）：设置后每次淘汰追加一行到该文件。
     // 这是指导书要求的能力：把缓冲池的每次淘汰记下来，便于演示与验收。
+    // 页替换日志（指导书"替换日志输出"）：设置后每次淘汰追加一行到该文件。
     if (const char* configured = std::getenv("MINISQL_BUFFER_LOG"); configured && *configured) buffer_.setEvictionLog(configured);
     // 启用淘汰日志。
     if (const char* configured = std::getenv("MINISQL_BACKGROUND_CHECKPOINT_MS")) {
@@ -826,8 +786,8 @@ Database::Database(const std::filesystem::path& path, std::size_t frames, storag
         // 上限一小时。
     }
     // 后台间隔处理结束。
-    for (const auto& table : catalog_.tables()) rebuildIndexes(table.id);
-    // 打开时把每张表的索引重建出来（内存引擎需重新灌数据，页级引擎会尝试直接从页文件加载）。
+    const bool forceIndexRebuild = std::getenv("MINISQL_REBUILD_INDEXES") != nullptr;
+    for (const auto& table : catalog_.tables()) initializeIndexes(table.id, forceIndexRebuild, true);
     if (backgroundCheckpointMs_ > 0) {
     // 配了间隔才启动后台线程。
         scheduler_ = std::thread([this] { backgroundSchedulerLoop(); });
@@ -931,8 +891,17 @@ void Database::checkCancelled() const {
     // 文件存在即视为收到取消：抛专门的 Cancelled 错误码，
     // 让上层能把它与真正的失败区分开。
 }
-nlohmann::json Database::compile(const std::string& source) const {
-// 只编译不执行：走完"词法 → 语法 → 语义 → 计划 → 优化"整条链。
+optimizer::Options Database::optimizerOptions() {
+    optimizer::Options options;
+    options.memoryBudgetBytes = queryMemoryBytes_;
+    for (const auto& table : catalog_.tables()) {
+        double rows = 0;
+        heap_.scan(table.id, rowSchema(table.definition), [&](storage::RowRef, const storage::Row&) { ++rows; });
+        options.tableRows[key(table.definition.table)] = rows;
+    }
+    return options;
+}
+nlohmann::json Database::compile(const std::string& source) {
     std::lock_guard<std::recursive_mutex> guard(mu_);
     // 拿全局锁。
     requireAvailable();
@@ -945,8 +914,7 @@ nlohmann::json Database::compile(const std::string& source) const {
     // 语法分析。
     const auto plans = sql::compilePlans(ast, catalog_.view());
     // 语义校验 + 生成逻辑计划（用当前目录做列绑定）。
-    const auto optimized = optimizer::optimize(plans);
-    // 跑优化器，得到改写后的计划与改写记录。
+    const auto optimized = optimizer::optimize(plans, optimizerOptions());
     return {{"success", true}, {"plan", sql::serializePlans(plans)}, {"optimizedPlan", sql::serializePlans(optimized.plans)},
              // 返回优化前与优化后的两套计划，便于对照。
             {"optimizationRules", optimized.changes}, {"statements", ast.size()},
@@ -965,143 +933,25 @@ nlohmann::json Database::compile(const std::string& source) const {
                          // 计划与优化也通过；执行阶段标记为 notRun（因为这是只编译）。
 }
 
-std::vector<std::string> Database::resolveAccessObjects(const std::string& source) const {
-// 解析出这条语句实际访问的基础表对象名（供入口层做权限校验）。
+security::AccessRequest Database::bindAccess(const std::string& source) const {
     std::lock_guard<std::recursive_mutex> guard(mu_);
     // 拿全局锁。
     requireAvailable();
     // 可用性检查。
-    try {
-    // 解析可能失败，失败时交给调用方走保守扫描。
-        auto tokens = sql::tokenize(source);
-        // 词法分析。
-        if (!tokens.empty() && key(tokens.front().lexeme) == "explain") {
-        // EXPLAIN 前缀要先摘掉。
-            tokens.erase(tokens.begin());
-            // 去掉 EXPLAIN。
-            if (!tokens.empty() && key(tokens.front().lexeme) == "analyze") tokens.erase(tokens.begin());
-            // 再去掉可选的 ANALYZE。
-        }
-        // 前缀处理结束。
-        const auto statements = sql::parse(tokens);
-        // 语法分析。
-        std::vector<std::string> result;
-        // 结果对象名列表。
-        std::unordered_set<std::string> seen;
-        // 去重集合。
-        const auto add = [&](const std::string& name) {
-        // 加一个对象名。
-            if (name.empty()) return;
-            // 空名跳过。
-            const auto* bound = catalog_.view().find(name);
-            // 先在目录里查有没有同名表。
-            const auto resolved = key(bound ? bound->name : name);
-            // 查到就用目录里的规范表名，否则用用户写的名字转小写。
-            // 这样"权限目录里写的是规范名"这条约定才能始终成立。
-            if (seen.insert(resolved).second) result.push_back(resolved);
-            // 去重后收进结果。
-        };
-        // add 定义结束。
-        std::function<void(const sql::Statement&)> visitStatement;
-        // 语句访问器（先声明，因为表达式访问器要回调它）。
-        std::function<void(const std::shared_ptr<sql::Expr>&)> visitExpression;
-        // 表达式访问器（先声明，因为语句访问器要调它）。
-        visitExpression = [&](const std::shared_ptr<sql::Expr>& expression) {
-        // 遍历表达式子树找子查询。
-            if (!expression) return;
-            // 空节点返回。
-            visitExpression(expression->left);
-            // 先递归左子树。
-            visitExpression(expression->right);
-            // 再递归右子树。
-            if (expression->subquery) visitStatement(*expression->subquery);
-            // 挂了结构化子查询就递归进去。
-            else if (!expression->subquerySql.empty()) {
-            // 只有子查询原文时（过渡形态），现场解析一次。
-                try {
-                // 解析可能失败。
-                    auto nestedSql = expression->subquerySql;
-                    // 复制原文。
-                    const auto last = nestedSql.find_last_not_of(" \t\r\n");
-                    // 找最后一个非空白字符。
-                    if (last == std::string::npos || nestedSql[last] != ';') nestedSql += ';';
-                    // 结尾不是分号就补一个，保证能被解析成完整语句。
-                    for (const auto& nested : sql::parse(sql::tokenize(nestedSql))) visitStatement(nested);
-                    // 解析后递归访问每条语句。
-                } catch (const MiniSqlError&) {
-                // 局部解析失败。
-                    // 不完整子查询由入口层保留现有保守对象扫描结果。
-                    // 这里故意吞掉：入口层在整体解析失败时会改用保守的词法扫描，
-                    // 局部失败时"少收集"比直接报错更合适。
-                }
-            }
-            // 子查询处理结束。
-        };
-        // visitExpression 定义结束。
-        visitStatement = [&](const sql::Statement& statement) {
-        // 访问一条语句，把其中的对象名抽出来。
-            if (!statement.fromSubquery && !statement.table.empty()) add(statement.table);
-            // FROM 是派生表时它的"表名"其实是别名，不能当对象；否则主表就是对象。
-            for (const auto& join : statement.joins) add(join.table);
-            // 每个连接涉及的表。
-            for (const auto& foreignKey : statement.foreignKeys) add(foreignKey.table);
-            // 表级外键引用的父表。
-            for (const auto& column : statement.columns)
-            // 列定义里的列级外键。
-                if (column.references) add(column.references->first);
-                // 有 REFERENCES 就收集父表名。
-            if (statement.fromSubquery) visitStatement(*statement.fromSubquery);
-            // 派生表内部语句继续递归。
-            visitExpression(statement.where);
-            // WHERE 里的子查询。
-            visitExpression(statement.having);
-            // HAVING 里的子查询。
-            for (const auto& item : statement.selectItems) visitExpression(item.expression);
-            // 投影表达式里的子查询。
-            for (const auto& item : statement.orderBy) visitExpression(item.expression);
-            // 排序键里的子查询。
-            for (const auto& item : statement.assignments) visitExpression(item.expression);
-            // UPDATE 赋值里的子查询。
-            for (const auto& item : statement.groupBy) visitExpression(item);
-            // 分组键里的子查询。
-            for (const auto& item : statement.checks) visitExpression(item);
-            // CHECK 约束里的子查询。
-            for (const auto& item : statement.valueExpressions) visitExpression(item);
-            // INSERT 表达式值里的子查询。
-            for (const auto& row : statement.valueRows)
-            // INSERT 多行形式逐行处理。
-                for (const auto& item : row) visitExpression(item);
-                // 每行的每个表达式都递归访问。
-            for (const auto& join : statement.joins) visitExpression(join.on);
-            // 连接 ON 条件里的子查询。
-        };
-        // visitStatement 定义结束。
-        for (const auto& statement : statements) visitStatement(statement);
-        // 从每条顶层语句开始遍历。
-        return result;
-        // 返回收集到的对象名。
-    } catch (const MiniSqlError&) {
-    // 解析失败：退回词法兜底路径。
-        std::vector<MiniSqlError> lexicalErrors;
-        // 用容错模式重新切词（错误只收集，不中断）。
-        const auto tokens = sql::tokenizeRecoverable(source, lexicalErrors);
-        // 容错词法分析：即使有非法字符也能拿到尽可能多的 token。
-        std::vector<std::string> result;
-        // 结果。
-        std::unordered_set<std::string> seen;
-        // 去重集合。
-        for (const auto& object : lexicalAccessObjects(tokens)) {
-        // 用前面那个词法版对象抽取器拿候选表名。
-            const auto* bound = catalog_.view().find(object);
-            // 同样先在目录里查规范名。
-            const auto resolved = key(bound ? bound->name : object);
-            // 查到用目录名，否则用候选名。
-            if (seen.insert(resolved).second) result.push_back(resolved);
-            // 去重后收进结果。
-        }
-        return result;
-        // 返回词法兜底的结果——宁可保守也不要因为解析失败而漏掉鉴权对象。
-    }
+    // 资源上限先于授权：超限的批量输入应报资源超限，而不是权限失败。
+    enforceBatchStatementBudget(source);
+    // 名称解析只发生在绑定器里。别名、派生表别名、CTE 名都是作用域名，
+    // 不会产生受权对象；任何无法闭合的引用都让 bound 保持 false。
+    return sql::bindSource(source, catalog_.view()).accessRequest();
+}
+
+std::vector<std::string> Database::resolveAccessObjects(const std::string& source) const {
+    const auto request = bindAccess(source);
+    std::vector<std::string> names;
+    if (!request.bound) return names;
+    for (const auto& object : request.objects)
+        if (std::find(names.begin(), names.end(), object.object) == names.end()) names.push_back(object.object);
+    return names;
 }
 nlohmann::json Database::catalog() {
 // 导出目录：把内存目录与实时的行数/页数信息合成一份可读的元数据。
@@ -1172,11 +1022,16 @@ nlohmann::json Database::checkpoint() {
     // 可用性检查。
     if (transaction_ != TransactionState::Idle) throw MiniSqlError(ErrorCode::Transaction, "CHECKPOINT requires an idle transaction");
     // 有活动事务时不允许做检查点：事务中间落盘会让"未提交"和"已落盘"混在一起。
-    buffer_.flushAll();
-    // 先把缓冲池里所有脏页刷下去，保证内存与主文件一致。
-    file_->checkpoint({catalogVersion_, indexVersion_});
-    // 再做页文件级检查点：写入检查点记录并截断 WAL。
-    // 两个版本号一起写进去，恢复时据此判断目录/索引是否与数据同步。
+    // 模糊检查点（MINISQL_FUZZY_CHECKPOINT=1）不强制刷出缓存，只记录检查点边界并保留日志。
+    const bool fuzzy = std::getenv("MINISQL_FUZZY_CHECKPOINT") != nullptr;
+    const bool archive = std::getenv("MINISQL_ARCHIVE_WAL") != nullptr;
+    if (!fuzzy) buffer_.flushAll();
+    storage::CheckpointOptions options;
+    options.catalogVersion = catalogVersion_;
+    options.indexVersion = indexVersion_;
+    options.fuzzy = fuzzy;
+    options.archive = archive;
+    file_->checkpoint(options);
     pendingAutoCheckpointWrites_ = 0;
     // 重置"待检查点"的写语句计数——刚做过检查点，这些积累都清了。
     pendingAutoCheckpointWalBytes_ = 0;
@@ -1187,8 +1042,8 @@ nlohmann::json Database::checkpoint() {
         // 以及墙上时钟时间戳，
         std::chrono::system_clock::now().time_since_epoch()).count());
         // 用于对外展示。
-    return {{"success", true}, {"kind", "Checkpoint"}, {"wal", "truncated"}};
-    // 返回结果，明确告知日志已被截断。
+    return {{"success", true}, {"kind", "Checkpoint"}, {"wal", fuzzy ? "retained" : "truncated"},
+            {"fuzzy", fuzzy}, {"archived", archive}};
 }
 
 class ScanRowStream : public RowStream {
@@ -1203,6 +1058,9 @@ public:
         // 一次性取出这张表所有行的引用（只是引用，不是数据本身）。
         // 这样做的好处是扫描过程中即使有插入/删除也不会让迭代器失效。
     }
+    ScanRowStream(storage::HeapStore& heap, std::uint64_t tableId, storage::RowSchema schema,
+                  std::vector<storage::RowRef> refs)
+        : heap_(heap), tableId_(tableId), schema_(std::move(schema)), refs_(std::move(refs)) {}
     bool next(nlohmann::json& row) override {
     // 取下一行。
         if (cancelled_) throw MiniSqlError(ErrorCode::Cancelled, "Query cancelled");
@@ -1257,8 +1115,7 @@ public:
         // 两者都用 move 接管。
     bool next(nlohmann::json& row) override {
     // 取下一行：循环向子流要，直到有一行通过谓词。
-        while (child_->next(row)) if (predicate_(row)) return true;
-        // 子流没有更多行时返回 false；有行且谓词为真时返回 true。
+        while (child_->next(row)) if (predicate_(row)) { ++rows_; return true; }
         return false;
         // 子流取完。
     }
@@ -1268,8 +1125,8 @@ public:
     // 关闭同样往下传。
     nlohmann::json resourceUsage() const override {
 // 返回过滤行流的资源使用信息。
-        return {{"kind", "FilterRowStream"}, {"rows", rows_}, {"pending", pending_}, {"cancelled", cancelled_}};
-// 包含已输出行数、是否有挂起行和取消标志。
+        return {{"kind", "FilterRowStream"}, {"rows", rows_}, {"pending", pending_}, {"cancelled", cancelled_},
+            {"child", child_->resourceUsage()}};
     }
 private:
 // 私有状态：子流、谓词和计数。
@@ -1312,8 +1169,7 @@ public:
     // 关闭往下传。
     nlohmann::json resourceUsage() const override {
     // 资源用量（投影本身不占额外内存，只报行数）。
-        return {{"kind", "ProjectRowStream"}, {"rows", rows_}};
-        // 类型名与输出行数。
+        return {{"kind", "ProjectRowStream"}, {"rows", rows_}, {"child", child_->resourceUsage()}};
     }
 private:
     // 内部状态。
@@ -1360,8 +1216,8 @@ public:
     // 关闭往下传。
     nlohmann::json resourceUsage() const override {
     // 资源用量。
-        return {{"kind", "LimitRowStream"}, {"rows", emitted_}, {"skipped", skipped_}};
-        // 类型名、输出行数与跳过行数——这两个数能直接反映分页参数的效果。
+        return {{"kind", "LimitRowStream"}, {"rows", emitted_}, {"skipped", skipped_},
+            {"child", child_->resourceUsage()}};
     }
 private:
     // 内部状态。
@@ -1423,8 +1279,7 @@ nlohmann::json Database::createSnapshot(const std::filesystem::path& target) {
 // 把页文件内容和检查点信息复制到目标文件。
     const auto& record = file_->checkpointRecord();
 // 读取当前检查点记录。
-    return {{"success", true}, {"kind", "Snapshot"}, {"target", target.string()},
-// 返回快照元数据：目标路径。
+    return {{"success", true}, {"kind", "Snapshot"}, {"target", pathToUtf8(target)},
         {"walBytes", file_->walBytes()}, {"walCutoffBytes", record.walCutoffBytes},
 // WAL 字节数与截止位置。
         {"committedSequence", record.committedSequence}, {"catalogVersion", record.catalogVersion},
@@ -1483,6 +1338,85 @@ nlohmann::json Database::indexInspect(const std::string& table, const std::strin
             // 叶链是否完整、父指针是否自洽，
             {"storage", "page-file"}, {"problems", std::move(problems)}, {"pages", std::move(pages)}};
             // 存储形态、问题列表与页明细。
+}
+nlohmann::json Database::indexVerify(const std::string& table, const std::string& index) {
+    std::lock_guard<std::recursive_mutex> guard(mu_);
+    requireAvailable();
+    const catalog::StoredTable* stored = nullptr;
+    for (const auto& candidate : catalog_.tables())
+        if (key(candidate.definition.table) == key(table)) { stored = &candidate; break; }
+    if (!stored) throw MiniSqlError(ErrorCode::Catalog, "Index table not found: " + table);
+    RuntimeIndex* found = nullptr;
+    for (auto& candidate : indexes_)
+        if (key(candidate->table) == key(table) && key(candidate->name) == key(index)) { found = candidate.get(); break; }
+    if (!found) throw MiniSqlError(ErrorCode::Catalog, "Index not found: " + index);
+    ++indexVerifications_;
+    auto report = verifyIndexConsistency(*found, stored->id, rowSchema(stored->definition));
+    report["kind"] = "IndexVerify";
+    report["table"] = found->table;
+    report["index"] = found->name;
+    report["unique"] = found->unique;
+    report["storage"] = found->pageFile ? "page-file" : "memory";
+    report["height"] = found->height();
+    return report;
+}
+nlohmann::json Database::indexRebuild(const std::string& table, const std::string& index) {
+    std::lock_guard<std::recursive_mutex> guard(mu_);
+    requireAvailable();
+    if (transaction_ == TransactionState::Aborted)
+        throw MiniSqlError(ErrorCode::Transaction, "Transaction aborted; ROLLBACK required");
+    const catalog::StoredTable* stored = nullptr;
+    for (const auto& candidate : catalog_.tables())
+        if (key(candidate.definition.table) == key(table)) { stored = &candidate; break; }
+    if (!stored) throw MiniSqlError(ErrorCode::Catalog, "Index table not found: " + table);
+    const auto* definition = catalog_.view().find(stored->definition.table);
+    if (!definition) throw MiniSqlError(ErrorCode::Catalog, "Index table definition not found");
+    const catalog::Index* definitionIndex = nullptr;
+    for (const auto& candidate : definition->indexes)
+        if (key(candidate.name) == key(index)) { definitionIndex = &candidate; break; }
+    if (!definitionIndex) throw MiniSqlError(ErrorCode::Catalog, "Index not found: " + index);
+    std::vector<std::size_t> columns;
+    for (const auto& name : definitionIndex->columns) columns.push_back(catalog::resolveColumnIndex(*definition, name));
+    const auto schema = rowSchema(stored->definition);
+    // 在线重建与堆页变更共用写批次：事务内随事务提交/回滚，事务外自成一批。
+    const bool ownBatch = transaction_ != TransactionState::Active;
+    if (ownBatch) buffer_.beginWriteBatch();
+    try {
+        // 阶段一 build + 阶段二 validate。
+        auto candidate = std::make_unique<RuntimeIndex>(definitionIndex->name, stored->definition.table,
+                                                        columns, definitionIndex->unique, pageFileIndexes_);
+        std::size_t entries = 0;
+        const auto problems = buildIndexEntries(*candidate, stored->id, schema, &entries);
+        if (!problems.empty()) {
+            const auto detail = "Index rebuild validation failed: " + index + " (" + joinProblems(problems) + ")";
+            throw MiniSqlError(ErrorCode::Execution, detail);
+        }
+        // 阶段三 publish：替换同一索引的运行实例，旧节点页随批次释放。
+        indexes_.erase(std::remove_if(indexes_.begin(), indexes_.end(), [&](const auto& runtime) {
+            return key(runtime->table) == key(stored->definition.table) && key(runtime->name) == key(index);
+        }), indexes_.end());
+        const auto height = candidate->height();
+        const auto pages = file_->pagesFor(indexOwnerId(stored->definition.table, index)).size();
+        indexes_.push_back(std::move(candidate));
+        ++indexOnlineRebuilds_;
+        ++indexVersion_;
+        if (!pageFileIndexes_) persistMemoryIndexes(stored->id);
+        if (ownBatch) {
+            const auto committedDirtyPages = file_->stagedPageCount();
+            buffer_.commitWriteBatch();
+            invalidateAnalyzeSnapshot();
+            evaluateAutoCheckpoint(1, committedDirtyPages);
+        } else {
+            ++transactionWriteStatements_;
+            invalidateAnalyzeSnapshot();
+        }
+        return {{"kind", "IndexRebuild"}, {"table", stored->definition.table}, {"index", index},
+                {"entries", entries}, {"height", height}, {"pages", pages},
+                {"commitState", ownBatch ? "committed" : "pending"}};
+    } catch (...) {
+        if (ownBatch) rollbackBatch();
+        throw;
+    }
 }
 void Database::evaluateAutoCheckpoint(std::size_t committedWriteStatements, std::size_t committedDirtyPages) {
 // 在一次成功提交之后评估"是否该做自动检查点"。
@@ -1576,6 +1510,7 @@ void Database::evaluateBackgroundCheckpoint() {
     if (reasons.empty()) return;
     // 没有理由就什么都不做。
     // 后台线程仅在空闲且事务空闲时执行检查点，绝不在活动事务提交点之前截断未提交日志。
+    // 后台线程仅在空闲且事务空闲时执行检查点，绝不在活动事务提交点之前截断未提交日志。
     if (transaction_ != TransactionState::Idle) { schedulerDeferredReasons_ = std::move(reasons); return; }
     // 事务不空闲就只记下"本可以触发"的理由，等下次再评估。
     buffer_.flushAll();
@@ -1639,17 +1574,11 @@ std::string Database::tableFingerprint(std::uint64_t tableId) {
         // 逐字节：先异或再乘 FNV 素数。
     };
     // mix 定义结束。
-    const auto schema = rowSchema(stored->definition);
-    // 取出这张表的行结构（编码要用）。
-    heap_.scan(tableId, schema, [&](storage::RowRef ref, const storage::Row& row) {
-    // 扫描全表。
-        const auto bytes = storage::encodeRow(row, schema);mix(bytes.data(), bytes.size());
-        // 把这一行的编码字节混进哈希——内容变了指纹就变。
-        const std::uint64_t values[] = {ref.page.id, ref.page.generation, ref.slot.slot, ref.slot.generation};
-        // 再取行位置的四个分量。
-        mix(reinterpret_cast<const std::uint8_t*>(values), sizeof(values));
-        // 位置也混进去：内容相同但换了物理位置的表，已有索引不再对应，必须要能察觉。
-    });
+    static constexpr char format[] = "minisql-index-v2";
+    mix(reinterpret_cast<const std::uint8_t*>(format), sizeof(format) - 1);
+    mix(reinterpret_cast<const std::uint8_t*>(&tableId), sizeof(tableId));
+    const auto tableName = key(stored->definition.table);
+    mix(reinterpret_cast<const std::uint8_t*>(tableName.data()), tableName.size());
     char buffer[17]{};std::snprintf(buffer, sizeof(buffer), "%016llx", static_cast<unsigned long long>(hash));
     // 格式化成 16 位定宽十六进制（缓冲区 17 字节刚好容纳结束符）。
     return buffer;
@@ -1706,12 +1635,10 @@ void Database::persistIndexPages(storage::BPlusTree& tree, std::uint64_t owner, 
         // 拿到这个页的写入句柄（guard 析构时会自动把页放回缓冲池）。
         std::vector<std::uint8_t> record;
         // 本页要写的记录。
-        record.reserve(12 + end - begin);
-        // 预留空间：8 字节魔数 + 三个 8 字节字段 + 正文。
+        record.reserve(32 + end - begin);
         const auto append = [&](std::uint64_t value) {
         // 局部工具：按小端序追加一个 64 位数。
-            for (unsigned shift = 0; shift < 8; shift += 8) record.push_back(static_cast<std::uint8_t>((value >> shift) & 0xff));
-            // 逐字节从低到高取。
+            for (unsigned shift = 0; shift < 64; shift += 8) record.push_back(static_cast<std::uint8_t>((value >> shift) & 0xff));
         };
         record.insert(record.end(), {'I', 'X', 'P', 'A', 'G', 'E', 0, 0});
         // 写 8 字节魔数 "IXPAGE"（后两字节补 0 凑满）。
@@ -1724,12 +1651,15 @@ void Database::persistIndexPages(storage::BPlusTree& tree, std::uint64_t owner, 
     }
     // 分片写入结束。
 }
-bool Database::loadIndexPages(storage::BPlusTree& tree, std::uint64_t owner, const std::string& fingerprint) {
-// 尝试从页文件恢复索引；任何一处不完整都返回 false 让调用方重建。
+bool Database::loadIndexPages(storage::BPlusTree& tree, std::uint64_t owner, const std::string& fingerprint,
+                              std::string* failure) {
+    const auto reject = [&](const char* reason) {
+        if (failure) *failure = reason;
+        return false;
+    };
     const auto pages = file_->pagesFor(owner);
     // 取该所有者的页。
-    if (pages.empty()) return false;
-    // 一页都没有，说明没存过索引。
+    if (pages.empty()) return reject("no snapshot pages");
     std::vector<std::string> chunks;
     // 按片序号收集正文。
     for (const auto& page : pages) {
@@ -1738,47 +1668,51 @@ bool Database::loadIndexPages(storage::BPlusTree& tree, std::uint64_t owner, con
         // 拿页的读句柄。
         const auto slots = guard.page().liveSlots();
         // 取这个页里"活着"的槽位。
-        if (slots.size() != 1) return false;
-        // 索引页应当恰好有一条记录；否则说明页被别的内容占用，放弃恢复。
+        if (slots.size() != 1) return reject("snapshot page slot count");
         const auto record = guard.page().read(slots.front());
         // 读出这条记录。
-        if (record.size() < 25 || record[0] != 'I' || record[1] != 'X') return false;
-        // 长度下限与魔数检查。
+        if (record.size() < 32 || record[0] != 'I' || record[1] != 'X') return reject("snapshot page header");
         const auto decode = [&](std::size_t offset) {
         // 局部工具：从指定偏移按小端序读一个 64 位数。
             std::uint64_t value = 0;
             // 累加器。
-            for (unsigned shift = 0; shift < 8; shift += 8) value |= static_cast<std::uint64_t>(record[offset + shift]) << shift;
-            // 逐字节拼回。
+            for (unsigned shift = 0; shift < 64; shift += 8) value |= static_cast<std::uint64_t>(record[offset + shift / 8]) << shift;
             return value;
             // 返回。
         };
         const auto sequence = decode(8), expectedTotal = decode(16), payloadSize = decode(24);
         // 读片序号、总片数、本片长度。
-        if (expectedTotal == 0 || payloadSize > 3800 || sequence >= expectedTotal || record.size() != 32 + payloadSize) return false;
-        // 四项一致性检查：片数非零、单片不超容量、序号在范围内、实际长度与声明相符。
-        // 任何一条不符都说明页内容被改过或写坏了，直接放弃恢复。
+        if (expectedTotal == 0 || payloadSize > 3800 || sequence >= expectedTotal || record.size() != 32 + payloadSize) {
+            if (failure) *failure = "snapshot chunk bounds: sequence=" + std::to_string(sequence) +
+                ", total=" + std::to_string(expectedTotal) + ", payload=" + std::to_string(payloadSize) +
+                ", record=" + std::to_string(record.size());
+            return false;
+        }
         if (chunks.size() <= sequence) chunks.resize(static_cast<std::size_t>(sequence) + 1);
         // 按需扩容结果数组。
-        if (!chunks[static_cast<std::size_t>(sequence)].empty()) return false;
-        // 同一个片序号出现两次，说明页重复，放弃。
+        if (!chunks[static_cast<std::size_t>(sequence)].empty()) return reject("duplicate snapshot chunk");
         chunks[static_cast<std::size_t>(sequence)].assign(record.begin() + 32, record.end());
         // 取出正文（头是 32 字节）放进对应位置。
     }
     // 逐页读取结束。
-    if (chunks.empty() || std::any_of(chunks.begin(), chunks.end(), [](const std::string& chunk) { return chunk.empty(); })) return false;
-    // 有空缺说明分片不全，放弃恢复。
+    if (chunks.empty() || std::any_of(chunks.begin(), chunks.end(), [](const std::string& chunk) { return chunk.empty(); }))
+        return reject("missing snapshot chunk");
     std::string bytes;
     // 拼回来的完整字节流。
     for (auto& chunk : chunks) bytes += chunk;
     // 按序号顺序拼接。
     try { tree.restore(bytes, fingerprint);return true; }
     // 交给树自己反序列化；指纹会一并校验，对不上就抛异常。
-    catch (const std::exception&) { return false; }
-    // 恢复失败（指纹不符或数据损坏）就返回 false，由调用方走重建。
+    catch (const std::exception& error) {
+        if (failure) *failure = error.what();
+        return false;
+    }
 }
 void Database::rebuildIndexes(std::uint64_t tableId) {
 // 重建某张表的全部索引（打开数据库或数据变动后调用）。
+    initializeIndexes(tableId, true, true);
+}
+void Database::initializeIndexes(std::uint64_t tableId, bool forceRebuild, bool allowRebuild) {
     const catalog::StoredTable* stored = nullptr;
     // 找这张表的目录记录。
     for (const auto& table : catalog_.tables()) if (static_cast<std::uint64_t>(table.id) == tableId) { stored = &table; break; }
@@ -1806,6 +1740,8 @@ void Database::rebuildIndexes(std::uint64_t tableId) {
         // 按当前引擎配置构造运行期索引对象。
         const auto owner = indexOwnerId(stored->definition.table, index.name);
         // 算出它在页文件里的所有者编号。
+        // 复用路径不重写页：已持久化且结构校验通过（或内存快照可还原）时直接发布。
+        bool reusable = false;
         if (pageFileIndexes_) {
         // 页级引擎分支。
             // 页级引擎主路径：每次重建清旧页后从堆全量建树，索引页与堆页同属一个
@@ -1814,44 +1750,168 @@ void Database::rebuildIndexes(std::uint64_t tableId) {
             // 关键理由：索引页与堆页同属一个 PageFile 与 WAL，
             // 它们随同一个写批次原子落盘或回滚，所以永远与堆数据一致，
             // 也就不需要用指纹去判断索引是否陈旧了。
-            clearIndexPages(owner);
-            // 清掉旧索引页。
             runtime->pageTree = std::make_unique<storage::PageBPlusTree>(file_, buffer_, owner, 64, index.unique);
             // 构造页级 B+ 树（64 阶、按索引的唯一性设置）。
-            if (!runtime->pageTree->create()) throw MiniSqlError(ErrorCode::Catalog, "Failed to create page index: " + index.name);
-            // 创建失败就报目录错误。
-            heap_.scan(tableId, schema, [&](storage::RowRef ref, const storage::Row& row) {
-            // 全表扫描，逐行插入索引。
-                storage::IndexKey key;
-                // 待插入的索引键。
-                for (const auto column : columns) key.values.push_back(row[column]);
-                // 按索引列顺序取值组成键。
-                if (!runtime->pageTree->insert(std::move(key), ref)) throw MiniSqlError(ErrorCode::Execution, "UNIQUE index violation: " + index.name);
-                // 插入失败说明数据里已经有重复键——唯一索引建不出来，直接报执行错误。
-            });
-            indexes_.push_back(std::move(runtime));continue;
-            // 收进索引表并继续下一个索引。
+            if (!forceRebuild && runtime->pageTree->exists()) {
+                try {
+                    reusable = runtime->pageTree->validate();
+                } catch (const MiniSqlError&) {
+                    if (!allowRebuild) throw;
+                }
+            }
+        } else if (!forceRebuild) {
+            std::string loadFailure;
+            reusable = loadIndexPages(runtime->tree, owner, fingerprint, &loadFailure);
+            if (!reusable && !allowRebuild)
+                throw MiniSqlError(ErrorCode::Storage, "Index snapshot missing after rollback: " + index.name + " (" + loadFailure + ")");
         }
         // 页级分支结束。
-        if (!std::getenv("MINISQL_REBUILD_INDEXES") && loadIndexPages(runtime->tree, owner, fingerprint)) {
-        // 内存引擎分支：只要没强制重建，就先试着从页文件恢复已有索引。
-            indexes_.push_back(std::move(runtime));continue;
-            // 恢复成功就直接用，省掉一次全表扫描。
+        if (reusable) { indexes_.push_back(std::move(runtime)); continue; }
+        if (!allowRebuild) throw MiniSqlError(ErrorCode::Storage, "Index pages missing after rollback: " + index.name);
+        // 阶段一 build + 阶段二 validate：候选树在写批次内重建并校验；
+        // 失败抛出即随批次回滚，绝不把未通过校验的索引发给优化器。
+        std::size_t entries = 0;
+        const auto problems = buildIndexEntries(*runtime, tableId, schema, &entries);
+        if (!problems.empty())
+            throw MiniSqlError(ErrorCode::Execution, "Index build validation failed: " + index.name + " (" + joinProblems(problems) + ")");
+        ++indexFullRebuilds_;
+        // 阶段三 publish：内存引擎写回快照，页级引擎的节点页已落在 owner 下。
+        if (!pageFileIndexes_) persistIndexPages(runtime->tree, owner, fingerprint);
+        indexes_.push_back(std::move(runtime));
+    }
+}
+// 三阶段建造的 build + validate：把堆表全量条目写进 index（页级引擎先清空 owner 页），
+// 再校验树结构、条目数与唯一性。返回的问题列表为空才算通过；调用方负责 publish。
+std::vector<std::string> Database::buildIndexEntries(RuntimeIndex& index, std::uint64_t tableId,
+                                                     const storage::RowSchema& schema, std::size_t* entries) {
+    std::vector<std::string> problems;
+    if (index.pageFile) {
+        const auto owner = indexOwnerId(index.table, index.name);
+        clearIndexPages(owner);
+        index.pageTree = std::make_unique<storage::PageBPlusTree>(file_, buffer_, owner, 64, index.unique);
+        if (!index.pageTree->create()) problems.push_back("cannot create index pages");
+    } else {
+        index.tree.reset();
+    }
+    std::size_t built = 0, duplicates = 0;
+    heap_.scan(tableId, schema, [&](storage::RowRef ref, const storage::Row& row) {
+        const auto indexKey = index.keyFor(row);
+        if (!RuntimeIndex::indexable(indexKey)) return;
+        if (index.insert(indexKey, ref)) ++built;
+        else ++duplicates;
+    });
+    const bool structureValid = index.pageFile ? index.pageTree->validate() : index.tree.validate();
+    if (!structureValid) problems.push_back("index structure invalid");
+    if (duplicates > 0) problems.push_back("duplicate keys for unique index (" + std::to_string(duplicates) + ")");
+    if (index.size() != built) problems.push_back("entry count mismatch (" + std::to_string(index.size()) + " != " + std::to_string(built) + ")");
+    if (entries) *entries = built;
+    return problems;
+}
+// 堆表与索引的双向一致性检查：结构、条目数、每条堆行在索引内可达、每个索引条目指向存活且键一致的堆行。
+nlohmann::json Database::verifyIndexConsistency(RuntimeIndex& index, std::uint64_t tableId,
+                                                const storage::RowSchema& schema) {
+    nlohmann::json foundProblems = nlohmann::json::array();
+    const auto appendProblem = [&](const std::string& problem) {
+        if (foundProblems.size() < 32) foundProblems.push_back(problem);
+    };
+    const auto sameRow = [](const storage::RowRef& a, const storage::RowRef& b) {
+        return a.page.id == b.page.id && a.page.generation == b.page.generation &&
+               a.slot.slot == b.slot.slot && a.slot.generation == b.slot.generation;
+    };
+    bool structureValid = false;
+    try {
+        structureValid = index.validate();
+    } catch (const std::exception&) {
+        structureValid = false;
+    }
+    if (!structureValid) appendProblem("index structure invalid");
+    if (index.pageFile) {
+        const auto state = index.pageTree->inspect();
+        for (const auto& problem : state.problems) appendProblem(problem);
+    }
+    std::size_t heapRows = 0, indexableRows = 0, missing = 0;
+    heap_.scan(tableId, schema, [&](storage::RowRef ref, const storage::Row& row) {
+        ++heapRows;
+        const auto indexKey = index.keyFor(row);
+        if (!RuntimeIndex::indexable(indexKey)) return;
+        ++indexableRows;
+        const auto matches = index.search(indexKey);
+        if (std::none_of(matches.begin(), matches.end(), [&](const storage::RowRef& candidate) { return sameRow(candidate, ref); })) {
+            ++missing;
+            appendProblem("heap row missing from index");
         }
         // 恢复判断结束。
-        heap_.scan(tableId, schema, [&](storage::RowRef ref, const storage::Row& row) {
-        // 恢复不了就全表扫描重建。
-            storage::IndexKey key;
-            // 键。
-            for (const auto column : columns) key.values.push_back(row[column]);
-            // 从行里取值。
-            if (!runtime->tree.insert(std::move(key), ref)) throw MiniSqlError(ErrorCode::Execution, "UNIQUE index violation: " + index.name);
-            // 唯一性冲突同样报错。
-        });
-        persistIndexPages(runtime->tree, owner, fingerprint);
-        // 把新建的内存索引写回页文件，下次打开就能直接恢复。
-        indexes_.push_back(std::move(runtime));
-        // 收进索引表。
+    });
+    const auto allEntries = index.range(std::nullopt, true, std::nullopt, true);
+    std::size_t dangling = 0, keyMismatch = 0;
+    for (const auto& ref : allEntries) {
+        storage::Row row;
+        bool alive = true;
+        try {
+            row = heap_.read(tableId, schema, ref);
+        } catch (const std::exception&) {
+            alive = false;
+        }
+        if (!alive) {
+            ++dangling;
+            appendProblem("index entry points to a missing row");
+            continue;
+        }
+        const auto indexKey = index.keyFor(row);
+        if (!RuntimeIndex::indexable(indexKey)) {
+            ++dangling;
+            appendProblem("index entry points to a non-indexable row");
+            continue;
+        }
+        const auto matches = index.search(indexKey);
+        if (std::none_of(matches.begin(), matches.end(), [&](const storage::RowRef& candidate) { return sameRow(candidate, ref); })) {
+            ++keyMismatch;
+            appendProblem("index entry key mismatch");
+        }
+    }
+    const std::size_t indexRows = allEntries.size();
+    return {{"consistent", structureValid && missing == 0 && dangling == 0 && keyMismatch == 0 &&
+                            indexRows == indexableRows && index.size() == indexRows},
+            {"structureValid", structureValid}, {"heapRows", heapRows}, {"indexableRows", indexableRows},
+            {"indexRows", indexRows}, {"runtimeEntries", index.size()}, {"missingEntries", missing},
+            {"danglingEntries", dangling}, {"keyMismatches", keyMismatch}, {"problems", std::move(foundProblems)}};
+}
+void Database::reloadIndexRuntimes() {
+    indexes_.clear();
+    for (const auto& table : catalog_.tables()) initializeIndexes(table.id, false, false);
+    ++indexRuntimeReloads_;
+}
+void Database::insertIndexEntries(std::uint64_t tableId, const storage::Row& row, storage::RowRef ref) {
+    const catalog::StoredTable* stored = nullptr;
+    for (const auto& table : catalog_.tables()) if (static_cast<std::uint64_t>(table.id) == tableId) { stored = &table; break; }
+    if (!stored) throw MiniSqlError(ErrorCode::Catalog, "Index table identity not found");
+    for (auto& index : indexes_) {
+        if (key(index->table) != key(stored->definition.table)) continue;
+        const auto indexKey = index->keyFor(row);
+        if (!index->insert(indexKey, ref)) throw MiniSqlError(ErrorCode::Execution, "UNIQUE index violation: " + index->name);
+        if (RuntimeIndex::indexable(indexKey)) ++indexEntriesInserted_;
+    }
+}
+void Database::eraseIndexEntries(std::uint64_t tableId, const storage::Row& row, storage::RowRef ref) {
+    const catalog::StoredTable* stored = nullptr;
+    for (const auto& table : catalog_.tables()) if (static_cast<std::uint64_t>(table.id) == tableId) { stored = &table; break; }
+    if (!stored) throw MiniSqlError(ErrorCode::Catalog, "Index table identity not found");
+    for (auto& index : indexes_) {
+        if (key(index->table) != key(stored->definition.table)) continue;
+        const auto indexKey = index->keyFor(row);
+        if (!index->erase(indexKey, ref)) throw MiniSqlError(ErrorCode::Storage, "Index entry missing during DML: " + index->name);
+        if (RuntimeIndex::indexable(indexKey)) ++indexEntriesErased_;
+    }
+}
+void Database::persistMemoryIndexes(std::uint64_t tableId) {
+    if (pageFileIndexes_) return;
+    const catalog::StoredTable* stored = nullptr;
+    for (const auto& table : catalog_.tables()) if (static_cast<std::uint64_t>(table.id) == tableId) { stored = &table; break; }
+    if (!stored) throw MiniSqlError(ErrorCode::Catalog, "Index table identity not found");
+    const auto fingerprint = tableFingerprint(tableId);
+    for (auto& index : indexes_) {
+        if (key(index->table) == key(stored->definition.table))
+            persistIndexPages(index->tree, indexOwnerId(index->table, index->name), fingerprint);
     }
     // 索引遍历结束。
 }
@@ -1871,6 +1931,7 @@ void Database::validateUniqueIndexes(std::uint64_t tableId, const storage::Row& 
         // 待查的键。
         for (const auto column : index->columns) key.values.push_back(row[column]);
         // 用这一行的值组键。
+        if (!RuntimeIndex::indexable(key)) continue;
         const auto matches = index->search(key);
         // 查索引里有没有同键的记录。
         for (const auto& match : matches) {
@@ -1886,6 +1947,8 @@ void Database::validateUniqueIndexes(std::uint64_t tableId, const storage::Row& 
     }
     // 索引遍历结束。
 }
+// X18: 实时单遍扫描构造各表统计（表/列/索引）。ANALYZE 用它生成快照，
+// statistics() 在无快照时也回退到它。
 // X18: 实时单遍扫描构造各表统计（表/列/索引）。ANALYZE 用它生成快照，
 // statistics() 在无快照时也回退到它。
 nlohmann::json Database::liveTableStatistics() {
@@ -2048,6 +2111,7 @@ nlohmann::json Database::liveTableStatistics() {
 }
 // ANALYZE 快照的旁路路径：<db>.analyze.json。写语句成功后删除即失效。
 // 之所以叫"旁路"：它不占用数据页，而是紧挨着数据库文件放一个同名 .json。
+// ANALYZE 快照的旁路路径：<db>.analyze.json。写语句成功后删除即失效。
 std::filesystem::path Database::analyzeMetadataPath() const {
 // 算出 ANALYZE 快照的文件路径。
     auto path = file_->path();
@@ -2097,6 +2161,7 @@ nlohmann::json Database::statistics() {
     // X18: 显式 ANALYZE 的持久快照优先（跨进程有效）；缺失或已被写语句删除时回退实时扫描。
     // 快照是持久的，所以跨进程也有效；一旦有写语句就会把它删掉（见 invalidateAnalyzeSnapshot），
     // 这样统计不会停留在过期数据上。
+    // X18: 显式 ANALYZE 的持久快照优先（跨进程有效）；缺失或已被写语句删除时回退实时扫描。
     const auto analyzed = loadAnalyzeMetadata();
     // 尝试读快照。
     const auto tables = analyzed ? analyzed->at("tables") : liveTableStatistics();
@@ -2107,6 +2172,7 @@ nlohmann::json Database::statistics() {
     // 脏页比例。
     const auto& record = file_->checkpointRecord();
     // 取页文件里的检查点记录（下面会用到它的字段）。
+    const auto wal = file_->walStatistics();
     const auto analyzedAtMs = analyzed ? analyzed->value("analyzedAtMs", std::uint64_t{0}) : std::uint64_t{0};
     // 快照的产生时间；没有快照就是 0。
     const auto refreshedAt = analyzed ? analyzedAtMs : static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -2139,12 +2205,25 @@ nlohmann::json Database::statistics() {
 // 检查点记录中的脏页水位与目录版本。
             {"indexVersion", record.indexVersion}, {"committedSequence", record.committedSequence},
 // 索引版本与提交序号。
-            {"timestampMs", record.timestampMs}}},
-// 检查点时间戳。
+            {"timestampMs", record.timestampMs}, {"walLsn", record.walLsn},
+            {"checkpointBeginLsn", record.checkpointBeginLsn}, {"checkpointEndLsn", record.checkpointEndLsn},
+            {"archivedBytes", record.archivedBytes}, {"archiveSegments", record.archiveSegments}}},
+        // 记录级 WAL 统计：逻辑 LSN 链、事务/记录类型计数与归档状态。
+        {"wal", {{"walBytes", wal.walBytes}, {"nextLsn", wal.nextLsn}, {"lastExtentLsn", wal.lastExtentLsn},
+            {"lastCheckpointLsn", wal.lastCheckpointLsn}, {"committedSequence", wal.committedSequence},
+            {"dirtyWatermark", wal.dirtyWatermark}, {"committedExtents", wal.committedExtents},
+            {"abortedExtents", wal.abortedExtents}, {"recordedPages", wal.recordedPages},
+            {"trackedPages", wal.trackedPages}, {"archivedBytes", wal.archivedBytes},
+            {"archiveSegments", wal.archiveSegments}, {"pendingCommitBytes", wal.pendingCommitBytes},
+            {"groupCommit", wal.groupCommit}, {"doubleWrite", wal.doubleWrite},
+            {"fuzzyCheckpoint", wal.fuzzyCheckpoint}}},
         {"lastCheckpointAtMs", lastCheckpointAtMs_}, {"lastAutoCheckpointAtMs", lastAutoCheckpointAtMs_},
 // 最近一次手动检查点与自动检查点时间。
         {"lastAutoCheckpointReasons", lastAutoCheckpointReasons_},
         // 最近一次自动检查点的触发原因列表。
+        {"indexMaintenance", {{"engine", pageFileIndexes_ ? "page-file" : "memory"},
+            {"fullRebuilds", indexFullRebuilds_}, {"runtimeReloads", indexRuntimeReloads_},
+            {"entriesInserted", indexEntriesInserted_}, {"entriesErased", indexEntriesErased_}}},
         {"backgroundScheduler", {{"enabled", backgroundCheckpointMs_ > 0 && scheduler_.joinable()},
 // 后台调度器状态：是否启用、间隔与最近评估情况。
             {"intervalMs", backgroundCheckpointMs_}, {"lastEvaluateMs", schedulerLastEvaluateMs_},
@@ -2534,6 +2613,7 @@ json Database::aggregateRows(const sql::LogicalPlan& plan) {
     } else if (input->kind == "Limit" && input->limit && *input->limit == 0) {
 // Limit 0 表示输入恒为空。
         // 恒假过滤已被改写为 Limit 0；空输入仍需保留全局聚合的一行结果。
+        // 恒假过滤已被改写为 Limit 0；空输入仍需保留全局聚合的一行结果。
     } else fail("Unsupported aggregate input");
 // 其他计划类型不支持直接聚合，属于内部错误。
     if (plan.groupKeys.empty() && records.empty()) {
@@ -2710,8 +2790,49 @@ std::unique_ptr<RowStream> Database::openRowStream(const sql::LogicalPlan& plan)
 // 按计划节点类型创建对应的行流，支持流式执行算子。
     checkCancelled();
 // 创建任何行流前先检查取消。
+    if (!activeResources_) activeResources_ = std::make_shared<QueryResourceManager>(queryMemoryBytes_, tempDiskBytes_);
     if (plan.kind == "SeqScan") return scanRowStream(plan);
 // 顺序扫描直接交给 scanRowStream。
+    if (plan.kind == "IndexScan") {
+        const catalog::StoredTable* table = nullptr;
+        for (const auto& candidate : catalog_.tables()) if (key(candidate.definition.table) == key(plan.table)) table = &candidate;
+        if (!table) fail("IndexScan references missing table");
+        const RuntimeIndex* index = nullptr;
+        for (const auto& candidate : indexes_)
+            if (key(candidate->table) == key(plan.table) && key(candidate->name) == key(plan.indexName)) index = candidate.get();
+        if (!index) fail("IndexScan references missing runtime index");
+        std::vector<storage::RowRef> refs;
+        if (!plan.indexRangeOperator.empty()) {
+            storage::IndexKey searchKey;
+            for (const auto& value : plan.indexValues)
+                searchKey.values.push_back(indexValue(value.at("value"), value.at("type").get<std::string>()));
+            searchKey.values.push_back(indexValue(plan.indexRangeValue.at("value"), plan.indexRangeValue.at("type").get<std::string>()));
+            const auto& op = plan.indexRangeOperator;
+            if (op == ">") refs = index->range(searchKey, false, std::nullopt, true);
+            else if (op == ">=") refs = index->range(searchKey, true, std::nullopt, true);
+            else if (op == "<") refs = index->range(std::nullopt, true, searchKey, false);
+            else refs = index->range(std::nullopt, true, searchKey, true);
+        } else if (!plan.indexValues.empty()) {
+            storage::IndexKey searchKey;
+            for (const auto& value : plan.indexValues)
+                searchKey.values.push_back(indexValue(value.at("value"), value.at("type").get<std::string>()));
+            refs = index->search(searchKey);
+        } else {
+            const auto& predicate = plan.predicate;
+            if (!predicate.is_object()) fail("IndexScan requires a predicate");
+            const auto op = predicate.value("operator", "");
+            const auto& right = predicate.at("right");
+            if (!right.is_object() || right.value("kind", "") != "Literal") fail("IndexScan requires a literal key");
+            const auto searchKey = storage::IndexKey{{indexValue(right.at("value"), right.at("type").get<std::string>())}};
+            if (op == "=") refs = index->search(searchKey);
+            else if (op == ">") refs = index->range(searchKey, false, std::nullopt, true);
+            else if (op == ">=") refs = index->range(searchKey, true, std::nullopt, true);
+            else if (op == "<") refs = index->range(std::nullopt, true, searchKey, false);
+            else if (op == "<=") refs = index->range(std::nullopt, true, searchKey, true);
+            else fail("IndexScan requires an indexed comparison");
+        }
+        return std::make_unique<ScanRowStream>(heap_, table->id, rowSchema(table->definition), std::move(refs));
+    }
     if (plan.kind == "Filter" || plan.kind == "SemiJoin" || plan.kind == "AntiJoin" || plan.kind == "Apply") {
 // 过滤、半连接、反连接和 Apply 都包装一个子流并施加谓词。
         if (plan.children.size() != 1) fail("Filter requires one child");
@@ -2781,12 +2902,158 @@ std::unique_ptr<RowStream> Database::openRowStream(const sql::LogicalPlan& plan)
     }
 // 该语句分支结束。
 // Limit 分支结束。
-    if (plan.kind == "Sort" || plan.kind == "Aggregate" || plan.kind == "Distinct") {
-// 排序、聚合和去重需要物化才能处理，无法逐行流水完成。
-        auto result = runNode(plan);
-// 直接调用 runNode 生成完整结果。
-        return std::make_unique<MaterializedRowStream>(result.at("rows"));
-// 把结果行包装成 MaterializedRowStream，保持统一接口。
+    if (plan.kind == "Sort") {
+        if (plan.children.size() != 1) fail("Sort requires one child");
+        auto child = openRowStream(plan.children.front());
+        const auto sortKeys = plan.sortKeys;
+        const auto inputSchema = plan.children.front().output;
+        const auto compareRows = [sortKeys, inputSchema](const json& left, const json& right) {
+            for (const auto& sort : sortKeys) {
+                const auto index = sort.at("index").get<std::size_t>();
+                const auto& a = left.at(index);
+                const auto& b = right.at(index);
+                if (a == b) continue;
+                if (a.is_null() || b.is_null()) return a.is_null() ? sort.at("nullsFirst").get<bool>() : !sort.at("nullsFirst").get<bool>();
+                if (index < inputSchema.size() && decimalType(inputSchema[index].type)) {
+                    const auto& type = inputSchema[index].type;
+                    const auto order = decimalValue(a, type).compare(decimalValue(b, type));
+                    if (order == 0) continue;
+                    return sort.at("descending").get<bool>() ? order > 0 : order < 0;
+                }
+                return sort.at("descending").get<bool>() ? a > b : a < b;
+            }
+            return false;
+        };
+        const auto operationId = sessionId_ + "-q" + std::to_string(currentQueryId_) + "-s" + std::to_string(++sortSequence_);
+        return std::make_unique<ExternalSortRowStream>(std::move(child), compareRows, activeResources_,
+            sortTempDirectory_, operationId, sortMemoryRows_, [this] { checkCancelled(); }, plan.output.size());
+    }
+    if (plan.kind == "Distinct") {
+        if (plan.children.size() != 1) fail("Distinct requires one child");
+        auto child = openRowStream(plan.children.front());
+        const auto operationId = sessionId_ + "-q" + std::to_string(currentQueryId_) + "-d" + std::to_string(++sortSequence_);
+        auto sorted = std::make_unique<ExternalSortRowStream>(std::move(child),
+            [](const json& left, const json& right) { return left < right; }, activeResources_,
+            sortTempDirectory_, operationId, distinctMemoryRows_, [this] { checkCancelled(); });
+        return std::make_unique<DistinctRowStream>(std::move(sorted), activeResources_);
+    }
+    if (plan.kind == "Aggregate") {
+        if (plan.children.size() != 1) fail("Aggregate requires one child");
+        auto child = openRowStream(plan.children.front());
+        const auto groupKeys = plan.groupKeys;
+        const auto aggregates = plan.aggregates;
+        json initial = json::array();
+        json emptyValues = json::array();
+        for (const auto& aggregate : aggregates) {
+            initial.push_back(aggregate.at("function") == "COUNT" ? json(std::int64_t{0}) :
+                aggregate.at("function") == "AVG" ? (aggregate.at("argument").at("type") == "float" ?
+                    json{{"sum", 0.0}, {"count", std::int64_t{0}}} : json{{"sum", "0"}, {"count", std::int64_t{0}}}) : json(nullptr));
+            emptyValues.push_back(nullptr);
+        }
+        std::optional<json> emptyRecord;
+        if (groupKeys.empty()) emptyRecord = json{{"key", json::array()}, {"values", emptyValues}};
+        auto records = std::make_unique<MappingRowStream>(std::move(child),
+            [this, groupKeys, aggregates](const json& input) {
+                json groupKey = json::array(), values = json::array();
+                for (const auto& expression : groupKeys) groupKey.push_back(evaluate(expression, input));
+                for (const auto& aggregate : aggregates) {
+                    const auto& argument = aggregate.at("argument");
+                    values.push_back(argument.is_null() ? json(true) : evaluate(argument, input));
+                }
+                return json{{"key", std::move(groupKey)}, {"values", std::move(values)}};
+            }, emptyRecord);
+        const auto operationId = sessionId_ + "-q" + std::to_string(currentQueryId_) + "-a" + std::to_string(++aggregateSequence_);
+        auto sorted = std::make_unique<ExternalSortRowStream>(std::move(records),
+            [](const json& left, const json& right) { return left.at("key") < right.at("key"); },
+            activeResources_, sortTempDirectory_, operationId, aggregateMemoryRows_, [this] { checkCancelled(); });
+        const auto combine = [aggregates](json& state, const json& values) {
+            if (!values.is_array() || values.size() != aggregates.size()) fail("Aggregate record schema mismatch");
+            for (std::size_t index = 0; index < aggregates.size(); ++index) {
+                const auto& aggregate = aggregates[index];
+                const auto& value = values[index];
+                if (value.is_null()) continue;
+                const auto function = aggregate.at("function").get<std::string>();
+                const auto& argument = aggregate.at("argument");
+                const SourceLocation location{
+                    argument.is_object() ? argument.value("line", std::size_t{0}) : 0,
+                    argument.is_object() ? argument.value("column", std::size_t{0}) : 0};
+                json next = state[index];
+                if (function == "COUNT") next = arithmetic64("+", state[index].get<std::int64_t>(), 1, location);
+                else if (function == "SUM") {
+                    if (const auto type = decimalType(argument.at("type").get<std::string>()))
+                        next = state[index].is_null() ? value : json(ExactDecimal::parse(state[index].get<std::string>(), 38, type->scale)
+                            .arithmetic("+", decimalValue(value, type->name()), location).format());
+                    else if (argument.at("type") == "float")
+                        next = state[index].is_null() ? value : json(requireFiniteFloat(state[index].get<double>() + value.get<double>(), location));
+                    else next = state[index].is_null() ? value : json(arithmetic64("+", state[index].get<std::int64_t>(), value.get<std::int64_t>(), location));
+                } else if (function == "MIN" || function == "MAX") {
+                    if (next.is_null()) next = value;
+                    else {
+                        const auto type = argument.at("type").get<std::string>();
+                        const auto order = decimalType(type) ? decimalValue(value, type).compare(decimalValue(next, type)) : value < next ? -1 : value > next ? 1 : 0;
+                        if ((function == "MIN" && order < 0) || (function == "MAX" && order > 0)) next = value;
+                    }
+                } else if (function == "AVG") {
+                    if (argument.at("type") == "float")
+                        next = {{"sum", requireFiniteFloat(state[index].at("sum").get<double>() + value.get<double>(), location)},
+                            {"count", arithmetic64("+", state[index].at("count").get<std::int64_t>(), 1, location)}};
+                    else {
+                        ExactDecimal::Integer total(state[index].at("sum").get<std::string>());
+                        if (decimalType(argument.at("type").get<std::string>())) total += decimalValue(value, argument.at("type").get<std::string>()).coefficient();
+                        else total += value.get<std::int64_t>();
+                        next = {{"sum", total.convert_to<std::string>()},
+                            {"count", arithmetic64("+", state[index].at("count").get<std::int64_t>(), 1, location)}};
+                    }
+                } else throw MiniSqlError(ErrorCode::NotImplemented, "Aggregate function evaluation is not implemented: " + function);
+                state[index] = std::move(next);
+            }
+        };
+        const auto outputSize = plan.output.size();
+        const auto finalize = [aggregates, outputSize](const json& groupKey, const json& state) {
+            json row = groupKey;
+            for (std::size_t index = 0; index < state.size(); ++index) {
+                if (aggregates[index].at("function") != "AVG") { row.push_back(state[index]); continue; }
+                const auto count = state[index].at("count").get<std::int64_t>();
+                const auto& argument = aggregates[index].at("argument");
+                const SourceLocation location{argument.value("line", std::size_t{0}), argument.value("column", std::size_t{0})};
+                if (aggregates[index].at("type") == "float") {
+                    row.push_back(count == 0 ? json(nullptr) : json(requireFiniteFloat(
+                        state[index].at("sum").get<double>() / static_cast<double>(count), location)));
+                    continue;
+                }
+                ExactDecimal::Integer denominator = count;
+                const auto argumentType = decimalType(argument.at("type").get<std::string>());
+                if (argumentType) for (unsigned digit = 0; digit < argumentType->scale; ++digit) denominator *= 10;
+                const auto outputType = decimalType(aggregates[index].at("type").get<std::string>());
+                try {
+                    row.push_back(count == 0 ? json(nullptr) : json(ExactDecimal::fromRatio(
+                        ExactDecimal::Integer(state[index].at("sum").get<std::string>()), denominator, 38, outputType->scale).format()));
+                } catch (const MiniSqlError& error) {
+                    throw MiniSqlError(error.code(), error.what(), location);
+                }
+            }
+            if (row.size() != outputSize) fail("Aggregate output schema mismatch");
+            return row;
+        };
+        return std::make_unique<GroupedAggregateRowStream>(std::move(sorted), std::move(initial), combine, finalize, activeResources_);
+    }
+    if (plan.kind == "NestedLoopJoin" || plan.kind == "HashJoin" || plan.kind == "LeftJoin") {
+        if (plan.children.size() != 2) fail("Join requires two children");
+        auto left = openRowStream(plan.children[0]);
+        auto right = openRowStream(plan.children[1]);
+        std::optional<std::pair<std::size_t, std::size_t>> keys;
+        if (plan.kind == "HashJoin") {
+            std::size_t leftKey = 0, rightKey = 0;
+            if (!hashJoinKeys(plan.predicate, plan.children[0].output.size(), leftKey, rightKey))
+                fail("HashJoin requires a direct equality key");
+            keys = std::pair{leftKey, rightKey};
+        }
+        const auto predicate = plan.predicate;
+        const auto operationId = sessionId_ + "-q" + std::to_string(currentQueryId_) + "-j" + std::to_string(++joinSequence_);
+        return std::make_unique<JoinRowStream>(std::move(left), std::move(right),
+            [this, predicate](const json& row) { return accepted(evaluate(predicate, row)); },
+            activeResources_, sortTempDirectory_, operationId, joinMemoryRows_, plan.children[1].output.size(),
+            plan.kind == "LeftJoin", keys, [this] { checkCancelled(); });
     }
 // 物化类分支结束。
     throw MiniSqlError(ErrorCode::InvalidArgument, "RowStream does not support plan kind " + plan.kind);
@@ -2800,6 +3067,19 @@ nlohmann::json Database::runNode(const sql::LogicalPlan& plan) {
 // 执行前检查取消标志。
     if (plan.kind == "Sort") {
 // Sort 分支：先执行孩子，再对结果排序。
+        try {
+            auto stream = openRowStream(plan);
+            json rows = json::array(), row;
+            while (stream->next(row)) rows.push_back(std::move(row));
+            stream->close();
+            auto usage = stream->resourceUsage();
+            json columns = json::array();
+            for (const auto& column : plan.output) columns.push_back(column.name);
+            return {{"kind", "Sort"}, {"columns", std::move(columns)}, {"rows", std::move(rows)},
+                {"affectedRows", 0}, {"resourceUsage", std::move(usage)}};
+        } catch (const MiniSqlError& error) {
+            if (error.code() != ErrorCode::InvalidArgument) throw;
+        }
         if (plan.children.size() != 1) fail("Sort requires one child");
 // 排序必须恰好有一个输入。
         auto result = run(plan.children.front());
@@ -2841,16 +3121,13 @@ nlohmann::json Database::runNode(const sql::LogicalPlan& plan) {
 // 两行在排序语义下相等。
         };
 // compareRows lambda 结束。
-        if (rows.size() > sortMemoryRows_) {
-// 行数超过内存排序阈值时走外排。
+        const bool external = rows.size() > sortMemoryRows_;
+        if (external) {
             const auto operationId = sessionId_ + "-q" + std::to_string(currentQueryId_) + "-s" + std::to_string(++sortSequence_);
 // 生成本次排序操作的唯一标识，用于临时文件命名。
             externalSort(rows, compareRows, sortMemoryRows_, sortTempDirectory_, operationId, [this] { checkCancelled(); });
 // 调用 externalSort 完成多路归并排序。
-        }
-// 外排分支结束。
-        else std::stable_sort(rows.begin(), rows.end(), compareRows);
-// 行数在内存预算内时使用稳定排序。
+        } else std::stable_sort(rows.begin(), rows.end(), compareRows);
         for (auto& row : rows) while (row.size() > plan.output.size()) row.erase(row.end() - 1);
 // 排序可能产生多余尾列，按输出模式裁掉。
         result["columns"] = json::array();
@@ -2861,8 +3138,7 @@ nlohmann::json Database::runNode(const sql::LogicalPlan& plan) {
 // 标记结果来自 Sort 节点。
         result["resourceUsage"] = {{"kind", "Sort"}, {"rows", rows.size()},
 // 记录排序资源使用情况，便于诊断接口展示。
-            {"external", rows.size() > sortMemoryRows_}, {"memoryRows", sortMemoryRows_}};
-// 标明是否走外排以及内存行阈值。
+            {"external", external}, {"memoryRows", sortMemoryRows_}};
         return result;
 // 返回排序后的结果。
     }
@@ -2909,14 +3185,15 @@ nlohmann::json Database::runNode(const sql::LogicalPlan& plan) {
 // 取行循环结束。
             stream->close();
 // 显式关闭行流，释放扫描器持有的资源。
+            auto childUsage = stream->resourceUsage();
             json columns = json::array();
 // 构造输出列名数组。
             for (const auto& column : plan.output) columns.push_back(column.name);
 // 按计划输出模式复制列名。
             return {{"kind", "Limit"}, {"columns", std::move(columns)}, {"rows", std::move(rows)},
 // 返回流式 Limit 结果。
-                {"affectedRows", 0}, {"resourceUsage", {{"kind", "LimitRowStream"}, {"rows", emitted}}}};
-// 记录本节点行数与实现方式，便于诊断。
+                {"affectedRows", 0}, {"resourceUsage", {{"kind", "LimitRowStream"}, {"rows", emitted},
+                    {"child", std::move(childUsage)}}}};
         } catch (const MiniSqlError& error) {
 // 捕获下层不支持行流的错误。
             if (error.code() != ErrorCode::InvalidArgument) throw;
@@ -2947,8 +3224,20 @@ nlohmann::json Database::runNode(const sql::LogicalPlan& plan) {
 // Limit 分支结束。
     if (plan.kind == "Distinct") {
 // Distinct 分支：对投影结果做去重。
-        if (plan.children.size() != 1 || plan.children.front().kind != "Project") fail("Distinct requires a projection child");
-// Distinct 只接受一个 Project 孩子，因为去重比较的是最终输出列。
+        try {
+            auto stream = openRowStream(plan);
+            json rows = json::array(), row;
+            while (stream->next(row)) rows.push_back(std::move(row));
+            stream->close();
+            auto usage = stream->resourceUsage();
+            json columns = json::array();
+            for (const auto& column : plan.output) columns.push_back(column.name);
+            return {{"kind", "Distinct"}, {"columns", std::move(columns)}, {"rows", std::move(rows)},
+                {"affectedRows", 0}, {"resourceUsage", std::move(usage)}};
+        } catch (const MiniSqlError& error) {
+            if (error.code() != ErrorCode::InvalidArgument) throw;
+        }
+        if (plan.children.size() != 1) fail("Distinct requires one child");
         auto result = run(plan.children.front());
 // 执行投影子节点。
         std::set<json> seen;
@@ -2961,6 +3250,7 @@ nlohmann::json Database::runNode(const sql::LogicalPlan& plan) {
 // 用去重结果替换原行数组。
         result["kind"] = "Distinct";
 // 标记结果为 Distinct 节点。
+        result["resourceUsage"] = {{"kind", "Distinct"}, {"rows", result.at("rows").size()}, {"external", false}};
         return result;
 // 返回去重结果。
     }
@@ -2969,6 +3259,17 @@ nlohmann::json Database::runNode(const sql::LogicalPlan& plan) {
 // 构造各类节点的统一结果骨架：kind、列名、行集合和影响行数。
     if (plan.kind == "Aggregate") {
 // Aggregate 节点执行分支。
+        try {
+            auto stream = openRowStream(plan);
+            json row;
+            while (stream->next(row)) result["rows"].push_back(std::move(row));
+            stream->close();
+            for (const auto& column : plan.output) result["columns"].push_back(column.name);
+            result["resourceUsage"] = stream->resourceUsage();
+            return result;
+        } catch (const MiniSqlError& error) {
+            if (error.code() != ErrorCode::InvalidArgument) throw;
+        }
         for (const auto& column : plan.output) result["columns"].push_back(column.name);
 // 按计划输出模式填写列名。
         result["rows"] = aggregateRows(plan);
@@ -3041,6 +3342,8 @@ nlohmann::json Database::runNode(const sql::LogicalPlan& plan) {
 // X09 3.3：外层 Select 投影在派生表等“成形子计划”之上时，需要先物化内层关系。
     // 关系，再对外层投影求值。普通 Select（Filter 下接裸 Scan）不受影响。
 // 普通 Select（Filter 下接裸 Scan）不走这条路径，保持原有流式扫描。
+    // X09 3.3: 外层 Select 投影于一个“成形的”子计划（派生表）之上 —— 先物化内层
+    // 关系，再对外层投影求值。普通 Select（Filter 下接裸 Scan）不受影响。
     if (plan.kind == "Project" && plan.children.size() == 1) {
 // 只有一个孩子的 Project 才需要判断是否属于成形子计划。
         std::function<bool(const sql::LogicalPlan&)> subplanRoot;
@@ -3101,24 +3404,20 @@ nlohmann::json Database::runNode(const sql::LogicalPlan& plan) {
 // 保存索引列在表中的下标。
         for (const auto& name : plan.indexColumns) columns.push_back(catalog::resolveColumnIndex(*definition, name));
 // 把每个索引列名解析成列下标。
-        if (plan.uniqueIndex) {
-// 唯一索引需要先扫描全表确认没有重复键。
-            std::set<json> keys;
-// 记录已经出现过的键集合。
-            heap_.scan(stored->id, rowSchema(stored->definition), [&](storage::RowRef, const storage::Row& row) {
-// 扫描目标表的所有行。
-                json key = json::array();
-// 构造当前行的索引键数组。
-                bool hasNull = false;
-// 标记键中是否含 NULL。
-                for (const auto column : columns) { key.push_back(cell(row[column]));hasNull = hasNull || key.back().is_null(); }
-// 逐列取出单元格拼成键；出现 NULL 时记录下来。
-                if (hasNull) return;
-// UNIQUE 允许多行含 NULL，所以含 NULL 的键不参与重复检查。
-                if (!keys.insert(key).second) fail("UNIQUE index contains duplicate keys");
-// 键已经存在说明有重复，建唯一索引必须失败。
+        // 唯一索引建造三阶段：先在候选树里 build，再 validate（结构/条目数/唯一性），
+        // 只有全部通过才在 publish 阶段登记目录与运行实例；任一步失败随写批次回滚。
+        auto candidate = std::make_unique<RuntimeIndex>(plan.indexName, stored->definition.table, columns,
+                                                        plan.uniqueIndex, pageFileIndexes_);
+        std::size_t entries = 0;
+        const auto problems = buildIndexEntries(*candidate, stored->id, rowSchema(stored->definition), &entries);
+        if (!problems.empty()) {
+            const bool duplicate = std::any_of(problems.begin(), problems.end(), [](const std::string& problem) {
+                return problem.rfind("duplicate keys", 0) == 0;
             });
 // 唯一性预检查扫描结束。
+            if (plan.uniqueIndex && duplicate) fail("UNIQUE index contains duplicate keys");
+            const auto detail = "Index build validation failed: " + plan.indexName + " (" + joinProblems(problems) + ")";
+            fail(detail.c_str());
         }
 // 唯一性检查分支结束。
         sql::Statement indexDefinition;
@@ -3131,10 +3430,12 @@ nlohmann::json Database::runNode(const sql::LogicalPlan& plan) {
 // 填写索引列列表。
         catalog_.createIndex(indexDefinition);
 // 写入目录，生成持久化索引定义。
-        rebuildIndexes(stored->id);
-// 为新索引重建运行期树结构和页。
+        indexes_.push_back(std::move(candidate));
+        // 内存引擎需把发布后的树写回快照，否则后续失败回滚无法还原运行时。
+        if (!pageFileIndexes_) persistMemoryIndexes(stored->id);
         result["kind"] = "CreateIndex";
 // 结果类型标记为 CreateIndex。
+        result["entriesBuilt"] = entries;
         return result;
     }
 // CreateIndex 分支结束。
@@ -3433,6 +3734,7 @@ nlohmann::json Database::runNode(const sql::LogicalPlan& plan) {
 // 扫描子表寻找引用旧父键的行。
                     // 当前行的自引用由候选最终状态检查；其他行仍执行 RESTRICT。
 // 当前行自身的自引用交给候选最终状态检查，这里跳过。
+                    // 当前行的自引用由候选最终状态检查；其他行仍执行 RESTRICT。
                     if (child.id == table->id && childRef.page.id == oldRef.page.id && childRef.page.generation == oldRef.page.generation &&
 // 先比较表身份和页身份。
                         childRef.slot.slot == oldRef.slot.slot && childRef.slot.generation == oldRef.slot.generation) return;
@@ -3605,10 +3907,12 @@ nlohmann::json Database::runNode(const sql::LogicalPlan& plan) {
 // 自引用检查分支结束。
         for (const auto& row : candidates) validateUniqueIndexes(table->id, row);
 // 对每个候选行检查运行期唯一索引，避免破坏索引语义。
-        for (const auto& row : candidates) heap_.insert(table->id, schema, row);
-// 所有校验通过后逐行写入堆表。
-        if (!indexes_.empty()) rebuildIndexes(table->id);
-// 有索引时重建索引，把新行登记进去。
+        for (const auto& row : candidates) {
+            const auto ref = heap_.insert(table->id, schema, row);
+            insertIndexEntries(table->id, row, ref);
+        }
+        persistMemoryIndexes(table->id);
+        if (!candidates.empty()) ++indexVersion_;
         heap_.flush();
 // 刷堆表数据，保证插入在返回前可见。
         result["affectedRows"] = candidates.size();
@@ -3652,18 +3956,24 @@ nlohmann::json Database::runNode(const sql::LogicalPlan& plan) {
 // Project 流式尝试结束。
     const auto* input = &plan.children.front();
 // 取得根计划的输入节点。
-    const json* predicate = nullptr;
-// 准备保存抽取出来的过滤谓词。
-    if (input->kind == "Filter" || input->kind == "SemiJoin" || input->kind == "AntiJoin" || input->kind == "Apply") {
-// 如果输入是过滤类节点，把谓词下推到扫描/连接消费阶段。
-        predicate = &input->predicate;
-// 保存过滤谓词指针。
+    std::vector<const json*> predicates;
+    while (input->kind == "Filter") {
+        predicates.push_back(&input->predicate);
         if (input->children.size() != 1) fail("Filter requires one child");
 // 过滤节点必须恰好有一个孩子。
         input = &input->children.front();
 // 继续向内找到真正的扫描或连接输入。
     }
 // 过滤剥离结束。
+    if (input->kind == "SemiJoin" || input->kind == "AntiJoin" || input->kind == "Apply") {
+        predicates.push_back(&input->predicate);
+        if (input->children.size() != 1) fail("Filter requires one child");
+        input = &input->children.front();
+    }
+    const auto acceptsPredicates = [&](const auto& row) {
+        for (const auto* predicate : predicates) if (!accepted(evaluate(*predicate, row))) return false;
+        return true;
+    };
     const bool joined = (input->kind == "NestedLoopJoin" || input->kind == "HashJoin" || input->kind == "LeftJoin" || input->kind == "RightJoin" || input->kind == "FullJoin") && plan.kind == "Project";
 // 判断输入是否为可供 Project 直接消费的 JOIN 结果。
     if (!joined && ((input->kind != "SeqScan" && input->kind != "IndexScan") || key(input->table) != key(plan.table))) fail("Unsupported scan plan");
@@ -3676,8 +3986,7 @@ nlohmann::json Database::runNode(const sql::LogicalPlan& plan) {
 // 执行索引扫描得到候选行。
         for (const auto& row : indexed.at("rows")) {
 // 逐行处理索引扫描结果。
-            if (predicate && !accepted(evaluate(*predicate, row))) continue;
-// 有过滤谓词时先筛选。
+            if (!acceptsPredicates(row)) continue;
             json projected = json::array();
 // 准备投影结果行。
             if (!plan.projections.empty()) for (const auto& expression : plan.projections) projected.push_back(evaluate(expression, row));
@@ -3692,10 +4001,13 @@ nlohmann::json Database::runNode(const sql::LogicalPlan& plan) {
 // 返回索引扫描投影结果。
     }
 // IndexScan+Project 特判结束。
-    std::vector<storage::RowRef> deletion;
-// 保存 Delete 需要删除的行引用；延迟到全部校验完成后再真正删除。
-    std::vector<std::pair<storage::RowRef, storage::Row>> updates;
-// 保存 Update 的行引用与替换后的完整行。
+    std::vector<std::pair<storage::RowRef, storage::Row>> deletion;
+    struct PendingUpdate {
+        storage::RowRef ref;
+        storage::Row original;
+        storage::Row replacement;
+    };
+    std::vector<PendingUpdate> updates;
     const bool inspectSelfReferences = hasSelfReferences && (plan.kind == "Update" || plan.kind == "Delete");
 // 只有更新/删除且存在自引用外键时，才需要检查最终表状态。
     std::vector<storage::Row> finalRows;
@@ -3704,8 +4016,7 @@ nlohmann::json Database::runNode(const sql::LogicalPlan& plan) {
 // 定义扫描单行时的处理逻辑：判断是读、删还是改。
         checkCancelled();
 // 每处理一行检查取消。
-        if (predicate && !accepted(evaluate(*predicate, row))) {
-// 谓词不接受这一行时进入“保留原行”分支。
+        if (!acceptsPredicates(row)) {
             if (plan.kind == "Update") checkUnique(row);
 // UPDATE 场景仍需把保留行纳入唯一性集合，保证后续候选行检查正确。
             if (inspectSelfReferences) finalRows.push_back(row);
@@ -3714,8 +4025,7 @@ nlohmann::json Database::runNode(const sql::LogicalPlan& plan) {
 // 保留行直接返回。
         }
 // 保留分支结束。
-        if (plan.kind == "Delete") { restrictParent(ref, row, nullptr); deletion.push_back(ref); return; }
-// Delete 场景先做父键 RESTRICT 检查，再记录待删除引用。
+        if (plan.kind == "Delete") { restrictParent(ref, row, nullptr); deletion.emplace_back(ref, row); return; }
         if (plan.kind == "Update") {
 // UPDATE 场景：先计算所有赋值后的新行，完成全部校验后再真正替换。
             if (plan.columnMapping.size() != plan.projections.size()) fail("UPDATE assignment mapping mismatch");
@@ -3786,8 +4096,7 @@ nlohmann::json Database::runNode(const sql::LogicalPlan& plan) {
 // 检查更新父键时是否被其他行 RESTRICT 引用。
             if (inspectSelfReferences) finalRows.push_back(replacement);
 // 需要自引用检查时，把新行加入最终行集合。
-            updates.emplace_back(ref, std::move(replacement));
-// 把待更新引用与新行放入 updates。
+            updates.push_back({ref, row, std::move(replacement)});
             return;
 // 当前更新行处理结束。
         }
@@ -3818,16 +4127,21 @@ nlohmann::json Database::runNode(const sql::LogicalPlan& plan) {
 // 普通扫描直接把每个 RowRef 与行交给 consume。
     if (inspectSelfReferences) checkSelfReferences(finalRows);
 // 更新/删除且存在自引用外键时，校验最终行集合。
-    for (auto ref : deletion) heap_.erase(table->id, ref);
-// 所有校验通过后执行删除。
     // 扫描及全部表达式检查完成后再写入，避免除零或行长错误造成前半批修改。
-// 扫描及全部表达式检查完成后再写入，避免除零或行长错误造成前半批修改。
-    for (const auto& [ref, replacement] : updates) validateUniqueIndexes(table->id, replacement, ref);
-// 更新前再检查运行期唯一索引，并排除被替换行自身。
-    for (const auto& [ref, replacement] : updates) (void)heap_.replace(table->id, schema, ref, replacement);
-// 逐行执行真实的堆表替换。
-    if (!indexes_.empty() && (!deletion.empty() || !updates.empty())) rebuildIndexes(table->id);
-// 有删除或更新时重建索引，保持索引与堆表一致。
+    for (const auto& update : updates) validateUniqueIndexes(table->id, update.replacement, update.ref);
+    for (const auto& [ref, row] : deletion) {
+        eraseIndexEntries(table->id, row, ref);
+        heap_.erase(table->id, ref);
+    }
+    for (const auto& update : updates) {
+        eraseIndexEntries(table->id, update.original, update.ref);
+        const auto replacementRef = heap_.replace(table->id, schema, update.ref, update.replacement);
+        insertIndexEntries(table->id, update.replacement, replacementRef);
+    }
+    if (!deletion.empty() || !updates.empty()) {
+        persistMemoryIndexes(table->id);
+        ++indexVersion_;
+    }
     if (plan.kind == "Update") { heap_.flush(); result["affectedRows"] = updates.size(); }
 // UPDATE 刷盘并报告影响行数。
     if (plan.kind == "Delete") { heap_.flush(); result["affectedRows"] = deletion.size(); }
@@ -3854,20 +4168,19 @@ void Database::rollbackBatch() {
 // 重新加载目录，丢弃事务期间未提交的目录改动。
         savepoints_.clear();
 // 清空事务保存点。
-        for (const auto& table : catalog_.tables()) rebuildIndexes(table.id);
-// 按恢复后的目录重建所有运行期索引。
-    } catch (...) {
-// 捕获回滚过程的异常。
+        reloadIndexRuntimes();
+    } catch (const std::exception& error) {
         unavailable_ = true;
 // 标记数据库实例不可用，后续操作必须重启恢复。
-        throw MiniSqlError(ErrorCode::Storage, "Commit state unknown; reopen for recovery");
-// 抛出存储错误，明确提交状态未知。
+        throw MiniSqlError(ErrorCode::Storage, std::string("Commit state unknown; reopen for recovery: ") + error.what());
     }
 }
 nlohmann::json Database::run(const sql::LogicalPlan& plan) {
 // 执行一个逻辑计划并记录节点级统计。
     checkCancelled();
 // 执行前检查取消。
+    const auto bufferBefore = buffer_.stats();
+    const auto fileBefore = file_->ioStats();
     const auto started = std::chrono::steady_clock::now();
 // 记录开始时间，用于计算耗时。
     auto result = runNode(plan);
@@ -3876,8 +4189,19 @@ nlohmann::json Database::run(const sql::LogicalPlan& plan) {
 // 只有开启节点统计时才记录。
         const auto elapsed = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
 // 计算本节点执行耗时（毫秒）。
-        nodeStats_->push_back({{"kind", plan.kind}, {"table", plan.table}, {"actualRows", result.value("rows", json::array()).size()}, {"durationMs", elapsed}, {"loops", 1}});
-// 追加一条节点统计：类型、表名、实际行数、耗时和循环次数。
+        const auto bufferAfter = buffer_.stats();
+        const auto fileAfter = file_->ioStats();
+        const json io{{"available", true}, {"scope", "inclusive-subtree"},
+            {"hits", bufferAfter.hits - bufferBefore.hits}, {"misses", bufferAfter.misses - bufferBefore.misses},
+            {"pageReads", bufferAfter.pageReads - bufferBefore.pageReads},
+            {"pageWrites", bufferAfter.pageWrites - bufferBefore.pageWrites},
+            {"stagedPageReads", bufferAfter.stagedPageReads - bufferBefore.stagedPageReads},
+            {"stagedPageWrites", bufferAfter.stagedPageWrites - bufferBefore.stagedPageWrites},
+            {"diskReads", fileAfter.reads - fileBefore.reads}, {"diskWrites", fileAfter.writes - fileBefore.writes},
+            {"ioErrors", fileAfter.errors - fileBefore.errors}};
+        nodeStats_->push_back({{"kind", plan.kind}, {"table", plan.table},
+            {"actualRows", result.value("rows", json::array()).size()}, {"durationMs", elapsed}, {"loops", 1},
+            {"io", std::move(io)}});
     }
 // 统计记录结束。
     return result;
@@ -3893,10 +4217,16 @@ nlohmann::json Database::runStatement(const sql::LogicalPlan& plan) {
 // Checkpoint 语句要求事务空闲。
         if (transaction_ != TransactionState::Idle) throw MiniSqlError(ErrorCode::Transaction, "CHECKPOINT requires an idle transaction");
 // 事务未空闲时不能做检查点。
-        buffer_.flushAll();
-// 先把缓冲池中所有脏页刷到主文件。
-        file_->checkpoint({catalogVersion_, indexVersion_});
-// 写入检查点记录，带上目录版本和索引版本。
+        // 模糊检查点（MINISQL_FUZZY_CHECKPOINT=1）只记录检查点边界并保留日志，不强制刷出缓存。
+        const bool fuzzy = std::getenv("MINISQL_FUZZY_CHECKPOINT") != nullptr;
+        const bool archive = std::getenv("MINISQL_ARCHIVE_WAL") != nullptr;
+        if (!fuzzy) buffer_.flushAll();
+        storage::CheckpointOptions options;
+        options.catalogVersion = catalogVersion_;
+        options.indexVersion = indexVersion_;
+        options.fuzzy = fuzzy;
+        options.archive = archive;
+        file_->checkpoint(options);
         ++checkpointCount_;
 // 累计检查点次数。
         pendingAutoCheckpointWrites_ = 0;
@@ -3909,8 +4239,9 @@ nlohmann::json Database::runStatement(const sql::LogicalPlan& plan) {
 // 记录本次检查点的墙上时间戳。
             std::chrono::system_clock::now().time_since_epoch()).count());
 // 把系统时钟毫秒数转成 uint64。
-        return {{"kind", plan.kind}, {"columns", json::array()}, {"rows", json::array()}, {"affectedRows", 0}, {"commitState", "committed"}};
-// 返回检查点成功结果。
+        return {{"kind", plan.kind}, {"columns", json::array()}, {"rows", json::array()}, {"affectedRows", 0},
+                {"commitState", "committed"}, {"wal", fuzzy ? "retained" : "truncated"},
+                {"fuzzy", fuzzy}, {"archived", archive}};
     }
 // Checkpoint 分支结束。
     if (plan.kind == "Rollback") {
@@ -3958,12 +4289,10 @@ nlohmann::json Database::runStatement(const sql::LogicalPlan& plan) {
 // 查找指定保存点。
         if (found == savepoints_.end()) throw MiniSqlError(ErrorCode::Transaction, "Savepoint does not exist: " + plan.savepointName);
 // 保存点不存在时报事务错误。
-        file_->restoreSavepoint(found->second.file);
-// 恢复页文件到保存点快照。
+        buffer_.restoreSavepoint(found->second.file);
         catalog_.restore(found->second.catalog);
 // 恢复目录到保存点快照。
-        for (const auto& table : catalog_.tables()) rebuildIndexes(table.id);
-// 按恢复后的目录重建索引。
+        reloadIndexRuntimes();
         return {{"kind", plan.kind}, {"columns", json::array()}, {"rows", json::array()}, {"affectedRows", 0}, {"commitState", "pending"}};
 // 返回回滚到保存点成功结果。
     }
@@ -4057,6 +4386,12 @@ nlohmann::json Database::diagnostics(const std::string& source) const {
 // stageFor lambda 结束。
     std::size_t statementIndex = 0;
 // 语句序号从 0 开始，每完成一条自增。
+    // 第十七章 REQ-CORE-001：collectDiagnostics 最多 100 条错误。
+    // 超出后不再追加错误，但仍在结果里明确报告已截断。
+    constexpr std::size_t kMaxDiagnosticErrors = 100;
+    std::size_t errorCount = 0;
+    bool truncated = false;
+    bool budgetReported = false;
     const auto sourceLine = [&](std::size_t line) {
 // 从整段源码中截取指定行文本，用于错误上下文展示。
         if (line == 0) return std::string{};
@@ -4141,6 +4476,8 @@ nlohmann::json Database::diagnostics(const std::string& source) const {
 // closestName lambda 结束。
     const auto append = [&](const MiniSqlError& error) {
 // 定义把 MiniSqlError 追加到诊断条目的函数。
+        if (errorCount >= kMaxDiagnosticErrors) { truncated = true; return; }
+        ++errorCount;
         const auto& loc = error.location();
 // 取错误源码位置。
         std::string suggestion = error.suggestion();
@@ -4176,6 +4513,7 @@ nlohmann::json Database::diagnostics(const std::string& source) const {
 // 进入列名建议分支。
                 // 新消息形如 Column 'ag' does not exist in table 'student'；旧消息形如 Column does not exist: ag。
 // 消息中的列名可能带单引号，也可能用冒号分隔，下面两种格式都尝试解析。
+                // 新消息形如 Column 'ag' does not exist in table 'student'；旧消息形如 Column does not exist: ag。
                 std::string target;
 // 保存从消息中提取的目标列名。
                 const auto open = message.find('\'');
@@ -4232,6 +4570,8 @@ nlohmann::json Database::diagnostics(const std::string& source) const {
 // 注释：用恢复模式做词法扫描，让每个词法错误都被报告，而不是只报第一个。
     // the first one. Valid tokens still come back for later statements.
 // 合法 token 仍会返回，以便继续检查后面的语句。
+    // Tokenize in recovery mode so every lexical error is reported, not only
+    // the first one. Valid tokens still come back for later statements.
     std::vector<MiniSqlError> lexicalErrors;
 // 保存词法错误。
     const auto tokens = sql::tokenizeRecoverable(source, lexicalErrors);
@@ -4240,8 +4580,8 @@ nlohmann::json Database::diagnostics(const std::string& source) const {
 // 把每个词法错误追加到诊断结果。
     if (!lexicalErrors.empty() && tokens.size() <= 1) {
 // 如果词法错误导致只剩 END token，就没有后续语句可分析。
-        return {{"success", false}, {"diagnostics", items}, {"count", items.size()}};
-// 直接返回当前诊断结果。
+        return {{"success", false}, {"diagnostics", items}, {"count", items.size()},
+                {"limit", kMaxDiagnosticErrors}, {"truncated", truncated}};
     }
 // 词法错误提前返回分支结束。
 
@@ -4253,6 +4593,15 @@ nlohmann::json Database::diagnostics(const std::string& source) const {
 // 定义处理一条完整语句的 lambda。
         if (statement.empty()) return;
 // 空语句直接返回。
+        // 第十七章 REQ-CORE-001：批量语句上限 10000，只报一次预算诊断后停止解析。
+        if (statementIndex >= kMaxBatchStatements) {
+            if (!budgetReported) {
+                budgetReported = true;
+                append(MiniSqlError(ErrorCode::Execution, kBatchBudgetMessage, statement.front().location));
+            }
+            statement.clear();
+            return;
+        }
         std::vector<MiniSqlError> syntaxErrors;
 // 保存语法错误。
         const auto ast = sql::parseRecoverable(statement, syntaxErrors);
@@ -4305,8 +4654,8 @@ nlohmann::json Database::diagnostics(const std::string& source) const {
 // token 遍历结束。
     const bool success = std::all_of(items.begin(), items.end(), [](const json& item) { return item.value("success", false); });
 // 所有条目都成功才算整体成功。
-    return {{"success", success}, {"diagnostics", items}, {"count", items.size()}};
-// 返回诊断汇总。
+    return {{"success", success}, {"diagnostics", items}, {"count", items.size()},
+            {"limit", kMaxDiagnosticErrors}, {"truncated", truncated}};
 }
 nlohmann::json Database::runCorrelatedSubquery(const json& expression, const json& row) {
 // 执行相关子查询：用当前外层行的值绑定子查询引用，并缓存不同参数的结果。
@@ -4332,6 +4681,13 @@ nlohmann::json Database::runCorrelatedSubquery(const json& expression, const jso
 // 注释：缓存按 subquerySql 解析出的结构化 AST。
     // 避免逐行文本重解析与字面量改写；仍以当前 catalog 编译，保证 schema 变更生效。
 // 注释：执行时用 by-value 参数绑定替换外层列，避免逐行文本重解析与字面量改写。
+    OuterValues currentValues;
+    for (const auto& [name, binding] : outer) {
+        if (binding.first >= row.size()) fail("Correlated subquery outer column outside row");
+        currentValues.emplace(name, std::make_pair(row.at(binding.first), binding.second));
+    }
+    // 缓存按 subquerySql 解析的结构化 AST，执行时以 by-value 参数绑定替换外层列，
+    // 避免逐行文本重解析与字面量改写；仍以当前 catalog 编译，保证 schema 变更生效。
     auto& ast = correlatedAstCache_[sql];
 // 从 AST 缓存取出该子查询语法树。
     if (ast.empty()) ast = sql::parse(sql::tokenize(sql + ";"));
@@ -4340,13 +4696,16 @@ nlohmann::json Database::runCorrelatedSubquery(const json& expression, const jso
 // 相关子查询必须是单条 SELECT。
         throw MiniSqlError(ErrorCode::Semantic, "Correlated subquery must be SELECT");
 // 否则抛语义错误。
-
     // 相关子查询「保守执行优化」：结果仅取决于被引用的外层列绑定值。以
 // 注释：相关子查询保守执行优化——结果只取决于被引用的外层列绑定值。
     // (subquerySql|scope) 标识相关形状、以绑定值分组，对每个不同参数物化子查询一次
 // 注释：以 SQL 与作用域标识相关形状，再按绑定值分组，参数相同只物化一次。
     // （集合语义半连接），结果在单条语句生命周期内复用，避免对重复参数逐行重执行。
 // 注释：结果在单条语句生命周期内复用，避免重复参数逐行重执行。
+
+    // 相关子查询「保守执行优化」：结果仅取决于被引用的外层列绑定值。以
+    // (subquerySql|scope) 标识相关形状、以绑定值分组，对每个不同参数物化子查询一次
+    // （集合语义半连接），结果在单条语句生命周期内复用，避免对重复参数逐行重执行。
     const std::string prepKey = sql + "\x1f" + scope.dump();
 // 生成本次相关形状的缓存前缀键。
     auto& referenced = correlatedColumnsCache_[prepKey];
@@ -4371,6 +4730,10 @@ nlohmann::json Database::runCorrelatedSubquery(const json& expression, const jso
 // 把外层列值加入元组。
     }
 // 元组构造结束。
+    std::map<std::string, json> inheritedTuple;
+    for (const auto& frame : activeOuterValues)
+        for (const auto& [name, value] : frame) inheritedTuple[name] = value.first;
+    for (const auto& [name, value] : inheritedTuple) tuple.push_back({{"name", name}, {"value", value}});
     const std::string fullKey = prepKey + "\x1f" + tuple.dump();
 // 用缓存前缀和绑定值生成完整缓存键。
     const auto cached = correlatedRowsCache_.find(fullKey);
@@ -4380,8 +4743,9 @@ nlohmann::json Database::runCorrelatedSubquery(const json& expression, const jso
 
     sql::Statement bound = bindOuterStatement(ast.front(), outer, row);
 // 把外层列替换成当前行值，得到可编译的绑定语句。
-    const auto subplans = sql::compilePlans({std::move(bound)}, catalog_.view());
-// 用当前目录快照编译子查询逻辑计划。
+    ActiveOuterScope outerScope(std::move(currentValues));
+    auto subplans = sql::compilePlans({std::move(bound)}, catalog_.view());
+    materializeSubqueries(subplans);
     const auto result = run(subplans.front());
 // 执行子查询计划。
     auto rows = result.at("rows");
@@ -4395,6 +4759,7 @@ void Database::materializeSubqueries(std::vector<sql::LogicalPlan>& plans) {
 // 把计划中的非相关子查询预先执行成字面量，并标记相关子查询为运行期处理。
     const auto isCorrelated = [&](const json& expression) {
 // 判断表达式是否真的引用了外层列。
+        if (!activeOuterValues.empty()) return true;
         if (!expression.contains("outerColumns") || !expression.at("outerColumns").is_object()) return false;
 // 没有 outerColumns 描述就不可能是相关子查询。
         const auto tokens = sql::tokenize(expression.at("subquerySql").get<std::string>());
@@ -4420,8 +4785,11 @@ void Database::materializeSubqueries(std::vector<sql::LogicalPlan>& plans) {
 // 必须是单条 SELECT。
             throw MiniSqlError(ErrorCode::Semantic, "Subquery must be a single SELECT");
 // 否则抛语义错误。
-        const auto subplans = sql::compilePlans(ast, catalog_.view());
-// 用当前目录编译子查询计划。
+        auto subplans = sql::compilePlans(ast, catalog_.view());
+        // 内层子查询必须先递归物化。否则嵌套标量子查询的内层会以原始
+        // ScalarSubquery 节点进入求值器，在 expression.at("left") 处抛出
+        // nlohmann json 异常并泄漏成 InternalError。相关子查询路径同样先物化。
+        materializeSubqueries(subplans);
         const auto result = run(subplans.front());
 // 执行子查询。
         if (result.at("columns").size() != 1)
@@ -4555,6 +4923,7 @@ nlohmann::json Database::execute(const std::string& source, bool optimize) {
 // 保存每条语句的结果。
     currentQueryId_ = ++querySequence_;
 // 为本次多语句执行分配查询序号。
+    QueryResourcesScope resources(activeResources_, std::make_shared<QueryResourceManager>(queryMemoryBytes_, tempDiskBytes_));
     try {
 // 整个执行过程用 try 捕获，保证错误也返回结构化 JSON。
         requireAvailable();
@@ -4565,8 +4934,10 @@ nlohmann::json Database::execute(const std::string& source, bool optimize) {
 // 设置线程局部当前数据库，供表达式里的相关子查询回查。
         // 按词法语句边界逐条分析，保留已成功语句的提交结果。
 // 注释：按词法语句边界逐条执行，已成功语句的结果保留，失败后后面的语句不再执行。
+        // 按词法语句边界逐条分析，保留已成功语句的提交结果。
         std::vector<sql::Token> statement;
 // 保存当前语句的 token。
+        std::size_t batchStatements = 0;
         sql::scanTokens(source, [&](const sql::Token& token) {
 // 用词法扫描器逐 token 回调。
             if (token.type == "END") {
@@ -4587,6 +4958,8 @@ nlohmann::json Database::execute(const std::string& source, bool optimize) {
 // 把当前 token 加入语句。
             if (token.lexeme != ";" || token.type != "DELIMITER") return;
 // 只有分号分隔符才表示一条语句结束。
+            if (++batchStatements > kMaxBatchStatements)
+                throw MiniSqlError(ErrorCode::Execution, kBatchBudgetMessage, statement.front().location);
             if (key(statement.front().lexeme) == "explain") {
 // EXPLAIN 语句在入口层特判，因为它需要额外的计划与统计信息。
                 const auto location = statement.front().location;
@@ -4613,8 +4986,7 @@ nlohmann::json Database::execute(const std::string& source, bool optimize) {
 // EXPLAIN ANALYZE 只允许 SELECT。
                     throw MiniSqlError(ErrorCode::Semantic, "EXPLAIN ANALYZE permits only SELECT", location);
 // 否则抛语义错误。
-                const auto optimized = optimizer::optimize(rawPlans);
-// 运行优化器，得到优化后计划和改写说明。
+                const auto optimized = optimizer::optimize(rawPlans, optimizerOptions());
                 const auto raw = sql::serializePlans(rawPlans);
 // 序列化原始计划，供输出。
                 const auto optimizedJson = sql::serializePlans(optimized.plans);
@@ -4931,6 +5303,9 @@ nlohmann::json Database::execute(const std::string& source, bool optimize) {
             // X18: `ANALYZE [TABLE] <name>;` 在入口层特判，不进入 AST/计划契约。
             // 它按需重新扫描一次全库统计，并把刷新时间 + 统计版本 + 表快照持久化到旁路文件，
             // 供 statistics() 跨进程报告 source=analyze（任何写语句成功后删除该文件即失效）。
+            // X18: `ANALYZE [TABLE] <name>;` 在入口层特判，不进入 AST/计划契约。
+            // 它按需重新扫描一次全库统计，并把刷新时间 + 统计版本 + 表快照持久化到旁路文件，
+            // 供 statistics() 跨进程报告 source=analyze（任何写语句成功后删除该文件即失效）。
             if (key(statement.front().lexeme) == "analyze") {
 // ANALYZE [TABLE] 语句在入口层特判，不进入普通 AST 计划流程。
                 const auto location = statement.front().location;
@@ -5005,8 +5380,7 @@ nlohmann::json Database::execute(const std::string& source, bool optimize) {
 // 抛出事务错误。
             auto plans = sql::compilePlans(ast, catalog_.view());
 // 编译逻辑计划。
-            if (optimize) plans = optimizer::optimize(plans).plans;
-// 开启优化时用优化器改写计划。
+            if (optimize) plans = optimizer::optimize(plans, optimizerOptions()).plans;
             materializeSubqueries(plans);
 // 把非相关子查询物化成字面量。
             for (const auto& plan : plans) {
@@ -5091,6 +5465,8 @@ nlohmann::json Database::executeStreaming(const std::string& source,
 // 行回调：返回 false 表示客户端停止接收。
     std::lock_guard<std::recursive_mutex> guard(mu_);
 // 加数据库全局递归锁。
+    currentQueryId_ = ++querySequence_;
+    QueryResourcesScope resources(activeResources_, std::make_shared<QueryResourceManager>(queryMemoryBytes_, tempDiskBytes_));
     requireAvailable();
 // 检查实例可用。
     checkCancelled();
@@ -5137,16 +5513,17 @@ nlohmann::json Database::executeStreaming(const std::string& source,
 // 逐行读取。
             checkCancelled();
 // 每行检查取消。
+            if (maxResultRows_ > 0 && emitted >= maxResultRows_)
+                throw MiniSqlError(ErrorCode::Execution, "Result row budget exceeded");
             if (emitRow && !emitRow(row)) throw MiniSqlError(ErrorCode::Cancelled, "Streaming client disconnected");
 // 行回调返回 false 说明客户端断开，抛取消错误。
             ++emitted;
 // 已发送行数加一。
         }
 // 行循环结束。
+        stream->close();
         const auto usage = stream->resourceUsage();
 // 读取流资源使用信息。
-        stream->close();
-// 关闭行流。
         return {{"success", true}, {"rows", emitted}, {"resourceUsage", usage}};
 // 返回流式执行成功结果。
     } catch (const MiniSqlError& error) {
@@ -5161,6 +5538,8 @@ nlohmann::json Database::executeStreaming(const std::string& source,
 // 遍历物化结果行。
         checkCancelled();
 // 逐行检查取消。
+        if (maxResultRows_ > 0 && emitted >= maxResultRows_)
+            throw MiniSqlError(ErrorCode::Execution, "Result row budget exceeded");
         if (emitRow && !emitRow(row)) throw MiniSqlError(ErrorCode::Cancelled, "Streaming client disconnected");
 // 客户端停止接收时抛取消错误。
         ++emitted;
@@ -5201,5 +5580,53 @@ nlohmann::json Database::executeScript(const std::string& source, bool optimize)
     return response;
 // 返回脚本执行响应。
 }
+
+nlohmann::json Database::executeSerializedPlan(const nlohmann::json& document) {
+    std::lock_guard<std::recursive_mutex> guard(mu_);
+    json results = json::array();
+    currentQueryId_ = ++querySequence_;
+    QueryResourcesScope resources(activeResources_, std::make_shared<QueryResourceManager>(queryMemoryBytes_, tempDiskBytes_));
+    try {
+        requireAvailable();
+        checkCancelled();
+        ActiveDatabaseScope active(this);
+        if (transaction_ == TransactionState::Aborted)
+            throw MiniSqlError(ErrorCode::Transaction, "Transaction aborted; ROLLBACK required");
+        const auto plans = sql::deserializePlans(document);
+        if (plans.empty())
+            throw MiniSqlError(ErrorCode::InvalidArgument, "Serialized plan document contains no plan nodes");
+        // 第十七章 REQ-CORE-002：计划绑定编译期的 Catalog 指纹，执行前重新校验。
+        // 不一致时拒绝执行并返回 PLAN_STALE_SCHEMA，绝不按旧列偏移访问新数据。
+        const auto current = catalog_.view().schemaFingerprint();
+        const auto verify = [&](const sql::LogicalPlan& plan) {
+            std::vector<const sql::LogicalPlan*> pending{&plan};
+            while (!pending.empty()) {
+                const auto* node = pending.back();
+                pending.pop_back();
+                if (!node->catalogFingerprint.empty() && node->catalogFingerprint != current)
+                    throw MiniSqlError(ErrorCode::PlanStaleSchema,
+                        "PLAN_STALE_SCHEMA: plan was compiled against catalog fingerprint " + node->catalogFingerprint +
+                        ", but the current catalog fingerprint is " + current + "; recompile the statement");
+                for (const auto& child : node->children) pending.push_back(&child);
+            }
+        };
+        for (const auto& plan : plans) verify(plan);
+        for (const auto& plan : plans) {
+            checkCancelled();
+            auto result = runStatement(plan);
+            if (!result.contains("commitState")) result["commitState"] = transaction_ == TransactionState::Active ? "pending" : "committed";
+            result["columnTypes"] = json::array();
+            for (const auto& column : plan.output) result["columnTypes"].push_back(column.type);
+            if (maxResultRows_ > 0 && result.contains("rows") && result.at("rows").is_array() && result.at("rows").size() > maxResultRows_)
+                throw MiniSqlError(ErrorCode::Execution, "Result row budget exceeded");
+            results.push_back(std::move(result));
+        }
+        return {{"success", true}, {"results", results}, {"statements", results.size()}, {"transactionState", transactionState()}};
+    } catch (const MiniSqlError& error) {
+        return executionFailure(error, std::move(results));
+    } catch (const std::exception& error) {
+        return executionFailure(MiniSqlError(ErrorCode::Internal, std::string("Execution failed: ") + error.what()), std::move(results));
+    }
 }
 // 关闭 minisql 命名空间。
+}

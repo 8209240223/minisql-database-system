@@ -119,6 +119,10 @@ BPlusTree::BPlusTree(std::size_t maxKeys, bool unique) : maxKeys_(maxKeys), uniq
     root_ = std::make_unique<Node>();
     // 初始根就是一个空叶子。
 }
+void BPlusTree::reset() {
+    root_ = std::make_unique<Node>();
+    size_ = 0;
+}
 bool BPlusTree::insert(IndexKey key, RowRef row) {
 // 插入入口：处理唯一性检查与根分裂。
     if (unique_ && !search(key).empty()) return false;
@@ -139,6 +143,27 @@ bool BPlusTree::insert(IndexKey key, RowRef row) {
     // 分裂出的右半成为第二个子节点。
     root_ = std::move(root);
     // 树高加一。
+    return true;
+}
+bool BPlusTree::erase(const IndexKey& key, RowRef row) {
+    std::vector<IndexEntry> entries;
+    entries.reserve(size_);
+    collectEntries(*root_, entries);
+    const auto sameRow = [&](const RowRef& candidate) {
+        return candidate.page.id == row.page.id && candidate.page.generation == row.page.generation &&
+               candidate.slot.slot == row.slot.slot && candidate.slot.generation == row.slot.generation;
+    };
+    const auto found = std::find_if(entries.begin(), entries.end(), [&](const IndexEntry& entry) {
+        return IndexKey::compare(entry.key, key) == 0 && sameRow(entry.row);
+    });
+    if (found == entries.end()) return false;
+    entries.erase(found);
+    root_ = std::make_unique<Node>();
+    size_ = 0;
+    for (auto& entry : entries) {
+        if (!insert(std::move(entry.key), entry.row))
+            throw MiniSqlError(ErrorCode::Storage, "Cannot restore in-memory B+ tree after erase");
+    }
     return true;
     // 插入成功。
 }
@@ -232,22 +257,7 @@ const BPlusTree::Node* BPlusTree::findLeaf(const IndexKey& key) const {
 }
 std::vector<RowRef> BPlusTree::search(const IndexKey& key) const {
 // 等值查找：在叶子里找所有等于该键的项。
-    const auto* leaf = findLeaf(key);
-    // 先定位叶子。
-    auto found = std::lower_bound(leaf->keys.begin(), leaf->keys.end(), key,
-        [](const IndexKey& left, const IndexKey& right) { return IndexKey::compare(left, right) < 0; });
-        // 找到第一个不小于该键的位置。
-    std::vector<RowRef> rows;
-    // 结果集合。
-    while (found != leaf->keys.end() && IndexKey::compare(*found, key) == 0) {
-    // 只要还等于目标键就继续收集，因为非唯一索引可能有多个。
-        rows.push_back(leaf->values[static_cast<std::size_t>(found - leaf->keys.begin())]);
-        // 收集对应的行引用。
-        ++found;
-        // 下一个键。
-    }
-    return rows;
-    // 返回匹配的行。
+    return range(key, true, key, true);
 }
 void BPlusTree::collect(const Node& node, const std::optional<IndexKey>& lower, bool lowerInclusive,
                         const std::optional<IndexKey>& upper, bool upperInclusive, std::vector<RowRef>& rows) const {
@@ -268,6 +278,14 @@ void BPlusTree::collect(const Node& node, const std::optional<IndexKey>& lower, 
     }
     for (const auto& child : node.children) collect(*child, lower, lowerInclusive, upper, upperInclusive, rows);
     // 内部节点递归处理所有子节点；简化实现不做区间剪枝。
+}
+void BPlusTree::collectEntries(const Node& node, std::vector<IndexEntry>& entries) const {
+    if (node.leaf) {
+        for (std::size_t index = 0; index < node.keys.size(); ++index)
+            entries.push_back({node.keys[index], node.values[index]});
+        return;
+    }
+    for (const auto& child : node.children) collectEntries(*child, entries);
 }
 std::vector<RowRef> BPlusTree::range(const std::optional<IndexKey>& lower, bool lowerInclusive,
                                      const std::optional<IndexKey>& upper, bool upperInclusive) const {
@@ -341,8 +359,10 @@ void BPlusTree::save(const std::filesystem::path& path, const std::string& finge
 // 保存快照：先写临时文件再原子改名，避免写到一半被读到。
     const auto document = dump(fingerprint);
     // 生成 JSON。
-    const auto temporary = path.string() + ".tmp";
-    // 临时文件名。
+    // 不要用 path.string() + ".tmp"：Windows 上会把路径窄转换成本地 ANSI，
+    // 含非 ASCII 的路径会被改写。直接做路径拼接保留本地编码。
+    auto temporary = path;
+    temporary += ".tmp";
     { std::ofstream output(temporary, std::ios::binary | std::ios::trunc);if (!output) throw MiniSqlError(ErrorCode::Storage, "Cannot write B+ tree snapshot");output << document;if (!output) throw MiniSqlError(ErrorCode::Storage, "Cannot write B+ tree snapshot"); }
     // 单行作用域：打开、写入、检查、关闭。
     std::filesystem::rename(temporary, path);
@@ -429,8 +449,10 @@ bool BPlusTree::validateNode(const Node& node, std::size_t depth, std::size_t& l
 // 递归校验 B+ 树的核心不变量。
     if (node.keys.size() > maxKeys_ || (!node.leaf && node.children.size() != node.keys.size() + 1)) return false;
     // 键数不能超上限；内部节点的子指针数必须恰好是键数加一。
-    for (std::size_t index = 1; index < node.keys.size(); ++index) if (IndexKey::compare(node.keys[index - 1], node.keys[index]) >= 0) return false;
-    // 同一节点内键必须严格递增。
+    for (std::size_t index = 1; index < node.keys.size(); ++index) {
+        const auto order = IndexKey::compare(node.keys[index - 1], node.keys[index]);
+        if (order > 0 || (unique_ && order == 0)) return false;
+    }
     if (node.leaf) {
     // 叶子分支。
         if (leafDepth == 0) leafDepth = depth;

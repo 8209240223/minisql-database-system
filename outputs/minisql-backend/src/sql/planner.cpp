@@ -28,6 +28,44 @@ std::string canonical(std::string value) {
     // 返回规范形式。
 }
 
+// X25：planner 的扁平作用域槽位 -> 绑定器的稳定标识。
+// 槽位顺序（FROM 项 + 各 JOIN 依次拼接）与绑定器的关系顺序一致，但这里不依赖
+// 该巧合：每个槽位按 (qualifier, name) 在作用域树里查，查不到就留 0（无身份），
+// 下游据此退回槽位语义，不会因为绑定缺失而算错。
+struct SlotIdentity { std::uint32_t binding = 0; std::uint32_t relation = 0; };
+using SlotMap = std::vector<SlotIdentity>;
+
+SlotMap slotIdentities(const catalog::Table& scope, const BindResult& bound, ScopeId scopeId) {
+    SlotMap slots(scope.columns.size());
+    if (!validId(scopeId)) return slots;
+    for (std::size_t index = 0; index < scope.columns.size(); ++index) {
+        const auto& column = scope.columns[index];
+        const auto resolved = bound.scopes.resolveColumn(column.qualifier, column.name, scopeId);
+        if (!resolved) continue;
+        slots[index] = {rawId(resolved->column), rawId(resolved->relation)};
+    }
+    return slots;
+}
+
+SlotIdentity slotAt(const SlotMap& slots, std::size_t index) {
+    return index < slots.size() ? slots[index] : SlotIdentity{};
+}
+
+// 表达式绑定需要的上下文：槽位->身份映射，以及绑定结果本身（用于相关子查询）。
+struct BindContext {
+    const BindResult* bound = nullptr;
+    SlotMap slots{};
+};
+
+// 子节点（基表扫描、JOIN 右侧）的槽位是外层槽位的一个连续窗口：
+// 取出该窗口，子节点的局部槽位就能拿到同一份稳定身份。
+SlotMap slotWindow(const SlotMap& slots, std::size_t offset, std::size_t count) {
+    SlotMap window(count);
+    for (std::size_t index = 0; index < count && offset + index < slots.size(); ++index)
+        window[index] = slots[offset + index];
+    return window;
+}
+
 [[noreturn]] void invalid(const std::string& message) {
 // 统一的"计划不变量被破坏"出口：这类问题说明编译器自身出错，而不是用户写错。
     throw MiniSqlError(ErrorCode::Internal, "Plan invariant: " + message);
@@ -73,8 +111,10 @@ nlohmann::json literalValue(const std::string& raw) {
     // 返回整数值。
 }
 
-nlohmann::json correlatedScope(const catalog::Table& table) {
-// 构造"相关子查询可见的外层列"映射，供执行期按名字找外层列。
+// 外层作用域快照。键仍是 "qualifier.name"——执行器 (database.cpp) 目前按这个
+// 键把内层 AST 的标识符文本绑到外层行槽位上。值里额外带上 binding/relation，
+// 执行器迁移到按身份绑定之后，字符串键即可退役。
+nlohmann::json correlatedScope(const catalog::Table& table, const SlotMap& slots) {
     nlohmann::json scope = nlohmann::json::object();
     // 结果是一个对象。
     for (std::size_t index = 0; index < table.columns.size(); ++index) {
@@ -83,11 +123,31 @@ nlohmann::json correlatedScope(const catalog::Table& table) {
         // 当前列。
         if (column.qualifier.empty()) continue;
         // 没有限定名的列无法生成唯一键，跳过。
-        scope[canonical(column.qualifier + "." + column.name)] = {{"columnId", index}, {"type", column.type}};
-        // 键是"限定名.列名"的小写形式；值记录列编号（用于取值）与类型（用于推导）。
+        const auto identity = slotAt(slots, index);
+        scope[canonical(column.qualifier + "." + column.name)] =
+            {{"columnId", index}, {"type", column.type},
+             {"binding", identity.binding}, {"relation", identity.relation}};
     }
     return scope;
     // 返回映射。
+}
+
+// 子查询实际引用到的外层列，来自绑定器而不是对 subquerySql 的再扫描。
+// 每项给出稳定身份与它在外层行里的槽位，供聚合下降时重映射。
+nlohmann::json outerReferences(const BindContext& context, const Expr& node) {
+    auto result = nlohmann::json::array();
+    if (!context.bound || !context.bound->complete) return result;
+    for (const auto& reference : context.bound->correlatedFor(&node)) {
+        const auto* column = context.bound->scopes.column(reference.column);
+        if (!column) continue;
+        std::size_t slot = static_cast<std::size_t>(-1);
+        for (std::size_t index = 0; index < context.slots.size(); ++index)
+            if (context.slots[index].binding == rawId(reference.column)) { slot = index; break; }
+        result.push_back({{"binding", rawId(reference.column)}, {"relation", rawId(reference.relation)},
+                          {"name", column->name}, {"columnId", slot},
+                          {"correlationDepth", reference.correlationDepth}});
+    }
+    return result;
 }
 bool containsSubquery(const Expr& expression) {
 // 判断一个表达式子树里是否含有子查询（EXISTS / IN / 标量）。
@@ -103,20 +163,26 @@ bool containsNegatedSubquery(const Expr& expression) {
     return (expression.left && containsNegatedSubquery(*expression.left)) || (expression.right && containsNegatedSubquery(*expression.right));
     // 否则递归左右子树继续找。
 }
-nlohmann::json bindExpression(const Expr& expression, const catalog::Table& table, std::size_t depth = 0) {
-// 把语法树里的表达式节点绑定成"计划表达式"：补上列编号、类型、可空性等执行期需要的信息。
+nlohmann::json bindExpression(const Expr& expression, const catalog::Table& table,
+                              const BindContext& context = {}, std::size_t depth = 0) {
     if (depth > 256) invalid("expression depth exceeded");
     // 深度保护，避免畸形表达式把递归栈打爆。
     nlohmann::json result = {{"kind", expression.kind}, {"line", expression.location.line},
                              // 先把节点种类与源位置搬过去，
                              {"column", expression.location.column}};
                              // 列号也一并记录，便于报错定位。
+    if (context.bound) result["expressionId"] = rawId(context.bound->idFor(&expression));
     if (expression.kind == "Identifier") {
     // 列引用：要解析成列编号并带上列元数据。
         const auto index = columnIndex(table, expression.value);
         // 解析列下标（含歧义与不存在检测）。
+        // columnId 是运行时槽位；binding/relation 是稳定身份。两者分开之后，
+        // 裁剪与下推可以看身份，执行器继续看槽位。
         result["columnId"] = index;
         // 计划里用列编号取数，这是最关键的字段。
+        const auto identity = slotAt(context.slots, index);
+        result["binding"] = identity.binding;
+        result["relation"] = identity.relation;
         result["name"] = table.columns[index].name;
         // 带上规范列名，便于展示与调试。
         result["type"] = table.columns[index].type;
@@ -157,10 +223,12 @@ nlohmann::json bindExpression(const Expr& expression, const catalog::Table& tabl
         // EXISTS 必须带子查询原文，否则语法树不完整。
         result["subquerySql"] = expression.subquerySql;
         // 把子查询原文带进计划，执行期据此再解析。
-        const auto outer = correlatedScope(table);
-        // 计算它对可见外层列的引用集合。
+        const auto outer = correlatedScope(table, context.slots);
         result["outerColumns"] = outer;
         // 写进计划供执行期做参数绑定。
+        // 绑定不完整时不写该字段：下游据此区分「确实没有外层引用」与「没有绑定信息」。
+        if (context.bound && context.bound->complete)
+            result["outerReferences"] = outerReferences(context, expression);
         result["planKind"] = outer.empty() ? "SemiJoin" : "Apply";
         // 不引用外层列就是普通半连接；引用外层列必须走相关执行（Apply）。
         result["decorrelation"] = outer.empty() ? "none" : "grouped-parameter-instances";
@@ -175,10 +243,12 @@ nlohmann::json bindExpression(const Expr& expression, const catalog::Table& tabl
         // 同样必须有子查询原文。
         result["subquerySql"] = expression.subquerySql;
         // 带进计划。
-        const auto outer = correlatedScope(table);
-        // 计算外层列引用。
+        const auto outer = correlatedScope(table, context.slots);
         result["outerColumns"] = outer;
         // 写进计划。
+        // 绑定不完整时不写该字段：下游据此区分「确实没有外层引用」与「没有绑定信息」。
+        if (context.bound && context.bound->complete)
+            result["outerReferences"] = outerReferences(context, expression);
         result["planKind"] = outer.empty() ? "ScalarSubquery" : "Apply";
         // 不相关时是标量子查询算子，相关时走 Apply。
         result["decorrelation"] = outer.empty() ? "none" : "grouped-parameter-instances";
@@ -191,14 +261,15 @@ nlohmann::json bindExpression(const Expr& expression, const catalog::Table& tabl
     // IN 子查询。
         if (!expression.left || expression.subquerySql.empty()) invalid("missing IN subquery operand");
         // 必须同时有左操作数与子查询原文。
-        result["left"] = bindExpression(*expression.left, table, depth + 1);
-        // 递归绑定左操作数。
+        result["left"] = bindExpression(*expression.left, table, context, depth + 1);
         result["subquerySql"] = expression.subquerySql;
         // 带进计划。
-        const auto outer = correlatedScope(table);
-        // 计算外层列引用。
+        const auto outer = correlatedScope(table, context.slots);
         result["outerColumns"] = outer;
         // 写进计划。
+        // 绑定不完整时不写该字段：下游据此区分「确实没有外层引用」与「没有绑定信息」。
+        if (context.bound && context.bound->complete)
+            result["outerReferences"] = outerReferences(context, expression);
         result["planKind"] = outer.empty() ? "SemiJoin" : "Apply";
         // 不相关时用半连接实现，相关时走 Apply。
         result["decorrelation"] = outer.empty() ? "none" : "grouped-parameter-instances";
@@ -213,8 +284,7 @@ nlohmann::json bindExpression(const Expr& expression, const catalog::Table& tabl
         // 聚合必须带参数节点（COUNT(*) 的参数是通配节点）。
         result["function"] = expression.value;
         // 记下函数名（已是大写）。
-        result["left"] = expression.left->kind == "Wildcard" ? nlohmann::json(nullptr) : bindExpression(*expression.left, table, depth + 1);
-        // COUNT(*) 的参数是通配，写成 null；否则递归绑定真实参数。
+        result["left"] = expression.left->kind == "Wildcard" ? nlohmann::json(nullptr) : bindExpression(*expression.left, table, context, depth + 1);
         result["type"] = expression.value == "COUNT" || expression.value == "SUM" ? "bigint" :
             // COUNT 与 SUM 统一按 bigint 处理，
             expression.value == "AVG" ? "decimal(38,6)" : result["left"].at("type").get<std::string>();
@@ -238,8 +308,7 @@ nlohmann::json bindExpression(const Expr& expression, const catalog::Table& tabl
         // 必须有被转换的表达式。
         result["type"] = canonical(expression.value);
         // 目标类型取规范名（小写）。
-        result["left"] = bindExpression(*expression.left, table, depth + 1);
-        // 递归绑定源表达式。
+        result["left"] = bindExpression(*expression.left, table, context, depth + 1);
         result["nullable"] = result["left"].value("nullable", true);
         // 转换不会改变可空性，沿用源表达式的。
     } else if (expression.kind == "Unary" || expression.kind == "Binary") {
@@ -250,14 +319,12 @@ nlohmann::json bindExpression(const Expr& expression, const catalog::Table& tabl
         // 先粗判类型：算术运算给 int，其余（比较、逻辑）给 bool；下面再细化。
         if (!expression.left) invalid("missing left operand");
         // 必须有左操作数。
-        result["left"] = bindExpression(*expression.left, table, depth + 1);
-        // 递归绑定左操作数。
+        result["left"] = bindExpression(*expression.left, table, context, depth + 1);
         if (expression.kind == "Binary") {
         // 二元运算还有右操作数。
             if (!expression.right) invalid("missing right operand");
             // 必须存在。
-            result["right"] = bindExpression(*expression.right, table, depth + 1);
-            // 递归绑定右操作数。
+            result["right"] = bindExpression(*expression.right, table, context, depth + 1);
         }
         // 右操作数处理结束。
         result["nullable"] = expression.value != "IS NULL" && expression.value != "IS NOT NULL" &&
@@ -296,18 +363,16 @@ nlohmann::json bindExpression(const Expr& expression, const catalog::Table& tabl
     // 返回绑定好的计划表达式。
 }
 
-std::vector<PlanColumn> schema(const catalog::Table& table) {
-// 把目录里的表定义翻译成计划的输出列描述（PlanColumn 列表）。
+std::vector<PlanColumn> schema(const catalog::Table& table, const SlotMap& slots = {}) {
     std::vector<PlanColumn> output;
     // 结果列表。
     for (std::size_t i = 0; i < table.columns.size(); ++i) {
     // 逐列转换，顺序必须与目录一致（列编号就是它的位置）。
-        const auto qualifier = table.columns[i].qualifier.empty() ? table.name : table.columns[i].qualifier;
-        // 列的限定名：优先用它自己的，缺省用表名。
+        const auto identity = slotAt(slots, i);
         output.push_back({table.columns[i].name, table.columns[i].type, i, table.columns[i].nullable, table.columns[i].defaultValue,
             // 依次填入列名、类型、列编号、可空性与默认值，
-            table.columns[i].primaryKey, table.columns[i].unique, table.columns[i].references, qualifier + "." + table.columns[i].name});
-            // 再填主键/唯一标记、外键，以及"限定名.列名"作为该列的稳定身份标识。
+            table.columns[i].primaryKey, table.columns[i].unique, table.columns[i].references,
+            identity.binding, identity.relation});
     }
     return output;
     // 返回列描述列表。
@@ -326,8 +391,8 @@ nlohmann::json expressionIdentity(nlohmann::json value) {
     return value;
     // 返回规范化后的表达式。
 }
-void lowerAggregate(LogicalPlan& project, const Statement& statement, const catalog::Table& scope) {
-// 把"投影里含聚合"的查询改写成显式的聚合算子 + 上层投影。
+void lowerAggregate(LogicalPlan& project, const Statement& statement, const catalog::Table& scope,
+                    const BindContext& context) {
     if (project.kind != "Project" || project.children.size() != 1) invalid("aggregate requires a projection input");
     // 只处理"投影且恰好一个输入"这种规整形态。
     LogicalPlan aggregate;
@@ -338,8 +403,7 @@ void lowerAggregate(LogicalPlan& project, const Statement& statement, const cata
     // 两张映射：分组键身份 → 槽位；聚合调用身份 → 槽位。
     for (const auto& key : statement.groupBy) {
     // 逐个处理 GROUP BY 分组键。
-        auto expression = bindExpression(*key, scope);
-        // 绑定成计划表达式（补列编号与类型）。
+        auto expression = bindExpression(*key, scope, context);
         const auto identity = expressionIdentity(expression).dump();
         // 计算它的结构身份，用于去重。
         if (groups.contains(identity)) continue;
@@ -366,6 +430,7 @@ void lowerAggregate(LogicalPlan& project, const Statement& statement, const cata
             // 位置信息从原表达式继承，保证报错仍指向用户写的那一处。
     };
     // reference 定义结束。
+    // 聚合以上的表达式只引用分组键或聚合槽位，不保留原始行列引用。
     // 聚合以上的表达式只引用分组键或聚合槽位，不保留原始行列引用。
     std::function<nlohmann::json(nlohmann::json, std::size_t)> rewrite;
     // 先声明再赋值，是为了让 lambda 能递归调用自己。
@@ -415,8 +480,7 @@ void lowerAggregate(LogicalPlan& project, const Statement& statement, const cata
     // rewrite 定义结束。
     if (project.projections.empty()) for (const auto& column : project.output)
     // 投影列表为空时（例如 SELECT * 展开前的形态），按输出列逐个补出列引用投影。
-        project.projections.push_back(bindExpression(Expr{"Identifier", column.name, {}, {}, statement.location}, scope));
-        // 把每个列名绑成列引用表达式后追加。
+        project.projections.push_back(bindExpression(Expr{"Identifier", column.name, {}, {}, statement.location}, scope, context));
     for (std::size_t i = 0; i < project.projections.size(); ++i) {
     // 逐条处理投影表达式。
         auto& expression = project.projections[i];
@@ -428,16 +492,11 @@ void lowerAggregate(LogicalPlan& project, const Statement& statement, const cata
         // 否则填 -1 表示"不是对某个输入列的直通"。
     }
     // 投影处理结束。
-    auto having = statement.having ? rewrite(bindExpression(*statement.having, scope), 0) : nlohmann::json(nullptr);
-    // HAVING 同样要绑定并改写成"只引用聚合输出"的形式；没有 HAVING 时记为 null。
+    auto having = statement.having ? rewrite(bindExpression(*statement.having, scope, context), 0) : nlohmann::json(nullptr);
     // X09 4.x: 聚合之上（HAVING / 投影）的相关子查询 —— 其 outerColumns 携带的是基表列下标，
-    // 聚合之上的相关子查询里，outerColumns 记的是基表列下标，
     // 而此处实际求值的行是聚合输出行（分组键 + 聚合槽位）。必须把外层列下标重映射到 GROUP BY
-    // 但这里真正求值的行是聚合输出行（分组键 + 聚合槽位），所以要把外层列下标重映射到
     // 键在 aggregate.output 中的槽位，否则执行期会越界（5001）或取自错误列。
-    // 分组键在 aggregate.output 里的槽位，否则执行期会越界或取错列。
     // 引用未参与分组的列按 SQL 语义报 2003，与 rewrite 对普通标识符的处理一致。
-    // 若引用的是没参与分组的列，按 SQL 语义报错，与上面 rewrite 对裸列的处理保持一致。
     std::unordered_map<std::size_t, std::size_t> groupSlot;
     // 基表列编号 → 分组键在聚合输出中的槽位。
     for (std::size_t i = 0; i < aggregate.groupKeys.size(); ++i) {
@@ -464,42 +523,46 @@ void lowerAggregate(LogicalPlan& project, const Statement& statement, const cata
             // 且必须带子查询原文，
             node.contains("outerColumns") && node.at("outerColumns").is_object()) {
             // 以及外层列映射。
-            std::vector<std::string> referenced;
-            // 本次真正被引用的外层列名。
-            try {
-            // 重新切一遍子查询文本，找出形如 表.列 的引用。
-                const auto toks = tokenize(node.at("subquerySql").get<std::string>());
-                // 词法切分。
-                for (std::size_t i = 0; i + 2 < toks.size(); ++i)
-                // 扫描三元组。
-                    if (toks[i].type == "IDENTIFIER" && toks[i + 1].lexeme == "." && toks[i + 2].type == "IDENTIFIER")
-                    // 匹配"标识符 . 标识符"。
-                        referenced.push_back(canonical(toks[i].lexeme + "." + toks[i + 2].lexeme));
-                        // 拼成小写的限定名收进列表。
-            } catch (...) { referenced.clear(); }
-            // 任何异常都退化成"没有引用"，避免因为文本畸形而误改映射。
             std::map<std::string, std::size_t> slots;
             // 外层列名 → 新的聚合输出槽位。
-            for (const auto& name : referenced) {
-            // 逐个被引用的外层列处理。
-                const auto found = node.at("outerColumns").find(name);
-                // 在 outerColumns 里查它。
-                if (found == node.at("outerColumns").end() || !found->is_object() || !found->contains("columnId")) continue;
-                // 查不到或结构不对就跳过（说明它本来就不是外层列）。
-                const auto slot = groupSlot.find(found->at("columnId").get<std::size_t>());
-                // 用它的基表列编号去映射表里找聚合槽位。
-                if (slot == groupSlot.end()) {
-                // 找不到说明这一列没参与分组。
-                    const auto dot = name.find('.');
-                    // 找到限定名里的点，便于截出裸列名。
-                    throw MiniSqlError(ErrorCode::Semantic, "Column must be grouped or aggregated: " +
-                        // 按 SQL 语义报错，
-                        (dot == std::string::npos ? name : name.substr(dot + 1)), statement.location);
-                        // 错误信息里用去掉限定前缀的列名。
+            if (node.contains("outerReferences") && node.at("outerReferences").is_array()) {
+                // 绑定器已经精确给出这个子查询引用到的外层列。此前这里是把
+                // subquerySql 重新分词、按 `IDENT . IDENT` 模式猜引用——未限定的
+                // 外层引用猜不到，字符串里的同名片段又会误命中。
+                for (auto& reference : node.at("outerReferences")) {
+                    if (!reference.is_object() || !reference.contains("columnId")) continue;
+                    const auto outerSlot = reference.at("columnId").get<std::size_t>();
+                    const auto grouped = groupSlot.find(outerSlot);
+                    if (grouped == groupSlot.end())
+                        throw MiniSqlError(ErrorCode::Semantic, "Column must be grouped or aggregated: " +
+                            reference.value("name", std::string{}), statement.location);
+                    const auto binding = reference.value("binding", std::uint32_t{0});
+                    for (auto entry : node.at("outerColumns").items())
+                        if (entry.value().is_object() && entry.value().value("binding", std::uint32_t{0}) == binding)
+                            slots.emplace(entry.key(), grouped->second);
+                    reference["columnId"] = grouped->second;
                 }
                 // 报错分支结束。
-                slots.emplace(name, slot->second);
-                // 记下"这个名字 → 新槽位"。
+            } else {
+                // 没有绑定信息（旧计划文档）时退回原来的词法扫描，行为不变。
+                std::vector<std::string> referenced;
+                try {
+                    const auto toks = tokenize(node.at("subquerySql").get<std::string>());
+                    for (std::size_t i = 0; i + 2 < toks.size(); ++i)
+                        if (toks[i].type == "IDENTIFIER" && toks[i + 1].lexeme == "." && toks[i + 2].type == "IDENTIFIER")
+                            referenced.push_back(canonical(toks[i].lexeme + "." + toks[i + 2].lexeme));
+                } catch (...) { referenced.clear(); }
+                for (const auto& name : referenced) {
+                    const auto found = node.at("outerColumns").find(name);
+                    if (found == node.at("outerColumns").end() || !found->is_object() || !found->contains("columnId")) continue;
+                    const auto slot = groupSlot.find(found->at("columnId").get<std::size_t>());
+                    if (slot == groupSlot.end()) {
+                        const auto dot = name.find('.');
+                        throw MiniSqlError(ErrorCode::Semantic, "Column must be grouped or aggregated: " +
+                            (dot == std::string::npos ? name : name.substr(dot + 1)), statement.location);
+                    }
+                    slots.emplace(name, slot->second);
+                }
             }
             // 逐个处理结束。
             for (const auto& entry : slots) node.at("outerColumns").at(entry.first)["columnId"] = entry.second;
@@ -533,8 +596,7 @@ void lowerAggregate(LogicalPlan& project, const Statement& statement, const cata
     } else project.children.push_back(std::move(aggregate));
     // 没有 HAVING 时投影直接架在聚合上。
 }
-LogicalPlan build(const Statement& statement, const catalog::Catalog& catalog) {
-// 把一条语句的语法树翻译成一个逻辑计划；这是计划生成的核心分派函数。
+LogicalPlan build(const Statement& statement, const catalog::Catalog& catalog, const BindResult& bound) {
     if (statement.kind == "Begin" || statement.kind == "Commit" || statement.kind == "Rollback" ||
         // 事务控制类语句
         statement.kind == "Savepoint" || statement.kind == "ReleaseSavepoint" || statement.kind == "RollbackTo") {
@@ -554,6 +616,8 @@ LogicalPlan build(const Statement& statement, const catalog::Catalog& catalog) {
     // （selectItems）成为外层查询的绑定作用域；未限定列名一律按该作用域解析，禁字符串替换。
     // 内层 select 的计划要先构建出来，它的实体输出（selectItems）成为外层查询的绑定作用域；
     // 未限定列名一律按该作用域解析，禁止用字符串替换的土办法伪装实现。
+    // X09 3.3: 派生表作为外层关系基座。内层 select 计划先构建，其实体输出
+    // （selectItems）成为外层查询的绑定作用域；未限定列名一律按该作用域解析，禁字符串替换。
     const bool derivedBase = statement.fromSubquery != nullptr;
     // 这条语句的 FROM 是不是派生表。
     const auto* table = derivedBase ? nullptr : catalog.find(statement.table);
@@ -568,8 +632,7 @@ LogicalPlan build(const Statement& statement, const catalog::Catalog& catalog) {
     // 派生表对应的内层计划。
     if (derivedBase) {
     // 分支一：FROM 是派生表。
-        derivedInput = build(*statement.fromSubquery, catalog);
-        // 递归构建内层 SELECT 的计划。
+        derivedInput = build(*statement.fromSubquery, catalog, bound);
         plan.table = statement.tableAlias.empty() ? statement.table : statement.tableAlias;
         // 外层看到的名字用别名（没写别名时退化成占位表名）。
         catalog::Table derived;
@@ -582,6 +645,13 @@ LogicalPlan build(const Statement& statement, const catalog::Catalog& catalog) {
             // 列名、类型、限定名（别名）、可空性、默认值、主键/唯一标记与外键都从内层输出继承。
         bindScope = std::move(derived);
         // 设为绑定作用域。
+        for (const auto& join : statement.joins) {
+            const auto* right = catalog.find(join.table);
+            if (!right) invalid("missing join table");
+            const auto qualifier = join.alias.empty() ? right->name : join.alias;
+            if (join.right) for (auto& column : bindScope.columns) column.nullable = true;
+            for (auto column : right->columns) { column.qualifier = qualifier; if (join.left) column.nullable = true; bindScope.columns.push_back(std::move(column)); }
+        }
     } else {
     // 分支二：FROM 是普通表。
         plan.table = table->name;
@@ -594,6 +664,11 @@ LogicalPlan build(const Statement& statement, const catalog::Catalog& catalog) {
         // 把主表与本次用到的 JOIN 合并成视图表，作为列解析的统一起点。
     }
     // 作用域准备结束。
+    // 该语句在绑定结果里的作用域；绑定失败或语句不在结果中时 slots 全 0，
+    // 计划仍按槽位语义构建，只是没有稳定身份。
+    const auto* boundStatement = bound.statementFor(&statement);
+    const auto slots = slotIdentities(bindScope, bound, boundStatement ? boundStatement->scope : ScopeId::Invalid);
+    const BindContext context{&bound, slots};
     const bool aggregated = statement.kind == "Select" && catalog::analyzeSelect(statement, bindScope).aggregated;
     // 先问一次语义层：这条 SELECT 是不是聚合查询（有 GROUP BY/HAVING/聚合函数）。
     // 后面决定是否插入聚合算子、以及扫描能否走索引都依赖这个结论。
@@ -627,8 +702,7 @@ LogicalPlan build(const Statement& statement, const catalog::Catalog& catalog) {
             // 逐行处理。
                 single.valueExpressions = row;
                 // 把这一行装进模板。
-                const auto item = build(single, catalog);
-                // 递归编译成单行插入计划。
+                const auto item = build(single, catalog, bound);
                 plan.insertRows.push_back({{"values", item.values}, {"expressions", item.insertExpressions}});
                 // 把该行的字面量值与表达式两种表示都收进多行计划。
                 plan.columnMapping = item.columnMapping;
@@ -681,22 +755,19 @@ LogicalPlan build(const Statement& statement, const catalog::Catalog& catalog) {
         // 所有列处理结束。
     } else if (statement.kind == "Select" || statement.kind == "Delete" || statement.kind == "Update") {
     // 分支三：查询三类数据语句，它们共用"输入关系 + 过滤 + 投影/修改"的骨架。
-        if (derivedBase && statement.kind != "Select")
-        // FROM 是派生表时只允许 SELECT。
-            throw MiniSqlError(ErrorCode::Semantic, "DELETE/UPDATE is not supported over a derived table", statement.location);
-            // DELETE/UPDATE 针对派生表没有明确语义，直接拒绝。
         LogicalPlan input;
         // 这三类语句共同的输入算子。
         if (derivedBase) {
         // 派生表基座。
-            if (!statement.joins.empty())
-            // 派生表上暂不支持连接。
-                throw MiniSqlError(ErrorCode::Semantic, "JOIN over a derived table is not supported yet", statement.location);
-                // 明确报"暂不支持"，而不是悄悄忽略连接条件。
-            // 派生表基座：直接以内层 select 计划作为输入，外层谓词/投影按 derivedScope 绑定。
-            // 直接把内层 SELECT 的计划当成输入，外层的谓词与投影按前面构造的虚拟表作用域绑定。
-            input = std::move(derivedInput);
-            // 接管内层计划。
+            if (statement.kind == "Select") input = std::move(derivedInput);
+            else {
+                const auto* physical = catalog.find(statement.fromSubquery->table);
+                if (!physical || derivedInput.kind != "Project" || derivedInput.children.size() != 1)
+                    invalid("derived table is not updatable");
+                plan.table = physical->name;
+                table = physical;
+                input = std::move(derivedInput.children.front());
+            }
         } else {
         // 普通表：从一次顺序扫描开始。
         LogicalPlan scan;
@@ -705,8 +776,7 @@ LogicalPlan build(const Statement& statement, const catalog::Catalog& catalog) {
         // 默认是顺序扫描。
         scan.table = table->name;
         // 扫哪张表。
-        scan.output = schema(*table);
-        // 输出列就是整张表。
+        scan.output = schema(*table, slotWindow(slots, 0, table->columns.size()));
         scan.preservesRowId = true;
         // 扫描保留物理行号，这样上层仍能定位到具体行（删除/更新要靠它回写）。
         if (statement.kind == "Select" && !aggregated && statement.joins.empty() && statement.where) {
@@ -783,14 +853,12 @@ LogicalPlan build(const Statement& statement, const catalog::Catalog& catalog) {
                 // 索引列。
                 scan.indexValues = nlohmann::json::array();
                 // 等值查找的值列表。
-                for (const auto& value : values) scan.indexValues.push_back(bindExpression(*value, bindScope));
-                // 逐个绑定等值常量。
+                for (const auto& value : values) scan.indexValues.push_back(bindExpression(*value, bindScope, context));
                 if (prefix < index.columns.size()) {
                 // 如果还用了范围条件。
                     scan.indexRangeOperator = range.first;
                     // 记下运算符。
-                    scan.indexRangeValue = bindExpression(*range.second, bindScope);
-                    // 绑定边界值。
+                    scan.indexRangeValue = bindExpression(*range.second, bindScope, context);
                 }
                 // 范围条件处理结束。
                 break;
@@ -811,20 +879,25 @@ LogicalPlan build(const Statement& statement, const catalog::Catalog& catalog) {
             // 取右表定义。
             if (!right) invalid("missing join table");
             // 目录里找不到，说明编译流程有漏，按内部错误处理。
+            catalog::Table prefix;
+            const auto rightOffset = input.output.size();
+            prefix.name = bindScope.name;
+            prefix.columns.assign(bindScope.columns.begin(), bindScope.columns.begin() + static_cast<std::ptrdiff_t>(rightOffset + right->columns.size()));
             LogicalPlan rightScan;
             // 右侧的扫描算子。
             rightScan.kind = "SeqScan";rightScan.table = right->name;
             // 顺序扫描右表。
-            rightScan.output = schema(*right);rightScan.preservesRowId = true;
-            // 输出列是右表全部列，并保留行号。
-            const auto prefix = catalog::queryScope(statement, catalog, i + 1);
-            // 构造"主表 + 前 i+1 个连接"的视图表，用于绑定 ON 条件里的列名。
+            rightScan.output = schema(*right, slotWindow(slots, rightOffset, right->columns.size()));
+            rightScan.preservesRowId = true;
             LogicalPlan join;
             // 连接算子。
-            join.kind = source.left && source.right ? "FullJoin" : source.left ? "LeftJoin" : source.right ? "RightJoin" : "NestedLoopJoin";join.table = table->name;
-            // 按标记选出连接种类：两侧都置位是全外连接，只左是左外，只右是右外，否则内连接。
-            join.output = schema(prefix);join.predicate = bindExpression(*source.on, prefix);
-            // 输出列是连接后的视图表，谓词是 ON 条件（在连接后的作用域里绑定）。
+            join.kind = source.left && source.right ? "FullJoin" : source.left ? "LeftJoin" : source.right ? "RightJoin" : "NestedLoopJoin";join.table = plan.table;
+            join.output = input.output;
+            if (source.right) for (auto& column : join.output) column.nullable = true;
+            auto rightOutput = rightScan.output;
+            if (source.left) for (auto& column : rightOutput) column.nullable = true;
+            join.output.insert(join.output.end(), rightOutput.begin(), rightOutput.end());
+            join.predicate = bindExpression(*source.on, prefix, context);
             join.children.push_back(std::move(input));join.children.push_back(std::move(rightScan));
             // 左边挂当前输入，右边挂右表扫描。
             input = std::move(join);
@@ -848,8 +921,7 @@ LogicalPlan build(const Statement& statement, const catalog::Catalog& catalog) {
             // 过滤不改变结果结构，输出列沿用输入。
             filter.preservesRowId = input.preservesRowId;
             // 行号保持性也沿用输入。
-            filter.predicate = bindExpression(*statement.where, bindScope);
-            // 绑定 WHERE 表达式（列名按视图表作用域解析）。
+            filter.predicate = bindExpression(*statement.where, bindScope, context);
             filter.children.push_back(std::move(input));
             // 输入挂在下面。
             input = std::move(filter);
@@ -868,10 +940,8 @@ LogicalPlan build(const Statement& statement, const catalog::Catalog& catalog) {
                 // 记录"第几个投影对应哪一列"。
                 if (item.expression->kind == "Default")
                 // 写的是 DEFAULT 关键字。
-                    plan.projections.push_back(bindExpression(Expr{"Literal", table->columns[index].defaultValue.value_or("NULL"), {}, {}, item.expression->location}, bindScope));
-                    // 换成该列的默认值字面量再绑定。
-                else plan.projections.push_back(bindExpression(*item.expression, bindScope));
-                // 其它情况直接绑定赋值表达式。
+                    plan.projections.push_back(bindExpression(Expr{"Literal", table->columns[index].defaultValue.value_or("NULL"), {}, {}, item.expression->location}, bindScope, context));
+                else plan.projections.push_back(bindExpression(*item.expression, bindScope, context));
             }
             // 赋值处理结束。
         }
@@ -888,8 +958,7 @@ LogicalPlan build(const Statement& statement, const catalog::Catalog& catalog) {
                     // 通配项需要展开成若干真实列。
                         const auto dot = item.expression->value.find('.');
                         // 看它是不是"表名.*"形式。
-                        for (const auto& column : schema(bindScope)) {
-                        // 遍历视图表的全部列。
+                        for (const auto& column : schema(bindScope, slots)) {
                             const auto& source = bindScope.columns[column.columnId];
                             // 取出对应源列（用于看它的限定名）。
                             if (dot != std::string::npos && canonical(source.qualifier) != canonical(item.expression->value.substr(0, dot))) continue;
@@ -898,38 +967,42 @@ LogicalPlan build(const Statement& statement, const catalog::Catalog& catalog) {
                             // 该列成为输出列之一。
                             Expr reference{"Identifier", source.qualifier + "." + column.name, {}, {}, item.expression->location};
                             // 造一个带限定名的列引用表达式。
-                            plan.projections.push_back(bindExpression(reference, bindScope));
-                            // 绑定后作为一条投影。
+                            plan.projections.push_back(bindExpression(reference, bindScope, context));
                         }
                         // 展开结束。
                         continue;
                         // 处理下一项。
                     }
                     // 通配分支结束。
-                    auto bound = bindExpression(*item.expression, bindScope);
-                    // 普通投影表达式直接绑定。
+                    auto bound = bindExpression(*item.expression, bindScope, context);
                     auto name = item.alias;
                     // 输出列名优先用别名。
                     if (name.empty()) name = item.expression->kind == "Identifier" ? bound.at("name").get<std::string>() : "expr_" + std::to_string(i + 1);
                     // 没写别名时：列引用用列名，其它表达式生成 expr_N 这样的占位名。
                     const auto columnId = item.expression->kind == "Identifier" ? bound.at("columnId").get<std::size_t>() : static_cast<std::size_t>(-1);
                     // 直通列引用才记下真实列编号，否则填 -1。
-                    plan.output.push_back({name, bound.at("type").get<std::string>(), columnId, bound.value("nullable", true)});
-                    // 记录这一列的名称、类型、来源列与可空性。
+                    PlanColumn projected{name, bound.at("type").get<std::string>(), columnId, bound.value("nullable", true)};
+                    // 投影列继承被投影标识符的稳定身份；表达式列没有身份（0）。
+                    projected.binding = bound.value("binding", std::uint32_t{0});
+                    projected.relation = bound.value("relation", std::uint32_t{0});
+                    projected.expression = bound.value("expressionId", std::uint32_t{0});
+                    plan.output.push_back(std::move(projected));
                     plan.projections.push_back(std::move(bound));
                     // 绑定结果收进投影列表。
                 }
                 // 投影项处理结束。
             } else if (!derivedBase) for (const auto& name : statement.selectList) {
             // 没有结构化投影（老路径）且不是派生表时，用字符串形式的投影列表。
-                if (name == "*") plan.output = schema(*table);
-                // 裸星号：整张表作为输出。
+                if (name == "*") plan.output = schema(*table, slots);
                 else {
                 // 具体列名。
                     auto index = columnIndex(*table, name);
                     // 解析列下标。
-                    plan.output.push_back({table->columns[index].name, table->columns[index].type, index});
-                    // 直接作为一列输出（没有投影表达式，说明取整列）。
+                    const auto identity = slotAt(slots, index);
+                    PlanColumn column{table->columns[index].name, table->columns[index].type, index};
+                    column.binding = identity.binding;
+                    column.relation = identity.relation;
+                    plan.output.push_back(std::move(column));
                 }
                 // 分支结束。
             }
@@ -957,8 +1030,7 @@ LogicalPlan build(const Statement& statement, const catalog::Catalog& catalog) {
             // 逐个输出列。
                 Expr reference{"Identifier", column.name, {}, {}};
                 // 造一个裸列引用表达式。
-                plan.projections.push_back(bindExpression(reference, bindScope));
-                // 绑定后追加为投影。
+                plan.projections.push_back(bindExpression(reference, bindScope, context));
             }
             // 补齐结束。
         }
@@ -967,8 +1039,7 @@ LogicalPlan build(const Statement& statement, const catalog::Catalog& catalog) {
         // 逐个排序键处理。
             const auto resolved = catalog::resolveOrder(statement, item, bindScope);
             // 先把"别名形式"的排序键还原成它真正指向的表达式。
-            const auto bound = bindExpression(*resolved, bindScope);
-            // 绑定成计划表达式。
+            const auto bound = bindExpression(*resolved, bindScope, context);
             const auto identity = expressionIdentity(bound);
             // 算它的结构身份，用来在投影列表里找同款表达式。
             std::size_t index = 0;
@@ -994,8 +1065,7 @@ LogicalPlan build(const Statement& statement, const catalog::Catalog& catalog) {
     // ORDER BY 处理结束。
     if (aggregated) {
     // 聚合查询：把投影改写成"聚合算子 + 上层投影"。
-        lowerAggregate(plan, statement, bindScope);
-        // 调用前面的下推函数完成改写。
+        lowerAggregate(plan, statement, bindScope, context);
         std::copy_n(plan.output.begin(), visibleOutput.size(), visibleOutput.begin());
         // 改写会调整输出列，这里用之前备份的可见列把它还原，保证对外列不变。
     }
@@ -1095,8 +1165,21 @@ std::vector<LogicalPlan> compilePlans(const std::vector<Statement>& statements,
         // 提交：只是清掉事务与保存点记录，快照保持当前值。
         snapshot = catalog::compileSnapshot({statement}, snapshot);
         // 在快照上预演这条语句（建表等会真的改快照），得到"执行后"的目录。
-        plans.push_back(build(statement, snapshot));
-        // 用更新后的目录编译这条语句的计划。
+        {
+            // 逐句绑定：批内 DDL 会改变 Catalog 快照，所以不能对整批只绑一次。
+            // 传指针而非拷贝，保证 BindResult 里的裸指针指向调用方持有的语句。
+            const auto bound = bindStatements({&statement}, snapshot);
+            auto built = build(statement, snapshot, bound);
+            // 计划绑定编译时的 Catalog 指纹，供执行阶段检测 schema 失效。
+            const auto fingerprint = snapshot.schemaFingerprint();
+            std::function<void(LogicalPlan&)> stamp = [&](LogicalPlan& node) {
+                node.catalogFingerprint = fingerprint;
+                if (node.sourceSpan.line == 0) node.sourceSpan = statement.location;
+                for (auto& child : node.children) stamp(child);
+            };
+            stamp(built);
+            plans.push_back(std::move(built));
+        }
     }
     // 语句遍历结束。
     return plans;
@@ -1122,20 +1205,23 @@ nlohmann::json serializePlans(const std::vector<LogicalPlan>& plans) {
         // 输出列的 JSON 数组。
         for (const auto& column : plan.output) {
         // 逐列序列化。
-            output.push_back({{"name", column.name}, {"type", column.type}, {"columnId", column.columnId}, {"identity", column.identity}, {"nullable", column.nullable},
-                // 列名、类型、列编号、身份标识、可空性，
+            output.push_back({{"name", column.name}, {"type", column.type}, {"columnId", column.columnId}, {"binding", column.binding}, {"relation", column.relation}, {"expressionId", column.expression}, {"nullable", column.nullable},
                 {"defaultValue", column.defaultValue ? nlohmann::json(*column.defaultValue) : nlohmann::json(nullptr)}, {"primaryKey", column.primaryKey}, {"unique", column.unique}, {"references", serializeReference(column.references)}});
                 // 默认值（没有就 null）、主键/唯一标记与列级外键。
         }
         // 输出列序列化结束。
-        rows.push_back({{"id", id}, {"parent", parent}, {"depth", depth}, {"statementIndex", statementIndex},
-                        // 先写结构性字段：编号、父编号（顶层是 -1）、深度、属于第几条语句，
+        const auto endLine = plan.sourceSpan.endLine ? plan.sourceSpan.endLine : plan.sourceSpan.line;
+        const auto endColumn = plan.sourceSpan.endColumn ? plan.sourceSpan.endColumn : plan.sourceSpan.column + (plan.sourceSpan.line ? 1 : 0);
+        rows.push_back({{"id", id}, {"nodeId", id}, {"parent", parent}, {"depth", depth}, {"statementIndex", statementIndex},
                         {"kind", plan.kind}, {"detail", plan.kind + " " + plan.table}, {"table", plan.table},
                         // 以及节点种类、一句人类可读的说明、表名，
+                        {"sourceSpan", {{"start", {{"line", plan.sourceSpan.line}, {"column", plan.sourceSpan.column}}},
+                                        {"end", {{"line", endLine}, {"column", endColumn}}}}},
+                        {"catalogFingerprint", plan.catalogFingerprint},
+                        {"optimizerDecision", plan.optimizerDecision},
                         {"indexName", plan.indexName}, {"savepointName", plan.savepointName}, {"subqueryJoinKind", plan.subqueryJoinKind}, {"uniqueIndex", plan.uniqueIndex}, {"indexColumns", plan.indexColumns}, {"indexValues", plan.indexValues}, {"indexRangeOperator", plan.indexRangeOperator}, {"indexRangeValue", plan.indexRangeValue},
                         // 索引与事务相关字段：索引名、保存点名、子查询连接种类、是否唯一索引、索引列、索引值、范围运算符与范围值，
-                        {"output", output}, {"preservesRowId", plan.preservesRowId},
-                        // 输出列定义与"是否保持行号"，
+                        {"output", output}, {"outputSchema", output}, {"preservesRowId", plan.preservesRowId},
                         {"predicate", plan.predicate}, {"values", plan.values}, {"insertExpressions", plan.insertExpressions}, {"insertRows", plan.insertRows},
                         // 谓词、字面量值、INSERT 表达式与多行数据，
                         {"columnMapping", plan.columnMapping}, {"projections", plan.projections}, {"children", nlohmann::json::array()}});
@@ -1260,14 +1346,19 @@ std::vector<LogicalPlan> deserializePlans(const nlohmann::json& document) {
         // 还原表名。
         item.plan.preservesRowId = row.at("preservesRowId").get<bool>();
         // 还原行号保持性。
+        item.plan.optimizerDecision = row.value("optimizerDecision", nlohmann::json(nullptr));
+        if (row.contains("sourceSpan")) {
+            const auto& span = row.at("sourceSpan");
+            if (!span.is_object() || !span.contains("start") || !span.contains("end") ||
+                !span.at("start").is_object() || !span.at("end").is_object()) invalid();
+            item.plan.sourceSpan = {span.at("start").value("line", std::size_t{0}), span.at("start").value("column", std::size_t{0}),
+                                    span.at("end").value("line", std::size_t{0}), span.at("end").value("column", std::size_t{0})};
+        }
     item.plan.indexName = row.value("indexName", std::string{});
     // 还原索引名（缺字段按空串）。
     item.plan.savepointName = row.value("savepointName", std::string{});
     // 还原保存点名。
-    item.plan.subqueryJoinKind = row.value("subqueryJoinKind", std::string{});
-    // 还原子查询连接种类。
-        item.plan.uniqueIndex = row.value("uniqueIndex", false);
-        // 还原是否唯一索引。
+    item.plan.subqueryJoinKind = row.value("subqueryJoinKind", std::string{});        item.plan.catalogFingerprint = row.value("catalogFingerprint", std::string{});        item.plan.uniqueIndex = row.value("uniqueIndex", false);
         item.plan.indexColumns = row.value("indexColumns", std::vector<std::string>{});
         // 还原索引列列表。
         item.plan.indexValues = row.value("indexValues", nlohmann::json::array());
@@ -1284,8 +1375,10 @@ std::vector<LogicalPlan> deserializePlans(const nlohmann::json& document) {
                 // 还要有非负整数 columnId 与布尔 nullable，否则整份文档作废。
             PlanColumn value{column.at("name").get<std::string>(), column.at("type").get<std::string>(), column.at("columnId").get<std::size_t>(), column.at("nullable").get<bool>()};
             // 还原名称、类型、列编号与可空性。
-            value.identity = column.value("identity", std::string{});
-            // 还原列的稳定身份标识（缺字段时为空）。
+            // X25：同 major 内的宽松读取——旧文档没有 binding/relation，缺失即无身份。
+            value.binding = column.value("binding", std::uint32_t{0});
+            value.relation = column.value("relation", std::uint32_t{0});
+            value.expression = column.value("expressionId", std::uint32_t{0});
             if (column.contains("defaultValue") && !column.at("defaultValue").is_null()) value.defaultValue = column.at("defaultValue").get<std::string>();
             // 默认值可选，非 null 时才还原。
             value.primaryKey = column.value("primaryKey", false);

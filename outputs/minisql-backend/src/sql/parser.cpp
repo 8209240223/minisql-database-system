@@ -7,8 +7,17 @@ namespace minisql::sql {
 namespace {
 // 传来的 errors（而不是抛出 MiniSqlError），再抛出 Recovered{} 让语句级处理器
 // 能够同步到下一条语句并继续解析。
+// Internal control-flow marker used only in recovery mode. When the parser
+// encounters a syntax error it records the diagnostic into the caller's
+// errors vector (instead of throwing MiniSqlError) and throws Recovered{} so
+// the statement-level handler can synchronize and continue.
 struct Recovered {};
 // 这个类型没有成员，只是一个"跳到语句边界"的信号。
+
+// 第十七章 REQ-CORE-001：批量语句上限 10000。超限按资源预算诊断，
+// 消息含 "budget exceeded" 以便 HTTP 适配层映射到 413。
+constexpr std::size_t kMaxStatements = 10000;
+const char* kStatementBudgetMessage = "Statement budget exceeded: batch input exceeds 10000 statements";
 
 class Parser {
 // 递归下降解析器：每个 SQL 语法成分对应一个成员函数，自顶向下往下推。
@@ -16,27 +25,41 @@ public:
     explicit Parser(const std::vector<Token>& tokens): t(tokens) {}
     // 构造时只保存 token 流引用，不做任何扫描，避免多余复制。
     // 严格解析：遇到第一个错误就抛 MiniSqlError（历史一直沿用的行为）。
+    // Strict parse: throws MiniSqlError on the first error (classic behaviour).
     std::vector<Statement> all(){
     // 把整条 token 流解析成语句列表。
         std::vector<Statement> out;
         // 结果容器，按语句出现顺序存放。
-        while(i<t.size() && t[i].type!="END"){out.push_back(statement());}
-        // 只要还没读到 END 结束标记，就反复解析一条完整语句；
-        // 每条语句解析完游标都会停在下一个语句的开头。
+        while(i<t.size() && t[i].type!="END"){
+            if(out.size()>=kMaxStatements)
+                throw MiniSqlError(ErrorCode::Execution, kStatementBudgetMessage,
+                                   i<t.size()?t[i].location:SourceLocation{});
+            out.push_back(statement());
+        }
         return out;
         // 返回全部语句。
     }
     // 打开恢复模式：语法错误写进 errors（永不抛出），并在下一条语句边界恢复解析。
+    // Enables recovery mode: syntax errors are pushed into `errors` (never
+    // thrown) and scanning resumes at the next statement boundary.
     void setRecoverable(std::vector<MiniSqlError>& errors){ recover_ = true; errors_ = &errors; }
     // 打开开关并记住错误收集容器；后续 fail() 会据此改走"记录"分支。
     // 容错解析：每个可恢复错误记录到 errors_ 并在下一条语句边界恢复解析，
     // 出错的那条语句被丢弃；合法语句照常产出。
+    // Recovery parse: each recoverable error is recorded into errors_ and
+    // scanning resumes at the next statement boundary; the offending statement
+    // is dropped. Valid statements are still produced.
     std::vector<Statement> allRecoverable(){
     // 容错模式的解析主循环。
         std::vector<Statement> out;
         // 结果容器。
         while(i<t.size() && t[i].type!="END"){
         // 同样循环到结束标记为止。
+            if(out.size()>=kMaxStatements){
+                errors_->emplace_back(ErrorCode::Execution, std::string(kStatementBudgetMessage),
+                                      i<t.size()?t[i].location:SourceLocation{});
+                break;
+            }
             try {
             // 用异常机制做"整条语句回退"：出错就抛出 Recovered 跳到这里。
                 auto st = statement();
@@ -48,6 +71,7 @@ public:
             } catch (const Recovered&) {
             // 捕获"需要跳到语句边界"的信号。
                 // 同步到下一条语句的边界。
+                // Synchronize to the next statement boundary.
                 inError_ = false;
                 // 清掉错误标记，准备处理下一条语句。
                 while(i<t.size() && t[i].type!="END" && t[i].lexeme!=";") ++i;
@@ -79,9 +103,12 @@ private:
     // 最后与传入的大写关键字比较，从而实现大小写不敏感的关键字匹配。
     std::string actualToken() const { return i<t.size() && t[i].type!="END" ? t[i].lexeme : std::string{}; }
     // 取当前 token 的文本用于报错；已经读到结尾时返回空串，避免越界。
-
     // 统一的错误出口。严格模式下与经典解析器一样抛出 MiniSqlError；
     // 恢复模式下记录诊断并抛出 Recovered{}，一路展开到最近的同步点。
+
+    // Central error outlet. In strict mode it throws MiniSqlError exactly as
+    // the classic parser did. In recovery mode it records the diagnostic and
+    // throws Recovered{} to unwind to the nearest sync point.
     [[noreturn]] void fail(ErrorCode code, const std::string& message, const SourceLocation& loc, const SourceLocation& end = {},
                            std::string actual = {}, std::vector<std::string> expected = {}){
         // [[noreturn]] 告诉编译器这个函数一旦调用就不会返回，消除"缺少返回值"的告警。
@@ -130,7 +157,6 @@ private:
         return x.lexeme;
         // 返回标识符原文（保留用户书写的大小写）。
     }
-
     std::string literal(){
     // 读一个字面量，返回它的文本形式（带符号、带 DATE 前缀）。
         if(keyword("DATE")&&i+1<t.size()&&t[i+1].type=="STRING"){++i;return "DATE"+take().lexeme;}
@@ -186,12 +212,47 @@ private:
     }
     void semicolon(){if(at(";"))++i;else fail(ErrorCode::Syntax, "Expected ';'", i<t.size()?t[i].location:SourceLocation{}, {}, actualToken(), {";"});}
     // 语句结束符处理：有分号就吃掉；没有也报错，保持"每条语句必须以分号结尾"的约定。
-    Statement statement(){auto loc=t[i].location;Statement s;if(keyword("BEGIN")||keyword("COMMIT")||keyword("ROLLBACK")||keyword("SAVEPOINT")||keyword("RELEASE"))s=transaction();else if(keyword("CREATE"))s=create();else if(keyword("INSERT"))s=insert();else if(keyword("SELECT"))s=select();else if(keyword("DELETE"))s=remove();else if(keyword("UPDATE"))s=update();else if(keyword("CHECKPOINT"))s=checkpointStatement();else if(keyword("DROP"))s=dropIndex();else fail(ErrorCode::Syntax, "Expected SQL statement or transaction command", loc, {}, actualToken(), {"BEGIN", "COMMIT", "ROLLBACK", "SAVEPOINT", "RELEASE", "CREATE", "INSERT", "SELECT", "DELETE", "UPDATE", "CHECKPOINT", "DROP"});s.location=loc;return s;}
-    // 语句分发入口：先记下起始位置，再按首个关键字把控制权交给对应的子解析函数。
-    // BEGIN/COMMIT/ROLLBACK/SAVEPOINT/RELEASE 走事务；CREATE 走建表或建索引；
-    // INSERT/SELECT/DELETE/UPDATE 走四类数据语句；CHECKPOINT 与 DROP 各有专门函数。
-    // 都不匹配说明这里不是一条合法语句的开头，报错并把所有合法开头列进期望集合。
-    // 最后把语句位置补齐后返回，语义阶段报错时就靠它定位。
+    Statement statement(){auto loc=t[i].location;Statement s;if(keyword("BEGIN")||keyword("COMMIT")||keyword("ROLLBACK")||keyword("SAVEPOINT")||keyword("RELEASE"))s=transaction();else if(keyword("CREATE"))s=create();else if(keyword("INSERT"))s=insert();else if(keyword("SELECT"))s=select();else if(keyword("DELETE"))s=remove();else if(keyword("UPDATE"))s=update();else if(keyword("CHECKPOINT"))s=checkpointStatement();else if(keyword("DROP"))s=dropIndex();else if(keyword("WITH"))s=withQuery();else fail(ErrorCode::Syntax, "Expected SQL statement or transaction command", loc, {}, actualToken(), {"BEGIN", "COMMIT", "ROLLBACK", "SAVEPOINT", "RELEASE", "CREATE", "INSERT", "SELECT", "DELETE", "UPDATE", "CHECKPOINT", "DROP", "WITH"});s.location=loc;return s;}
+    // X25: 非递归 WITH。CTE 名是作用域名，绑定器据此把引用解析到内部查询，
+    // 因此权限层不会把 CTE 别名误当成数据库对象，也不需要任何文本扫描兜底。
+    Statement withQuery(){
+        expect("WITH");
+        if(keyword("RECURSIVE")) fail(ErrorCode::NotImplemented, "Recursive common table expressions are not supported",
+            t[i].location, {}, actualToken(), {"IDENTIFIER"});
+        std::vector<CommonTableExpr> ctes;
+        do {
+            if(ctes.size()>=32) fail(ErrorCode::Syntax, "Common table expression count exceeds 32", t[i].location);
+            CommonTableExpr cte;
+            cte.location=i<t.size()?t[i].location:SourceLocation{};
+            cte.name=identifier();
+            for(const auto& existing: ctes)
+                if(equalNames(existing.name,cte.name))
+                    fail(ErrorCode::Semantic, "Duplicate common table expression name", cte.location, {}, cte.name, {});
+            if(at("(")){
+                ++i;
+                do { cte.columns.push_back(identifier()); } while(at(",")&&(++i,true));
+                expect(")");
+            }
+            expect("AS");expect("(");
+            auto query=select(false);
+            expect(")");
+            if(!cte.columns.empty()&&!query.selectItems.empty()&&query.selectList.size()==query.selectItems.size()&&
+               cte.columns.size()!=query.selectItems.size())
+                fail(ErrorCode::Semantic, "Common table expression column count does not match its query", cte.location);
+            cte.query=std::make_shared<Statement>(std::move(query));
+            ctes.push_back(std::move(cte));
+        } while(at(",")&&(++i,true));
+        if(!keyword("SELECT")) fail(ErrorCode::Syntax, "Expected SELECT after WITH",
+            i<t.size()?t[i].location:SourceLocation{}, {}, actualToken(), {"SELECT"});
+        auto s=select();
+        s.ctes=std::move(ctes);
+        return s;
+    }
+    static bool equalNames(std::string left,std::string right){
+        const auto fold=[](std::string& value){std::transform(value.begin(),value.end(),value.begin(),
+            [](unsigned char c){return static_cast<char>(std::tolower(c));});};
+        fold(left);fold(right);return left==right;
+    }
     Statement dropIndex(){Statement s{"DropIndex"};expect("DROP");expect("INDEX");s.indexName=identifier();if(keyword("ON")){++i;s.table=identifier();}semicolon();return s;}
     // 解析 DROP INDEX 名称 [ON 表名]；ON 子句可选，给定了就限制只在指定表里找索引。
     Statement checkpointStatement(){Statement s{"Checkpoint"};expect("CHECKPOINT");semicolon();return s;}
@@ -230,8 +291,9 @@ private:
     }
     Statement update() {
     // 解析 UPDATE 表名 SET 列=值[, 列=值...] [WHERE 条件];
-        Statement s{"Update"};expect("UPDATE");s.table=identifier();expect("SET");
-        // 依次消费 UPDATE、表名、SET。
+        Statement s{"Update"};expect("UPDATE");
+        if(at("(")) derivedTarget(s); else s.table=identifier();
+        expect("SET");
         do {auto name=identifier();expect("=");s.assignments.push_back({std::move(name),writeValue()});}
         while(at(",")&&(++i,true));
         // 循环读取赋值项：读列名、吃等号、再读赋值表达式（writeValue 支持 DEFAULT）；
@@ -410,7 +472,6 @@ private:
         return s;
         // 返回解析好的建表语句。
     }
-
     Statement insert(){
     // 解析 INSERT INTO 表名 [(列,...)] VALUES (...)[,(...)...]; 以及 DEFAULT VALUES 写法。
         Statement s{"Insert"};expect("INSERT");expect("INTO");s.table=identifier();
@@ -487,6 +548,7 @@ private:
             if (tok.type=="END" || tok.lexeme==";") return true;
             // 遇到输入结束或分号，说明已经到下一条语句边界，告诉调用方"整条语句作废"。
             // 停在下一个 SELECT 子句/子句关键字上。
+            // Stop at the next SELECT clause / sub-clause keyword.
             if (tok.type=="KEYWORD" && (tok.lexeme=="WHERE"||tok.lexeme=="GROUP"||tok.lexeme=="HAVING"||
                 tok.lexeme=="ORDER"||tok.lexeme=="LIMIT"||tok.lexeme=="OFFSET"||tok.lexeme=="JOIN"||
                 tok.lexeme=="INNER"||tok.lexeme=="LEFT"||tok.lexeme=="RIGHT"||tok.lexeme=="FULL")) return false;
@@ -534,6 +596,9 @@ private:
         if(at("(")) {
         // 分支一：FROM 后面是左括号，说明是派生表（子查询）。
             // X09：派生表 `FROM ( SELECT ... ) [AS] alias`，必须有显式别名。
+            // X09: 派生表 `FROM ( SELECT ... ) [AS] alias`，必须有显式别名。
+            // 第十七章：派生表嵌套必须计数，否则 `FROM (SELECT ... (SELECT ...))` 可以无界递归。
+            if(++depth>256) fail(ErrorCode::Syntax, "Query nesting depth exceeded", t[i].location);
             ++i;
             // 吃掉左括号。
             auto derived = select(false);
@@ -549,6 +614,7 @@ private:
             if(alias.empty()) fail(ErrorCode::Semantic, "A derived table must have an explicit alias", t[i].location);
             // 没写别名就直接拒绝：派生表没有名字，外层没法引用它。
             // 派生表输出列名不得歧义（重复 → 语义歧义错误）。
+            // 派生表输出列名不得歧义（重复 → 语义歧义错误）。
             if(derived.selectList.size()==derived.selectItems.size()) {
             // 只有当兼容用的 selectList 与结构化投影项一一对应时才做静态判重。
                 std::vector<std::string> names;
@@ -563,7 +629,7 @@ private:
                     // 有别名就用别名，它是最终输出列名。
                     else if(item.expression&&item.expression->kind=="Identifier"){name=item.expression->value;}
                     // 否则若投影是普通列，列名就是输出名。
-                    else { opaque=true; break; } // 通配符 / 表达式：静态无法判重，跳过。
+                    else { opaque=true; break; } // wildcard / 表达式：静态无法判重，跳过。
                     // 其它形态（通配符展开、计算表达式）静态判断不了，直接放弃判重。
                     names.push_back(name);
                     // 记下这一列的名字。
@@ -586,6 +652,7 @@ private:
             s.table=alias; // 3.3 planner 以 Scope 链消费 fromSubquery；此处占位保持既有表路径兼容。
             // 占位写法：planner 已经改走 Scope 链消费 fromSubquery，这里把别名叫表名
             // 只是为了让仍按"表名"取数的老路径不至于拿到空串。
+            --depth;
         } else {
         // 分支二：FROM 后面是普通表。
             s.table=identifier();
@@ -679,8 +746,18 @@ private:
         return value;
         // 返回解析出的数值。
     }
-    Statement remove(){Statement s{"Delete"};expect("DELETE");expect("FROM");s.table=identifier();if(keyword("WHERE")){++i;s.where=expression();}semicolon();return s;}
-    // 解析 DELETE FROM 表名 [WHERE 条件]; WHERE 可选，其余结构固定。
+    void derivedTarget(Statement& s) {
+        expect("(");
+        auto derived=select(false);
+        expect(")");
+        std::string alias;
+        if(keyword("AS")){++i;alias=identifier();}
+        else if(i<t.size()&&t[i].type=="IDENTIFIER")alias=identifier();
+        if(alias.empty()) fail(ErrorCode::Semantic, "A derived table must have an explicit alias", t[i].location);
+        s.fromSubquery=std::make_shared<Statement>(std::move(derived));
+        s.tableAlias=alias;s.table=alias;
+    }
+    Statement remove(){Statement s{"Delete"};expect("DELETE");expect("FROM");if(at("("))derivedTarget(s);else s.table=identifier();if(keyword("WHERE")){++i;s.where=expression();}semicolon();return s;}
     std::shared_ptr<Expr> expression(){auto left=conjunction();while(keyword("OR")){++i;left=std::make_shared<Expr>(Expr{"Binary","OR",left,conjunction()});}return left;}
     // 表达式的最外层：先解析一个合取式，再不断看后面有没有 OR；
     // 每读到一个 OR 就把左边已解析结果和右边新的合取式拼成 Binary 节点。
@@ -739,6 +816,7 @@ private:
             expect(")");--depth;
             // 逗号分隔；最后吃掉右括号并还原深度。
             // 平衡 OR 树避免长列表产生线性递归深度。
+            // 平衡 OR 树避免长列表产生线性递归深度。
             while(terms.size()>1){
             // 反复两两合并，直到只剩一个节点，形成接近平衡的 OR 树。
                 std::vector<std::shared_ptr<Expr>> next;
@@ -756,6 +834,7 @@ private:
         if(keyword("IS")){auto op=take();bool negate=keyword("NOT");if(negate)++i;expect("NULL");return std::make_shared<Expr>(Expr{"Unary",negate?"IS NOT NULL":"IS NULL",left,{},op.location});}
         // IS NULL / IS NOT NULL：消费 IS，看有没有 NOT，再要求必须有 NULL，
         // 最后按是否取反生成 Unary 节点，节点种类名直接写成可读的 IS NULL / IS NOT NULL。
+        // 方言归一：`==` 等价 `=`，`<>` 等价 `!=`。词素保持源码原文，语义统一按规范算子处理。
         // 方言归一：`==` 等价 `=`，`<>` 等价 `!=`。词素保持源码原文，语义统一按规范算子处理。
         if(at("=")||at("==")||at("!=")||at("<>")||at("<")||at("<=")||at(">")||at(">=")){
         // 八种比较运算符任意一种都进入比较分支。
@@ -860,8 +939,9 @@ private:
             // 复制下一个 token 的词素并转大写，用于关键字比较。
             if(next=="SELECT"){
             // 括号里是 SELECT，说明这是标量子查询。
-                const auto token=take();const auto start=i;auto query=select(false);const auto text=tokenText(start,i);expect(")");
-                // 取左括号的位置，解析内层 SELECT 并存下它的原文，再吃右括号。
+                // 第十七章：标量子查询同样计入嵌套深度，防止 `(SELECT (SELECT ...))` 无界递归。
+                if(++depth>256) fail(ErrorCode::Syntax, "Query nesting depth exceeded", t[i].location);
+                const auto token=take();const auto start=i;auto query=select(false);const auto text=tokenText(start,i);expect(")");--depth;
                 auto node=std::make_shared<Expr>(Expr{"ScalarSubquery","",nullptr,{},token.location,text});
                 // 构造标量子查询节点。
                 node->subquery=std::make_shared<Statement>(std::move(query));
@@ -883,9 +963,12 @@ private:
 };
 }
 // 严格入口（普通执行与计划生成都走这里）。与经典解析器一样，第一个错误就抛出。
+// Strict entry point (used by normal execution/planning). Throws on the first
+// error just like the classic parser.
 std::vector<Statement> parse(const std::vector<Token>& tokens){return Parser(tokens).all();}
 // 直接构造解析器并跑全量解析，不做任何容错处理。
 // 容错入口：收集语法错误并继续解析。
+// Recovery entry point: collects syntax errors and keeps parsing.
 std::vector<Statement> parseRecoverable(const std::vector<Token>& tokens, std::vector<MiniSqlError>& errors){
     Parser parser(tokens);
     // 构造解析器。

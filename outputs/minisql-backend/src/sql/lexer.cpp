@@ -2,6 +2,8 @@
 #include <unordered_set>
 namespace minisql::sql {
 namespace {
+// 第十七章 REQ-CORE-001 的工程基线默认值：单标识符上限 128 个 ASCII 字符。
+constexpr std::size_t kMaxIdentifierLength = 128;
 const std::unordered_set<std::string>& keywords() {
 // 返回主关键字表；用函数包一层是为了借助函数内 static 的线程安全惰性初始化。
     static const std::unordered_set<std::string> k{"SELECT","FROM","WHERE","CREATE","TABLE","INSERT","INTO","VALUES","DELETE","AND","OR","NOT","INT","BIGINT","FLOAT","VARCHAR","AS","DISTINCT","LIMIT","OFFSET","ORDER","BY","ASC","DESC","UPDATE","SET","JOIN","INNER","ON","LEFT","RIGHT","FULL","OUTER","CROSS","NATURAL","USING","NULL","IS","TRUE","FALSE","NULLS","FIRST","LAST","GROUP","HAVING","CHECKPOINT"};
@@ -22,11 +24,16 @@ bool isKeyword(const std::string& normalized) {
     // 与约束相关（PRIMARY/KEY/UNIQUE/REFERENCES/CHECK/FOREIGN/CONSTRAINT）以及 CAST/DEFAULT/BIGINT。
     // 拆成两组的目的是让主表保持紧凑，新增少量关键字时只改这一行即可。
 }
-
 // 共用扫描器。errors 为空指针时运行在严格模式：遇到第一个词法错误就按经典行为
 // 抛出异常，现有所有调用点都走这条路。errors 非空时运行在恢复模式：每条词法
 // 错误都记录成一条 MiniSqlError（带结束区间），随后在稳定位置继续扫描，从而
 // 把整批语句里的词法错误一次性报全；合法 token 照常产出，后续语句仍能解析。
+
+// Shared scanner. When `errors` is nullptr it runs in strict mode (throws on
+// the first lexical error, the classic behaviour used by all existing call
+// sites). When `errors` is non-null it runs in recovery mode: each lexical
+// error is recorded as a MiniSqlError (with an end span) and scanning resumes
+// at a stable point so every lexical error in the batch is reported at once.
 void scanImpl(const std::string& s, const std::function<void(const Token&)>& consume,
               std::vector<MiniSqlError>* errors) {
     std::size_t i=0, line=1, column=1;
@@ -50,6 +57,8 @@ void scanImpl(const std::string& s, const std::function<void(const Token&)>& con
     };
     // 报告一个词法错误，出错区间是 [locStart, locEnd]。严格模式下抛出异常；
     // 恢复模式下记录进 errors 并返回 false，让调用方继续往下扫。
+    // Reports a lexical error at [locStart, locEnd]. In strict mode throws;
+    // in recovery mode records and returns false so the caller continues.
     auto report=[&](const char* message, const SourceLocation& locStart, const SourceLocation& locEnd){
         if (errors) {
         // 恢复模式：errors 不为空。
@@ -77,6 +86,9 @@ void scanImpl(const std::string& s, const std::function<void(const Token&)>& con
         // 预取当前位置往后两个字符，用来判断 -- 、/* 、>= 这类多字符记号。
         // 识别到坏 token 后该标志为真，表示这个 token 已被丢弃（错误已记录），
         // 扫描改从下一个稳定记号继续，而不是让整批语句全部作废。
+        // If true after recognizing a bad token, the token is dropped (errors
+        // recorded) and scanning resumes at the next stable token instead of
+        // aborting the whole batch. In strict mode report() throws first.
         bool dropped=false;
         // dropped 为真时主循环末尾会 continue，跳过后面的产出逻辑。
         const auto dropToStable=[&](){
@@ -86,6 +98,8 @@ void scanImpl(const std::string& s, const std::function<void(const Token&)>& con
                 const char d=s[i];
                 // 取当前字符判断是不是边界。
                 // 空白分隔的 token 边界，以及语句/表达式分隔符，都是稳定恢复点。
+                // Space-separated token boundaries and statement/expression
+                // delimiters are stable recovery points.
                 if(d==' '||d=='\t'||d=='\r'||d=='\n'||d==';'||d==')'||d=='('||d==',')return;
                 // 遇到这些字符就停下，说明已经停在一个新 token 的自然起点上。
                 advance();
@@ -120,6 +134,13 @@ void scanImpl(const std::string& s, const std::function<void(const Token&)>& con
             // 把副本里的小写字母统一减 32 变成大写，实现大小写不敏感比较。
             type=isKeyword(normalized)?"KEYWORD":"IDENTIFIER";
             // 转大写后能在关键字表里查到的算 KEYWORD，否则算普通 IDENTIFIER。
+            // 词法只接受 ASCII 字母/数字/下划线，因此字节数即字符数。
+            if(type=="IDENTIFIER"&&i-start>kMaxIdentifierLength){
+                const SourceLocation end{line,column};
+                report("Identifier exceeds 128 characters",loc,end);
+                drop();
+                continue;
+            }
         } else if(digit(c)){
         // 分支二：以数字开头，进入数字字面量识别。
             while(i<s.size()&&digit(s[i]))advance();
@@ -168,7 +189,7 @@ void scanImpl(const std::string& s, const std::function<void(const Token&)>& con
                     // 上报"不支持字符串内换行"，严格模式在此抛出。
                     recovered=true;
                     // 标记已走恢复路径，循环随即结束。
-                    if(!closed)drop(); // 跳过坏字符串，但保持继续扫描
+                    if(!closed)drop(); // skip malformed string; keep scanning
                     // 尚未闭合时把这个坏 token 丢掉并重新同步到下一个稳定点。
                     break;
                     // 跳出字符串扫描循环。
@@ -188,7 +209,7 @@ void scanImpl(const std::string& s, const std::function<void(const Token&)>& con
             }
             if(!closed&&!recovered){const SourceLocation end{line,column};report("Unterminated string literal",loc,end);drop();}
             // 一路读到文件末尾都没闭合，属于未闭合字符串：上报并丢弃该 token。
-            if(recovered){continue;} // 已经丢弃并安全跳过换行，直接进入下一轮
+            if(recovered){continue;} // already dropped+safely skipped past the newline
             // 若走的是换行错误路径，这里直接继续，避免把半截字符串当合法 token 产出。
             type="STRING";
             // 正常闭合，种别码为 STRING。
@@ -208,11 +229,9 @@ void scanImpl(const std::string& s, const std::function<void(const Token&)>& con
         // 如果本次识别过程中已判定为坏 token，就不产出，直接进入下一轮。
         const SourceLocation endLoc{line,column};
         // 记录 token 结束位置：此时游标已停在 token 之后。
-        consume({type,s.substr(start,i-start),loc,endLoc});
-        // 产出这个 token：种别码 + 词素值 + 起始位置 + 结束位置，交给回调。
+        consume({type,s.substr(start,i-start),loc,endLoc,start,i});
     }
-    consume({"END","",{line,column},{line,column}});
-    // 全部字符扫完后补一个 END 结束标记，方便上层解析循环用它判断"输入结束"。
+    consume({"END","",{line,column},{line,column},i,i});
 }
 } // namespace
 

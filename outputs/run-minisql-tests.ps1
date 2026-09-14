@@ -31,6 +31,15 @@ function Invoke-FrontendTests {
     } finally { Pop-Location }
 }
 
+if (-not (Test-Path -LiteralPath (Join-Path $frontend 'node_modules'))) {
+    Write-Host "`n>>> npm.cmd ci" -ForegroundColor Cyan
+    Push-Location $frontend
+    try {
+        npm.cmd ci
+        if ($LASTEXITCODE -ne 0) { throw 'Frontend dependency installation failed.' }
+    } finally { Pop-Location }
+}
+
 if ($Build) {
     Write-Host "`n>>> cmake build Release" -ForegroundColor Cyan
     Push-Location $backend
@@ -38,6 +47,25 @@ if ($Build) {
         cmake --build build/windows --config Release --parallel 4
         if ($LASTEXITCODE -ne 0) { throw 'Backend build failed.' }
     } finally { Pop-Location }
+}
+
+# 仓库里 43 个进程测试从 bin/ 读取可执行体（bin/ 被 .gitignore 忽略，属于本地产物）。
+# 不同步的话，回归会静默地验证上一次构建的旧二进制 —— 曾因此把一个真实的栈溢出
+# 崩溃误判成“既有失败”。跑测试前把最新构建产物同步回 bin/。
+$releaseDir = Join-Path $backend 'build/windows/Release'
+if (Test-Path -LiteralPath $releaseDir) {
+    $binDir = Join-Path $backend 'bin'
+    New-Item -ItemType Directory -Force -Path $binDir | Out-Null
+    $synced = 0
+    Get-ChildItem -Path (Join-Path $releaseDir '*.exe'), (Join-Path $releaseDir '*.dll') -ErrorAction SilentlyContinue | ForEach-Object {
+        Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $binDir $_.Name) -Force
+        $synced++
+    }
+    # 测试引用的是构建产物原名（minisql_journal_probe.exe 等），这里不做任何别名映射，
+    # 保证 bin/ 是构建输出的忠实镜像，避免出现“测试找不到可执行体”的静默 ENOENT。
+    Write-Host "`n>>> synced $synced build artifacts into bin/" -ForegroundColor Cyan
+} else {
+    Write-Host "`n>>> build/windows/Release not found; using existing bin/ artifacts" -ForegroundColor Yellow
 }
 
 $groups = @{
@@ -66,6 +94,8 @@ $groups = @{
         'tests/transaction-process.mjs'
         'tests/transaction-savepoint.mjs'
         'tests/transaction-overflow.mjs'
+        'tests/requirements-limits-process.mjs'
+        'tests/nesting-depth-process.mjs'
     )
     storage = @(
         'tests/checkpoint-smoke.mjs',
@@ -74,17 +104,25 @@ $groups = @{
         'tests/background-checkpoint-fault-injection.mjs',
         'tests/cli-input-and-buffer-log.mjs',
         'tests/journal-process.mjs',
+        'tests/wal-metadata-process.mjs',
+        'tests/wal-group-commit.mjs',
+        'tests/doublewrite-torn-page.mjs',
         'tests/index-smoke.mjs',
+        'tests/incremental-index-process.mjs',
+        'tests/index-transaction-process.mjs',
         'tests/index-performance-curve.mjs',
         'tests/backup-smoke.mjs',
         'tests/external-sort-smoke.mjs',
-        'tests/external-aggregate-smoke.mjs'
+        'tests/external-aggregate-smoke.mjs',
+        'tests/query-resource-process.mjs'
     )
     http = @(
         'tests/database-http.mjs',
         'tests/session-http.mjs',
         'tests/multi-session-http.mjs',
         'tests/access-control-http.mjs',
+        'tests/access-binding-process.mjs',
+        'tests/requirements-http-contract.mjs',
         'tests/observability-http.mjs',
         'tests/cancel-smoke.mjs',
         'tests/result-budget-smoke.mjs',

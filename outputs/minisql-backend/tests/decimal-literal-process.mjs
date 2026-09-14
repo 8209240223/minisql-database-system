@@ -36,7 +36,10 @@ const avgOverflow=run(`SELECT\nAVG(${maximum}) FROM t;`);
 equal(avgOverflow.error.line,2);equal(avgOverflow.error.column,5);
 const averageMaximum='99999999999999999999999999999999.999999';
 equal(query(`SELECT AVG(${averageMaximum}) FROM t;`),[[averageMaximum]]);
-for(const raw of ['1.','1.2.3','1.2e3','1.2abc','.5']) equal(run(`SELECT ${raw} FROM t;`).error.code,2001);
+for(const raw of ['1.','1.2.3','1.2abc','.5']) equal(run(`SELECT ${raw} FROM t;`).error.code,2001);
+// grammar.md 的 float_literal 允许尾随指数段：带指数的字面量是合法的 FLOAT，
+// 不是非法 DECIMAL（此前这条断言写于 FLOAT 指数形式实现之前，已过时）。
+equal(query('SELECT 1.2e3,1.2E-3 FROM t LIMIT 1;'),[[1200,0.0012]]);
 for(const raw of ['1.'+'0'.repeat(38),'0.'+'0'.repeat(38)+'1']) equal(run(`SELECT ${raw} FROM t;`).error.code,2003);
 equal(run('SELECT 1.0+TRUE FROM t;').error.code,2003);
 equal(run("SELECT 1.0='1.0' FROM t;").error.code,2003);
