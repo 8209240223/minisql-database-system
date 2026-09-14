@@ -104,10 +104,26 @@ int main(int argc, char** argv) {
             // 语义分析 + 计划生成，得到优化前的逻辑计划。
             plans = minisql::sql::serializePlans(original);
             // 序列化原计划。
+            // plan[*].checkDefinitions 必须与上面 ast 里的 checks 逐节点相等
+            // （tests/check-process.mjs 的 checkDefinitions == ast.checks 断言依赖这一点）。
+            // ast 侧由 serializeAst 内的 annotateAst 分配 nodeId/sourceSpan，
+            // 而 checkDefinitions 由 serializePlans 单独序列化、拿不到同一套编号。
+            // 两者本是同一批表达式树的副本，这里用已标注的 ast 侧覆盖计划侧，保证一致。
+            // serializeAst 对单条语句返回裸对象、多条语句才返回数组，这里统一成数组再逐条对齐。
+            const auto astStatements = nodes.is_array() ? nodes : json::array({nodes});
+            for (std::size_t i = 0; i < astStatements.size() && i < plans.size(); ++i) {
+                if (astStatements[i].is_object() && astStatements[i].contains("checks") && plans[i].is_object())
+                    plans[i]["checkDefinitions"] = astStatements[i]["checks"];
+            }
             const auto optimized = minisql::optimizer::optimize(original);
             // 跑优化器，得到改写后的计划以及改写记录。
             optimizedPlans = minisql::sql::serializePlans(optimized.plans);
             // 序列化优化后的计划。
+            // 优化后的计划同样要与 ast 的 checks 保持一致（见上面原计划的说明）。
+            for (std::size_t i = 0; i < astStatements.size() && i < optimizedPlans.size(); ++i) {
+                if (astStatements[i].is_object() && astStatements[i].contains("checks") && optimizedPlans[i].is_object())
+                    optimizedPlans[i]["checkDefinitions"] = astStatements[i]["checks"];
+            }
             rules = optimized.changes;
             // 记录每一处改写，便于在界面上展示优化过程。
             optimizerStatus["iterations"] = optimized.iterations;

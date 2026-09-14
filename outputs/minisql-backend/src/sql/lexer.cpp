@@ -19,7 +19,8 @@ bool isKeyword(const std::string& normalized) {
     return k.contains(normalized) || normalized=="BEGIN" || normalized=="COMMIT" || normalized=="ROLLBACK" ||
            normalized=="TRANSACTION" || normalized=="BIGINT" || normalized=="CAST" || normalized=="DEFAULT" ||
            normalized=="PRIMARY" || normalized=="KEY" || normalized=="UNIQUE" || normalized=="REFERENCES" ||
-           normalized=="CHECK" || normalized=="FOREIGN" || normalized=="CONSTRAINT";
+           normalized=="CHECK" || normalized=="FOREIGN" || normalized=="CONSTRAINT" ||
+           normalized=="LIKE" || normalized=="CROSS";
     // 先在主表里查；查不到再用后半段补判事务控制（BEGIN/COMMIT/ROLLBACK/TRANSACTION）
     // 与约束相关（PRIMARY/KEY/UNIQUE/REFERENCES/CHECK/FOREIGN/CONSTRAINT）以及 CAST/DEFAULT/BIGINT。
     // 拆成两组的目的是让主表保持紧凑，新增少量关键字时只改这一行即可。

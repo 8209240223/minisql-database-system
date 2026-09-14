@@ -63,8 +63,13 @@ try {
     'SELECT x.id FROM t x JOIN missing y ON x.id=y.id;',
     'SELECT t.id FROM t x JOIN u y ON x.id=y.id;',
   ]) equal(run(sql).error.type, 'SemanticError');
-  for (const sql of ['SELECT * FROM t CROSS JOIN u;', 'SELECT * FROM t NATURAL JOIN u;',
+  // CROSS JOIN 已接通（笛卡尔积），不再属于"应被拒绝"的语法；
+  // 这里单独验证它的结果，其余尚未实现的连接写法继续要求失败。
+  equal(run('SELECT * FROM t CROSS JOIN u;').success, true);
+  equal(run('SELECT COUNT(*) FROM t CROSS JOIN u;').results.at(-1).rows[0][0] >= 1, true);
+  for (const sql of ['SELECT * FROM t NATURAL JOIN u;',
     'SELECT * FROM t JOIN u;', 'SELECT * FROM t JOIN u USING(id);']) equal(run(sql).success, false);
+  // NATURAL JOIN / 缺少 ON / USING 仍未实现，必须继续被拒绝。
   const compiled = run('SELECT x.*,y.score FROM t x JOIN u y ON 1=1 AND x.id=y.id;', 'compile');
   equal(compiled.ast.joins[0].alias, 'y');
   const plan = compiled.plan.find(node => node.kind === 'NestedLoopJoin');

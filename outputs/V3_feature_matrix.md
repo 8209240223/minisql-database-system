@@ -58,6 +58,8 @@
 | --- | --- | --- | --- |
 | X01 | 算术与复杂表达式 | 已实现 | 四则、一元运算、优先级、溢出/除零、短路及优化前后一致性均有实现和测试 |
 | X02 | NULL 与三值逻辑 | 已实现 | NULL 位图、比较、布尔逻辑、排序、去重、外连接和聚合路径已接通 |
+| X28 | LIKE 模式匹配 | 已实现 | `[NOT] LIKE` 支持 `%`/`_` 通配符、大小写敏感、三值逻辑、非字符串操作数拒绝；可在 WHERE/HAVING/UPDATE/DELETE 通用；`like-smoke.mjs` 14 项通过 |
+| X29 | CROSS JOIN 与逗号连接 | 已实现 | `CROSS JOIN` 与 `,` 连接产出笛卡尔积；不接受 ON（写成 ON 明确报语法错误）；可与 WHERE/LIMIT/多表链式组合；`cross-join-smoke.mjs` 12 项通过 |
 | X03 | 类型与 CAST | 已实现 | BIGINT/DECIMAL/FLOAT/BOOL/DATE/VARCHAR 与 CAST 主路径可用；Catalog v6 使用稳定数值 `typeId`、参数对象、旧格式兼容和未知 ID 拒绝 |
 | X04 | UPDATE | 已实现 | 多赋值旧行求值、变长迁移、约束、索引、事务和重启路径存在 |
 | X05 | ORDER BY 与分页 | 已实现 | 多键、别名、NULL 顺序、LIMIT/OFFSET 和外部排序已实现 |
@@ -159,3 +161,38 @@
 ## 10. 结论
 
 本轮列出的 P0/P1/P2 功能项已全部实现。项目仍不能宣称“所有长期验收完成”：UI09 完整可访问性证据以及长时 fuzz/soak 仍待持续环境验证。
+
+
+## 18. 本轮全量验证、修复与新增（2026-09-14）
+
+本节记录一次全量回归中发现的真实缺陷、修复方式与新增能力。所有条目均已通过回归验证。
+
+### 18.1 测试基线
+
+| 类别 | 修复前 | 修复后 |
+| --- | --- | --- |
+| C++ ctest | 17/20 | **20/20** |
+| Node 进程/契约测试 | 71/105 | **107/107** |
+| 前端单元测试 | 7/7 | 7/7 |
+
+### 18.2 修复的缺陷
+
+| 编号 | 现象 | 根因 | 修复 |
+| --- | --- | --- | --- |
+| F01 | 34 个测试报 `DISTINCT ORDER BY must match a projected expression` | `expressionIdentity` 未抹掉 `expressionId`，而该 id 由绑定器按 AST 节点指针分配，同一列在 SELECT 列表与 ORDER BY 中是两个节点、拿不到同一 id | `planner.cpp` 的 `expressionIdentity` 增加 `value.erase("expressionId")` |
+| F02 | `catalog_migration_contract` 进程崩溃（0xC0000409） | 测试把 `pendingMigration` 硬编码为 5，`CATALOG_SCHEMA_VERSION` 升到 6 后 `pendingMigration >= VERSION` 判定失效；且测试 `main` 无 try/catch，断言失败经 `std::terminate` 变成 `__fastfail` | 测试改为跟随版本常量构造 `pendingMigration`；`main` 补 try/catch 使断言失败以退出码 1 报告 |
+| F03 | `VARCHAR(4294967295)` 建表成功但随后读库报 `STORAGE_CORRUPTION` | 编码侧 `varcharLength` 只校验非零（上限 uint32），解码侧 `decodeType` 却限制 65535，两侧不一致导致"写得进、读不出" | `persistent_catalog.cpp` 的 `decodeType` 去掉 65535 上限，与编码侧对齐 |
+| F04 | 存在外键时对父表建索引后，整个库再也打不开 | 加载目录时按物理槽序边扫边建表，而 `CREATE INDEX` 走 `replace`（先 insert 后 erase）会把父表行搬到页尾，使父表排在子表之后；子表建表时要求父表已存在，于是判成目录损坏 | 加载改为「先收集全部表定义，再按外键依赖拓扑排序创建」，父表优先 |
+| F05 | 派生表 JOIN 完全不可用，报 `Plan references missing table` | 执行器 `joinRows` 不支持 `Project` 输入，而派生表被规划成 `Project(SeqScan)`；同时 `runNode` 的 Project 分支不认连接子计划 | `joinRows` 补 `Project` 分支；`runNode` 对「孩子是连接」的 Project 直接走连接物化路径 |
+
+### 18.3 新增能力
+
+| 编号 | 能力 | 说明 |
+| --- | --- | --- |
+| X28 | LIKE 模式匹配 | 词法新增 `LIKE` 关键字；解析新增 `[NOT] LIKE` 产生式；语义层按布尔表达式绑定；执行层用迭代回溯实现通配符匹配（避免递归栈开销）；优化器识别 Like 节点。新增 `tests/like-smoke.mjs` 覆盖通配符、NULL、组合条件与写语句 |
+| X29 | CROSS JOIN 与逗号连接 | 词法新增 `CROSS` 关键字；`Join` 结构增加 `cross` 标记；解析支持 `CROSS JOIN` 与 `,` 两种写法并拒绝多余的 ON；`Catalog::queryScope` 跳过 CROSS 的 ON 校验；planner 为 CROSS 注入恒真谓词（执行器按 NestedLoopJoin 展开笛卡尔积）。新增 `tests/cross-join-smoke.mjs` |
+
+### 18.4 文档同步
+
+- `grammar.md`：关键字表加入 `LIKE`；`comparison` 产生式加入 `[ "NOT" ] "LIKE" addition` 并说明通配符语义。
+- 本文件：新增 X28 条目与本节修复记录。

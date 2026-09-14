@@ -308,7 +308,11 @@ inline void annotateAst(nlohmann::json& node, std::size_t& nextId) {
         return;
     }
     if (!node.is_object()) return;
-    if (node.contains("kind") && node.at("kind").is_string()) {
+    // 判定"这是不是一个 AST 节点"不能只看 kind：constraintNames 的元素也带 kind
+    // （取值是 key/check/foreignKey 这类约束类别），若一并标注就会在 ast.constraintNames
+    // 里凭空多出 nodeId/sourceSpan，与 tests/named-constraint-process.mjs 的期望不符。
+    // 真正的 AST/表达式节点一定带源位置（line/column），用这个特征把元数据排除掉。
+    if (node.contains("kind") && node.at("kind").is_string() && node.contains("line") && node.contains("column")) {
         node["nodeId"] = nextId++;
         node["sourceSpan"] = astSourceSpan(node);
         if (node.contains("selectItems")) {

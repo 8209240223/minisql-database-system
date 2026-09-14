@@ -122,6 +122,38 @@ json cell(const storage::Value& value) {
         // 其余类型直接构造 JSON（整数、浮点、字符串、布尔都能隐式转换）。
     }, value);
 }
+bool likeMatch(const std::string& text, const std::string& pattern) {
+// LIKE 模式匹配：% 匹配任意长度子串（含空串），_ 匹配恰好一个字符，其余按字面比较。
+// 用迭代回溯实现，避免递归带来的栈开销：记录最近一次 % 的位置与当时匹配到的文本下标。
+    std::size_t ti = 0, pi = 0;
+// ti 是文本游标，pi 是模式游标。
+    std::size_t starPattern = std::string::npos, starText = 0;
+// starPattern 记录最近一个 % 在模式中的位置，starText 记录它当时对应的文本位置。
+    while (ti < text.size()) {
+// 只要文本还没走完就继续匹配。
+        if (pi < pattern.size() && (pattern[pi] == '_' || pattern[pi] == text[ti])) {
+// 单字符匹配：_ 吃掉任意一个字符，普通字符要求逐字相等。
+            ++ti; ++pi;
+// 两个游标一起前进。
+        } else if (pi < pattern.size() && pattern[pi] == '%') {
+// 遇到 %：先假设它匹配空串，记住这个可以回溯的位置。
+            starPattern = pi; starText = ti; ++pi;
+// 记下 % 的位置与当前文本位置，模式游标前进一格。
+        } else if (starPattern != std::string::npos) {
+// 上面两条都不成立，但之前见过 %：让它多吞一个字符再重试。
+            pi = starPattern + 1; ++starText; ti = starText;
+// 模式游标回到 % 之后，文本多前进一个字符。
+        } else {
+// 没有可回溯的 %，说明匹配失败。
+            return false;
+        }
+    }
+// 文本已经走完。
+    while (pi < pattern.size() && pattern[pi] == '%') ++pi;
+// 模式尾部剩余的 % 可以匹配空串，全部跳过。
+    return pi == pattern.size();
+// 模式也走完才算整体匹配成功。
+}
 bool accepted(const json& value) { return value.is_boolean() && value.get<bool>(); }
 // 判断谓词求值结果是否"成立"：只有明确的 true 才算通过（NULL 与 false 都不通过）。
 bool hashJoinKeys(const json& predicate, std::size_t leftSize, std::size_t& leftKey, std::size_t& rightKey) {
@@ -516,6 +548,18 @@ json evaluate(const json& expression, const Row& row) {
     // 同理 OR 左边为真直接返回真。
     const json right = evaluate(expression.at("right"), row);
     // 走到这里说明必须求右侧了。
+    if (op == "LIKE" || op == "NOT LIKE") {
+    // LIKE 模式匹配：% 匹配任意长度子串（含空串），_ 匹配单个字符，其余按字面比较。
+    // 三值逻辑下任一侧为 NULL 时结果也是 NULL（与 SQL 标准一致）。
+        if (left.is_null() || right.is_null()) return nullptr;
+    // 任一操作数为空直接返回 NULL。
+        if (!left.is_string() || !right.is_string()) fail("LIKE requires string operands");
+    // 两侧都必须是字符串；混合类型属于用法错误。
+        const bool matched = likeMatch(left.get<std::string>(), right.get<std::string>());
+    // 按通配符规则逐字符比对。
+        return op == "NOT LIKE" ? json(!matched) : json(matched);
+    // NOT LIKE 取反。
+    }
     if (op == "AND" || op == "OR") {
     // 逻辑与/或的三值真值表。
         if (op == "AND" && right == false) return false;
@@ -915,7 +959,22 @@ nlohmann::json Database::compile(const std::string& source) {
     const auto plans = sql::compilePlans(ast, catalog_.view());
     // 语义校验 + 生成逻辑计划（用当前目录做列绑定）。
     const auto optimized = optimizer::optimize(plans, optimizerOptions());
-    return {{"success", true}, {"plan", sql::serializePlans(plans)}, {"optimizedPlan", sql::serializePlans(optimized.plans)},
+    // plan[*].checkDefinitions 必须与 ast 里的 checks 逐节点相等
+    // （tests/check-process.mjs 的 checkDefinitions == ast.checks 断言依赖这一点）。
+    // ast 侧的节点由 serializeAst 内的 annotateAst 分配 nodeId/sourceSpan，
+    // 而 checkDefinitions 由 serializePlans 单独序列化、拿不到同一套编号。
+    // 两者本是同一批表达式树的副本，这里用已标注的 ast 侧覆盖计划侧，保证两份产物一致。
+    auto astStatements = sql::serializeAst(ast);
+    // serializeAst 对单条语句返回裸对象、多条语句才返回数组，这里统一成数组。
+    if (!astStatements.is_array()) astStatements = nlohmann::json::array({astStatements});
+    auto planRows = sql::serializePlans(plans);
+    auto optimizedRows = sql::serializePlans(optimized.plans);
+    for (std::size_t i = 0; i < astStatements.size(); ++i) {
+        if (!astStatements[i].is_object() || !astStatements[i].contains("checks")) continue;
+        if (i < planRows.size() && planRows[i].is_object()) planRows[i]["checkDefinitions"] = astStatements[i]["checks"];
+        if (i < optimizedRows.size() && optimizedRows[i].is_object()) optimizedRows[i]["checkDefinitions"] = astStatements[i]["checks"];
+    }
+    return {{"success", true}, {"plan", planRows}, {"optimizedPlan", optimizedRows},
              // 返回优化前与优化后的两套计划，便于对照。
             {"optimizationRules", optimized.changes}, {"statements", ast.size()},
              // 命中的优化规则与语句条数。
@@ -2316,6 +2375,53 @@ std::vector<storage::Row> Database::joinRows(const sql::LogicalPlan& plan) {
         return rows;
 // 返回过滤后的行集合，本分支结束。
     }
+    if (plan.kind == "Project") {
+// Project 也可以作为 JOIN 的输入出现：FROM (SELECT ...) x JOIN t y 会把派生表
+// 规划成 Project(SeqScan)，而这里原本没有 Project 分支，导致 joinRows 走到末尾的
+// "Unsupported join input"——派生表 JOIN 因此完全不可用。派生表是带别名的子查询，
+// 语义上就是"先算出子查询的行，再按外层列引用取列"，所以这里先递归物化子节点，
+// 再对每一行求值投影表达式即可。
+        if (plan.children.size() != 1) fail("Join projection requires one child");
+// 投影必须恰好有一个输入。
+        rows = joinRows(plan.children.front());
+// 先物化子输入。
+        for (auto& row : rows) {
+// 逐行做投影。
+            storage::Row projected;
+// 投影后的强类型行。
+            projected.reserve(plan.projections.empty() ? plan.output.size() : plan.projections.size());
+// 按输出列数预留空间。
+            if (!plan.projections.empty()) {
+// 有显式投影表达式时逐项求值。
+                for (const auto& expression : plan.projections) {
+// 遍历每个投影表达式。
+                    const auto value = evaluate(expression, row);
+// 在子输入行上求值。
+                    const auto type = expression.value("type", std::string{"int"});
+// 取出表达式类型，供下面的转换使用。
+                    projected.push_back(indexValue(value, type));
+// 转成内部存储值并追加。
+                }
+// 投影表达式遍历结束。
+            } else {
+// 没有显式表达式时按输出模式的列号直接取列。
+                for (const auto& column : plan.output) {
+// 遍历每一输出列。
+                    if (column.columnId >= row.size()) fail("Join projection outside row");
+// 列号越界说明计划与输入模式不一致。
+                    projected.push_back(row.at(column.columnId));
+// 复制对应单元格。
+                }
+// 输出列遍历结束。
+            }
+// 投影分支结束。
+            row = std::move(projected);
+// 用投影结果替换原行，保持行数不变。
+        }
+// 逐行投影结束。
+        return rows;
+// 返回投影后的行集合。
+    }
 // 过滤类输入分支结束。
     if (plan.kind == "IndexScan") {
 // IndexScan 节点：按索引键或范围取出候选行引用，再回堆表读行。
@@ -3360,6 +3466,44 @@ nlohmann::json Database::runNode(const sql::LogicalPlan& plan) {
 // 其他节点不算成形子计划。
         };
 // 递归 lambda 定义结束。
+        // 孩子是连接时，先物化连接结果，再对外层投影表达式逐行求值。
+        // 必须单独处理：派生表参与连接时连接节点的 table 字段是派生表别名
+        // （FROM (SELECT ...) x JOIN t y 里的 x），目录里没有这张表，若落到下面那条
+        // 按 plan.table 找物理表的通用路径，会报 Plan references missing table。
+        // joinRows 支持连接及其输入子树（含派生表 Project），因此这里直接复用。
+        if (plan.children.front().kind == "NestedLoopJoin" || plan.children.front().kind == "HashJoin" ||
+            plan.children.front().kind == "LeftJoin" || plan.children.front().kind == "RightJoin" ||
+            plan.children.front().kind == "FullJoin") {
+            for (const auto& column : plan.output) result["columns"].push_back(column.name);
+// 填写外层输出列名。
+            for (const auto& joinedRow : joinRows(plan.children.front())) {
+// 物化连接并逐行投影。
+                const auto asJson = rowJson(joinedRow);
+// 转成 JSON 便于表达式求值。
+                json projected = json::array();
+// 投影结果行。
+                if (!plan.projections.empty()) for (const auto& expression : plan.projections) projected.push_back(evaluate(expression, asJson));
+// 有显式投影时逐表达式求值。
+                else for (const auto& column : plan.output) {
+// 否则按输出列号取列。
+                    if (column.columnId >= asJson.size()) fail("Join projection outside row");
+// 越界说明计划与输入模式不一致。
+                    projected.push_back(asJson.at(column.columnId));
+// 取出对应单元格。
+                }
+// 投影分支结束。
+                result["rows"].push_back(std::move(projected));
+// 收集结果行。
+            }
+// 连接结果遍历结束。
+            result["kind"] = "Project";
+// 标记结果类型。
+            result["resourceUsage"] = {{"kind", "Project"}, {"rows", result.at("rows").size()}};
+// 附带资源使用信息。
+            return result;
+// 返回连接加投影的结果。
+        }
+// 连接孩子特判结束。
         if (subplanRoot(plan.children.front())) {
 // 孩子确实是成形子计划时走物化投影路径。
             for (const auto& column : plan.output) result["columns"].push_back(column.name);

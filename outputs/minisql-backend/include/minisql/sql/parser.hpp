@@ -39,10 +39,11 @@ struct OrderItem { std::shared_ptr<Expr> expression; bool descending = false; st
 // nullsFirst 记录 NULLS FIRST / NULLS LAST 的显式指定，未写时为空。
 struct Assignment { std::string column; std::shared_ptr<Expr> expression; };
 // UPDATE 里的一条赋值：column = expression。
-struct Join { std::string table; std::string alias; std::shared_ptr<Expr> on; bool left = false; bool right = false; };
+struct Join { std::string table; std::string alias; std::shared_ptr<Expr> on; bool left = false; bool right = false; bool cross = false; };
 // 一个连接子句。
 // table 是被连接的表名；alias 是它的别名。
 // on 是连接条件表达式；left / right 标记是左外连接还是右外连接。
+// cross 标记这是 CROSS JOIN 或逗号连接：没有 ON 条件，语义是笛卡尔积。
 struct KeyConstraint { bool primary = false; std::vector<std::string> columns{}; };
 // 表级键约束：primary 为真表示 PRIMARY KEY，否则表示 UNIQUE；
 // columns 是构成该键的列名序列，顺序有意义（复合键的前缀可独立走索引）。
