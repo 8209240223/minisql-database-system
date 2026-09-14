@@ -192,7 +192,12 @@
 | X28 | LIKE 模式匹配 | 词法新增 `LIKE` 关键字；解析新增 `[NOT] LIKE` 产生式；语义层按布尔表达式绑定；执行层用迭代回溯实现通配符匹配（避免递归栈开销）；优化器识别 Like 节点。新增 `tests/like-smoke.mjs` 覆盖通配符、NULL、组合条件与写语句 |
 | X29 | CROSS JOIN 与逗号连接 | 词法新增 `CROSS` 关键字；`Join` 结构增加 `cross` 标记；解析支持 `CROSS JOIN` 与 `,` 两种写法并拒绝多余的 ON；`Catalog::queryScope` 跳过 CROSS 的 ON 校验；planner 为 CROSS 注入恒真谓词（执行器按 NestedLoopJoin 展开笛卡尔积）。新增 `tests/cross-join-smoke.mjs` |
 
-### 18.4 文档同步
+### 18.4 类型编解码往返防护
 
-- `grammar.md`：关键字表加入 `LIKE`；`comparison` 产生式加入 `[ "NOT" ] "LIKE" addition` 并说明通配符语义。
+F03 属于"编码侧接受、解码侧拒绝"的不一致，这类缺陷只在重新打开数据库时才暴露，普通测试难以发现。除修复本身外，补充 `tests/type-roundtrip-smoke.mjs`：对全部基础类型与两类带参类型的边界值（VARCHAR 从 1 到 4294967295、DECIMAL 从 (1,0) 到 (38,38)）逐一做"建表 → 新进程读回"的往返，并确认超上限值在建表阶段就被拒绝而不是落盘后读不出。14 项通过。
+
+### 18.5 文档同步
+
+- `grammar.md`：关键字表加入 `LIKE`；`comparison` 产生式加入 `[ "NOT" ] "LIKE" addition` 并说明通配符语义；
+  `join_clause` 加入 `CROSS JOIN` 与逗号连接；从"不支持列表"移除 `CROSS JOIN`。
 - 本文件：新增 X28 条目与本节修复记录。
