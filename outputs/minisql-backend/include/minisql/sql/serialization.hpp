@@ -287,7 +287,7 @@ inline nlohmann::json serializeStatement(const Statement& statement) {
     // 连接列表先置空。
     for (const auto& join : statement.joins)
     // 逐个序列化 JOIN 子句。
-        node["joins"].push_back({{"kind", join.left && join.right ? "FullJoin" : join.left ? "LeftJoin" : join.right ? "RightJoin" : "InnerJoin"}, {"table", join.table}, {"alias", join.alias}, {"on", serializeExpression(join.on)}});
+        node["joins"].push_back({{"kind", join.cross ? "CrossJoin" : join.left && join.right ? "FullJoin" : join.left ? "LeftJoin" : join.right ? "RightJoin" : "InnerJoin"}, {"table", join.table}, {"alias", join.alias}, {"on", serializeExpression(join.on)}});
         // 两个布尔标记被压成一个可读的连接类型字符串：同时置位是 FullJoin，
         // 只左是 LeftJoin，只右是 RightJoin，都不置位是 InnerJoin，
         // 这样反序列化时按一个字段就能还原出原来的两个布尔值。
@@ -465,8 +465,8 @@ inline Statement readStatement(const nlohmann::json& node, std::size_t depth = 0
     }
     if (node.contains("joins")) for (const auto& item : node.at("joins")) {
     // 逐项还原 JOIN 子句。
-        if (!item.is_object() || !item.contains("table") || !item.contains("on")) invalid();
-        // 连接必须有被连接的表名和 ON 条件。
+        if (!item.is_object() || !item.contains("table")) invalid();
+        // 连接必须有被连接的表名；ON 是否必需取决于连接类型，下面按类型分别校验。
         Join join;
         // 准备连接结构。
         join.table = item.at("table").get<std::string>();
@@ -475,12 +475,24 @@ inline Statement readStatement(const nlohmann::json& node, std::size_t depth = 0
         // 还原别名，缺字段按空串。
         const auto kind = item.value("kind", "InnerJoin");
         // 取连接类型字符串，缺字段时按内连接处理（兼容只写 kind 的老格式）。
+        join.cross = kind == "CrossJoin";
+        // CROSS JOIN 与逗号连接没有 ON 条件，语义是笛卡尔积；
+        // 必须显式还原这个标记，否则往返后会退化成 InnerJoin 并丢失笛卡尔积语义。
+        if (kind != "InnerJoin" && kind != "LeftJoin" && kind != "RightJoin" && kind != "FullJoin" && !join.cross) invalid();
+        // 连接类型白名单，未知取值一律拒绝而不是按内连接猜测。
         join.left = kind == "LeftJoin" || kind == "FullJoin";
         // 左外与全外连接都满足"左侧保留"这一条。
         join.right = kind == "RightJoin" || kind == "FullJoin";
         // 右外与全外连接都满足"右侧保留"这一条。
-        join.on = deserializeExpression(item.at("on"), depth + 1);
-        // 还原 ON 条件表达式。
+        if (join.cross) {
+        // CROSS JOIN 不留 ON；产物里若带 ON 说明与类型自相矛盾。
+            if (item.contains("on") && !item.at("on").is_null()) invalid();
+        } else {
+            if (!item.contains("on")) invalid();
+            // 其余连接类型必须带 ON 字段。
+            join.on = deserializeExpression(item.at("on"), depth + 1);
+            // 还原 ON 条件表达式。
+        }
         statement.joins.push_back(std::move(join));
         // 收进连接列表。
     }

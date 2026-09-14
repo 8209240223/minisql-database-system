@@ -56,4 +56,9 @@ assert.equal(compiled.success, true);
 // 编译必须成功。
 assert.equal(compiled.plan[0].kind, 'Project');
 // 根节点应是投影。
+assert.equal(compiled.ast.joins[0].kind, 'CrossJoin');
+// AST 里必须把 CROSS JOIN 标成独立的 CrossJoin 类型，而不是退化成 InnerJoin；
+// 否则序列化往返后 on 为空、语义会从"笛卡尔积"变成"无条件的连接"。
+assert.equal(compiled.ast.joins[0].on, null);
+// CROSS JOIN 没有 ON 条件。
 console.log('12 CROSS JOIN smoke checks passed');
