@@ -61,4 +61,25 @@ assert.equal(compiled.ast.joins[0].kind, 'CrossJoin');
 // 否则序列化往返后 on 为空、语义会从"笛卡尔积"变成"无条件的连接"。
 assert.equal(compiled.ast.joins[0].on, null);
 // CROSS JOIN 没有 ON 条件。
-console.log('12 CROSS JOIN smoke checks passed');
+// ---- 计划序列化往返：CROSS JOIN 必须能在计划文档里存活 ----
+const rtSource = 'SELECT a.id, b.id FROM a CROSS JOIN b ORDER BY a.id, b.id;';
+const rtCompiled = run(rtSource, 'compile');
+// 编译出计划文档。
+assert.equal(rtCompiled.success, true);
+// 编译必须成功。
+const rtDocument = JSON.stringify(rtCompiled.plan);
+// 计划文档。
+const rtDirect = rows(rtSource);
+// 直接执行结果。
+const rtViaPlan = (() => {
+// 经 executePlan 往返后执行。
+  const result = run(rtDocument, 'executePlan');
+// 执行计划文档。
+  assert.equal(result.success, true, JSON.stringify(result.error ?? result));
+// 必须成功。
+  return result.results.at(-1).rows;
+// 取结果。
+})();
+assert.deepEqual(rtViaPlan, rtDirect);
+// 往返前后结果一致，笛卡尔积语义未丢失。
+console.log('14 CROSS JOIN smoke checks passed');
