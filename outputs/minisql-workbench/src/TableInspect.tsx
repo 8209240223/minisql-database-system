@@ -2,9 +2,13 @@ import type { Table } from './types';
 import './inspect-table.css';
 
 export function TableInspectView({ table }: { table: Table | undefined }) {
+// 表结构详情组件：展示列、主键、唯一键、外键和索引。
   if (!table) return <p className="inspect-empty">点击左侧表名查看表结构详情。</p>;
+// 没有选中表时显示引导文案。
   const primaryKeys = table.keys?.filter(key => key.primary) ?? [];
+// 过滤出主键定义。
   const uniqueKeys = table.keys?.filter(key => !key.primary) ?? [];
+// 过滤出唯一键定义。
   return <section className="inspect-info" aria-label="表结构详情">
     <header><strong>{table.name}</strong><span className="inspect-mode">表结构</span></header>
     <div className="inspect-summary"><dl>

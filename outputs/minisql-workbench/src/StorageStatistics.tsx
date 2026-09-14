@@ -3,16 +3,26 @@ import { useState } from 'react';
 import { RotateCcw } from 'lucide-react';
 
 export function StorageStatisticsView({ value, disabled, onConfigure }: { value: StorageStatistics; disabled: boolean; onConfigure: (action: 'LRU' | 'FIFO' | 'RESET') => Promise<void> }) {
+// 存储统计组件：展示页文件、缓冲池和淘汰日志，并提供缓存策略切换。
   const [busy, setBusy] = useState(false);
+// 标记配置请求是否正在进行，防止重复提交。
   const [error, setError] = useState('');
+// 保存配置失败时的错误信息。
   async function configure(action: 'LRU' | 'FIFO' | 'RESET') {
+// 执行缓冲池策略切换或统计清零。
     if (busy || disabled) return;
+// 正在请求或组件被禁用时不重复操作。
     setBusy(true); setError('');
+// 进入忙碌状态并清空旧错误。
     try { await onConfigure(action); }
+// 调用上层传入的配置回调。
     catch (failure) { setError(failure instanceof Error ? failure.message : String(failure)); }
+// 捕获失败并展示错误消息。
     finally { setBusy(false); }
+// 无论成功失败都退出忙碌状态。
   }
   const buffer = value.buffer;
+// 取出缓冲池统计，后面根据 available 决定是否展示详情。
   return <section className="storage-info" aria-label="存储统计">
     <div>页大小 {value.pageSize} B · 文件大小 {value.fileBytes} B</div>
     <div>已分配页 {value.allocatedPages}</div>

@@ -1,4 +1,4 @@
-$ErrorActionPreference = 'SilentlyContinue'
+﻿$ErrorActionPreference = 'SilentlyContinue'
 foreach ($port in 8081, 8082, 4173) {
   $listeners = Get-NetTCPConnection -LocalPort $port -State Listen
   foreach ($listener in $listeners) {

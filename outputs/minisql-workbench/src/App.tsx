@@ -20,6 +20,8 @@ import { DRAFT_KEY, emptyView, newQueryTab, restoreTabs, serializeTabs } from '.
 import type { QueryView } from './query-tabs';
 import './query-tabs.css';
 import { decodeSqlFile, sqlFilename, MAX_SQL_FILE_BYTES } from './sql-files';
+// 引入自定义补全模块：幽灵文本、Tab 键位与按目录表结构构建的 schema。
+import { completionBaseExtension, completionTabKeymap, inlineCompletionExtensions, sqlSchemaFor } from './sql-completion';
 import { mapDiagnostic } from './diagnostic-location';
 import { mutationWarning } from './sql-safety';
 import { formatMiniSql } from './sql-format';
@@ -48,7 +50,14 @@ const connectionKindLabel = (kind: Connection['kind']) => kind === 'demo' ? '本
 const CONNECTIONS_KEY = 'minisql-studio-connections-v1';
 const CLIENT_TIMEOUT_KEY = 'minisql-client-timeout-ms';
 const DEFAULT_CLIENT_TIMEOUT_MS = 120000;
-const editorExtensions = [sql(), lintGutter()];
+// 编辑器扩展改由 buildEditorExtensions 按当前目录动态生成，
+// 因为 schema 补全需要把表名、列名喂给 CodeMirror 的 SQL 语言扩展。
+
+// 按目录里的表结构构造编辑器扩展。
+// 目录为空（未连接）时 sqlSchemaFor 返回 undefined，语言扩展退回纯关键字补全。
+function buildEditorExtensions(tables: Table[]) {
+  return [sql({ schema: sqlSchemaFor(tables) }), lintGutter(), completionBaseExtension, ...inlineCompletionExtensions(tables), completionTabKeymap];
+}
 
 function restoreConnectionProfiles(): ConnectionProfile[] {
   const fallback: ConnectionProfile[] = [
@@ -86,6 +95,8 @@ function App() {
   const [connectionFeedback, setConnectionFeedback] = useState<string>();
   const [connectionTest, setConnectionTest] = useState<string>();
   const [tables, setTables] = useState<Table[]>([]);
+  // 扩展跟着目录变化重建：表结构刷新后补全列表立即同步，不需要重挂编辑器。
+  const editorExtensions = useMemo(() => buildEditorExtensions(tables), [tables]);
   const [tabs, setTabs] = useState<QueryTab[]>(() => restoreTabs([newQueryTab({ id: 'q1', name: 'query_1.sql', sql: starter })]));
   const [active, setActive] = useState(tabs[0].id);
   const current = tabs.find(t => t.id === active) ?? tabs[0];
@@ -769,7 +780,7 @@ const [accessOpen, setAccessOpen] = useState(false);
       <main className="main"><div className="query-tabs"><div className="tab-scroll" ref={tabScrollRef}>{tabs.map(tab => <button className={tab.id === active ? 'query-tab active' : 'query-tab'} key={tab.id} onClick={() => setActive(tab.id)}><FileCode2 size={14}/><span>{tab.name}</span>{tab.running && <small aria-label={`${tab.name} 执行中`}>...</small>}<X size={13} onClick={e => { e.stopPropagation(); void closeTab(tab.id); }}/></button>)}<button className="new-tab" title="新建查询" onClick={addTab}><Plus size={16}/></button></div><div className="tab-actions"><button className="toolbar-btn" disabled={running || current.running || (!sessionId || ['UNKNOWN','ABORTED'].includes(transactionState))} onClick={() => void execute(true)}><Braces size={15}/> Explain</button><button className="run-btn" onClick={() => void execute(false)} disabled={running || current.running || (!sessionId || transactionState === 'UNKNOWN')}><Play size={15} fill="currentColor"/>{current.running ? 'Running...' : 'Run'}</button></div></div>
         <div className="query-state"><span title={current.name}>{current.name}</span><button className="icon-btn" aria-label="重命名查询" title="重命名查询" onClick={renameTab}><Pencil size={14}/></button>{current.dirty && <small>已修改</small>}{current.running && <small role="status">执行中</small>}{result && resultSource !== current.sql && <small data-testid="stale-result">结果对应旧 SQL</small>}{['pending','rolledBack','unknown'].includes(outcome ?? '') && <small data-testid="result-outcome">{outcome === 'pending' ? '未提交结果' : outcome === 'rolledBack' ? '事务已回滚' : '提交状态未知'}</small>}</div>
         <div className="file-toolbar"><button className="icon-btn" aria-label="导入 SQL" title="导入 SQL" onClick={() => fileInput.current?.click()}><Upload size={15}/></button><button className="icon-btn" aria-label="导出 SQL" title="导出 SQL" onClick={exportSql}><Download size={15}/></button><button className="icon-btn" aria-label="格式化 SQL" title="格式化 SQL" onClick={formatCurrentSql}><WandSparkles size={15}/></button>{selectedResult && <small data-testid="selection-result">选区结果</small>}{diagnostic && <><button className="icon-btn" aria-label="定位错误" title={`第 ${diagnostic.line} 行，第 ${diagnostic.column} 列`} disabled={current.sql.replace(/\r\n|\r/g, '\n') !== diagnostic.source} onClick={locateDiagnostic}><Search size={15}/></button><small data-testid="diagnostic-position">第 {diagnostic.line} 行，第 {diagnostic.column} 列{current.sql.replace(/\r\n|\r/g, '\n') !== diagnostic.source ? ' · 原 SQL 已修改' : ''}</small></>}</div>
-        <section className="editor-wrap"><CodeMirror key={active} onCreateEditor={view => { editor.current = view; setEditorInstance(view); }} value={current?.sql ?? ''} height="100%" theme="light" extensions={editorExtensions} onChange={updateSql} basicSetup={{ lineNumbers: true, foldGutter: true, highlightActiveLine: true, autocompletion: true }} /></section>
+        <section className="editor-wrap"><CodeMirror key={active} onCreateEditor={view => { editor.current = view; setEditorInstance(view); }} value={current?.sql ?? ''} height="100%" theme="light" extensions={editorExtensions} onChange={updateSql} basicSetup={{ lineNumbers: true, foldGutter: true, highlightActiveLine: true, autocompletion: false }} /></section>
         <section className="output"><div className="output-tabs"><button className={output === 'results' ? 'selected' : ''} onClick={() => setOutput('results')}><Table2 size={14}/> Result <span>{result?.rows.length ?? 0}</span></button><button className={output === 'plan' ? 'selected' : ''} onClick={() => setOutput('plan')}><Activity size={14}/> Plan <span>{result?.plan.length ?? 0}</span></button><button className={output === 'ast' ? 'selected' : ''} onClick={() => setOutput('ast')}><Braces size={14}/> AST</button><button className={output === 'tokens' ? 'selected' : ''} onClick={() => setOutput('tokens')}><Terminal size={14}/> Token 流 <span>{result?.tokens?.length ?? 0}</span></button><button className={output === 'diagnostics' ? 'selected' : ''} onClick={() => setOutput('diagnostics')}><Search size={14}/> Diagnostics</button><button className={output === 'inspect' ? 'selected' : ''} onClick={() => setOutput('inspect')}><Database size={14}/> Inspect</button><div className="output-spacer"/><span className="query-meta">{result ? `${result.durationMs.toFixed(1)} ms · ${result.affectedRows} affected` : 'Ready'}</span></div><div className="output-body">{notice ? <div className="error-state"><span>!</span><div><strong>Query failed</strong><p>{notice}</p>{diagnostics?.[0] && (diagnostics[0].actual || diagnostics[0].expected?.length) && <p>实际：{diagnostics[0].actual || '空'} · 期望：{diagnostics[0].expected?.join(' | ') || '未提供'}</p>}{diagnostics && diagnostics.length > 1 && <div className="diagnostic-list">{diagnostics.map((item, index) => <button key={`${item.statementIndex ?? index}-${item.column ?? 0}`} onClick={() => locateDiagnosticItem(item)}><b>{item.code ?? 'SQL'}</b> 第 {item.line ?? 1} 行，第 {item.column ?? 1} 列：{item.message}</button>)}</div>}<button onClick={() => setNotice('')}>Dismiss</button></div></div> : output === 'results' ? <Results result={result}/> : output === 'plan' ? <Plan result={result}/> : output === 'ast' ? <pre className="json-view">{result?.ast ? JSON.stringify(result.ast, null, 2) : 'Compile a query to inspect its AST.'}</pre> : output === 'tokens' ? <TokenStream result={result} onSelect={locateToken}/> : output === 'diagnostics' ? <Diagnostics result={result}/> : inspectInfo ? <IndexInspectView info={inspectInfo} busy={running} onVerify={verifyInspectedIndex} onRebuild={rebuildInspectedIndex}/> : <TableInspectView table={tableInspect}/>}</div></section>
       </main>
       <aside className="rightbar">{historyContent}<div className="right-bottom"><Search size={14}/><input placeholder="Search tables" value={filter} onChange={e => setFilter(e.target.value)}/></div></aside>

@@ -7,9 +7,13 @@ import { calculateVirtualRange } from './virtual-window';
 type Position = { row: number; column: number };
 
 export function Results({ result, rowLimit }: { result: QueryResult | null; rowLimit?: number }) {
+// 结果表格主组件：负责虚拟滚动、选区复制和 CSV 导出。
   rowLimit ??= Math.max(100, Math.min(10000, Number(localStorage.getItem('minisql-result-limit') ?? 1000) || 1000));
+// 从本地设置读取显示行数上限，并限制在 100 到 10000 之间。
   const [formulaProtection, setFormulaProtection] = useState(true);
+// 控制导出时是否对 Excel 公式注入做防护。
   const [distinguishNull, setDistinguishNull] = useState(true);
+// 控制导出时是否区分 NULL 与空字符串。
   const [exportError, setExportError] = useState('');
   const [selection, setSelection] = useState<{ source: QueryResult; anchor: Position; focus: Position } | null>(null);
   const [copied, setCopied] = useState(false);
@@ -17,7 +21,9 @@ export function Results({ result, rowLimit }: { result: QueryResult | null; rowL
   const [scrollTop, setScrollTop] = useState(0);
   const [viewportHeight, setViewportHeight] = useState(360);
   useEffect(() => { setSelection(null); setExportError(''); setCopied(false); }, [result]);
+// 每次查询结果变化时清空旧选区、旧错误和复制状态。
   useEffect(() => {
+// 监听结果容器尺寸变化，用于重新计算虚拟滚动视口高度。
     const element = scrollRef.current;
     if (!element) return;
     const measure = () => setViewportHeight(Math.max(0, element.clientHeight - 34));
@@ -27,15 +33,19 @@ export function Results({ result, rowLimit }: { result: QueryResult | null; rowL
     return () => observer.disconnect();
   }, [result]);
   const visibleRows = useMemo(() => result?.rows.slice(0, rowLimit) ?? [], [result, rowLimit]);
+// 根据显示上限截取需要渲染的行。
   const virtualRange = calculateVirtualRange({ rowCount: visibleRows.length, rowHeight: 30, viewportHeight, scrollTop });
+// 根据滚动位置计算当前真正需要挂载的行区间。
   const current = selection?.source === result ? selection : null;
   const bounds = current ? { top: Math.min(current.anchor.row,current.focus.row), bottom: Math.max(current.anchor.row,current.focus.row), left: Math.min(current.anchor.column,current.focus.column), right: Math.max(current.anchor.column,current.focus.column) } : null;
   function select(position: Position, extend: boolean) {
+// 选中一个单元格；按住 Shift 时以当前锚点扩展选区。
     if (!result) return;
     setSelection({ source: result, anchor: extend && current ? current.anchor : position, focus: position });
     setCopied(false); setExportError('');
   }
   async function copy() {
+// 把当前选区导出为 TSV 并写入系统剪贴板。
     if (!result || !bounds) return;
     try {
       if (!navigator.clipboard?.writeText) throw new Error('当前浏览器不允许访问剪贴板。');
@@ -45,6 +55,7 @@ export function Results({ result, rowLimit }: { result: QueryResult | null; rowL
     } catch (error) { setExportError(error instanceof Error ? error.message : String(error)); }
   }
   function cellKeys(event: React.KeyboardEvent<HTMLTableCellElement>, position: Position) {
+// 处理结果表格的键盘导航与复制快捷键。
     if (!result) return;
     if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'c') { event.preventDefault(); void copy(); return; }
     if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'a') {
@@ -58,6 +69,7 @@ export function Results({ result, rowLimit }: { result: QueryResult | null; rowL
     event.currentTarget.closest('table')?.querySelector<HTMLElement>(`[data-row="${next.row}"][data-column="${next.column}"]`)?.focus();
   }
   function download() {
+// 把全部已加载结果导出为 CSV 文件。
     if (!result?.columns.length) return;
     try {
       const csv = resultCsv(result.columns, result.rows, { formulaProtection, distinguishNull });
@@ -67,6 +79,7 @@ export function Results({ result, rowLimit }: { result: QueryResult | null; rowL
     } catch (error) { setExportError(error instanceof Error ? error.message : String(error)); }
   }
   if (!result) return <div className="empty-results"><Table2 size={28}/><strong>暂无查询结果</strong></div>;
+// 没有查询结果时显示空状态。
   return <div className="result-content">
     <div className="result-tools" aria-label="结果导出">
       <button className="icon-btn" title="导出已加载结果 CSV" aria-label="导出已加载结果 CSV" disabled={!result.columns.length} onClick={download}><Download size={16}/></button>

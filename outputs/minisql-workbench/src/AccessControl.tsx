@@ -10,11 +10,13 @@ type Tab = 'users' | 'roles' | 'audit' | 'sessions';
 type Subject = { type: 'user' | 'role'; name: string };
 
 function GrantEditor({ subject, connection, onChanged }: { subject: Subject; connection: Connection; onChanged: () => void }) {
+// 权限授予编辑器：选择对象并勾选需要授予或撤销的权限。
   const [object, setObject] = useState('*');
   const [selected, setSelected] = useState<string[]>(['read']);
   const [message, setMessage] = useState<string>();
   const toggle = (permission: string) => setSelected(previous => previous.includes(permission) ? previous.filter(p => p !== permission) : [...previous, permission]);
   const run = async (revoke = false) => {
+// 提交本轮授权变更；revoke 为真时执行撤权。
     setMessage(undefined);
     try {
       if (revoke) {
@@ -64,12 +66,14 @@ export function AccessControl({ connection, open, onClose }: { connection: Conne
   const apiMode = connection.mode === 'api';
 
   const doAction = async (run: () => Promise<unknown>, success?: string) => {
+// 执行一次权限操作并统一处理成功/失败提示。
     setError(undefined);
     try { await run(); setNewUser({ name: '', password: '', roles: '' }); setNewRole({ name: '', inherits: '', grants: '' }); await refresh(); }
     catch (e) { setError(e instanceof Error ? e.message : String(e)); }
     void success;
   };
   const cancel = async (sessionId: string) => {
+// 取消指定会话的正在执行请求。
     setSessionMessage(undefined);
     try { await cancelSession(connection, sessionId); setSessionMessage('已发送取消请求'); await refresh(); }
     catch (failure) { setSessionMessage(failure instanceof Error ? failure.message : String(failure)); }
@@ -116,6 +120,7 @@ export function AccessControl({ connection, open, onClose }: { connection: Conne
 }
 
 function UserRow({ user, connection, onChanged, onAction }: {
+// 用户列表行：展示用户、角色与授权入口。
   user: AccessUser; connection: Connection; onChanged: () => Promise<void>; onAction: (run: () => Promise<unknown>, success?: string) => Promise<void>;
 }) {
   const [roleName, setRoleName] = useState('');
@@ -137,6 +142,7 @@ function UserRow({ user, connection, onChanged, onAction }: {
 }
 
 function RoleRow({ role, connection, onChanged, onAction }: {
+// 角色列表行：展示角色继承关系与授权入口。
   role: AccessRole; connection: Connection; onChanged: () => Promise<void>; onAction: (run: () => Promise<unknown>, success?: string) => Promise<void>;
 }) {
   const [expanded, setExpanded] = useState(false);
@@ -153,6 +159,7 @@ function RoleRow({ role, connection, onChanged, onAction }: {
 }
 
 function AuditPanel({ entries, connection, onChanged }: { entries: AuditEntry[]; connection: Connection; onChanged: () => Promise<void> }) {
+// 审计面板：展示近期操作记录并支持刷新。
   const [filter, setFilter] = useState('');
   const filtered = entries.filter(e => !filter || e.user.includes(filter) || e.object?.includes(filter) || e.path.includes(filter));
   return <div className="access-panel">
