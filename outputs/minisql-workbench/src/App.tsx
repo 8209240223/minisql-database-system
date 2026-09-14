@@ -24,6 +24,7 @@ import { mapDiagnostic } from './diagnostic-location';
 import { mutationWarning } from './sql-safety';
 import { formatMiniSql } from './sql-format';
 import { HISTORY_KEY, MAX_HISTORY_SQL, limitHistory, restoreHistory, filterHistory } from './query-history';
+import { completionBaseExtension, completionTabKeymap, inlineCompletionExtensions, sqlSchemaFor } from './sql-completion';
 
 const starter = `-- MiniSQL Studio
 SELECT s.id, s.name, s.department, e.score
@@ -48,9 +49,13 @@ const connectionKindLabel = (kind: Connection['kind']) => kind === 'demo' ? '本
 const CONNECTIONS_KEY = 'minisql-studio-connections-v1';
 const CLIENT_TIMEOUT_KEY = 'minisql-client-timeout-ms';
 const DEFAULT_CLIENT_TIMEOUT_MS = 120000;
-const editorExtensions = [sql(), lintGutter()];
+// 编辑器的语言与补全扩展跟着目录变化重建：有表结构时按 schema 补全，未连接时退回关键字补全。
+function buildEditorExtensions(tables: Table[]) {
+  return [sql({ schema: sqlSchemaFor(tables) }), lintGutter(), completionBaseExtension, ...inlineCompletionExtensions(tables), completionTabKeymap];
+}
 
 function restoreConnectionProfiles(): ConnectionProfile[] {
+// 从本地存储恢复连接配置，缺失或损坏时回退到默认配置。
   const fallback: ConnectionProfile[] = [
     { ...connectionDefaults, user: 'admin' },
     { ...demoConnectionDefaults, user: 'admin' },
@@ -74,6 +79,7 @@ function restoreConnectionProfiles(): ConnectionProfile[] {
 }
 
 function App() {
+// 工作台主组件：管理连接、标签页、执行、历史与结果视图。
   const [connection, setConnection] = useState<Connection>(() => ({
     ...connectionDefaults,
     user: localStorage.getItem('minisql-user') ?? 'admin',
@@ -86,6 +92,8 @@ function App() {
   const [connectionFeedback, setConnectionFeedback] = useState<string>();
   const [connectionTest, setConnectionTest] = useState<string>();
   const [tables, setTables] = useState<Table[]>([]);
+  // 编辑器扩展随目录变化重建，表结构刷新后补全列表立即同步。
+  const editorExtensions = useMemo(() => buildEditorExtensions(tables), [tables]);
   const [tabs, setTabs] = useState<QueryTab[]>(() => restoreTabs([{ id: 'q1', name: 'query_1.sql', sql: starter }]));
   const [active, setActive] = useState(tabs[0].id);
   const [views, setViews] = useState<Record<string, QueryView>>({});
@@ -100,12 +108,16 @@ function App() {
   const importing = useRef(false);
   const [runningTab, setRunningTab] = useState<string>();
   function updateView(patch: Partial<QueryView>) {
+// 更新指定查询标签页的视图状态。
     const id = active;
     setViews(previous => liveTabs.current.has(id) ? { ...previous, [id]: { ...(previous[id] ?? emptyView), ...patch } } : previous);
   }
   function setOutput(value: QueryView['output']) { updateView({ output: value }); }
+// 切换当前标签页的输出面板。
   function setNotice(value: string) { updateView({ notice: value, diagnostic: undefined, diagnostics: undefined }); }
+// 显示提示信息并清除旧的诊断内容。
   function settlePending(value: string) {
+// 把所有仍处于 pending 状态的标签页结算为指定结果。
     setViews(previous => Object.fromEntries(Object.entries(previous).map(([id, view]) => [id, view.outcome === 'pending' ? { ...view, outcome: value } : view])));
   }
   const [running, setRunning] = useState(false);
@@ -202,6 +214,7 @@ const [accessOpen, setAccessOpen] = useState(false);
     };
   }, []);
   function recordHistory(source: string, compile: boolean, durationMs: number, rows: number, error?: string) {
+// 记录一次编译或执行历史，超长 SQL 只标记省略而不保存。
     setHistoryOmitted(source.length > MAX_HISTORY_SQL);
     if (source.length > MAX_HISTORY_SQL) return;
     const item: HistoryItem = { id: crypto.randomUUID(), sql: source, at: Date.now(), durationMs, rows,
@@ -234,6 +247,7 @@ const [accessOpen, setAccessOpen] = useState(false);
   }, [editorInstance, current.sql, diagnostic, notice]);
 
   function handleFailure(error: unknown) {
+// 统一处理请求失败：更新提示、事务状态并刷新会话。
     const details = error as { transactionState?: string; status?: number; commitState?: string };
     if (sessionId) {
       if (details.transactionState === 'ABORTED') settlePending('rolledBack');
@@ -244,8 +258,11 @@ const [accessOpen, setAccessOpen] = useState(false);
     setNotice(error instanceof Error ? error.message : String(error));
   }
   async function refresh() { try { setTables(await getCatalog(effectiveConnection)); } catch (e) { handleFailure(e); } }
+// 重新读取当前连接的数据库目录。
   async function refreshStorage() { if (sessionId) { try { setStorageInfo(await getStorage(effectiveConnection)); } catch (e) { handleFailure(e); } } }
+// 重新读取当前会话的存储与缓冲池统计。
   async function refreshSystem(target = effectiveConnection) {
+// 刷新后端能力声明与备份列表。
     setSystemBusy(true);
     setSystemError(undefined);
     try {
@@ -260,6 +277,7 @@ const [accessOpen, setAccessOpen] = useState(false);
   }
   useEffect(() => { if (settingsOpen) void refreshSystem(); }, [settingsOpen, connection.user, connection.password]);
   async function inspectTableIndex(table: string, index: string) {
+// 查看指定索引的页级结构并切换输出面板。
     if (busy.current || connection.mode !== 'api' || !sessionId) return;
     busy.current = true; setRunning(true);
     try { setInspectInfo(await inspectIndex(effectiveConnection, table, index)); setOutput('inspect'); }
@@ -267,6 +285,7 @@ const [accessOpen, setAccessOpen] = useState(false);
     finally { busy.current = false; setRunning(false); }
   }
   function inspectTable(table: Table) {
+// 在侧栏展示表结构详情。
     setTableInspect(table);
     setInspectInfo(undefined);
     setNotice('');
@@ -336,6 +355,7 @@ const [accessOpen, setAccessOpen] = useState(false);
     activeTab?.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'center' });
   }, [active]);
   function openConnectionManager() {
+// 打开连接管理对话框并初始化编辑草稿。
     setConnectionDraft({ ...connection, sessionId: undefined });
     setEditingConnectionName(connection.name);
     setConnectionFeedback(undefined);
@@ -343,12 +363,14 @@ const [accessOpen, setAccessOpen] = useState(false);
     setConnectionDialogOpen(true);
   }
   function newConnection() {
+// 新建一份默认连接草稿。
     setConnectionDraft({ ...connectionDefaults, name: `MiniSQL ${savedConnections.length + 1}`, user: 'admin', password: '' });
     setEditingConnectionName(undefined);
     setConnectionFeedback(undefined);
     setConnectionTest(undefined);
   }
   function normalizeConnectionDraft(): Connection | undefined {
+// 校验并补全连接草稿，非法时返回空并给出提示。
     const name = connectionDraft.name.trim();
     const user = connectionDraft.user.trim();
     const url = connectionDraft.url.trim().replace(/\/+$/, '');
@@ -376,6 +398,7 @@ const [accessOpen, setAccessOpen] = useState(false);
     return next;
   }
   function selectConnection(profile: ConnectionProfile) {
+// 切换到已保存的连接配置。
     if (sessionId) { setConnectionFeedback('请先断开当前会话，再切换连接。'); return; }
     setConnectionDraft({ ...profile, password: '' });
     setEditingConnectionName(profile.name);
@@ -383,12 +406,14 @@ const [accessOpen, setAccessOpen] = useState(false);
     setConnectionTest(undefined);
   }
   function removeConnection(profile: ConnectionProfile) {
+// 从本地存储删除指定连接配置。
     if (sessionId && profile.name === connection.name) return;
     if (!window.confirm(`删除连接配置 ${profile.name}？`)) return;
     setSavedConnections(previous => previous.filter(item => item.name !== profile.name));
     if (editingConnectionName === profile.name) newConnection();
   }
   async function testConnection() {
+// 测试连接草稿能否成功登录后端。
     const target = normalizeConnectionDraft();
     if (!target) return;
     setConnectionTest('正在测试连接...');
@@ -398,12 +423,14 @@ const [accessOpen, setAccessOpen] = useState(false);
     } catch (error) { setConnectionTest(error instanceof Error ? `连接失败 · ${error.message}` : `连接失败 · ${String(error)}`); }
   }
   async function connectFromDraft() {
+// 保存草稿后立即建立连接。
     const target = saveConnectionDraft();
     if (!target) return;
     setConnectionDialogOpen(false);
     await connect(target);
   }
   async function connect(target: Connection = connection) {
+// 与后端建立会话连接并加载目录。
     if (busy.current) return;
     busy.current = true; setRunning(true); setNotice('');
     let openedId: string | undefined;
@@ -431,7 +458,9 @@ const [accessOpen, setAccessOpen] = useState(false);
     finally { busy.current = false; setRunning(false); }
   }
   function updateSql(sqlText: string) { setTabs(v => v.map(t => t.id === active ? { ...t, sql: sqlText, dirty: t.dirty || t.sql !== sqlText } : t)); }
+// 更新当前标签页的 SQL 文本并标记未保存。
   async function execute(compile = false, command?: string) {
+// 执行当前 SQL；compile 为真时只做编译检查。
     const range = editor.current?.state.selection.main;
     const selected = range && !range.empty ? editor.current!.state.sliceDoc(range.from, range.to) : '';
     const hasSelection = !!range && !range.empty;
@@ -485,8 +514,11 @@ const [accessOpen, setAccessOpen] = useState(false);
     } finally { window.clearTimeout(timeoutTimer); if (hardTimeoutTimer !== undefined) window.clearTimeout(hardTimeoutTimer); busy.current = false; setRunning(false); setRunningTab(undefined); }
   }
   function addTab() { if (tabs.length >= 50) { setNotice('最多保留 50 个查询标签。'); return; } const id = crypto.randomUUID(); setTabs(v => [...v, { id, name: `query_${v.length + 1}.sql`, sql: '-- New query\n' }]); setActive(id); }
+// 新建查询标签页，最多保留 50 个。
   function insertTable(table: Table) { updateSql(`${current.sql}\nSELECT * FROM ${table.name};`); }
+// 把 SELECT * FROM 表名 插入当前编辑器。
   function queryColumn(table: Table, column: Table['columns'][number]) {
+// 生成针对某列的条件查询语句。
     if (tabs.length >= 50) { setNotice('最多保留 50 个查询标签。'); return; }
     const id = crypto.randomUUID();
     const sql = `SELECT ${column.name} FROM ${table.name};`;
@@ -501,6 +533,7 @@ const [accessOpen, setAccessOpen] = useState(false);
     void execute(false);
   }, [tabs, active]);
   function closeTab(id: string) {
+// 关闭查询标签页，正在执行的标签页不允许关闭。
     if (tabs.length === 1) return;
     if (id === runningTab) { setNotice('该标签正在执行，请等待请求结束。'); return; }
     if (tabs.find(tab => tab.id === id)?.dirty && !window.confirm('关闭标签将删除此 SQL 草稿，确认关闭？')) return;
@@ -516,6 +549,7 @@ const [accessOpen, setAccessOpen] = useState(false);
     setTabs(previous => previous.map(tab => tab.id === active ? { ...tab, name } : tab));
   }
   async function importSql(file?: File) {
+// 导入本地 SQL 文件到新的查询标签页。
     if (!file || importing.current) return;
     importing.current = true;
     try {
@@ -535,6 +569,7 @@ const [accessOpen, setAccessOpen] = useState(false);
     setTimeout(() => URL.revokeObjectURL(url), 1000);
   }
   async function formatCurrentSql() {
+// 格式化当前标签页中的 SQL 文本。
     try {
       const formatted = await formatMiniSql(current.sql);
       updateSql(formatted);
@@ -544,6 +579,7 @@ const [accessOpen, setAccessOpen] = useState(false);
     }
   }
   function locateDiagnostic() {
+// 把编辑器光标定位到当前诊断位置。
     const view = editor.current;
     if (!view || !diagnostic || view.state.doc.toString() !== diagnostic.source) return;
     view.dispatch({ selection: { anchor: diagnostic.offset, head: diagnostic.offset + diagnostic.length },
@@ -571,6 +607,7 @@ const [accessOpen, setAccessOpen] = useState(false);
     view.focus();
   }
   function shortcut(event: React.KeyboardEvent) {
+// 处理工作台范围内的快捷键。
     if (historyDialogOpen) return;
     if ((!event.ctrlKey && !event.metaKey) || event.altKey || event.nativeEvent.isComposing) return;
     if (event.key === 'Enter' && (event.target as HTMLElement).closest('.cm-editor')) {
@@ -580,6 +617,7 @@ const [accessOpen, setAccessOpen] = useState(false);
   }
 
   function historyKeys(event: React.KeyboardEvent<HTMLDialogElement>) {
+// 处理历史对话框内的 Tab 焦点循环。
     if (event.key !== 'Tab') return;
     const controls = Array.from(event.currentTarget.querySelectorAll<HTMLElement>('button:not(:disabled), input:not(:disabled)'));
     const first = controls[0], last = controls.at(-1);
@@ -682,7 +720,7 @@ const [accessOpen, setAccessOpen] = useState(false);
       <main className="main"><div className="query-tabs"><div className="tab-scroll" ref={tabScrollRef}>{tabs.map(tab => <button className={tab.id === active ? 'query-tab active' : 'query-tab'} key={tab.id} onClick={() => setActive(tab.id)}><FileCode2 size={14}/><span>{tab.name}</span><X size={13} onClick={e => { e.stopPropagation(); closeTab(tab.id); }}/></button>)}<button className="new-tab" title="新建查询" onClick={addTab}><Plus size={16}/></button></div><div className="tab-actions"><button className="toolbar-btn" disabled={running || (!sessionId || ['UNKNOWN','ABORTED'].includes(transactionState))} onClick={() => execute(true)}><Braces size={15}/> Explain</button><button className="run-btn" onClick={() => execute(false)} disabled={running || (!sessionId || transactionState === 'UNKNOWN')}><Play size={15} fill="currentColor"/>{running ? 'Running...' : 'Run'}</button></div></div>
         <div className="query-state"><span title={current.name}>{current.name}</span><button className="icon-btn" aria-label="重命名查询" title="重命名查询" onClick={renameTab}><Pencil size={14}/></button>{current.dirty && <small>已修改</small>}{runningTab === active && <small role="status">执行中</small>}{result && resultSource !== current.sql && <small data-testid="stale-result">结果对应旧 SQL</small>}{['pending','rolledBack','unknown'].includes(outcome ?? '') && <small data-testid="result-outcome">{outcome === 'pending' ? '未提交结果' : outcome === 'rolledBack' ? '事务已回滚' : '提交状态未知'}</small>}</div>
         <div className="file-toolbar"><button className="icon-btn" aria-label="导入 SQL" title="导入 SQL" onClick={() => fileInput.current?.click()}><Upload size={15}/></button><button className="icon-btn" aria-label="导出 SQL" title="导出 SQL" onClick={exportSql}><Download size={15}/></button><button className="icon-btn" aria-label="格式化 SQL" title="格式化 SQL" onClick={formatCurrentSql}><WandSparkles size={15}/></button>{selectedResult && <small data-testid="selection-result">选区结果</small>}{diagnostic && <><button className="icon-btn" aria-label="定位错误" title={`第 ${diagnostic.line} 行，第 ${diagnostic.column} 列`} disabled={current.sql.replace(/\r\n|\r/g, '\n') !== diagnostic.source} onClick={locateDiagnostic}><Search size={15}/></button><small data-testid="diagnostic-position">第 {diagnostic.line} 行，第 {diagnostic.column} 列{current.sql.replace(/\r\n|\r/g, '\n') !== diagnostic.source ? ' · 原 SQL 已修改' : ''}</small></>}</div>
-        <section className="editor-wrap"><CodeMirror key={active} onCreateEditor={view => { editor.current = view; setEditorInstance(view); }} value={current?.sql ?? ''} height="100%" theme="light" extensions={editorExtensions} onChange={updateSql} basicSetup={{ lineNumbers: true, foldGutter: true, highlightActiveLine: true, autocompletion: true }} /></section>
+        <section className="editor-wrap"><CodeMirror key={active} onCreateEditor={view => { editor.current = view; setEditorInstance(view); }} value={current?.sql ?? ''} height="100%" theme="light" extensions={editorExtensions} onChange={updateSql} basicSetup={{ lineNumbers: true, foldGutter: true, highlightActiveLine: true, autocompletion: false }} /></section>
         <section className="output"><div className="output-tabs"><button className={output === 'results' ? 'selected' : ''} onClick={() => setOutput('results')}><Table2 size={14}/> Result <span>{result?.rows.length ?? 0}</span></button><button className={output === 'plan' ? 'selected' : ''} onClick={() => setOutput('plan')}><Activity size={14}/> Plan <span>{result?.plan.length ?? 0}</span></button><button className={output === 'ast' ? 'selected' : ''} onClick={() => setOutput('ast')}><Braces size={14}/> AST</button><button className={output === 'tokens' ? 'selected' : ''} onClick={() => setOutput('tokens')}><Terminal size={14}/> Token 流 <span>{result?.tokens?.length ?? 0}</span></button><button className={output === 'diagnostics' ? 'selected' : ''} onClick={() => setOutput('diagnostics')}><Search size={14}/> Diagnostics</button><button className={output === 'inspect' ? 'selected' : ''} onClick={() => setOutput('inspect')}><Database size={14}/> Inspect</button><div className="output-spacer"/><span className="query-meta">{result ? `${result.durationMs.toFixed(1)} ms · ${result.affectedRows} affected` : 'Ready'}</span></div><div className="output-body">{notice ? <div className="error-state"><span>!</span><div><strong>Query failed</strong><p>{notice}</p>{diagnostics?.[0] && (diagnostics[0].actual || diagnostics[0].expected?.length) && <p>实际：{diagnostics[0].actual || '空'} · 期望：{diagnostics[0].expected?.join(' | ') || '未提供'}</p>}{diagnostics && diagnostics.length > 1 && <div className="diagnostic-list">{diagnostics.map((item, index) => <button key={`${item.statementIndex ?? index}-${item.column ?? 0}`} onClick={() => locateDiagnosticItem(item)}><b>{item.code ?? 'SQL'}</b> 第 {item.line ?? 1} 行，第 {item.column ?? 1} 列：{item.message}</button>)}</div>}<button onClick={() => setNotice('')}>Dismiss</button></div></div> : output === 'results' ? <Results result={result}/> : output === 'plan' ? <Plan result={result}/> : output === 'ast' ? <pre className="json-view">{result?.ast ? JSON.stringify(result.ast, null, 2) : 'Compile a query to inspect its AST.'}</pre> : output === 'tokens' ? <TokenStream result={result} onSelect={locateToken}/> : output === 'diagnostics' ? <Diagnostics result={result}/> : inspectInfo ? <IndexInspectView info={inspectInfo}/> : <TableInspectView table={tableInspect}/>}</div></section>
       </main>
       <aside className="rightbar">{historyContent}<div className="right-bottom"><Search size={14}/><input placeholder="Search tables" value={filter} onChange={e => setFilter(e.target.value)}/></div></aside>
@@ -691,6 +729,7 @@ const [accessOpen, setAccessOpen] = useState(false);
 }
 
 function SystemSettings({ connection, capabilities, backups, error, busy, connected, onRefresh }: {
+// 系统设置面板：展示能力与备份，并执行维护操作。
   connection: Connection;
   capabilities?: Capabilities;
   backups: BackupEntry[];

@@ -9,6 +9,7 @@
     "test:csv": "node --test tests/result-csv.test.mjs",
     "test:format": "node tests/sql-format.test.mjs",
     "test:virtual": "node tests/virtual-window.test.mjs",
+    "test:completion": "node --test tests/sql-completion.test.mjs",
     "test:dom": "node tests/c2-dom.cjs",
     "test:demo": "node tests/demo-mode-smoke.cjs",
     "test:browser": "node tests/compiler-dom.cjs && node tests/c2-dom.cjs && node tests/c2-resilience-dom.cjs",
@@ -17,8 +18,11 @@
     "preview": "vite preview --host 127.0.0.1"
   },
   "dependencies": {
+    "@codemirror/autocomplete": "^6.20.3",
     "@codemirror/lang-sql": "^6.10.0",
+    "@codemirror/language": "^6.12.4",
     "@codemirror/lint": "^6.9.7",
+    "@codemirror/state": "^6.7.4",
     "@codemirror/view": "^6.38.0",
     "@uiw/react-codemirror": "^4.25.0",
     "csv-stringify": "6.6.0",
