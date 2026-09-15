@@ -69,7 +69,7 @@ void scanTokens(const std::string& s, const std::function<void(const Token&)>& c
             }
             if(!closed)fail("Unterminated string literal: reached end of input, expected closing '\\''");
             type="STRING";
-        } else if(two=="=="||two=="<>"){fail("Unsupported comparison operator '"+two+"' (did you mean '=' or '!=' ?);}
+        } else if(two=="=="||two=="<>"){fail("Unsupported comparison operator '"+two+"' (did you mean '=' or '!=' ?)");}
         else if(two==">="||two=="<="||two=="!="){advance();advance();type="OPERATOR";}
         else if(std::string("=<>+-*/").find(c)!=std::string::npos){advance();type="OPERATOR";}
         else if(c=='.' && i+1<s.size() && digit(s[i+1]))fail("Unsupported numeric literal starting with '.': use '0.' prefix (found "+describeContext()+")");
