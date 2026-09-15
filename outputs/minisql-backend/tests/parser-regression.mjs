@@ -72,9 +72,13 @@ assert.match(lex9.error.message, /Unsupported numeric literal starting with '\.'
 const lex10 = run('SELECT a<>b;');
 assert.equal(lex10.success, false);
 assert.match(lex10.error.message, /Unsupported comparison operator '<>'/);
+// Multiline block comments are skipped without disturbing the token stream (lexer.cpp)
+const comment = run('SELECT 1 /* first\nsecond\nthird */ + 2 FROM t;');
+assert.equal(comment.success, true);
+assert.equal(comment.ast.selectItems[0].expression.kind, 'Binary');
 // Verify EXISTS / scalar-subquery recursion is depth-limited (parser.cpp)
 const deepExists = 'SELECT * FROM t WHERE ' + 'EXISTS(SELECT 1 FROM u WHERE '.repeat(300) + 'EXISTS(SELECT 1)' + ')'.repeat(300) + ';';
 assert.equal(run(deepExists).success, false);
 const deepScalar = 'SELECT ' + '(SELECT '.repeat(300) + '1' + ')'.repeat(300) + ' FROM t;';
 assert.equal(run(deepScalar).success, false);
-console.log('55 parser/lexer regression checks passed (including 16 error-message format checks)');
+console.log('57 parser/lexer regression checks passed (including 16 error-message format checks)');

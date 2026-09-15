@@ -24,6 +24,7 @@ void scanTokens(const std::string& s, const std::function<void(const Token&)>& c
         auto describeContext = [&]() -> std::string {
             if (i >= s.size()) return "reached end of input";
             std::string peek = s.substr(i, 8);
+            while (!peek.empty() && (static_cast<unsigned char>(peek.back()) & 0xc0) == 0x80) peek.pop_back();
             for (auto& ch : peek) if ((static_cast<unsigned char>(ch) < 0x20 || ch == 0x7F)) ch = '.';
             return "'" + peek + "'";
         };
@@ -33,7 +34,7 @@ void scanTokens(const std::string& s, const std::function<void(const Token&)>& c
         if(two=="--"){while(i<s.size()&&s[i]!='\n'&&s[i]!='\r')advance();continue;}
         if(two=="/*"){
             advance();advance();
-            while(i<s.size()&&s.substr(i,2)!="*/")advance();
+            while(i<s.size()&&!(s[i]=='*'&&i+1<s.size()&&s[i+1]=='/'))advance();
             if(i==s.size())fail("Unterminated block comment: reached end of input, expected '*/'");
             advance();advance();continue;
         }
