@@ -281,9 +281,10 @@ private:
     std::shared_ptr<Expr> multiplication(){auto left=unary();while(at("*")||at("/")){auto op=take();left=std::make_shared<Expr>(Expr{"Binary",op.lexeme,left,unary(),op.location});}return left;}
     std::shared_ptr<Expr> unary(){
         if(keyword("EXISTS")){
-            const auto token=take();expect("(");
+            const auto token=take();if(++depth>256)throw MiniSqlError(ErrorCode::Syntax,"Expression depth exceeded",token.location);
+            expect("(");
             if(!keyword("SELECT"))throw MiniSqlError(ErrorCode::Syntax,"EXISTS requires a SELECT subquery but found "+describeCurrentToken(),t[i].location);
-            const auto start=i;(void)select(false);const auto text=tokenText(start,i);expect(")");
+            const auto start=i;(void)select(false);const auto text=tokenText(start,i);expect(")");--depth;
             return std::make_shared<Expr>(Expr{"Exists","",nullptr,{},token.location,text});
         }
         if(i+1<t.size()&&t[i+1].lexeme=="("&&
@@ -322,7 +323,8 @@ private:
         if(at("(") && i+1<t.size()){
             auto next=t[i+1].lexeme;for(char& c:next)if(c>='a'&&c<='z')c-=32;
             if(next=="SELECT"){
-                const auto token=take();const auto start=i;(void)select(false);const auto text=tokenText(start,i);expect(")");
+                const auto token=take();if(++depth>256)throw MiniSqlError(ErrorCode::Syntax,"Expression depth exceeded",token.location);
+                const auto start=i;(void)select(false);const auto text=tokenText(start,i);expect(")");--depth;
                 return std::make_shared<Expr>(Expr{"ScalarSubquery","",nullptr,{},token.location,text});
             }
         }
