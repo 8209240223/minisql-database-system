@@ -106,6 +106,8 @@ $groups = @{
         'tests/type-roundtrip-smoke.mjs'
         # 查询结果缓存：命中正确性 + 写入后失效。
         'tests/query-result-cache-smoke.mjs'
+        # Top-N 排序下推：Limit 下推到 Sort，只保留前 N 行（含并列键稳定性）。
+        'tests/top-n-sort-smoke.mjs'
     )
     storage = @(
         'tests/checkpoint-smoke.mjs',

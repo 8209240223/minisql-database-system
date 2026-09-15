@@ -662,6 +662,32 @@ bool pushPredicateIntoJoin(sql::LogicalPlan& filter, json& changes, std::size_t 
     return true;
     // 报告已改写。
 }
+bool pushTopNIntoSort(sql::LogicalPlan& limit, json& changes, std::size_t statement) {
+// Top-N 下推：Limit 直接架在 Sort 上时，把“只需前 N 行”的需求传给 Sort。
+// 执行器据此只维护 N 个元素，而不是对全表排序后再截前 N 行。
+    if (limit.kind != "Limit" || !limit.limit || limit.children.size() != 1) return false;
+    // 必须是带确定条数的 Limit，且恰好一个输入。
+    auto& child = limit.children.front();
+    // 取它的输入。
+    if (child.kind != "Sort") return false;
+    // 只处理 Limit 直接架在 Sort 上的形态。
+    const std::uint64_t needed = *limit.limit + limit.offset;
+    // 排序只需要前 (limit + offset) 行：跳过 offset 行后再取 limit 行。
+    if (needed == 0) return false;
+    // 条数为 0 时没有下推价值。
+    if (child.limit && *child.limit <= needed) return false;
+    // 孩子已有更严的上限，不必改写（避免反复标记同一件事）。
+    if (child.sortKeys.empty()) return false;
+    // 没有排序键就不是真正的排序节点。
+    const auto before = sql::serializePlans({limit});
+    // 记录改写前的形态。
+    child.limit = needed;
+    // 把需要的行数写到 Sort 上；执行器会读它做有界排序。
+    record(changes, "top-n-sort", statement, before, sql::serializePlans({limit}));
+    // 记录这次下推。
+    return true;
+    // 报告已改写。
+}
 void rewritePlan(sql::LogicalPlan& plan, const Options& options, json& changes, std::size_t statement, std::size_t depth = 0, bool selectQuery = false) {
 // 对一棵逻辑计划做规则改写；采用自底向上：先改写所有孩子，再处理本节点。
     if (depth > 256) throw MiniSqlError(ErrorCode::Internal, "Optimizer plan depth exceeded");
@@ -685,6 +711,8 @@ void rewritePlan(sql::LogicalPlan& plan, const Options& options, json& changes, 
     // 改写 INSERT 多行形式的每一行。
         for (auto& expression : row.at("expressions")) expression = rewrite(expression, options, changes, statement);
         // 行内逐个表达式处理。
+        if (options.topNSort && pushTopNIntoSort(plan, changes, statement)) return;
+        // Top-N 下推：在孩子已改写完成后判断，改写成功就结束本节点。
     if (plan.kind != "Filter" && plan.kind != "SemiJoin" && plan.kind != "AntiJoin" && plan.kind != "Apply" &&
         // 下面这些规则都只作用于"带谓词的算子"，
         plan.kind != "NestedLoopJoin" && plan.kind != "LeftJoin" && plan.kind != "HashJoin") return;
@@ -865,10 +893,13 @@ nlohmann::json ruleDescriptors() {
         {{"ruleId", "hash-join"}, {"scope", "plan"}, {"precondition", "INNER NestedLoopJoin with direct left/right column equality"}, {"postcondition", "Same inner-join rows, duplicates and NULL non-matching semantics"}},
         // 哈希连接：前提是内连接且谓词为左右列的直接等值比较；
         // 保证连接结果、重复行与 NULL 不匹配语义一致。
-        {{"ruleId", "prune-columns"}, {"scope", "plan"}, {"precondition", "Project over SeqScan with optional single Filter; projections are explicit"}, {"postcondition", "Scan output metadata contains exactly referenced columns; row values and errors unchanged"}}
+        {{"ruleId", "prune-columns"}, {"scope", "plan"}, {"precondition", "Project over SeqScan with optional single Filter; projections are explicit"}, {"postcondition", "Scan output metadata contains exactly referenced columns; row values and errors unchanged"}},
         // 列裁剪：前提是投影直接架在扫描上（中间可有一层过滤）且投影是显式写出的；
         // 保证扫描输出只保留被引用的列，行值与错误不变。
-        ,{{"ruleId", "decorrelate-subquery"}, {"scope", "plan"}, {"precondition", "Filter carries SemiJoin/AntiJoin/Apply subquery classification"}, {"postcondition", "Promote to typed subquery node while preserving grouped-parameter execution semantics"}}
+        {{"ruleId", "top-n-sort"}, {"scope", "plan"}, {"precondition", "Limit with a concrete row count directly above a Sort with sort keys"}, {"postcondition", "Same first limit+offset rows in the same order; only the rows kept in memory change"}},
+        // Top-N 下推：前提是带确定条数的 Limit 直接架在有排序键的 Sort 上；
+        // 保证输出的前 (limit+offset) 行与顺序不变，变的只是内存中保留哪些行。
+        {{"ruleId", "decorrelate-subquery"}, {"scope", "plan"}, {"precondition", "Filter carries SemiJoin/AntiJoin/Apply subquery classification"}, {"postcondition", "Promote to typed subquery node while preserving grouped-parameter execution semantics"}}
         // 子查询去关联：前提是过滤器带有 semi/anti/apply 分类标记；
         // 保证提升为带类型的子查询节点后，按绑定参数分组执行的语义不变。
     });
@@ -893,6 +924,8 @@ Result optimize(const std::vector<sql::LogicalPlan>& plans, Options options) {
         else if (id == "remove-false-filter") options.removeFalseFilter = false;
         // 删除恒假过滤。
         else if (id == "predicate-pushdown") options.predicatePushdown = false;
+        else if (id == "top-n-sort") options.topNSort = false;
+        // 支持单独禁用 Top-N 下推，方便 A/B 对比。
         // 谓词下推。
         else if (id == "hash-join") options.hashJoin = false;
         // 哈希连接。

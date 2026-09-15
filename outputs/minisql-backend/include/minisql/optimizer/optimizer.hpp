@@ -23,6 +23,9 @@ struct Options {
     // 常量算术折叠：把常量参与的算术表达式提前算出来。
     bool decorrelateSubquery = true;
     // 子查询去关联：把相关子查询改写成可独立执行的连接或聚合形式。
+    bool topNSort = true;
+    // Top-N 排序：Limit 直接架在 Sort 上时，把取前 N 行的需求下推给 Sort，
+    // 子查询去关联：把相关子查询改写成可独立执行的连接或聚合形式。
     double defaultTableRows = 1000.0;
     std::size_t memoryBudgetBytes = 64 * 1024 * 1024;
     std::unordered_map<std::string, double> tableRows{};

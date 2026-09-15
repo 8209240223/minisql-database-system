@@ -164,6 +164,10 @@ struct ExternalSortRowStream::Implementation {
     std::size_t maxRows;
     CancelCheck checkCancelled;
     std::optional<std::size_t> outputWidth;
+    std::optional<std::size_t> topN;
+    // Top-N 上限：有值时只保留排序结果的前 N 行。
+    std::size_t discarded = 0;
+    // 被丢弃的行数：供资源用量与调试观察。
     std::vector<json> memoryRows;
     std::vector<QueryResourceManager::MemoryReservation> memoryReservations;
     std::vector<Run> runs;
@@ -182,10 +186,10 @@ struct ExternalSortRowStream::Implementation {
                    std::shared_ptr<QueryResourceManager> manager,
                    std::filesystem::path tempDirectory, std::string id,
                    std::size_t rowLimit, CancelCheck cancel,
-                   std::optional<std::size_t> width)
+                   std::optional<std::size_t> width, std::optional<std::size_t> limit)
         : child(std::move(input)), compare(std::move(comparator)), resources(std::move(manager)),
           directory(std::move(tempDirectory)), operationId(artifactId(std::move(id))),
-          maxRows(std::max<std::size_t>(1, rowLimit)), checkCancelled(std::move(cancel)), outputWidth(width) {}
+          maxRows(std::max<std::size_t>(1, rowLimit)), checkCancelled(std::move(cancel)), outputWidth(width), topN(limit) {}
 
     void check() const {
         if (cancelled) throw MiniSqlError(ErrorCode::Cancelled, "Query cancelled");
@@ -285,6 +289,9 @@ struct ExternalSortRowStream::Implementation {
     void prepare() {
         if (prepared) return;
         prepared = true;
+        // 有界排序：上方只要前 N 行时，没必要把全表排序。
+        if (topN) { prepareTopN(*topN); return; }
+        // 完整排序：需要全部有序结果（如没有 LIMIT 的 ORDER BY）。
         json row;
         while (child->next(row)) {
             check();
@@ -307,6 +314,83 @@ struct ExternalSortRowStream::Implementation {
         if (!memoryRows.empty()) runs.push_back(spillRows(memoryRows));
         reduceRuns();
         openRuns();
+    }
+    void prepareTopN(std::size_t limit) {
+    // 有界排序：只保留当前最优的 limit 行。
+    // 读满后，新行只在优于「缓冲区里最差的一行」时才替换它，否则直接丢弃。
+    // 内存占用与排序代价因此只与 limit 相关，与输入行数无关。
+    //
+    // precedes(a, b) 为真表示 a 必须排在 b 之前，语义与完整排序的 std::stable_sort 一致：
+    // 主键能分先后时按主键；主键并列时按输入序号，靠前的在前。
+    // 并列决胜必须显式写出：Top-N 会把行丢弃，若并列时任意取舍，
+    // 保留下来的行与完整排序的前 N 行就会不同（这是实测发现过的缺陷）。
+        const std::size_t bound = std::max<std::size_t>(1, limit);
+        // 至少保留一行，避免 limit=0 时边界处理变得特殊。
+        struct Entry { json row; std::size_t sequence; };
+        // 缓冲区元素：行 + 它的输入序号。
+        std::vector<Entry> buffer;
+        // 有界缓冲区，最多 bound 个元素。
+        buffer.reserve(bound);
+        // 预留容量，避免反复扩容。
+        std::size_t sequence = 0;
+        // 输入序号，从 0 开始递增。
+        const auto precedes = [&](const Entry& left, const Entry& right) {
+        // 判定 left 是否必须排在 right 之前。
+            if (compare(left.row, right.row)) return true;
+            // 主键决定 left 在前。
+            if (compare(right.row, left.row)) return false;
+            // 主键决定 right 在前。
+            return left.sequence < right.sequence;
+            // 主键并列：输入序号小的在前，复现稳定排序语义。
+        };
+        // precedes 定义结束。
+        json row;
+        // 复用同一个 JSON 对象接收每一行。
+        while (child->next(row)) {
+        // 一直读到输入结束。
+            check();
+            // 响应取消与超时。
+            const auto bytes = rowBytes(row);
+            // 本行的内存体积。
+            if (bytes > resources->memoryLimitBytes()) resourceFailure("Single row exceeds query memory budget");
+            // 单行超预算直接报错，与完整排序保持一致。
+            ++inputRows;
+            // 输入行数照样累计，方便对比。
+            Entry entry{std::move(row), sequence++};
+            // 记下这一行与它的输入序号。
+            if (buffer.size() < bound) {
+            // 还没填满：直接收下。
+                memoryReservations.push_back(resources->reserveMemory(bytes));
+                buffer.push_back(std::move(entry));
+                continue;
+            }
+            // 已经满了：找出缓冲区里排在最末尾的那一个（最差者）。
+            std::size_t worst = 0;
+            for (std::size_t k = 1; k < buffer.size(); ++k)
+                if (precedes(buffer[worst], buffer[k])) worst = k;
+                // 若最差者排在候选 k 之前，说明 k 更靠后，更新最差者。
+            if (precedes(entry, buffer[worst])) {
+            // 新行排在最差者之前，说明新行更好：替换掉它。
+                memoryReservations[worst] = resources->reserveMemory(bytes);
+                // 重新计账内存（旧预留会在赋值时释放）。
+                buffer[worst] = std::move(entry);
+                // 用新行替换掉最差的那一行。
+            } else {
+            // 新行排不进前 bound 名：直接丢弃。
+                ++discarded;
+                // 记一个丢弃计数。
+            }
+            // 替换或丢弃分支结束。
+        }
+        // 输入读完。
+        child->close();
+        // 关闭子流释放资源。
+        std::stable_sort(buffer.begin(), buffer.end(), precedes);
+        // 缓冲区排序：用同一个 precedes，结果与完整 stable_sort 的前 N 行完全一致。
+        memoryRows.reserve(buffer.size());
+        // 结果行数不会再超过 bound。
+        for (auto& item : buffer) memoryRows.push_back(std::move(item.row));
+        // 把行搬进最终输出缓冲区。
     }
     bool next(json& row) {
         prepare();
@@ -348,6 +432,8 @@ struct ExternalSortRowStream::Implementation {
         usage["rows"] = emitted;
         usage["inputRows"] = inputRows;
         usage["external"] = external;
+        if (topN) { usage["topN"] = *topN; usage["discardedRows"] = discarded; }
+        // 有界排序时额外报告上限与丢弃行数，便于确认优化真的生效了。
         usage["maxRows"] = maxRows;
         usage["child"] = child->resourceUsage();
         return usage;
@@ -358,9 +444,10 @@ ExternalSortRowStream::ExternalSortRowStream(std::unique_ptr<RowStream> child, R
                                              std::shared_ptr<QueryResourceManager> resources,
                                              std::filesystem::path directory, std::string operationId,
                                              std::size_t maxRows, CancelCheck checkCancelled,
-                                             std::optional<std::size_t> outputWidth)
+                                             std::optional<std::size_t> outputWidth,
+                                             std::optional<std::size_t> topN)
     : implementation_(std::make_unique<Implementation>(std::move(child), std::move(compare), std::move(resources),
-          std::move(directory), std::move(operationId), maxRows, std::move(checkCancelled), outputWidth)) {}
+          std::move(directory), std::move(operationId), maxRows, std::move(checkCancelled), outputWidth, topN)) {}
 ExternalSortRowStream::~ExternalSortRowStream() { implementation_->close(); }
 bool ExternalSortRowStream::next(json& row) { return implementation_->next(row); }
 void ExternalSortRowStream::cancel() {

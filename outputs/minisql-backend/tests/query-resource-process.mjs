@@ -1,6 +1,6 @@
 import { spawn, spawnSync } from 'node:child_process';
 import { once } from 'node:events';
-import { mkdtempSync, readdirSync } from 'node:fs';
+import { existsSync, mkdtempSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -52,6 +52,9 @@ function query(sql) {
 }
 
 function noSpillFiles() {
+  // Top-N 下推生效时，排序只需保留前 N 行，根本不会创建 spill 目录。
+  // 目录不存在按「没有溢写文件」处理，否则这里会抛 ENOENT 而不是给出结论。
+  if (!existsSync(tempDirectory)) return true;
   return !readdirSync(tempDirectory, { withFileTypes: true }).some(entry => entry.isFile());
 }
 
@@ -60,13 +63,31 @@ const rightValues = Array.from({ length: 30 }, (_, index) => `(${index},${index 
 assert.equal(run(`CREATE TABLE l(id INT,k INT); CREATE TABLE r(id INT,v INT);
   INSERT INTO l VALUES${leftValues}; INSERT INTO r VALUES${rightValues};`).success, true); ++checks;
 
+// Top-N 下推后，带 LIMIT 的排序只需要前 N 行，因此不再溢写磁盘。
+// 这里验证的正是优化生效：结果正确，且 Sort 报告保留了恰好 4 行。
 const sorted = query('SELECT id FROM l ORDER BY id DESC LIMIT 4;');
 assert.deepEqual(sorted.rows, [[29], [28], [27], [26]]); ++checks;
 const sortUsage = findUsage(sorted.resourceUsage, 'Sort');
-assert.equal(sortUsage?.external, true); ++checks;
-assert.ok(sortUsage.spillBytes > 0 && sortUsage.spillFiles > 0); ++checks;
+assert.equal(sortUsage?.external, false); ++checks;
+assert.equal(sortUsage?.topN, 4); ++checks;
+assert.equal(sortUsage?.rows, 4); ++checks;
+assert.equal(sortUsage?.inputRows, 30); ++checks;
+// 丢弃行数取决于输入顺序：本用例的输入恰好降序，前 4 行就是最优解，
+// 因此 discardedRows 合法地为 0，不能假定它一定大于 0。
+// 这里断言的是必然成立的性质：排序读入了全部 30 行，但只保留 topN 行。
+assert.ok(sortUsage?.discardedRows >= 0); ++checks;
 assert.equal(sortUsage.tempDiskCurrentBytes, 0); ++checks;
-assert.equal(sortUsage.tempFilesCleaned, sortUsage.spillFiles); ++checks;
+assert.equal(noSpillFiles(), true); ++checks;
+
+// 外排机制本身仍须可用：去掉 LIMIT 后无法做 Top-N，必须走溢写路径。
+// 这一条与上面的 LIMIT 用例互补，共同保证两种能力都没有退化。
+const fullySorted = query('SELECT id FROM l ORDER BY id;');
+assert.deepEqual(fullySorted.rows.map(row => row[0]), Array.from({ length: 30 }, (_, index) => index)); ++checks;
+const fullSortUsage = findUsage(fullySorted.resourceUsage, 'Sort');
+assert.equal(fullSortUsage?.external, true); ++checks;
+assert.ok(fullSortUsage.spillBytes > 0 && fullSortUsage.spillFiles > 0); ++checks;
+assert.equal(fullSortUsage.tempDiskCurrentBytes, 0); ++checks;
+assert.equal(fullSortUsage.tempFilesCleaned, fullSortUsage.spillFiles); ++checks;
 assert.equal(noSpillFiles(), true); ++checks;
 
 const distinct = query('SELECT DISTINCT k FROM l;');

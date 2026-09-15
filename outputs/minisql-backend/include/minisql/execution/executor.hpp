@@ -115,7 +115,10 @@ public:
                           std::shared_ptr<QueryResourceManager> resources,
                           std::filesystem::path directory, std::string operationId,
                           std::size_t maxRows, CancelCheck checkCancelled = {},
-                          std::optional<std::size_t> outputWidth = std::nullopt);
+                          std::optional<std::size_t> outputWidth = std::nullopt,
+                          std::optional<std::size_t> topN = std::nullopt);
+                          // topN：只保留排序结果的前 N 行（Top-N 有界排序）。
+                          // 由优化器的 top-n-sort 规则从上方 Limit 下推而来；为空表示需要完整有序结果。
     ~ExternalSortRowStream() override;
     bool next(nlohmann::json& row) override;
     void cancel() override;

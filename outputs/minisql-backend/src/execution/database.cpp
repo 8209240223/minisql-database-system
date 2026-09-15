@@ -3428,7 +3428,9 @@ std::unique_ptr<RowStream> Database::openRowStream(const sql::LogicalPlan& plan)
         };
         const auto operationId = sessionId_ + "-q" + std::to_string(currentQueryId_) + "-s" + std::to_string(++sortSequence_);
         return std::make_unique<ExternalSortRowStream>(std::move(child), compareRows, activeResources_,
-            sortTempDirectory_, operationId, sortMemoryRows_, [this] { checkCancelled(); }, plan.output.size());
+            sortTempDirectory_, operationId, sortMemoryRows_, [this] { checkCancelled(); }, plan.output.size(),
+            // Top-N：优化器把上方 Limit 的条数下推到本节点；有值时只保留前 N 行。
+            plan.limit ? std::optional<std::size_t>(static_cast<std::size_t>(*plan.limit)) : std::nullopt);
     }
     if (plan.kind == "Distinct") {
         if (plan.children.size() != 1) fail("Distinct requires one child");
