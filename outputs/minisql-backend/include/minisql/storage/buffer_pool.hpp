@@ -12,6 +12,10 @@ struct BufferStats {
     // 依次为：命中次数、未命中次数、磁盘读次数、磁盘写次数、IO 错误次数。
     std::uint64_t stagedPageReads = 0, stagedPageWrites = 0;
     std::uint64_t clockSweeps = 0, clockSecondChances = 0;
+    std::uint64_t evictionScans = 0;
+    // 淘汰时检查过的帧数累计（所有策略都统计）。
+    // LRU/FIFO 每次要遍历全部帧找最小序号，CLOCK 只沿指针增量扫描，
+    // 这一项让两者的淘汰代价可以直接对比。
     // CLOCK 专用：指针扫过的帧数（扫描代价）与给出二次机会的次数。
     // 这两项让"新算法与 LRU 的差异"可以被测量，而不是只写在报告里。
     // 写批次期间从暂存区读写的次数，与真正落盘区分开。

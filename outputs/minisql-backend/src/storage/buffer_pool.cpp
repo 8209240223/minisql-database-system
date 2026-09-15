@@ -136,6 +136,8 @@ PageId BufferPool::clockEvict() {
         }
         // 找到对应帧。
         ++stats_.clockSweeps;
+        ++stats_.evictionScans;
+        // CLOCK 的一次扫描同样计入 evictionScans，便于与 LRU 同口径对比。
         // 记一次扫描步数，用于量化算法成本。
         auto& frame = *found->second;
         // 取帧引用。
@@ -205,6 +207,8 @@ void BufferPool::makeRoom() {
     auto victim = frames_.end();
     // 候选受害者，初始为空。
     for (auto it = frames_.begin(); it != frames_.end(); ++it) {
+    ++stats_.evictionScans;
+    // 记一次"检查了一个帧"，用于量化淘汰搜索代价。
     // 遍历所有缓存帧。
         if (it->second->pins) continue;
         // 正在被使用的页不能淘汰。

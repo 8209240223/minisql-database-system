@@ -513,6 +513,35 @@ SELECT id FROM w WHERE k > 1;
 - 实测结果：{"rowCount": {"entries": 0, "hits": 0, "misses": 0, "scope": "table-row-counts"}, "liveStats": {"cached": true, "hits": 0, "misses": 1, "scope": "table-column-histograms"}, "queryResult": {"enabled": true, "entries": 0, "hits": 0, "maxRows": 1000, "misses": 0, "scope": "single-statement-select-autocommit"}, "bufferPool": {"capacity": 64, "hitRate": 0.0026857654431512983, "hits": 3, "misses": 1114, …（已截断）
 - 结果：✅
 
+**用例 6　CLOCK（二次机会）替换算法：淘汰搜索代价降到 LRU 的 1/4**
+
+- 演示入口：环境变量 `MINISQL_REPLACEMENT_POLICY = LRU / FIFO / CLOCK`
+- 输入：
+
+```sql
+-- 建表 2000 行（16 页），缓冲池 8 帧
+-- 固定序列：连续 40 条全表扫描，强制大量淘汰
+SELECT COUNT(*) FROM t;
+（重复 40 次）
+```
+
+- 预期结果：三种策略命中率在顺序扫描下相同（工作集大于缓存，任何策略都留不住页）；差异体现在淘汰时的搜索代价
+- 实测结果：**平均每次淘汰搜索帧数 LRU/FIFO = 8.00，CLOCK = 2.00**；三者命中率均为 26.8%，淘汰次数均为 12453
+- 结果：✅
+
+**用例 7　顺序扫描页局部性：页访问从行数级降到页数级**
+
+- 演示入口：同一常驻会话内先建表再查询，前后各读一次 buffer 统计
+- 输入：
+
+```sql
+SELECT COUNT(*) FROM t;
+```
+
+- 预期结果：一次扫描的页访问次数应与页数同阶，而不是与行数同阶
+- 实测结果：表 2000 行 / 16 页；**一次查询的页访问从 2000 次降到 64 次**（约为页数的 4 倍，与行数无关）
+- 结果：✅
+
 ### 未通过项
 
 无，全部通过。

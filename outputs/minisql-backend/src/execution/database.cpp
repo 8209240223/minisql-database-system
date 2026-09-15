@@ -2795,7 +2795,8 @@ nlohmann::json Database::bufferStatus() const {
         {"stagedPageWrites", stats.stagedPageWrites}, {"evictions", evictions},
         // CLOCK 专用指标：扫描步数与二次机会次数。
         // 有了它才能量化新算法与 LRU 的差异，而不是只停在描述上。
-        {"clockSweeps", stats.clockSweeps}, {"clockSecondChances", stats.clockSecondChances}};
+        {"clockSweeps", stats.clockSweeps}, {"clockSecondChances", stats.clockSecondChances},
+        {"evictionScans", stats.evictionScans}};
 // 经由暂存区完成的写次数与前面整理的淘汰日志。
 }
 // bufferStatus 返回结束。
