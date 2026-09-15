@@ -13,10 +13,16 @@ private:
     const std::vector<Token>& t; std::size_t i=0;
     bool at(const std::string& s){return i<t.size() && t[i].lexeme==s;}
     bool keyword(const std::string& s){if(i>=t.size())return false; auto v=t[i].lexeme; std::transform(v.begin(),v.end(),v.begin(),[](unsigned char c){return static_cast<char>(std::toupper(c));}); return v==s;}
-    const Token& take(){if(i>=t.size())throw MiniSqlError(ErrorCode::Syntax,"Unexpected end of input");return t[i++];}
-    void expect(const std::string& s){if(!keyword(s)&&!at(s))throw MiniSqlError(ErrorCode::Syntax,"Expected '"+s+"'",i<t.size()?t[i].location:SourceLocation{});++i;}
-    std::string identifier(){const auto& x=take();if(x.type!="IDENTIFIER")throw MiniSqlError(ErrorCode::Syntax,"Expected identifier",x.location);return x.lexeme;}
-    std::string literal(){if(keyword("DATE")&&i+1<t.size()&&t[i+1].type=="STRING"){++i;return "DATE"+take().lexeme;}if(keyword("NULL")||keyword("TRUE")||keyword("FALSE"))return take().lexeme;std::string sign;if(at("-")||at("+"))sign=take().lexeme;const auto& x=take();if(x.type!="INTEGER"&&x.type!="DECIMAL"&&x.type!="FLOAT"&&(x.type!="STRING"||!sign.empty()))throw MiniSqlError(ErrorCode::Syntax,"Expected literal",x.location);return sign+x.lexeme;}
+    std::string describeCurrentToken() const {
+        if (i >= t.size() || t[i].type == "END") return "EOF";
+        return "'" + t[i].lexeme + "' (" + t[i].type + ")";
+    }
+    std::string describeToken(const Token& x) const { return "'" + x.lexeme + "' (" + x.type + ")"; }
+
+    const Token& take(){if(i>=t.size())throw MiniSqlError(ErrorCode::Syntax,"Unexpected end of input while looking for more tokens");return t[i++];}
+    void expect(const std::string& s){if(!keyword(s)&&!at(s)){const auto loc=i<t.size()?t[i].location:SourceLocation{};throw MiniSqlError(ErrorCode::Syntax,"Expected '"+s+"' but found "+describeCurrentToken(),loc);}++i;}
+    std::string identifier(){const auto& x=take();if(x.type!="IDENTIFIER")throw MiniSqlError(ErrorCode::Syntax,"Expected identifier but found "+describeToken(x),x.location);return x.lexeme;}
+    std::string literal(){if(keyword("DATE")&&i+1<t.size()&&t[i+1].type=="STRING"){++i;return "DATE"+take().lexeme;}if(keyword("NULL")||keyword("TRUE")||keyword("FALSE"))return take().lexeme;std::string sign;if(at("-")||at("+"))sign=take().lexeme;const auto& x=take();if(x.type!="INTEGER"&&x.type!="DECIMAL"&&x.type!="FLOAT"&&(x.type!="STRING"||!sign.empty()))throw MiniSqlError(ErrorCode::Syntax,"Expected literal but found "+describeToken(x),x.location);return sign+x.lexeme;}
     std::string typeName() {
         if(keyword("INT")||keyword("BIGINT")||keyword("FLOAT")||keyword("BOOL")||keyword("DATE"))return take().lexeme;
         const bool varchar=keyword("VARCHAR");
@@ -34,8 +40,8 @@ private:
         expect(",");const auto scale=parameter();expect(")");
         return "decimal("+std::to_string(precision)+","+std::to_string(scale)+")";
     }
-    void semicolon(){if(at(";"))++i;else throw MiniSqlError(ErrorCode::Syntax,"Expected ';'",i<t.size()?t[i].location:SourceLocation{});}
-    Statement statement(){auto loc=t[i].location;Statement s;if(keyword("BEGIN")||keyword("COMMIT")||keyword("ROLLBACK"))s=transaction();else if(keyword("CREATE"))s=create();else if(keyword("INSERT"))s=insert();else if(keyword("SELECT"))s=select();else if(keyword("DELETE"))s=remove();else if(keyword("UPDATE"))s=update();else if(keyword("CHECKPOINT"))s=checkpointStatement();else if(keyword("DROP"))s=dropIndex();else throw MiniSqlError(ErrorCode::Syntax,"Expected SQL statement or transaction command",loc);s.location=loc;return s;}
+    void semicolon(){if(at(";"))++i;else throw MiniSqlError(ErrorCode::Syntax,"Expected ';' but found "+describeCurrentToken(),i<t.size()?t[i].location:SourceLocation{});}
+    Statement statement(){auto loc=t[i].location;Statement s;if(keyword("BEGIN")||keyword("COMMIT")||keyword("ROLLBACK"))s=transaction();else if(keyword("CREATE"))s=create();else if(keyword("INSERT"))s=insert();else if(keyword("SELECT"))s=select();else if(keyword("DELETE"))s=remove();else if(keyword("UPDATE"))s=update();else if(keyword("CHECKPOINT"))s=checkpointStatement();else if(keyword("DROP"))s=dropIndex();else throw MiniSqlError(ErrorCode::Syntax,"Expected SQL statement (CREATE/INSERT/SELECT/DELETE/UPDATE) or transaction command but found "+describeCurrentToken(),loc);s.location=loc;return s;}
     Statement dropIndex(){Statement s{"DropIndex"};expect("DROP");expect("INDEX");s.indexName=identifier();if(keyword("ON")){++i;s.table=identifier();}semicolon();return s;}
     Statement checkpointStatement(){Statement s{"Checkpoint"};expect("CHECKPOINT");semicolon();return s;}
     Statement transaction() {
@@ -320,7 +326,7 @@ private:
                 return std::make_shared<Expr>(Expr{"ScalarSubquery","",nullptr,{},token.location,text});
             }
         }
-        if(at("(")){if(++depth>256)throw MiniSqlError(ErrorCode::Syntax,"Expression depth exceeded",t[i].location);++i;auto e=expression();expect(")");--depth;return e;}auto loc=t[i].location;if(at("-")||at("+"))return std::make_shared<Expr>(Expr{"Literal",literal(),{},{},loc});const auto& x=take();if(x.type=="IDENTIFIER"){auto name=x.lexeme;if(at(".")){++i;name+="."+identifier();}return std::make_shared<Expr>(Expr{"Identifier",name,{},{},x.location});}if(x.type=="INTEGER"||x.type=="DECIMAL"||x.type=="FLOAT"||x.type=="STRING")return std::make_shared<Expr>(Expr{"Literal",x.lexeme,{},{},x.location});throw MiniSqlError(ErrorCode::Syntax,"Expected identifier, literal or '('",x.location);}
+        if(at("(")){if(++depth>256)throw MiniSqlError(ErrorCode::Syntax,"Expression depth exceeded",t[i].location);++i;auto e=expression();expect(")");--depth;return e;}auto loc=t[i].location;if(at("-")||at("+"))return std::make_shared<Expr>(Expr{"Literal",literal(),{},{},loc});const auto& x=take();if(x.type=="IDENTIFIER"){auto name=x.lexeme;if(at(".")){++i;name+="."+identifier();}return std::make_shared<Expr>(Expr{"Identifier",name,{},{},x.location});}if(x.type=="INTEGER"||x.type=="DECIMAL"||x.type=="FLOAT"||x.type=="STRING")return std::make_shared<Expr>(Expr{"Literal",x.lexeme,{},{},x.location});throw MiniSqlError(ErrorCode::Syntax,"Expected identifier, literal, or '(' but found "+describeToken(x),x.location);}
 };
 }
 std::vector<Statement> parse(const std::vector<Token>& tokens){return Parser(tokens).all();}
