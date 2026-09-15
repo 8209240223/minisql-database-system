@@ -22,8 +22,8 @@ export function IndexInspectView({ info, busy, onVerify, onRebuild }: {
   }
   return <section className="inspect-info" aria-label="索引检查">
     <header><strong>{info.table}.{info.index}</strong><span className="inspect-mode">页级索引</span><div className="output-spacer"/>
-      <button className="icon-btn" title="校验索引与堆表一致性" aria-label="校验索引" disabled={busy || !onVerify} onClick={() => void onVerify?.()}><ShieldCheck size={15}/></button>
-      <button className="icon-btn" title="在线重建索引" aria-label="重建索引" disabled={busy || !onRebuild} onClick={() => void onRebuild?.()}><RefreshCw size={15}/></button>
+      <button className="icon-btn" title="校验索引与堆表一致性" data-tip="扫描索引页与堆表逐条比对，报告不一致的键（只读检查）。" aria-label="校验索引" disabled={busy || !onVerify} onClick={() => void onVerify?.()}><ShieldCheck size={15}/></button>
+      <button className="icon-btn" title="在线重建索引" data-tip="不阻塞读写地重建整棵 B+ 树，修复页分裂碎片或不一致。" aria-label="重建索引" disabled={busy || !onRebuild} onClick={() => void onRebuild?.()}><RefreshCw size={15}/></button>
     </header>
     {info.message && <p role="status">{info.message}</p>}
     <div className="inspect-summary">

@@ -28,8 +28,8 @@ export function StorageStatisticsView({ value, disabled, onConfigure }: { value:
     <div>已分配页 {value.allocatedPages}</div>
     {buffer?.available ? <>
       <h3>当前会话缓冲池</h3>
-      <label>替换策略<select value={buffer.policy} disabled={disabled || busy} onChange={event => void configure(event.target.value as 'LRU' | 'FIFO')}><option value="LRU">LRU</option><option value="FIFO">FIFO</option></select></label>
-      <button className="icon-btn" title="清零缓存统计" aria-label="清零缓存统计" disabled={disabled || busy} onClick={() => void configure('RESET')}><RotateCcw size={16}/></button>
+      <label title="替换策略" data-tip="缓冲池页淘汰策略：LRU 优先淘汰最久未用页，FIFO 按进入顺序淘汰；切换后统计保留。">替换策略<select value={buffer.policy} disabled={disabled || busy} onChange={event => void configure(event.target.value as 'LRU' | 'FIFO')}><option value="LRU">LRU</option><option value="FIFO">FIFO</option></select></label>
+      <button className="icon-btn" title="清零缓存统计" data-tip="把命中率计数清零，方便演示前重新开始统计。" aria-label="清零缓存统计" disabled={disabled || busy} onClick={() => void configure('RESET')}><RotateCcw size={16}/></button>
       {error && <p role="alert">{error}</p>}
       <div>策略 {buffer.policy} · 驻留页 {buffer.residentPages} / {buffer.capacity}</div>
       <div>命中 {buffer.hits} · 未命中 {buffer.misses} · 命中率 {(buffer.hitRate * 100).toFixed(2)}%</div>
