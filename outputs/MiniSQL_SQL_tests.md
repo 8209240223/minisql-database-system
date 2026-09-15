@@ -6,11 +6,14 @@
 | --- | --- |
 | 被测引擎 | `outputs/minisql-backend/bin/minisql_database.exe` |
 | 调用方式 | `minisql_database.exe <db.pages> execute`，SQL 由标准输入传入 |
-| 用例总数 | 110 |
-| 通过 | 110 |
+| 用例总数 | 114 |
+| 通过 | 114 |
 | 失败 | 0 |
 
 判定口径：期望 ok 的用例必须执行成功；期望 err 的用例必须被引擎拒绝。两者都算通过。
+
+本集还覆盖本轮新增的查询优化能力：查询结果缓存（重复 SELECT 直接命中）、
+三级缓存可观测性（statistics 里的 queryCache）、以及索引建议器（基于实际查询负载给出建索引建议）。
 
 说明：`err` 有两种含义，文档中按用例名区分——一类是**应当拒绝的非法输入**（如缺 ON、超长 VARCHAR），
 另一类是**当前尚未实现的语法**（如 COUNT(DISTINCT)、BETWEEN、CASE WHEN），它们都会返回明确错误而非静默通过。
@@ -179,11 +182,15 @@
 | 3 | EXPLAIN INSERT（设计允许） | `EXPLAIN INSERT INTO t VALUES(2,20);` | ok | [['Insert', 'Insert t', 2.0, 1.0, 'stats-v1', 'table-column-statistics-or-default']] | ✅ |
 | 4 | EXPLAIN ANALYZE 写语句拒绝 | `EXPLAIN ANALYZE INSERT INTO t VALUES(3,30);` | err | - | ✅ |
 
-## 统计与缓存可观测
+## 统计、缓存与索引建议
 
 | # | 用例 | SQL | 期望 | 实测 | 结果 |
 | --- | --- | --- | --- | --- | --- |
 | 1 | 统计接口可用 | `SELECT COUNT(*) FROM t;` | ok | [[2]] | ✅ |
+| 2 | 聚合查询（可走缓存） | `SELECT SUM(v) FROM t;` | ok | [[30]] | ✅ |
+| 3 | 重复查询结果一致 | `SELECT COUNT(*) FROM t; SELECT COUNT(*) FROM t;` | ok | [[2]] | ✅ |
+| 4 | 带谓词查询（累积建议负载） | `SELECT id FROM t WHERE v=10; SELECT id FROM t WHERE v=20;` | ok | [[2]] | ✅ |
+| 5 | 建索引后查询仍正确 | `CREATE INDEX ix_v ON t(v); SELECT COUNT(*) FROM t;` | ok | [[2]] | ✅ |
 
 ## 失败用例说明
 
