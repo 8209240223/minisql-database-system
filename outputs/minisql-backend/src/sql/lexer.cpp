@@ -18,7 +18,7 @@ void scanTokens(const std::string& s, const std::function<void(const Token&)>& c
         if(c==' '||c=='\t'||c=='\r'||c=='\n'){advance();continue;}
         const SourceLocation loc{line,column};
         auto describeChar = [](unsigned char ch) -> std::string {
-            if (ch >= 0x20 && ch < 0x7F) return {"'", static_cast<char>(ch), "'"};
+            if (ch >= 0x20 && ch < 0x7F) return std::string({39, static_cast<char>(ch), 39});
             char buf[8]; std::snprintf(buf, sizeof(buf), "\\x%02X", ch); return buf;
         };
         auto describeContext = [&]() -> std::string {
