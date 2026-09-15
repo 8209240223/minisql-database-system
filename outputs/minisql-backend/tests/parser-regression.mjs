@@ -37,4 +37,15 @@ assert.match(err5.error.message, /PRIMARY KEY on column 'a' cannot declare NULL/
 const err6 = run('SELECT * AS x FROM t;');
 assert.equal(err6.success, false);
 assert.match(err6.error.message, /Wildcard '\*' cannot have an alias/);
-console.log('24 parser/lexer regression checks passed (including 6 error-message format checks)');
+// Verify lexer error messages carry actual character context (lexer.cpp)
+const lex1 = run('SELECT @;');
+assert.equal(lex1.success, false);
+assert.match(lex1.error.message, /Illegal character.*'@'/);
+assert.equal(lex1.error.code, 2001); // Lexical
+const lex2 = run('SELECT a==b;');
+assert.equal(lex2.success, false);
+assert.match(lex2.error.message, /Unsupported comparison operator '=='/);
+const lex3 = run('SELECT 1.2.3+;');
+assert.equal(lex3.success, false);
+assert.match(lex3.error.message, /Unsupported numeric literal.*followed by '\.'/);
+console.log('27 parser/lexer regression checks passed (including 9 error-message format checks)');

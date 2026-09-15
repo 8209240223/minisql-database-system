@@ -1,4 +1,5 @@
 #include "minisql/sql/lexer.hpp"
+#include <cstdio>
 #include <unordered_set>
 namespace minisql::sql {
 void scanTokens(const std::string& s, const std::function<void(const Token&)>& consume) {
@@ -16,14 +17,24 @@ void scanTokens(const std::string& s, const std::function<void(const Token&)>& c
         const char c=s[i];
         if(c==' '||c=='\t'||c=='\r'||c=='\n'){advance();continue;}
         const SourceLocation loc{line,column};
-        auto fail=[&](const char* message){throw MiniSqlError(ErrorCode::Lexical,message,loc);};
+        auto describeChar = [](unsigned char ch) -> std::string {
+            if (ch >= 0x20 && ch < 0x7F) return {"'", static_cast<char>(ch), "'"};
+            char buf[8]; std::snprintf(buf, sizeof(buf), "\\x%02X", ch); return buf;
+        };
+        auto describeContext = [&]() -> std::string {
+            if (i >= s.size()) return "reached end of input";
+            std::string peek = s.substr(i, 8);
+            for (auto& ch : peek) if ((static_cast<unsigned char>(ch) < 0x20 || ch == 0x7F)) ch = '.';
+            return "'" + peek + "'";
+        };
+        auto fail = [&](const std::string& message){throw MiniSqlError(ErrorCode::Lexical,message,loc);};
         const auto start=i;
         const auto two=s.substr(i,2);
         if(two=="--"){while(i<s.size()&&s[i]!='\n'&&s[i]!='\r')advance();continue;}
         if(two=="/*"){
             advance();advance();
             while(i<s.size()&&s.substr(i,2)!="*/")advance();
-            if(i==s.size())fail("Unterminated block comment");
+            if(i==s.size())fail("Unterminated block comment: reached end of input, expected '*/'");
             advance();advance();continue;
         }
         std::string type;
@@ -37,33 +48,33 @@ void scanTokens(const std::string& s, const std::function<void(const Token&)>& c
             type="INTEGER";
             if(i<s.size()&&s[i]=='.'){
                 advance();
-                if(i==s.size()||!digit(s[i]))fail("Malformed DECIMAL literal");
+                if(i==s.size()||!digit(s[i]))fail("Malformed DECIMAL literal: expected digits after '.' but found "+(i>=s.size()?std::string("end of input"):describeChar(static_cast<unsigned char>(s[i]))));
                 while(i<s.size()&&digit(s[i]))advance();
                 type="DECIMAL";
             }
             if(i<s.size()&&(s[i]=='e'||s[i]=='E')){
                 advance();
                 if(i<s.size()&&(s[i]=='+'||s[i]=='-'))advance();
-                if(i==s.size()||!digit(s[i]))fail("Malformed FLOAT literal");
+                if(i==s.size()||!digit(s[i]))fail("Malformed FLOAT literal: expected digits after exponent but found "+(i>=s.size()?std::string("end of input"):describeChar(static_cast<unsigned char>(s[i]))));
                 while(i<s.size()&&digit(s[i]))advance();
                 type="FLOAT";
             }
-            if(i<s.size()&&(s[i]=='.'||alpha(s[i])))fail("Unsupported or malformed numeric literal");
+            if(i<s.size()&&(s[i]=='.'||alpha(s[i])))fail("Unsupported numeric literal: '"+s.substr(start,i-start)+"' followed by "+describeChar(static_cast<unsigned char>(s[i]))+" (expected digits or operator)");
         } else if(c=='\''){
             advance();bool closed=false;
             while(i<s.size()){
-                if(s[i]=='\r'||s[i]=='\n')fail("Newline in string literal is not supported");
+                if(s[i]=='\r'||s[i]=='\n')fail("Newline in string literal is not supported; use '\\n' escape instead");
                 if(s[i]=='\''){advance();if(i<s.size()&&s[i]=='\''){advance();continue;}closed=true;break;}
                 advance();
             }
-            if(!closed)fail("Unterminated string literal");
+            if(!closed)fail("Unterminated string literal: reached end of input, expected closing '\\''");
             type="STRING";
-        } else if(two=="=="||two=="<>"){fail("Unsupported comparison operator");}
+        } else if(two=="=="||two=="<>"){fail("Unsupported comparison operator '"+two+"' (did you mean '=' or '!=' ?);}
         else if(two==">="||two=="<="||two=="!="){advance();advance();type="OPERATOR";}
         else if(std::string("=<>+-*/").find(c)!=std::string::npos){advance();type="OPERATOR";}
-        else if(c=='.' && i+1<s.size() && digit(s[i+1]))fail("Unsupported numeric literal");
+        else if(c=='.' && i+1<s.size() && digit(s[i+1]))fail("Unsupported numeric literal starting with '.': use '0.' prefix (found "+describeContext()+")");
         else if(std::string("(),;.").find(c)!=std::string::npos){advance();type="DELIMITER";}
-        else fail("Illegal character");
+        else fail("Illegal character "+describeChar(static_cast<unsigned char>(c))+" at "+describeContext());
         consume({type,s.substr(start,i-start),loc});
     }
     consume({"END","",{line,column}});
