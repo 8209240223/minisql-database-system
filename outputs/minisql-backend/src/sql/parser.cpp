@@ -26,11 +26,11 @@ private:
     std::string typeName() {
         if(keyword("INT")||keyword("BIGINT")||keyword("FLOAT")||keyword("BOOL")||keyword("DATE"))return take().lexeme;
         const bool varchar=keyword("VARCHAR");
-        if(!varchar && !keyword("DECIMAL"))throw MiniSqlError(ErrorCode::Syntax,"Expected INT, BIGINT, FLOAT, VARCHAR(n), BOOL, DATE or DECIMAL(p,s) type",t[i].location);
+        if(!varchar && !keyword("DECIMAL"))throw MiniSqlError(ErrorCode::Syntax,"Expected INT, BIGINT, FLOAT, VARCHAR(n), BOOL, DATE or DECIMAL(p,s) type but found "+describeCurrentToken(),t[i].location);
         ++i;if(varchar && !at("("))return "varchar";expect("(");
         const auto parameter=[&](){
             const auto token=take();unsigned value{};
-            if(token.type!="INTEGER")throw MiniSqlError(ErrorCode::Syntax,"Expected unsigned type parameter",token.location);
+            if(token.type!="INTEGER")throw MiniSqlError(ErrorCode::Syntax,"Expected unsigned integer type parameter but found "+describeToken(token),token.location);
             const auto parsed=std::from_chars(token.lexeme.data(),token.lexeme.data()+token.lexeme.size(),value);
             if(parsed.ec!=std::errc{}||parsed.ptr!=token.lexeme.data()+token.lexeme.size())throw MiniSqlError(ErrorCode::Syntax,"Type parameter is too large",token.location);
             return value;
@@ -70,7 +70,7 @@ private:
             expect(")");semicolon();
             return index;
         }
-        if (unique) throw MiniSqlError(ErrorCode::Syntax, "Expected INDEX after UNIQUE", t[i].location);
+        if (unique) throw MiniSqlError(ErrorCode::Syntax, "Expected INDEX after UNIQUE but found "+describeCurrentToken(), t[i].location);
         expect("TABLE");
         Statement s{"CreateTable"};s.table=identifier();expect("(");
         std::vector<std::string> explicitNull;
@@ -97,7 +97,7 @@ private:
                 expect("(");do{constraint.columns.push_back(identifier());}while(at(",")&&(++i,true));expect(")");
                 s.keys.push_back(std::move(constraint));continue;
             }
-            if(!label.empty())throw MiniSqlError(ErrorCode::Syntax,"Expected table constraint",t[i].location);
+            if(!label.empty())throw MiniSqlError(ErrorCode::Syntax,"Expected table constraint (PRIMARY KEY/UNIQUE/FOREIGN KEY/CHECK) but found "+describeCurrentToken(),t[i].location);
             auto name=identifier();
             ColumnDef column{name,typeName()};bool seenNull=false;
             while(keyword("NOT")||keyword("NULL")||keyword("DEFAULT")||keyword("PRIMARY")||keyword("UNIQUE")||keyword("REFERENCES")||keyword("CHECK")||keyword("CONSTRAINT")){
@@ -128,7 +128,7 @@ private:
                     if(seenNull)throw MiniSqlError(ErrorCode::Syntax,"Duplicate nullability declaration",t[i].location);
                     seenNull=true;
                     if(keyword("NOT")){++i;expect("NULL");column.nullable=false;}else ++i;
-                }else throw MiniSqlError(ErrorCode::Syntax,"Expected column constraint",t[i].location);
+                }else throw MiniSqlError(ErrorCode::Syntax,"Expected column constraint (NOT NULL/DEFAULT/PRIMARY KEY/UNIQUE/REFERENCES/CHECK) but found "+describeCurrentToken(),t[i].location);
             }
             if(seenNull&&column.nullable)explicitNull.push_back(column.name);
             if(column.primaryKey){
@@ -282,7 +282,7 @@ private:
     std::shared_ptr<Expr> unary(){
         if(keyword("EXISTS")){
             const auto token=take();expect("(");
-            if(!keyword("SELECT"))throw MiniSqlError(ErrorCode::Syntax,"EXISTS requires a SELECT subquery",t[i].location);
+            if(!keyword("SELECT"))throw MiniSqlError(ErrorCode::Syntax,"EXISTS requires a SELECT subquery but found "+describeCurrentToken(),t[i].location);
             const auto start=i;(void)select(false);const auto text=tokenText(start,i);expect(")");
             return std::make_shared<Expr>(Expr{"Exists","",nullptr,{},token.location,text});
         }
@@ -294,7 +294,7 @@ private:
             expect("(");std::shared_ptr<Expr> argument;
             if(at("*")){
                 const auto star=take();
-                if(name!="COUNT")throw MiniSqlError(ErrorCode::Syntax,"Only COUNT accepts '*'",star.location);
+                if(name!="COUNT")throw MiniSqlError(ErrorCode::Syntax,"Only COUNT accepts '*' but found "+describeToken(star),star.location);
                 argument=std::make_shared<Expr>(Expr{"Wildcard","*",{},{},star.location});
             }else argument=expression();
             expect(")");--depth;
