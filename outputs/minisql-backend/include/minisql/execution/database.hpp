@@ -82,6 +82,8 @@ public:
     // 在给定行上执行一个相关子查询表达式，返回结果。
 private:
     nlohmann::json bufferStatus() const;
+    nlohmann::json queryCacheDocument() const;
+    // 把三级缓存（行数、统计、页）的命中情况汇总成一个 JSON 文档，供 statistics 展示。
     // 返回缓冲池状态（帧数、命中率、淘汰记录等）。
     // X18: 实时单遍扫描的表/列/索引统计；ANALYZE 用它生成快照，statistics() 无快照时回退到它。
     // X18: 实时单遍扫描的表/列/索引统计；ANALYZE 用它生成快照，statistics() 无快照时回退到它。

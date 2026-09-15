@@ -2325,6 +2325,14 @@ nlohmann::json Database::statistics() {
             {"fuzzyCheckpoint", wal.fuzzyCheckpoint}}},
         {"lastCheckpointAtMs", lastCheckpointAtMs_}, {"lastAutoCheckpointAtMs", lastAutoCheckpointAtMs_},
 // 最近一次手动检查点与自动检查点时间。
+        // 缓存可观测指标：把行数缓存与统计缓存的命中情况暴露出来。
+        // 没有这组指标，使用者只能看到“变快了”却说不清为什么；
+        // 有了它就能直接对比：命中率越高，重复扫描越少。
+        {"queryCache", queryCacheDocument()},
+        // 缓存可观测指标：行数缓存、统计缓存与页缓存的命中情况。
+        // 单独抽成一个函数构造，避免在这个已经很长的初始化列表里
+        // 再套一层嵌套字典，那样很容易写错括号层级。
+        // 容量与当前驻留页数，看得出缓存是否吃紧。
         {"lastAutoCheckpointReasons", lastAutoCheckpointReasons_},
         // 最近一次自动检查点的触发原因列表。
         {"indexMaintenance", {{"engine", pageFileIndexes_ ? "page-file" : "memory"},
@@ -2336,6 +2344,32 @@ nlohmann::json Database::statistics() {
 // 评估间隔与最近一次评估时间的时间戳。
             {"lastRunMs", schedulerLastRunMs_}, {"deferredReasons", schedulerDeferredReasons_}}}};
 // 最近一次真正执行时间，以及这一轮被推迟的原因。
+}
+nlohmann::json Database::queryCacheDocument() const {
+// 汇总三级缓存的命中情况，供 statistics 对外展示。
+// 三级分别是：行数缓存（优化器估算用）、
+// 实时统计缓存（EXPLAIN 与 statistics 用）、以及底层页缓存（磁盘 IO 用）。
+    const auto& pageStats = buffer_.stats();
+    // 取底层页缓存统计。
+    const auto requests = pageStats.hits + pageStats.misses;
+    // 总请求数，用于算命中率。
+    return {
+    // 下面逐级组织。
+        {"rowCount", {{"hits", rowCountCacheHits_}, {"misses", rowCountCacheMisses_},
+        // 行数缓存：命中与未命中次数。
+            {"entries", rowCountCache_.size()}, {"scope", "table-row-counts"}}},
+        // 当前缓存的表数与缓存范围。
+        {"liveStats", {{"hits", liveStatsCacheHits_}, {"misses", liveStatsCacheMisses_},
+        // 统计缓存：命中与未命中次数。
+            {"cached", !liveStatsCache_.is_null()}, {"scope", "table-column-histograms"}}},
+        // cached 直接告诉调用方当前是否持有有效缓存。
+        {"bufferPool", {{"hits", pageStats.hits}, {"misses", pageStats.misses},
+        // 页缓存的命中与未命中次数。
+            {"hitRate", requests == 0 ? 0.0 : static_cast<double>(pageStats.hits) / static_cast<double>(requests)},
+        // 命中率：没有请求时按 0 处理，避免除零。
+            {"capacity", buffer_.capacity()}, {"residentPages", buffer_.size()}}},
+        // 容量与当前驻留页数。
+    };
 }
 nlohmann::json Database::bufferStatus() const {
 // 返回当前缓冲池的运行状态快照，供诊断接口和验收脚本读取。
