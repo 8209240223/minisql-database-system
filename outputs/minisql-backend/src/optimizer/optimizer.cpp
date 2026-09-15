@@ -609,7 +609,18 @@ bool pushPredicateIntoJoin(sql::LogicalPlan& filter, json& changes, std::size_t 
         // 同时依赖两侧（真正的连接条件），必须留在连接上方，不能下推。
     }
     // 归属判断结束。
-    if (leftTerms.empty() && rightTerms.empty()) return false;
+    if (leftTerms.empty() && rightTerms.empty()) {
+    // 一项都下推不了，本条规则不适用，直接放弃这次改写。
+        filter.children.front() = std::move(joined);
+        // 关键：必须把提前取出的连接算子原位放回。
+        // 连接算子在上面被 std::move 到了局部变量 joined，此时
+        // filter.children.front() 已经是个空壳。若这里直接 return，
+        // joined 会随函数返回被析构，计划中只剩一个 kind 为空、
+        // children 为空的节点，执行层随即报 "Unsupported scan plan"。
+        // 恒真条件（WHERE 1=1 折叠成 true 字面量）走的正是这条路径。
+        return false;
+    }
+    // 早退路径结束，连接算子已归位。
     // 一项都下推不了，规则没有效果。
     const auto before = sql::serializePlans({filter});
     // 记下改写前的形态。

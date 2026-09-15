@@ -125,6 +125,19 @@ private:
     void checkCancelled() const;
     // 检查是否收到取消请求，收到就抛出取消错误。
     optimizer::Options optimizerOptions();
+    // 行数缓存：支持计划的估算不必每次都全表扫描。
+    // 以前 optimizerOptions() 每调一次就把库里每张表扫一遍，只为数行数；
+    // 这在大表上会把每条 SELECT 都拖成全库扫描。现在改为缓存行数，
+    // 并在任何成功写入后立即使其失效，保证估算不会用旧值。
+    std::uint64_t cachedTableRows(std::uint64_t tableId, const sql::Statement& definition);
+    // 取某张表的行数：命中直接返回，未命中才扫一次并记入缓存。
+    void invalidateRowCountCache();
+    // 统计缓存：实时统计（全表扫描 + 直方图）是 EXPLAIN 的真正瓶颈，
+    // 而它在同一进程内会被反复调用（每条 EXPLAIN 都调一次）。
+    // 这里把结果缓存，写语句使其失效，从而把重复扫描降为一次。
+    nlohmann::json cachedLiveTableStatistics();
+    // 取实时表统计：命中直接返回，未命中才全表扫描一次。
+    // 清空行数缓存：任何写语句成功后调用。
     nlohmann::json runStatement(const sql::LogicalPlan& plan);
     // 执行一条语句对应的计划。
     nlohmann::json run(const sql::LogicalPlan& plan);
@@ -157,6 +170,19 @@ private:
     std::unordered_map<std::string, std::vector<std::size_t>> correlatedColumnsCache_;
     // 缓存：形状到外层列下标列表的映射。
     std::unordered_map<std::string, nlohmann::json> correlatedRowsCache_;
+    std::unordered_map<std::uint64_t, std::uint64_t> rowCountCache_;
+    // 表 id 到行数的缓存；命中时不必再扫堆表。
+    std::uint64_t rowCountCacheHits_ = 0;
+    // 行数缓存命中次数，供诊断与性能观察使用。
+    std::uint64_t rowCountCacheMisses_ = 0;
+    // 行数缓存未命中次数。
+    nlohmann::json liveStatsCache_ = nullptr;
+    // 实时表统计缓存：下游是完整直方图，重算代价高，值得缓存。
+    std::uint64_t liveStatsCacheHits_ = 0;
+    // 统计缓存命中次数。
+    std::uint64_t liveStatsCacheMisses_ = 0;
+    // 统计缓存未命中次数。
+    // 行数缓存未命中次数。
     // 缓存：形状加绑定值到结果行的映射。
     std::vector<nlohmann::json>* nodeStats_ = nullptr;
     // 指向当前语句的节点统计数组，供 EXPLAIN ANALYZE 使用。

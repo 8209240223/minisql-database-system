@@ -936,14 +936,56 @@ void Database::checkCancelled() const {
     // 让上层能把它与真正的失败区分开。
 }
 optimizer::Options Database::optimizerOptions() {
+// 构造优化器选项：把改写预算与表行数交给优化器。
     optimizer::Options options;
     options.memoryBudgetBytes = queryMemoryBytes_;
+    // 内存预算直接沿用查询级配额。
     for (const auto& table : catalog_.tables()) {
-        double rows = 0;
-        heap_.scan(table.id, rowSchema(table.definition), [&](storage::RowRef, const storage::Row&) { ++rows; });
-        options.tableRows[key(table.definition.table)] = rows;
+    // 逐张表填行数估算。
+        options.tableRows[key(table.definition.table)] = cachedTableRows(table.id, table.definition);
+        // 关键改动：改走行数缓存。
+        // 原实现每次都用 heap_.scan 把整张表读一遍只为数行数，
+        // 而这个函数在每条 SELECT 编译时都会被调用，
+        // 等于把每条查询都拖成“全库全表扫描”。
+        // 现在只有缓存未命中时才扫一次，写语句会使其失效。
     }
     return options;
+}
+std::uint64_t Database::cachedTableRows(std::uint64_t tableId, const sql::Statement& definition) {
+// 取表行数：先查缓存，命中直接返回；未命中才扫一次并记入。
+    const auto found = rowCountCache_.find(tableId);
+    // 先在缓存里查这张表。
+    if (found != rowCountCache_.end()) { ++rowCountCacheHits_; return found->second; }
+    // 命中：命中计数加一，直接返回缓存值，不再触磁盘。
+    std::uint64_t rows = 0;
+    // 未命中：从 0 开始数。
+    heap_.scan(tableId, rowSchema(definition), [&](storage::RowRef, const storage::Row&) { ++rows; });
+    // 扫一遍堆表把行数数出来。
+    ++rowCountCacheMisses_;
+    // 未命中计数加一。
+    rowCountCache_[tableId] = rows;
+    // 结果写进缓存，下次直接用。
+    return rows;
+    // 返回行数。
+}
+void Database::invalidateRowCountCache() {
+// 失效行数缓存：任何成功写入都会改变行数。
+    rowCountCache_.clear();
+    liveStatsCache_ = nullptr;
+    // 统计缓存一并失效：写入会改变行数、最值、直方图等全部统计量。
+    // 直接清空：写语句数量远少于读，清空比逐项维护更简单也更不容易出错。
+}
+
+nlohmann::json Database::cachedLiveTableStatistics() {
+// 取实时表统计：命中直接返回缓存，未命中才做一次全表扫描。
+    if (!liveStatsCache_.is_null()) { ++liveStatsCacheHits_; return liveStatsCache_; }
+    // 命中：直接返回上次算好的结果，不再触磁盘。
+    ++liveStatsCacheMisses_;
+    // 未命中计数加一。
+    liveStatsCache_ = liveTableStatistics();
+    // 真正执行一次全表统计（这是贵的那一步）。
+    return liveStatsCache_;
+    // 返回结果，同时已经写进缓存。
 }
 nlohmann::json Database::compile(const std::string& source) {
     std::lock_guard<std::recursive_mutex> guard(mu_);
@@ -1464,10 +1506,14 @@ nlohmann::json Database::indexRebuild(const std::string& table, const std::strin
             const auto committedDirtyPages = file_->stagedPageCount();
             buffer_.commitWriteBatch();
             invalidateAnalyzeSnapshot();
+            invalidateRowCountCache();
+            // 写入已提交：行数可能变了，行数缓存必须一并失效。
             evaluateAutoCheckpoint(1, committedDirtyPages);
         } else {
             ++transactionWriteStatements_;
             invalidateAnalyzeSnapshot();
+            invalidateRowCountCache();
+            // 写入已提交：行数可能变了，行数缓存必须一并失效。
         }
         return {{"kind", "IndexRebuild"}, {"table", stored->definition.table}, {"index", index},
                 {"entries", entries}, {"height", height}, {"pages", pages},
@@ -2223,7 +2269,8 @@ nlohmann::json Database::statistics() {
     // X18: 显式 ANALYZE 的持久快照优先（跨进程有效）；缺失或已被写语句删除时回退实时扫描。
     const auto analyzed = loadAnalyzeMetadata();
     // 尝试读快照。
-    const auto tables = analyzed ? analyzed->at("tables") : liveTableStatistics();
+    const auto tables = analyzed ? analyzed->at("tables") : cachedLiveTableStatistics();
+    // 无 ANALYZE 快照时走统计缓存：内容与实时扫描一致，但不必每次重扫。
     // 有快照用快照，否则实时扫描。
     const auto dirtyPages = buffer_.dirtyPages();
     // 脏页数。
@@ -4475,7 +4522,8 @@ nlohmann::json Database::runStatement(const sql::LogicalPlan& plan) {
 // 如果已经处于显式事务中。
         auto result = run(plan);
 // 直接执行语句，不再为单条语句额外开写批次。
-        if (writes) { ++transactionWriteStatements_; invalidateAnalyzeSnapshot(); }
+        if (writes) { ++transactionWriteStatements_; invalidateAnalyzeSnapshot(); invalidateRowCountCache(); }
+        // 事务内写语句同样会改变行数，两个缓存都要失效。
 // 写语句累计事务内写入数，并让 ANALYZE 快照失效。
         return result;
 // 返回事务内语句结果。
@@ -4494,6 +4542,8 @@ nlohmann::json Database::runStatement(const sql::LogicalPlan& plan) {
         buffer_.commitWriteBatch();
 // 提交写批次，使修改对外可见。
         invalidateAnalyzeSnapshot();
+        invalidateRowCountCache();
+        // 写入已提交：行数可能变了，行数缓存必须一并失效。
 // 写成功后让 ANALYZE 快照失效。
         evaluateAutoCheckpoint(1, committedDirtyPages);
 // 按一条写语句的写入量评估自动检查点。
@@ -5141,8 +5191,10 @@ nlohmann::json Database::execute(const std::string& source, bool optimize) {
 // 在目录中查找指定表。
                         double rows = 0;
 // 统计行数。
-                        heap_.scan(table.id, rowSchema(table.definition), [&](storage::RowRef, const storage::Row&) { ++rows; });
-// 扫描堆表累计行数。
+                        // 改走行数缓存：原来这里也在全表扫描只为数行数，
+                        // 而 EXPLAIN 对每个涉及的表都会调一次，与 cachedTableRows 重复。
+                        rows = static_cast<double>(cachedTableRows(table.id, table.definition));
+// 行数直接取缓存，不再重扫堆表。
                         return {rows, static_cast<double>(file_->pagesFor(table.id).size())};
 // 返回行数与页文件页数。
                     }
