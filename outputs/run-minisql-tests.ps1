@@ -116,7 +116,9 @@ $groups = @{
         'tests/auto-checkpoint-smoke.mjs',
         'tests/x22-fault-injection.mjs',
         'tests/background-checkpoint-fault-injection.mjs',
-        'tests/cli-input-and-buffer-log.mjs',
+        'tests/cli-input-and-buffer-log.mjs'
+        # 缓存替换策略（LRU / FIFO / CLOCK）与顺序扫描的页局部性。
+        'tests/cache-policy-smoke.mjs',
         'tests/journal-process.mjs',
         'tests/wal-metadata-process.mjs',
         'tests/wal-group-commit.mjs',
