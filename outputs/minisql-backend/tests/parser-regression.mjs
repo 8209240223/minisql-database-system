@@ -27,4 +27,14 @@ assert.match(err2.error.message, /EXISTS requires a SELECT subquery but found/);
 const err3 = run('SELECT SUM(*) FROM t;');
 assert.equal(err3.success, false);
 assert.match(err3.error.message, /Only COUNT accepts '\*' but found/);
-console.log('21 parser/lexer regression checks passed (including 3 error-message format checks)');
+// Verify business-constraint errors carry column/constraint names (dc090a0)
+const err4 = run('CREATE TABLE t(a INT PRIMARY KEY PRIMARY KEY);');
+assert.equal(err4.success, false);
+assert.match(err4.error.message, /Duplicate PRIMARY KEY on column 'a'/);
+const err5 = run('CREATE TABLE t(a INT NULL PRIMARY KEY);');
+assert.equal(err5.success, false);
+assert.match(err5.error.message, /PRIMARY KEY on column 'a' cannot declare NULL/);
+const err6 = run('SELECT * AS x FROM t;');
+assert.equal(err6.success, false);
+assert.match(err6.error.message, /Wildcard '\*' cannot have an alias/);
+console.log('24 parser/lexer regression checks passed (including 6 error-message format checks)');
