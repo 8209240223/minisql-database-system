@@ -6,14 +6,15 @@
 | --- | --- |
 | 被测引擎 | `outputs/minisql-backend/bin/minisql_database.exe` |
 | 调用方式 | `minisql_database.exe <db.pages> execute`，SQL 由标准输入传入 |
-| 用例总数 | 114 |
-| 通过 | 114 |
+| 用例总数 | 122 |
+| 通过 | 122 |
 | 失败 | 0 |
 
 判定口径：期望 ok 的用例必须执行成功；期望 err 的用例必须被引擎拒绝。两者都算通过。
 
 本集还覆盖本轮新增的查询优化能力：查询结果缓存（重复 SELECT 直接命中）、
-三级缓存可观测性（statistics 里的 queryCache）、以及索引建议器（基于实际查询负载给出建索引建议）。
+三级缓存可观测性（statistics 里的 queryCache）、索引建议器（基于实际查询负载给出建索引建议）、
+以及 Top-N 排序下推（ORDER BY + LIMIT 只保留前 N 行，不再全量排序）。
 
 说明：`err` 有两种含义，文档中按用例名区分——一类是**应当拒绝的非法输入**（如缺 ON、超长 VARCHAR），
 另一类是**当前尚未实现的语法**（如 COUNT(DISTINCT)、BETWEEN、CASE WHEN），它们都会返回明确错误而非静默通过。
@@ -191,6 +192,19 @@
 | 3 | 重复查询结果一致 | `SELECT COUNT(*) FROM t; SELECT COUNT(*) FROM t;` | ok | [[2]] | ✅ |
 | 4 | 带谓词查询（累积建议负载） | `SELECT id FROM t WHERE v=10; SELECT id FROM t WHERE v=20;` | ok | [[2]] | ✅ |
 | 5 | 建索引后查询仍正确 | `CREATE INDEX ix_v ON t(v); SELECT COUNT(*) FROM t;` | ok | [[2]] | ✅ |
+
+## Top-N 排序下推
+
+| # | 用例 | SQL | 期望 | 实测 | 结果 |
+| --- | --- | --- | --- | --- | --- |
+| 1 | ORDER BY + LIMIT 正确取前 N | `SELECT id FROM o ORDER BY v LIMIT 3;` | ok | [[4], [8], [2]] | ✅ |
+| 2 | ORDER BY DESC + LIMIT | `SELECT id FROM o ORDER BY v DESC LIMIT 3;` | ok | [[3], [7], [5]] | ✅ |
+| 3 | ORDER BY + OFFSET + LIMIT | `SELECT id FROM o ORDER BY v LIMIT 2 OFFSET 2;` | ok | [[2], [6]] | ✅ |
+| 4 | 多键排序 + LIMIT | `SELECT id FROM o ORDER BY v, id LIMIT 4;` | ok | [[4], [8], [2]] ...共 4 行 | ✅ |
+| 5 | 并列键降序 + LIMIT | `SELECT id FROM o ORDER BY k DESC LIMIT 3;` | ok | [[5], [6], [8]] | ✅ |
+| 6 | LIMIT 超过行数返回全部 | `SELECT id FROM o ORDER BY v LIMIT 100;` | ok | [[4], [8], [2]] ...共 8 行 | ✅ |
+| 7 | 无 LIMIT 的完整排序 | `SELECT id FROM o ORDER BY v;` | ok | [[4], [8], [2]] ...共 8 行 | ✅ |
+| 8 | Top-N 与 WHERE 组合 | `SELECT id FROM o WHERE v>2 ORDER BY v DESC LIMIT 2;` | ok | [[3], [7]] | ✅ |
 
 ## 失败用例说明
 
