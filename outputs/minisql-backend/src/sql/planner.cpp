@@ -384,6 +384,10 @@ nlohmann::json expressionIdentity(nlohmann::json value) {
     // 非对象（例如 null 常量）直接返回。
     value.erase("line"); value.erase("column");
     // 去掉行号列号，这样同一表达式在不同位置也视为相同。
+    // X25 回归修复：binding/relation/expressionId 是 X25 稳定绑定身份的"实例级"编号，
+    // 同一列引用在不同位置（GROUP BY 键 vs 投影）必然不同；结构身份必须抹掉，
+    // 否则 lowerAggregate 的分组键匹配永远失配，裸列全部误报 2003。
+    value.erase("binding"); value.erase("relation"); value.erase("expressionId");
     if (value.contains("left")) value["left"] = expressionIdentity(value["left"]);
     // 递归规范化左子树。
     if (value.contains("right")) value["right"] = expressionIdentity(value["right"]);
