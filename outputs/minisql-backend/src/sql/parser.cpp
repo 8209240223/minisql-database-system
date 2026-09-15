@@ -238,10 +238,10 @@ private:
         return value;
     }
     Statement remove(){Statement s{"Delete"};expect("DELETE");expect("FROM");s.table=identifier();if(keyword("WHERE")){++i;s.where=expression();}semicolon();return s;}
-    std::shared_ptr<Expr> expression(){auto left=conjunction();while(keyword("OR")){++i;left=std::make_shared<Expr>(Expr{"Binary","OR",left,conjunction()});}return left;}
-    std::shared_ptr<Expr> conjunction(){auto left=negation();while(keyword("AND")){++i;left=std::make_shared<Expr>(Expr{"Binary","AND",left,negation()});}return left;}
+    std::shared_ptr<Expr> expression(){auto left=conjunction();while(keyword("OR")){const auto loc=t[i].location;++i;left=std::make_shared<Expr>(Expr{"Binary","OR",left,conjunction(),loc});}return left;}
+    std::shared_ptr<Expr> conjunction(){auto left=negation();while(keyword("AND")){const auto loc=t[i].location;++i;left=std::make_shared<Expr>(Expr{"Binary","AND",left,negation(),loc});}return left;}
     std::size_t depth=0;
-    std::shared_ptr<Expr> negation(){if(keyword("NOT")){if(++depth>256)throw MiniSqlError(ErrorCode::Syntax,"Expression depth exceeded",t[i].location);++i;auto child=negation();--depth;return std::make_shared<Expr>(Expr{"Unary","NOT",child,{}});}return comparison();}
+    std::shared_ptr<Expr> negation(){if(keyword("NOT")){if(++depth>256)throw MiniSqlError(ErrorCode::Syntax,"Expression depth exceeded",t[i].location);const auto loc=t[i].location;++i;auto child=negation();--depth;return std::make_shared<Expr>(Expr{"Unary","NOT",child,{},loc});}return comparison();}
     std::shared_ptr<Expr> comparison(){
         auto left=addition();
         if(keyword("IN")||keyword("NOT")){
