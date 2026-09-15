@@ -232,7 +232,7 @@ private:
     }
     std::uint64_t unsignedCount(){
         const auto& token=take();std::uint64_t value=0;
-        if(token.type!="INTEGER")throw MiniSqlError(ErrorCode::Syntax,"Expected non-negative integer count",token.location);
+        if(token.type!="INTEGER")throw MiniSqlError(ErrorCode::Syntax,"Expected non-negative integer count but found "+describeToken(token),token.location);
         const auto parsed=std::from_chars(token.lexeme.data(),token.lexeme.data()+token.lexeme.size(),value);
         if(parsed.ec!=std::errc{}||parsed.ptr!=token.lexeme.data()+token.lexeme.size())throw MiniSqlError(ErrorCode::Syntax,"Pagination count exceeds UINT64 range",token.location);
         return value;
