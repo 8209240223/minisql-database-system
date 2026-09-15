@@ -17,4 +17,14 @@ assert.equal(run('INSERT INTO t(a) VALUES(1),;').success,false);
 assert.deepEqual(run('BEGIN TRANSACTION; COMMIT; ROLLBACK;').ast.map(node=>node.kind),['Begin','Commit','Rollback']);
 assert.equal(run('BEGIN bad;').success,false);
 assert.equal(run('COMMIT').success,false);
-console.log('18 parser/lexer regression checks passed');
+// Verify new-style error messages carry actual-token context (ee77006 + 7dc0736)
+const err1 = run('CREATE UNIQUE TABLE t(a INT);');
+assert.equal(err1.success, false);
+assert.match(err1.error.message, /Expected INDEX after UNIQUE but found/);
+const err2 = run('SELECT * FROM t WHERE EXISTS (NOT);');
+assert.equal(err2.success, false);
+assert.match(err2.error.message, /EXISTS requires a SELECT subquery but found/);
+const err3 = run('SELECT SUM(*) FROM t;');
+assert.equal(err3.success, false);
+assert.match(err3.error.message, /Only COUNT accepts '\*' but found/);
+console.log('21 parser/lexer regression checks passed (including 3 error-message format checks)');
