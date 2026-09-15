@@ -96,6 +96,14 @@ $groups = @{
         'tests/transaction-overflow.mjs'
         'tests/requirements-limits-process.mjs'
         'tests/nesting-depth-process.mjs'
+        # SQL 扩展功能：LIKE 模式匹配、CROSS JOIN 与逗号连接。
+        'tests/like-smoke.mjs'
+        'tests/cross-join-smoke.mjs'
+        # 目录持久化与类型编解码往返。
+        'tests/catalog-persistence-smoke.mjs'
+        'tests/type-roundtrip-smoke.mjs'
+        # 查询结果缓存：命中正确性 + 写入后失效。
+        'tests/query-result-cache-smoke.mjs'
     )
     storage = @(
         'tests/checkpoint-smoke.mjs',
