@@ -61,6 +61,9 @@ int main() {
     require(minisql::sql::serializeAst(astRestored) == astDocument);
     const auto astWrapped = nlohmann::json{{"schemaVersion", 1}, {"statements", astDocument}};
     require(minisql::sql::serializeAst(minisql::sql::deserializeAst(astWrapped)) == astDocument);
+    const auto wildcardAst = parse("SELECT * FROM existing; SELECT COUNT(*),SUM(id),AVG(id) FROM existing GROUP BY id HAVING COUNT(*)>1;");
+    const auto wildcardDocument = minisql::sql::serializeAst(wildcardAst);
+    require(minisql::sql::serializeAst(minisql::sql::deserializeAst(wildcardDocument)) == wildcardDocument);
     bool badAstVersion = false;
     try { (void)minisql::sql::deserializeAst(nlohmann::json{{"schemaVersion", 2}, {"statements", astDocument}}); }
     catch (const minisql::MiniSqlError&) { badAstVersion = true; }

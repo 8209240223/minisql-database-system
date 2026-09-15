@@ -61,16 +61,26 @@ inline std::shared_ptr<Expr> readCheckExpression(const nlohmann::json& node, std
     for (char& c : value) if (c >= 'a' && c <= 'z') c -= 32;
     const bool binary = kind == "Binary";
     const bool unary = kind == "Unary" || kind == "Cast";
+    const bool wildcard = kind == "Wildcard";
+    const bool aggregate = kind == "AggregateExpr";
     if ((binary || kind == "Unary") && expression->value != value) invalid();
-    if (!binary && !unary && kind != "Literal" && kind != "Identifier" && !subqueryKind) invalid();
+    if (!binary && !unary && !wildcard && !aggregate && kind != "Literal" && kind != "Identifier" && !subqueryKind) invalid();
     if (subqueryKind) {
         if (!node.contains("subquerySql") || !node.at("subquerySql").is_string()) invalid();
         expression->subquerySql = node.at("subquerySql").get<std::string>();
         if (expression->subquerySql.empty() || expression->subquerySql.size() > 1048576) invalid();
     }
-    const std::size_t expectedSize = binary ? 6u : unary ? 5u : subqueryKind ? (kind == "InSubquery" ? 6u : 5u) : 4u;
+    if (wildcard && expression->value != "*") {
+        const auto tokens = tokenize(expression->value);
+        std::string joined;
+        for (const auto& token : tokens) joined += token.lexeme;
+        if (joined != expression->value ||
+            !(tokens.size() == 4 && tokens[0].type == "IDENTIFIER" && tokens[1].lexeme == "." && tokens[2].lexeme == "*")) invalid();
+    }
+    if (aggregate && value != "COUNT" && value != "SUM" && value != "AVG" && value != "MIN" && value != "MAX") invalid();
+    const std::size_t expectedSize = binary ? 6u : unary ? 5u : aggregate ? 5u : subqueryKind ? (kind == "InSubquery" ? 6u : 5u) : 4u;
     if (node.size() != expectedSize ||
-        node.contains("left") != (binary || unary || kind == "InSubquery") || node.contains("right") != binary) invalid();
+        node.contains("left") != (binary || unary || kind == "InSubquery" || aggregate) || node.contains("right") != binary) invalid();
     if (binary && value != "AND" && value != "OR" && value != "=" && value != "!=" &&
         value != "<" && value != "<=" && value != ">" && value != ">=" &&
         value != "+" && value != "-" && value != "*" && value != "/") invalid();
@@ -80,7 +90,7 @@ inline std::shared_ptr<Expr> readCheckExpression(const nlohmann::json& node, std
         for (char& c : type) if (c >= 'A' && c <= 'Z') c += 32;
         if (!minisql::decimalType(type) && !minisql::varcharLength(type)) invalid();
     }
-    if (!binary && !unary && !subqueryKind) {
+    if (!binary && !unary && !wildcard && !aggregate && !subqueryKind) {
         const auto tokens = tokenize(expression->value);
         std::string joined;
         for (const auto& token : tokens) joined += token.lexeme;
@@ -96,7 +106,7 @@ inline std::shared_ptr<Expr> readCheckExpression(const nlohmann::json& node, std
             if (!single && !signedInteger && !dateLiteral) invalid();
         }
     }
-    if (binary || unary || kind == "InSubquery") expression->left = readCheckExpression(node.at("left"), depth + 1, remaining);
+    if (binary || unary || kind == "InSubquery" || aggregate) expression->left = readCheckExpression(node.at("left"), depth + 1, remaining);
     if (binary) expression->right = readCheckExpression(node.at("right"), depth + 1, remaining);
     return expression;
 }
