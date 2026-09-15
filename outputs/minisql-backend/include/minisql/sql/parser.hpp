@@ -39,7 +39,13 @@ struct OrderItem { std::shared_ptr<Expr> expression; bool descending = false; st
 // nullsFirst 记录 NULLS FIRST / NULLS LAST 的显式指定，未写时为空。
 struct Assignment { std::string column; std::shared_ptr<Expr> expression; };
 // UPDATE 里的一条赋值：column = expression。
-struct Join { std::string table; std::string alias; std::shared_ptr<Expr> on; bool left = false; bool right = false; bool cross = false; };
+struct Join { std::string table; std::string alias; std::shared_ptr<Expr> on; bool left = false; bool right = false; bool cross = false;
+// 上面是原有字段；table 是右侧表名（普通表时有效）。
+    std::shared_ptr<Statement> fromSubquery{};
+    // 下面是新增字段：JOIN 右侧写成派生表（子查询）时存放内层 SELECT 语法树。
+    // 为空表示右侧是普通表，此时走 table 字段；非空时 table 存的是它的别名。
+    // 这与 Statement::fromSubquery（FROM 位置的派生表）语义一致，只是位置在 JOIN 上。
+};
 // 一个连接子句。
 // table 是被连接的表名；alias 是它的别名。
 // on 是连接条件表达式；left / right 标记是左外连接还是右外连接。

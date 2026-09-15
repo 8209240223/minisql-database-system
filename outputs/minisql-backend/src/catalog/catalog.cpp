@@ -464,7 +464,73 @@ std::size_t resolveColumnIndex(const Table& table, const std::string& name, Sour
     return match;
     // 返回唯一的列下标。
 }
-Table queryScope(const sql::Statement& statement, const Catalog& catalog, std::size_t joinCount) {
+// 前向声明：下面两个函数互相递归（派生表里可以再出现派生表）。
+Table derivedTableScope(const sql::Statement& inner, const Catalog& catalog, std::size_t depth);
+// 把一个派生表的内层 SELECT 算成一张“虚拟表”，供外层列解析与类型校验使用。
+
+Table derivedTableScope(const sql::Statement& inner, const Catalog& catalog, std::size_t depth) {
+// 派生表作用域：先算出内层自己的作用域，再按内层投影列造出对外的列。
+    if (depth > 256) fail("Derived table nesting depth exceeded", inner.location);
+    // 嵌套深度保护，防止极端嵌套把递归栈打爆。
+    std::unordered_map<std::string, Table> scopes;
+    // 内层自己的 JOIN 也可能带派生表，先递归算好。
+    for (const auto& join : inner.joins)
+        if (join.fromSubquery) scopes[key(join.alias)] = derivedTableScope(*join.fromSubquery, catalog, depth + 1);
+    // 逐个派生表 JOIN 递归展开。
+    Table innerScope;
+    // 内层自己的作用域表。
+    if (inner.fromSubquery) {
+    // 内层 FROM 也是派生表。
+        innerScope = derivedTableScope(*inner.fromSubquery, catalog, depth + 1);
+        // 递归取它的作用域。
+        for (const auto& join : inner.joins) {
+        // 内层的 JOIN 列也要并进来。
+            const auto* right = catalog.find(join.table);
+            // 普通表直接取目录定义。
+            if (!right) fail("Table does not exist: " + join.table, inner.location);
+            for (auto column : right->columns) { column.qualifier = join.alias.empty() ? right->name : join.alias; innerScope.columns.push_back(std::move(column)); }
+            // 打上限定名后并入。
+        }
+    } else {
+    // 内层 FROM 是普通表：直接用 queryScope 拼。
+        innerScope = queryScope(inner, catalog, static_cast<std::size_t>(-1), scopes.empty() ? nullptr : &scopes);
+        // 把内层自己的作用域交给它。
+    }
+    Table scope;
+    // 对外对象：列名与类型来自内层投影。
+    for (const auto& item : inner.selectItems) {
+    // 逐个看内层投影项。
+        if (!item.expression) continue;
+        // 没有表达式的项（理论上不会出现）跳过。
+        if (item.expression->kind == "Wildcard") {
+        // 通配符：把内层作用域的全部列原样带出去。
+            for (auto column : innerScope.columns) { column.qualifier.clear(); scope.columns.push_back(std::move(column)); }
+            // 清掉限定名：到了外层，这些列属于派生表别名。
+            continue;
+            // 本项结束。
+        }
+        std::string name = item.alias;
+        // 优先用显式别名。
+        if (name.empty() && item.expression->kind == "Identifier") {
+        // 没别名且是普通列引用：取去限定名后的列名。
+            const auto& text = item.expression->value;
+            const auto dot = text.find('.');
+            name = dot == std::string::npos ? text : text.substr(dot + 1);
+            // 有点号就取右半段，否则原样。
+        }
+        if (name.empty()) name = "expr_" + std::to_string(scope.columns.size() + 1);
+        // 计算列用稳定的名字，保证外层可引用。
+        const auto type = expressionType(*item.expression, innerScope, inner.location, 0, true);
+        // 用内层作用域推导这一列的类型（允许聚合）。
+        scope.columns.push_back({name, type, std::string{}, true, std::nullopt, false, false, std::nullopt});
+        // 列名、类型已知；限定名由调用方补，默认可空。
+    }
+    return scope;
+    // 返回派生表的对外作用域。
+}
+
+Table queryScope(const sql::Statement& statement, const Catalog& catalog, std::size_t joinCount,
+                 const std::unordered_map<std::string, Table>* derivedScopes) {
 // 把主表与参与连接的右表合并成一张"视野表"，让后续校验统一按一张表来查列。
     const auto* first = catalog.find(statement.table);
     // 先按表名取出主表定义。
@@ -480,6 +546,36 @@ Table queryScope(const sql::Statement& statement, const Catalog& catalog, std::s
     // 只合并需要参与本次校验的那些 JOIN。
         const auto& join = statement.joins[i];
         // 取出第 i 个 JOIN 子句。
+        if (join.fromSubquery) {
+        // JOIN 右侧是派生表：它不在 catalog 里，
+        // 用调用方预先算好的作用域表把它的输出列合并进来。
+        // 必须正常合并而不能跳过：跳过会让作用域表少列，
+        // planner 随后按右偏移读取时会越界，直接崩溃。
+            if (!derivedScopes) fail("JOIN derived table requires prepared scope", statement.location);
+            // 调用方没传作用域表，属于内部不变量破坏。
+            const auto prepared = derivedScopes->find(key(join.alias));
+            // 按别名取派生表的作用域。
+            if (prepared == derivedScopes->end()) fail("JOIN derived table scope is missing: " + join.alias, statement.location);
+            // 找不到说明 planner 漏了一个派生表，按语义错误报出。
+            const auto qualifier = join.alias;
+            // 限定名就是别名。
+            if (!names.insert(key(qualifier)).second) fail("Duplicate table alias: " + qualifier, statement.location);
+            // 重复别名拒绝。
+            if (join.right) for (auto& column : scope.columns) column.nullable = true;
+            // RIGHT JOIN 时左侧整侧可能补 NULL。
+            for (auto column : prepared->second.columns) { column.qualifier = qualifier; if (join.left) column.nullable = true; scope.columns.push_back(std::move(column)); }
+            // 逐列并入：打上限定名，LEFT JOIN 时标可空。
+            if (join.cross) continue;
+            // CROSS JOIN 与逗号连接没有 ON，列已并入，直接结束本项。
+            if (!join.on) fail("JOIN ON requires a BOOL expression", statement.location);
+            // 其余连接形式必须带 ON。
+            const auto onType = expressionType(*join.on, scope, statement.location);
+            // 用已合并的作用域表推导 ON 的类型。
+            if (onType != "bool" && onType != "null") fail("JOIN ON requires a BOOL expression", statement.location);
+            // ON 必须是布尔表达式。
+            continue;
+            // 本项处理完毕。
+        }
         const auto* right = catalog.find(join.table);
         // 按表名取出被连接的右表定义。
         if (!right) fail("Table does not exist: " + join.table, statement.location);
@@ -924,8 +1020,14 @@ void validate(const std::vector<sql::Statement>& statements, Catalog& catalog) {
             continue;
             // 跳过常规校验流程。
         }
-        auto binding = queryScope(statement, catalog);
-        // 把主表与本次语句用到的 JOIN 合并成视图表，作为列解析的统一依据。
+        std::unordered_map<std::string, Table> derivedScopes;
+        // 先把所有派生表 JOIN 的内层 SELECT 算成作用域表。
+        for (const auto& join : statement.joins)
+        // 逐个看 JOIN 右侧。
+            if (join.fromSubquery) derivedScopes[key(join.alias)] = derivedTableScope(*join.fromSubquery, catalog, 0);
+            // 派生表不在 catalog 里，它的列必须预先算出来再传给 queryScope。
+        auto binding = queryScope(statement, catalog, static_cast<std::size_t>(-1), derivedScopes.empty() ? nullptr : &derivedScopes);
+        // 把主表、本次语句用到的 JOIN 与派生表作用域合并成视图表，作为列解析的统一依据。
         const auto* table = &binding;
         // 用指针引用视图表，后面代码都按 table 访问。
         if (statement.kind == "Insert") {

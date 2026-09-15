@@ -39,7 +39,15 @@ std::size_t resolveColumnIndex(const Table& table, const std::string& name, Sour
 // 把列名解析成列下标；列不存在或名字有歧义时报错。
 std::string notNullConstraintSuffix(const Table& table, std::size_t index);
 // 为 NOT NULL 报错找出约束名，便于提示是哪条约束被违反。
-Table queryScope(const sql::Statement& statement, const Catalog& catalog, std::size_t joinCount = static_cast<std::size_t>(-1));
+Table derivedTableScope(const sql::Statement& inner, const Catalog& catalog, std::size_t depth = 0);
+// 把一个派生表的内层 SELECT 算成一张“虚拟表”（列名 + 类型）。
+// 派生表不在 catalog 里，它的输出列必须由调用方预先算出来，
+// planner 依靠它把派生表参与到作用域与类型校验里。
+Table queryScope(const sql::Statement& statement, const Catalog& catalog, std::size_t joinCount = static_cast<std::size_t>(-1),
+                  const std::unordered_map<std::string, Table>* derivedScopes = nullptr);
+// derivedScopes：JOIN 右侧是派生表时用的作用域表（按别名索引）。
+// 派生表不在 catalog 里，它的输出列只有 planer 能算出来，
+// 所以由调用方预先算好并传入；为空表示没有派生表参与连接。
 // 构造查询作用域：主表加参与连接的表的列合并成一张“视角表”，供名字解析使用。
 std::shared_ptr<sql::Expr> resolveOrder(const sql::Statement& statement, const sql::OrderItem& item, const Table& table);
 // 解析 ORDER BY：优先匹配投影别名，其次按普通列处理。

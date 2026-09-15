@@ -287,7 +287,10 @@ inline nlohmann::json serializeStatement(const Statement& statement) {
     // 连接列表先置空。
     for (const auto& join : statement.joins)
     // 逐个序列化 JOIN 子句。
-        node["joins"].push_back({{"kind", join.cross ? "CrossJoin" : join.left && join.right ? "FullJoin" : join.left ? "LeftJoin" : join.right ? "RightJoin" : "InnerJoin"}, {"table", join.table}, {"alias", join.alias}, {"on", serializeExpression(join.on)}});
+        node["joins"].push_back({{"kind", join.cross ? "CrossJoin" : join.left && join.right ? "FullJoin" : join.left ? "LeftJoin" : join.right ? "RightJoin" : "InnerJoin"}, {"table", join.table}, {"alias", join.alias}, {"on", serializeExpression(join.on)},
+        // JOIN 右侧是派生表时，内层 SELECT 也要序列化；否则往返后这个字段会静默丢失。
+        // 普通表时写 null，保持字段始终存在，读侧不用区分“字段缺失”和“值为空”。
+        {"joinFromSubquery", join.fromSubquery ? serializeStatement(*join.fromSubquery) : nullptr}});
         // 两个布尔标记被压成一个可读的连接类型字符串：同时置位是 FullJoin，
         // 只左是 LeftJoin，只右是 RightJoin，都不置位是 InnerJoin，
         // 这样反序列化时按一个字段就能还原出原来的两个布尔值。
@@ -492,6 +495,11 @@ inline Statement readStatement(const nlohmann::json& node, std::size_t depth = 0
             // 其余连接类型必须带 ON 字段。
             join.on = deserializeExpression(item.at("on"), depth + 1);
             // 还原 ON 条件表达式。
+        }
+        if (item.contains("joinFromSubquery") && !item.at("joinFromSubquery").is_null()) {
+        // JOIN 右侧是派生表：递归还原内层 SELECT。
+            join.fromSubquery = std::make_shared<Statement>(readStatement(item.at("joinFromSubquery"), depth + 1));
+            // 还原出来的内层语句挂回 join 上，与 FROM 派生表处理一致。
         }
         statement.joins.push_back(std::move(join));
         // 收进连接列表。

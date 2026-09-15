@@ -688,12 +688,72 @@ private:
             // 消费 JOIN。
             }
             // 非 CROSS 分支结束。
-            join.table=identifier();
-            // 读被连接的表名。
-            if(keyword("AS")){++i;join.alias=identifier();}
-            // 带 AS 的右表别名。
-            else if(i<t.size()&&t[i].type=="IDENTIFIER")join.alias=identifier();
-            // 隐式别名。
+            if(at("(")){
+            // 分支一：JOIN 右侧是左括号，说明写的是派生表（子查询）。
+            // 这里与 FROM 位置的派生表走相同的规则：计入嵌套深度、
+            // 必须有显式别名、输出列名不得歧义。
+                if(++depth>256) fail(ErrorCode::Syntax, "Query nesting depth exceeded", t[i].location);
+                // 深度上限检查，防止嵌套写法把递归栈打爆。
+                ++i;
+                // 吃掉左括号。
+                auto derived=select(false);
+                // 递归解析内层 SELECT；不消费分号，因为后面还有外层内容。
+                expect(")");
+                // 吃掉右括号。
+                std::string alias;
+                // 准备别名。
+                if(keyword("AS")){++i;alias=identifier();}
+                // 带 AS 的显式别名。
+                else if(i<t.size()&&t[i].type=="IDENTIFIER")alias=identifier();
+                // 不带 AS 的隐式别名。
+                if(alias.empty()) fail(ErrorCode::Semantic, "A derived table must have an explicit alias", t[i].location);
+                // 别名是必需的：没有名字，外层无法引用这个派生表。
+                if(derived.selectList.size()==derived.selectItems.size()){
+                // 只有当兼容用的 selectList 与结构化投影项一一对应时才做静态判重。
+                    std::vector<std::string> names;
+                    // 收集内层投影的输出列名。
+                    bool opaque=false;
+                    // 标记是否存在“静态看不出来”的投影项。
+                    for(const auto& item: derived.selectItems){
+                    // 逐个看内层投影项。
+                        std::string name;
+                        // 本项的输出列名。
+                        if(!item.alias.empty()){name=item.alias;}
+                        // 有别名就用别名，它是最终输出列名。
+                        else if(item.expression&&item.expression->kind=="Identifier"){name=item.expression->value;}
+                        // 否则若投影是普通列，列名就是输出名。
+                        else { opaque=true; break; }
+                        // 通配符展开、计算表达式等静态判不了，直接放弃判重。
+                        names.push_back(name);
+                        // 记下这一列的名字。
+                    }
+                    if(!opaque){
+                    // 只有所有列名都清楚时才检查。
+                        auto sorted=names;std::sort(sorted.begin(),sorted.end());
+                        // 复制一份并排序，让相同名字在排序后彼此相邻。
+                        if(std::adjacent_find(sorted.begin(),sorted.end())!=sorted.end())
+                            fail(ErrorCode::Semantic, "Derived table output column name is ambiguous", t[i].location);
+                        // 排序后存在相邻相等元素，说明有重名列，拒绝。
+                    }
+                }
+                join.fromSubquery=std::make_shared<Statement>(std::move(derived));
+                // 把内层 SELECT 的语法树挂到连接子句上。
+                join.table=alias;
+                // 别名充当对外表名，与 FROM 派生表的占位写法一致。
+                join.alias=alias;
+                // 同时记下别名，供作用域限定名使用。
+                --depth;
+                // 嵌套结束，深度还原。
+            } else {
+            // 分支二：JOIN 右侧是普通表。
+                join.table=identifier();
+                // 读被连接的表名。
+                if(keyword("AS")){++i;join.alias=identifier();}
+                // 带 AS 的右表别名。
+                else if(i<t.size()&&t[i].type=="IDENTIFIER")join.alias=identifier();
+                // 隐式别名。
+            }
+            // 两个分支都会把 join.table 填好（派生表时填别名）。
             if(join.cross){
             // CROSS JOIN 与逗号连接不带 ON；写成 ON 属于语法错误，明确报出来而不是静默忽略。
                 if(keyword("ON")) fail(ErrorCode::Syntax, "CROSS JOIN does not accept an ON clause", t[i].location);

@@ -651,6 +651,32 @@ LogicalPlan build(const Statement& statement, const catalog::Catalog& catalog, c
         bindScope = std::move(derived);
         // 设为绑定作用域。
         for (const auto& join : statement.joins) {
+        // 逐个把 JOIN 右侧的列并入绑定作用域。
+            if (join.fromSubquery) {
+            // 这里用与普通表相同的方式处理派生表：它不是 catalog 对象，
+            // 但它的输出列已经在 derivedTableScope 里算好，这里按类型并入即可。
+
+            // 右侧是派生表：先把内层 SELECT 编译成计划，
+            // 再用它的输出列构造一张“虚拟表”并入作用域。
+                const auto rightPlan = build(*join.fromSubquery, catalog, bound);
+                // 递归编译内层，拿到它的输出列。
+                const auto qualifier = join.alias.empty() ? join.table : join.alias;
+                // 限定名用别名（派生表必须有别名）。
+                if (join.right) for (auto& column : bindScope.columns) column.nullable = true;
+                // RIGHT JOIN 时左侧整侧可能补 NULL。
+                for (const auto& column : rightPlan.output) {
+                // 逐列把计划列（PlanColumn）转成目录列（catalog::Column）。
+                // 两者是不同类型，不能直接赋值，必须逐字段构造。
+                    catalog::Column copied{column.name, column.type, qualifier, column.nullable || join.left,
+                    // 依次是：列名、类型、限定名（别名）、是否可空（LEFT JOIN 时右列可能补 NULL）、
+                        column.defaultValue, column.primaryKey, column.unique, column.references};
+                        // 默认值、主键标记、唯一标记与外键信息逐项继承。
+                    bindScope.columns.push_back(std::move(copied));
+                    // 并入作用域表。
+                }
+                continue;
+                // 派生表路径已处理完。
+            }
             const auto* right = catalog.find(join.table);
             if (!right) invalid("missing join table");
             const auto qualifier = join.alias.empty() ? right->name : join.alias;
@@ -665,8 +691,16 @@ LogicalPlan build(const Statement& statement, const catalog::Catalog& catalog, c
         // 逐条 CHECK 约束。
             plan.checks.push_back(bindExpression(*deserializeExpression(nlohmann::json::parse(check)), *table));
             // 磁盘上存的是表达式文本，这里解析回语法树再绑定成计划表达式。
-        bindScope = catalog::queryScope(statement, catalog);
-        // 把主表与本次用到的 JOIN 合并成视图表，作为列解析的统一起点。
+        std::unordered_map<std::string, catalog::Table> derivedScopes;
+        // 先把所有派生表 JOIN 的内层 SELECT 算成作用域表；
+        // queryScope 只认得 catalog 里的物理表，派生表的列必须由这里预先算好。
+        for (const auto& join : statement.joins)
+        // 逐个看 JOIN 右侧。
+            if (join.fromSubquery) derivedScopes[canonical(join.alias)] = catalog::derivedTableScope(*join.fromSubquery, catalog, 0);
+            // canonical() 是 planner 自有的转小写函数，与 catalog 内部 key() 行为一致。
+            // 只有派生表需要预备；普通表由 queryScope 自己去 catalog 查。
+        bindScope = catalog::queryScope(statement, catalog, static_cast<std::size_t>(-1), derivedScopes.empty() ? nullptr : &derivedScopes);
+        // 把主表、本次用到的 JOIN 与派生表作用域合并成视图表，作为列解析的统一起点。
     }
     // 作用域准备结束。
     // 该语句在绑定结果里的作用域；绑定失败或语句不在结果中时 slots 全 0，
@@ -885,20 +919,46 @@ LogicalPlan build(const Statement& statement, const catalog::Catalog& catalog, c
         // 按书写顺序逐个叠加连接，每次把"当前输入"与"右边新表"接起来。
             const auto& source = statement.joins[i];
             // 当前连接子句。
-            const auto* right = catalog.find(source.table);
-            // 取右表定义。
-            if (!right) invalid("missing join table");
-            // 目录里找不到，说明编译流程有漏，按内部错误处理。
-            catalog::Table prefix;
             const auto rightOffset = input.output.size();
-            prefix.name = bindScope.name;
-            prefix.columns.assign(bindScope.columns.begin(), bindScope.columns.begin() + static_cast<std::ptrdiff_t>(rightOffset + right->columns.size()));
+            // 右输入在拼接后的列起始位置。
+            catalog::Table prefix;
+            // 用于绑定 ON 条件的作用域表。
             LogicalPlan rightScan;
-            // 右侧的扫描算子。
-            rightScan.kind = "SeqScan";rightScan.table = right->name;
-            // 顺序扫描右表。
-            rightScan.output = schema(*right, slotWindow(slots, rightOffset, right->columns.size()));
-            rightScan.preservesRowId = true;
+            // 右侧输入子计划。
+            const std::size_t rightWidth = source.fromSubquery
+                ? [&]{ LogicalPlan p2 = build(*source.fromSubquery, catalog, bound); const auto n = p2.output.size(); rightScan = std::move(p2); return n; }()
+                : 0;
+            // 上面这一步分两种情况：
+            //   派生表：递归编译内层 SELECT，拿到它的计划与列数；
+            //   普通表：下面另行处理，这里先留 0 作临时值。
+            if (source.fromSubquery) {
+            // 分支一：JOIN 右侧是派生表。
+                const auto qualifier = source.alias.empty() ? source.table : source.alias;
+                // 限定名用别名。
+                prefix.name = bindScope.name;
+                // 作用域表沿用外层的名字。
+                prefix.columns.assign(bindScope.columns.begin(), bindScope.columns.begin() + static_cast<std::ptrdiff_t>(rightOffset + rightWidth));
+                // 取前缀：左输入列 + 右输入列。
+                for (std::size_t k = rightOffset; k < prefix.columns.size() && k < bindScope.columns.size(); ++k) prefix.columns[k].qualifier = qualifier;
+                // 给右输入那一段列打上限定名，让 ON 里的 x.列能解析。
+                rightScan.preservesRowId = true;
+                // 派生表输出不带物理行号，但上层还会按这个标记决定能否回表；
+                // 这里保持与普通表一致，因为连接结果本身不依赖右侧的行号。
+            } else {
+            // 分支二：JOIN 右侧是普通表。
+                const auto* right = catalog.find(source.table);
+                // 取右表定义。
+                if (!right) invalid("missing join table");
+                // 目录里找不到，说明编译流程有漏。
+                prefix.name = bindScope.name;
+                prefix.columns.assign(bindScope.columns.begin(), bindScope.columns.begin() + static_cast<std::ptrdiff_t>(rightOffset + right->columns.size()));
+                // 取前缀：左输入列 + 右表列。
+                rightScan.kind = "SeqScan";rightScan.table = right->name;
+                // 顺序扫描右表。
+                rightScan.output = schema(*right, slotWindow(slots, rightOffset, right->columns.size()));
+                rightScan.preservesRowId = true;
+            }
+            // 两个分支都已把 rightScan 准备好。
             LogicalPlan join;
             // 连接算子。
             join.kind = source.left && source.right ? "FullJoin" : source.left ? "LeftJoin" : source.right ? "RightJoin" : "NestedLoopJoin";join.table = plan.table;

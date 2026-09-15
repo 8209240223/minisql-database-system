@@ -191,6 +191,28 @@ private:
             bindFromName(statement.table, statement.tableAlias, scope, statement.location, AccessAction::Select);
         }
         for (const auto& join : statement.joins) {
+        // 逐个绑定 JOIN 右侧。
+            if (join.fromSubquery) {
+            // 右侧是派生表（子查询）：先绑定内层，再把它当成本层的一个关系。
+                const auto inner = bindStatement(*join.fromSubquery, scope, depth + 1);
+                // 递归绑定内层 SELECT，得到它的作用域号。
+                BoundRelation relation;
+                relation.kind = RelationKind::DerivedTable;
+                // 关系种类标成派生表，后续权限与列解析都参考这个标记。
+                relation.name = join.alias;
+                // 对外名字就是别名（派生表必须有别名，解析时已校验）。
+                relation.alias = join.alias;
+                relation.scope = scope;
+                relation.innerScope = inner;
+                relation.location = statement.location;
+                const auto id = result_.scopes.addRelation(scope, std::move(relation));
+                // 把它登记成本层作用域的一个关系。
+                copyOutputColumns(*join.fromSubquery, inner, id);
+                // 把内层的输出列拷贝到这个关系上，外层才能按别名.列名引用。
+                continue;
+                // 派生表路径已处理完，进入下一个 JOIN。
+            }
+            // 下面是普通表路径。
             if (join.table.empty()) failBind("join has no relation name");
             bindFromName(join.table, join.alias, scope, statement.location, AccessAction::Select);
         }
