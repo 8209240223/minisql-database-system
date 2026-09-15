@@ -351,4 +351,35 @@ std::vector<RowRef> HeapStore::refsFor(std::uint64_t table) {
     return refs;
     // 返回收集结果。
 }
+
+HeapStore::RowCursor::RowCursor(HeapStore& heap, std::uint64_t table, const RowSchema& schema, std::vector<RowRef> refs)
+// 构造游标：保存堆、表、行结构与待读行引用。
+    : heap_(heap), table_(table), schema_(schema), refs_(std::move(refs)) {}
+// 初始化列表结束；此时还没有任何页在手。
+
+bool HeapStore::RowCursor::next(Row& row) {
+// 取下一行：同一页的连续行复用已持有的页凭证。
+    if (cursor_ >= refs_.size()) return false;
+    // 已经读完全部行。
+    const auto& ref = refs_[cursor_];
+    // 取当前行引用。
+    if (!guard_ || residentPage_ != ref.page.id) {
+    // 换页了（或还没取页）：才真正取一次页。
+        guard_ = heap_.buffer_.get(ref.page);
+        // 取页并持有凭证；凭证在本游标内保持，直到换页才释放。
+        residentPage_ = ref.page.id;
+        // 记下当前持有的页号。
+        ++fetches_;
+        // 计一次取页，供验证优化效果。
+    }
+    // 页检查结束。
+    if (guard_->page().owner() != table_) fail("Row belongs to another table");
+    // 校验页的归属，防止跨表误读。
+    row = decodeRow(guard_->page().read(ref.slot), schema_);
+    // 从当前页读出该槽并解码。
+    ++cursor_;
+    // 游标前移。
+    return true;
+    // 成功取到一行。
+}
 }

@@ -1,6 +1,7 @@
 #pragma once
 #include "minisql/storage/buffer_pool.hpp"
 #include <functional>
+#include <optional>
 #include <string>
 #include <variant>
 
@@ -55,10 +56,43 @@ public:
     void scan(std::uint64_t table, const RowSchema& schema, const std::function<void(RowRef, const Row&)>& visitor);
     // 全表扫描：逐页逐槽读取并回调给上层。
     std::vector<RowRef> refsFor(std::uint64_t table);
+    // 顺序扫描游标：按行引用顺序读行，同一页的连续行只取一次页。
+    // 存在的理由：此前每个行都单独调一次 read()，而 read() 内部每次都取页，
+    // 导致页访问次数与行数同阶（实测 4000 行 4000 次），而实际只需要页数那么多次。
+    class RowCursor {
+    public:
+        RowCursor(HeapStore& heap, std::uint64_t table, const RowSchema& schema, std::vector<RowRef> refs);
+        // 构造：绑定堆、表、行结构与待读的行引用快照。
+        bool next(Row& row);
+        // 取下一行；读完返回 false。
+        std::size_t pageFetches() const { return fetches_; }
+        // 实际取页次数，用来验证优化是否生效。
+    private:
+        HeapStore& heap_;
+        // 所属堆存储。
+        std::uint64_t table_;
+        // 表编号，读行时用于校验归属。
+        const RowSchema& schema_;
+        // 行结构，解码时使用。
+        std::vector<RowRef> refs_;
+        // 全部待读行的引用快照。
+        std::size_t cursor_ = 0;
+        // 当前读到第几条。
+        std::size_t fetches_ = 0;
+        // 已取页次数。
+        std::optional<PageGuard> guard_;
+        // 当前持有页的使用凭证；为空表示还没有页在手。
+        PageId residentPage_ = 0;
+        // 当前凭证对应哪一页；0 表示无效（页号从 1 开始）。
+    };
+
     // 只收集行引用不读取内容，供索引重建等场景使用。
     void flush() { buffer_.flushAll(); }
     // 把缓冲池里的改动全部刷盘。
 private:
+    friend class RowCursor;
+    // RowCursor 需要直接取页（buffer_.get），因此授予友元；
+    // 这样可以把"取页"留在游标内部，避免每行都走一次公开 read()。
     std::shared_ptr<PageFile> file_;
     // 页文件，用于查询某张表有哪些页。
     BufferPool& buffer_;

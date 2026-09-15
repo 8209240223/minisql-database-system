@@ -100,9 +100,29 @@ std::size_t resolveBufferFrames(std::size_t frames) {
         if (end && *end == '\0' && parsed >= 1 && parsed <= 1000000) return static_cast<std::size_t>(parsed);
         // 必须整串都是数字、且落在 1..1000000 之间；不满足就静默忽略，退回默认值。
     }
-    // 环境变量分支结束。
     return frames;
     // 返回构造参数给的默认帧数。
+}
+
+storage::ReplacementPolicy resolvePolicy() {
+// 决定缓存淘汰策略：默认 LRU，可用 MINISQL_REPLACEMENT_POLICY 覆盖。
+// 三种取值都是大小写不敏感的：LRU / FIFO / CLOCK。
+    if (const char* configured = std::getenv("MINISQL_REPLACEMENT_POLICY")) {
+    // 读环境变量。
+        std::string value(configured);
+        // 复制一份用于统一转大写。
+        for (char& c : value) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+        // 全部转大写，让 lru / Lru / LRU 都能识别。
+        if (value == "FIFO") return storage::ReplacementPolicy::FIFO;
+        // 先进先出。
+        if (value == "CLOCK") return storage::ReplacementPolicy::CLOCK;
+        // 二次机会。
+        if (value == "LRU") return storage::ReplacementPolicy::LRU;
+        // 最近最少使用。
+    }
+    // 未设或值不认识时回到默认 LRU。
+    return storage::ReplacementPolicy::LRU;
+    // 返回默认策略。
 }
 std::optional<std::uint64_t> positiveEnvironmentValue(const char* name, std::uint64_t maximum) {
     const char* configured = std::getenv(name);
@@ -733,7 +753,7 @@ struct Database::RuntimeIndex {
 };
 Database::Database(const std::filesystem::path& path, std::size_t frames, storage::PageFile::CommitObserver observer)
 // 构造数据库：按"页文件 → 缓冲池 → 堆存储 → 持久化目录"的顺序把各层串起来。
-    : file_(std::make_shared<storage::PageFile>(path, std::move(observer))), buffer_(file_, resolveBufferFrames(frames), storage::ReplacementPolicy::LRU),
+    : file_(std::make_shared<storage::PageFile>(path, std::move(observer))), buffer_(file_, resolveBufferFrames(frames), resolvePolicy()),
       // 先建页文件（接管提交观察者），再用它建缓冲池并指定帧数与 LRU 策略。
       heap_(file_, buffer_), catalog_(heap_) {
       // 堆存储依赖页文件与缓冲池；目录又依赖堆存储。这个顺序不能颠倒。
@@ -1216,19 +1236,29 @@ public:
         : heap_(heap), tableId_(tableId), schema_(std::move(schema)) {
         // 前两项存引用/值，行结构用 move 接管。
         refs_ = heap_.refsFor(tableId_);
+        reader_ = std::make_unique<storage::HeapStore::RowCursor>(heap_, tableId_, schema_, refs_);
+        // 用同一份行引用构造游标：后续读行由游标负责按页取页。
         // 一次性取出这张表所有行的引用（只是引用，不是数据本身）。
         // 这样做的好处是扫描过程中即使有插入/删除也不会让迭代器失效。
     }
     ScanRowStream(storage::HeapStore& heap, std::uint64_t tableId, storage::RowSchema schema,
                   std::vector<storage::RowRef> refs)
-        : heap_(heap), tableId_(tableId), schema_(std::move(schema)), refs_(std::move(refs)) {}
+        : heap_(heap), tableId_(tableId), schema_(std::move(schema)), refs_(std::move(refs)) {
+            reader_ = std::make_unique<storage::HeapStore::RowCursor>(heap_, tableId_, schema_, refs_);
+            // 用传入的行引用构造游标。
+        }
     bool next(nlohmann::json& row) override {
     // 取下一行。
         if (cancelled_) throw MiniSqlError(ErrorCode::Cancelled, "Query cancelled");
         // 被取消就抛专门的取消错误，让上层能区分于普通失败。
         if (cursor_ >= refs_.size()) return false;
         // 已经取完，返回 false。
-        row = rowJson(heap_.read(tableId_, schema_, refs_[cursor_]));
+        storage::Row pending;
+        // 游标读出的原始行（强类型），下面再转成 JSON。
+        if (!reader_->next(pending)) return false;
+        // 从游标取下一行：同一页的连续行不会重复取页。
+        row = rowJson(pending);
+        // 转成 JSON 返回。
         // 读出这一行并转成 JSON。
         ++cursor_;
         // 游标前移。
@@ -1255,6 +1285,9 @@ private:
     storage::RowSchema schema_;
     // 行结构（读行时要用它解码）。
     std::vector<storage::RowRef> refs_;
+    // 全部行的引用快照（保留用于统计剩余行数与构造游标）。
+    std::unique_ptr<storage::HeapStore::RowCursor> reader_;
+    // 顺序读游标：同一页的连续行共用一次取页，避免每行都走一次缓冲池查找。
     // 全部行的引用快照。
     std::size_t cursor_ = 0;
     // 当前读到第几条。
@@ -2735,7 +2768,7 @@ nlohmann::json Database::bufferStatus() const {
 // 逐条遍历最近发生的页淘汰事件。
         evictions.push_back({{"sequence", event.sequence},
 // 写入淘汰事件序号，作为事件先后顺序的稳定标识。
-            {"policy", event.policy == storage::ReplacementPolicy::LRU ? "LRU" : "FIFO"},
+            {"policy", event.policy == storage::ReplacementPolicy::LRU ? "LRU" : event.policy == storage::ReplacementPolicy::CLOCK ? "CLOCK" : "FIFO"},
 // 记录淘汰时采用的替换策略：LRU 或 FIFO。
             {"pageId", event.page.id}, {"generation", event.page.generation},
 // 记录被淘汰页的页号和代数，代数用于区分同一页号的旧版本。
@@ -2745,7 +2778,7 @@ nlohmann::json Database::bufferStatus() const {
 // 单条淘汰事件组装结束，回到循环处理下一条。
     return {{"available", true}, {"scope", "database-instance"},
 // 开始组装缓冲池状态返回值：作用域限定在当前数据库实例。
-        {"policy", buffer_.policy() == storage::ReplacementPolicy::LRU ? "LRU" : "FIFO"},
+        {"policy", buffer_.policy() == storage::ReplacementPolicy::LRU ? "LRU" : buffer_.policy() == storage::ReplacementPolicy::CLOCK ? "CLOCK" : "FIFO"},
 // 当前生效的替换策略。
         {"capacity", buffer_.capacity()}, {"residentPages", buffer_.size()},
 // 缓冲池容量与当前常驻页数。
@@ -2759,7 +2792,10 @@ nlohmann::json Database::bufferStatus() const {
 // 说明磁盘统计包含数据库文件头页，避免口径不一致。
         {"ioErrors", file_->ioStats().errors}, {"stagedPageReads", stats.stagedPageReads},
 // 页 IO 错误数与经由暂存区完成的读次数。
-        {"stagedPageWrites", stats.stagedPageWrites}, {"evictions", evictions}};
+        {"stagedPageWrites", stats.stagedPageWrites}, {"evictions", evictions},
+        // CLOCK 专用指标：扫描步数与二次机会次数。
+        // 有了它才能量化新算法与 LRU 的差异，而不是只停在描述上。
+        {"clockSweeps", stats.clockSweeps}, {"clockSecondChances", stats.clockSecondChances}};
 // 经由暂存区完成的写次数与前面整理的淘汰日志。
 }
 // bufferStatus 返回结束。
@@ -2777,9 +2813,11 @@ nlohmann::json Database::bufferStatus() const {
 // 动作 LRU：切换为最近最少使用替换策略。
     else if (action == "FIFO") buffer_.setPolicy(storage::ReplacementPolicy::FIFO);
 // 动作 FIFO：切换为先进入先淘汰策略。
+    else if (action == "CLOCK") buffer_.setPolicy(storage::ReplacementPolicy::CLOCK);
+    // 动作 CLOCK：切换为二次机会替换策略。
     else if (action == "RESET") buffer_.resetStats();
 // 动作 RESET：保留当前策略，只把统计计数清零。
-    else throw MiniSqlError(ErrorCode::InvalidArgument, "Expected LRU, FIFO or RESET");
+    else throw MiniSqlError(ErrorCode::InvalidArgument, "Expected LRU, FIFO, CLOCK or RESET");
 // 其他动作一律视为非法参数，防止静默忽略拼写错误。
     return {{"tables", json::array()}, {"buffer", bufferStatus()}};
 // 返回空表列表与更新后的缓冲池状态，方便调用方立即确认效果。

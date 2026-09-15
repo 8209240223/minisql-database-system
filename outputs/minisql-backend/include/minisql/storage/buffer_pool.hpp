@@ -3,13 +3,17 @@
 #include <memory>
 
 namespace minisql::storage {
-enum class ReplacementPolicy { LRU, FIFO };
-// 缓存淘汰策略：LRU 淘汰最久未访问的页，FIFO 淘汰最早装入的页。
+enum class ReplacementPolicy { LRU, FIFO, CLOCK };
+// 缓存淘汰策略：LRU 淘汰最久未访问的页；FIFO 淘汰最早装入的页；
+// CLOCK（二次机会）用环形指针扫描，引用位为 1 的给一次机会并清位，为 0 的淘汰。
 struct BufferStats {
 // 缓存运行统计，供 statistics 命令输出。
     std::uint64_t hits = 0, misses = 0, pageReads = 0, pageWrites = 0, ioErrors = 0;
     // 依次为：命中次数、未命中次数、磁盘读次数、磁盘写次数、IO 错误次数。
     std::uint64_t stagedPageReads = 0, stagedPageWrites = 0;
+    std::uint64_t clockSweeps = 0, clockSecondChances = 0;
+    // CLOCK 专用：指针扫过的帧数（扫描代价）与给出二次机会的次数。
+    // 这两项让"新算法与 LRU 的差异"可以被测量，而不是只写在报告里。
     // 写批次期间从暂存区读写的次数，与真正落盘区分开。
 };
 struct Eviction {
@@ -34,6 +38,8 @@ struct BufferFrame {
     bool dirty = false;
     // 页是否被修改过但还没写回。
     std::uint64_t loaded = 0, accessed = 0;
+    bool referenced = false;
+    // CLOCK 的引用位：本页被访问过就置 1；淘汰扫描时据此决定"给二次机会"还是淘汰。
     // 装入顺序号与最近访问顺序号，分别供 FIFO 与 LRU 使用。
 };
 class PageGuard {
@@ -129,6 +135,12 @@ private:
     std::filesystem::path evictionLogPath_;
     // 替换日志路径，为空表示不写日志。
     void makeRoom();
+    std::vector<PageId> clockOrder_;
+    // CLOCK 的环形顺序：按装入先后排列当前驻留的页号。
+    std::size_t clockHand_ = 0;
+    // CLOCK 的环形指针：指向下一次淘汰扫描的起点。
+    PageId clockEvict();
+    // CLOCK 选 victim：环形扫描，引用位为 1 的给一次机会并清位，为 0 的淘汰。
     // 缓存满时腾出一个位置，必要时先把脏页写回。
     void writeBack(BufferFrame& frame);
     // 把一帧写回磁盘并清掉脏标记。

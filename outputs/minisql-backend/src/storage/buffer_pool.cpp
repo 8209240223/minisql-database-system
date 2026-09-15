@@ -10,7 +10,7 @@ namespace {
 // 统一的存储错误出口。
 void validPolicy(ReplacementPolicy policy) {
 // 校验策略取值合法。
-    if (policy != ReplacementPolicy::LRU && policy != ReplacementPolicy::FIFO) fail("Unknown replacement policy");
+    if (policy != ReplacementPolicy::LRU && policy != ReplacementPolicy::FIFO && policy != ReplacementPolicy::CLOCK) fail("Unknown replacement policy");
     // 目前只支持两种策略，其他取值一律拒绝。
 }
 }
@@ -105,17 +105,103 @@ void BufferPool::appendEvictionLog(const Eviction& event) const {
         std::chrono::system_clock::now().time_since_epoch()).count();
     // 取当前时间的毫秒表示。
     stream << atMs << " seq=" << event.sequence
-           << " policy=" << (event.policy == ReplacementPolicy::LRU ? "LRU" : "FIFO")
+           << " policy=" << (event.policy == ReplacementPolicy::LRU ? "LRU" : event.policy == ReplacementPolicy::CLOCK ? "CLOCK" : "FIFO")
            << " page=" << event.page.id
            << " generation=" << event.page.generation
            << " dirty=" << (event.dirty ? 1 : 0)
            << " writeBack=" << event.writeBack << '\n';
     // 输出一行结构化文本：时间、序号、策略、页号、代数、脏页标志、写回结果。
 }
+PageId BufferPool::clockEvict() {
+// CLOCK（二次机会）选 victim：环形扫描，参考位为 1 的给一次机会并清位。
+// 与 LRU 的核心差异：LRU 要维护全局访问序号并每次都换入淼求最旧页，
+// CLOCK 只用一个引用位加一个环形指针，每次选 victim 的平均扫描步数远小于遍历全表。
+    if (clockOrder_.empty()) return {};
+    // 环形顺序为空说明一页未驻留，无法选择。
+    for (;;) {
+    // 一直扫到找到可淘汰的页为止。
+        if (clockOrder_.empty()) return {};
+        // 每轮开始都再确认环里还有页。
+        clockHand_ %= clockOrder_.size();
+        // 指针转到环内（避免因淘汰导致越界）。
+        const auto candidate = clockOrder_[clockHand_];
+        // 取当前指针指向的页号。
+        auto found = frames_.find(candidate);
+        // 到缓存里取该页。
+        if (found == frames_.end()) {
+        // 页已不在缓存（可能被 release 掉），从环里剔除。
+            clockOrder_.erase(clockOrder_.begin() + static_cast<std::ptrdiff_t>(clockHand_));
+            continue;
+            // 继续扫描，指针不动（删除后同一位置已换成后继）。
+        }
+        // 找到对应帧。
+        ++stats_.clockSweeps;
+        // 记一次扫描步数，用于量化算法成本。
+        auto& frame = *found->second;
+        // 取帧引用。
+        if (frame.pins) {
+        // 被 pin 住的页不能淘汰：指针前移，继续找。
+            clockHand_ = (clockHand_ + 1) % clockOrder_.size();
+            continue;
+        }
+        // pin 检查结束。
+        if (frame.referenced) {
+        // 引用位为 1：这页最近被用过，给它一次机会。
+            frame.referenced = false;
+            // 清位，下一圈再扫到它就会被淘汰。
+            ++stats_.clockSecondChances;
+            // 记一次二次机会，便于对比 LRU。
+            clockHand_ = (clockHand_ + 1) % clockOrder_.size();
+            // 指针前移继续扫。
+            continue;
+            // 本轮不淘汰它。
+        }
+        // 引用位为 0：这页就是 victim。
+        clockOrder_.erase(clockOrder_.begin() + static_cast<std::ptrdiff_t>(clockHand_));
+        // 从环里移除（指针保持不动，自然指向后继）。
+        return candidate;
+        // 返回被选中的页号。
+    }
+    // 不可达（循环内总会 return）。
+}
 void BufferPool::makeRoom() {
 // 缓存未满直接返回；满了就挑一页淘汰，必要时先写回。
     if (frames_.size() < capacity_) return;
     // 还有空位，不需要淘汰。
+    if (policy_ == ReplacementPolicy::CLOCK) {
+    // CLOCK：用环形扫描选 victim，不走下面按序号遍历的 LRU/FIFO 路径。
+        const auto chosen = clockEvict();
+        // 环形扫描得到要淘汰的页号。
+        const auto target = frames_.find(chosen);
+        // 再到缓存里取它。
+        if (target == frames_.end()) fail("CLOCK selected a page that is not resident");
+        // 选出的页必须仍在缓存里，否则说明环形结构与缓存不一致。
+        const auto& frame = *target->second;
+        // 取该帧。
+        Eviction event{sequence_ + 1, policy_, {frame.page.id(), frame.page.generation()}, frame.dirty};
+        // 先构造淘汰事件。
+        try { writeBack(*target->second); }
+        // 脏页先写回。
+        catch (...) {
+            event.writeBack = "failed";
+            // 写回失败要在记录里体现。
+            evictions_.push_back(event);
+            appendEvictionLog(event);
+            throw;
+            // 写回失败不能继续淘汰，否则会丢数据。
+        }
+        // 写回分支结束。
+        if (event.dirty) event.writeBack = file_->writeBatchActive() ? "staged" : "written";
+        // 记录脏页的实际去向。
+        evictions_.push_back(event);
+        appendEvictionLog(event);
+        // 登记淘汰事件。
+        frames_.erase(target);
+        // 从缓存移除；环形顺序已在 clockEvict 里同步移除。
+        return;
+        // CLOCK 分支结束。
+    }
+    // 非 CLOCK 策略继续走按序号挑选的路径。
     auto victim = frames_.end();
     // 候选受害者，初始为空。
     for (auto it = frames_.begin(); it != frames_.end(); ++it) {
@@ -165,6 +251,8 @@ PageGuard BufferPool::get(PageRef ref) {
         if (found->second->page.generation() != ref.generation) fail("STALE_PAGE_ID");
         // 代数不一致说明引用来自被回收前的旧页。
         found->second->accessed = ++sequence_;
+        found->second->referenced = true;
+        // CLOCK 的引用位：命中即置 1，表示这一页最近被访问过，淘汰时值得再给一次机会。
         // 更新最近访问序号，供 LRU 使用。
         ++stats_.hits;
         // 命中计数加一。
@@ -178,6 +266,10 @@ PageGuard BufferPool::get(PageRef ref) {
     auto frame = std::make_shared<BufferFrame>(BufferFrame{std::move(page), 0, false, ++sequence_, sequence_});
     // 新建缓存帧：pin 为 0、非脏，装入与访问序号都取当前递增值。
     frames_.emplace(ref.id, frame);
+    frame->referenced = true;
+    // 新装入的页刚被访问过，引用位置 1。
+    if (policy_ == ReplacementPolicy::CLOCK) clockOrder_.push_back(ref.id);
+    // CLOCK 需要维护环形顺序：新页追加到环尾。
     // 放入映射表。
     ++stats_.misses;
     // 未命中计数加一。
@@ -306,6 +398,14 @@ void BufferPool::setPolicy(ReplacementPolicy policy) {
 void BufferPool::resetStats() {
 // 清空统计与淘汰记录。
     stats_ = {};
+    clockHand_ = 0;
+    // CLOCK 指针归零，重新从环首开始扫描。
+    clockOrder_.clear();
+    // 先清空再按当前实际驻留的页重建：
+    // RESET 动作只清统计、不清缓存，若只清不建，
+    // clockEvict 就看不到已驻留的页，选 victim 时会与缓存状态不一致。
+    for (const auto& entry : frames_) clockOrder_.push_back(entry.first);
+    // 按当前驻留的页重建环形顺序（顺序不敏感，CLOCK 只需环形）。
     // 统计结构恢复默认值。
     file_->resetIoStats();
     // 页文件层的读写计数也清零。
