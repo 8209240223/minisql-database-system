@@ -54,13 +54,13 @@ try {
         try { (void)optimizer::optimize(original, options); } catch (const MiniSqlError& e) { invalidOption = e.code() == ErrorCode::InvalidArgument; }
         require(invalidOption, "invalid iteration budget rejected");
     }
-    require(optimizer::ruleDescriptors().size() == 10, "built-in rule metadata exposed");
+    require(optimizer::ruleDescriptors().size() == 11, "built-in rule metadata exposed");
     auto incompatible = sql::compilePlans(parse("SELECT id FROM t WHERE 1=1;"), catalog);
     incompatible[0].children[0].output[0].name = "renamed";
     require(optimizer::optimize(incompatible).plans[0].children[0].kind == "Filter", "filter with different output contract not eliminated");
     require(sql::serializePlans(second.plans) == sql::serializePlans(optimized.plans), "second pass stable");
     optimizer::Options allDisabled;
-    allDisabled.disabledRules = {"constant-arithmetic", "constant-comparison", "boolean-simplification", "remove-true-filter", "remove-false-filter", "predicate-pushdown", "hash-join", "prune-columns", "decorrelate-subquery", "top-n-sort"};
+    allDisabled.disabledRules = {"constant-arithmetic", "constant-comparison", "boolean-simplification", "remove-true-filter", "remove-false-filter", "predicate-pushdown", "hash-join", "prune-columns", "decorrelate-subquery", "top-n-sort", "index-order-scan"};
     auto disabled = optimizer::optimize(original, allDisabled);
     require(disabled.changes.empty() && sql::serializePlans(disabled.plans) == before, "all rules disabled");
     auto comparisonOnly = optimizer::optimize(original, {true, false, false});
