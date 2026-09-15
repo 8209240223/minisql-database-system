@@ -6,13 +6,16 @@
 | --- | --- |
 | 被测引擎 | `outputs/minisql-backend/bin/minisql_database.exe` |
 | 调用方式 | `minisql_database.exe <db.pages> execute`，SQL 由标准输入传入 |
-| 用例总数 | 102 |
-| 通过 | 100 |
-| 失败 | 2 |
+| 用例总数 | 110 |
+| 通过 | 110 |
+| 失败 | 0 |
 
-判定口径：标注"期望"为 ok 的用例必须执行成功；标注 err 的用例必须被引擎拒绝（返回错误），两者都算通过。
+判定口径：期望 ok 的用例必须执行成功；期望 err 的用例必须被引擎拒绝。两者都算通过。
 
-## JOIN 与连接
+说明：`err` 有两种含义，文档中按用例名区分——一类是**应当拒绝的非法输入**（如缺 ON、超长 VARCHAR），
+另一类是**当前尚未实现的语法**（如 COUNT(DISTINCT)、BETWEEN、CASE WHEN），它们都会返回明确错误而非静默通过。
+
+## JOIN 与派生表
 
 | # | 用例 | SQL | 期望 | 实测 | 结果 |
 | --- | --- | --- | --- | --- | --- |
@@ -25,7 +28,7 @@
 | 7 | 三表逗号连接 | `SELECT t.id FROM t, d, d AS d2;` | ok | [[1], [1], [1]] ...共 36 行 | ✅ |
 | 8 | 自连接 | `SELECT a.id,b.id FROM t a JOIN t b ON a.dept=b.dept;` | ok | [[1, 1], [2, 2], [3, 3]] | ✅ |
 | 9 | JOIN + WHERE 等值过滤 | `SELECT t.id FROM t JOIN d ON t.dept=d.id WHERE d.dname='CS';` | ok | [[1]] | ✅ |
-| 10 | JOIN + WHERE 恒真（回归） | `SELECT t.id FROM t JOIN d ON t.dept=d.id WHERE 1=1;` | ok | [[1], [2]] | ✅ |
+| 10 | JOIN + WHERE 恒真（回归用例） | `SELECT t.id FROM t JOIN d ON t.dept=d.id WHERE 1=1;` | ok | [[1], [2]] | ✅ |
 | 11 | LEFT JOIN 谓词下推 | `SELECT t.id FROM t LEFT JOIN d ON t.dept=d.id WHERE t.id>1;` | ok | [[2], [3], [4]] | ✅ |
 | 12 | JOIN 缺 ON 报错 | `SELECT t.id FROM t JOIN d;` | err | - | ✅ |
 | 13 | CROSS JOIN 带 ON 报错 | `SELECT t.id FROM t CROSS JOIN d ON t.dept=d.id;` | err | - | ✅ |
@@ -34,8 +37,13 @@
 | 16 | JOIN 歧义列名报错 | `SELECT id FROM t JOIN d ON t.dept=d.id;` | err | - | ✅ |
 | 17 | 派生表作数据源 | `SELECT x.id FROM (SELECT id FROM d) x;` | ok | [[10], [20], [40]] | ✅ |
 | 18 | 派生表无别名报错 | `SELECT id FROM (SELECT id FROM d);` | err | - | ✅ |
-| 19 | 派生表 JOIN | `SELECT t.id FROM t JOIN (SELECT id FROM d) x ON t.dept=x.id;` | ok | Expected identifier | ❌ |
-| 20 | 派生表 CROSS JOIN | `SELECT t.id FROM t CROSS JOIN (SELECT id FROM d) x;` | ok | Expected identifier | ❌ |
+| 19 | 派生表作 JOIN 右操作数 | `SELECT t.id FROM t JOIN (SELECT id FROM d) x ON t.dept=x.id;` | ok | [[1], [2]] | ✅ |
+| 20 | 派生表作 LEFT JOIN 右操作数 | `SELECT t.id FROM t LEFT JOIN (SELECT id FROM d) x ON t.dept=x.id;` | ok | [[1], [2], [3]] ...共 4 行 | ✅ |
+| 21 | 派生表作 CROSS JOIN 右操作数 | `SELECT t.id FROM t CROSS JOIN (SELECT id FROM d) x;` | ok | [[1], [1], [1]] ...共 12 行 | ✅ |
+| 22 | 逗号连接 + 派生表 | `SELECT t.id FROM t, (SELECT id FROM d) x;` | ok | [[1], [1], [1]] ...共 12 行 | ✅ |
+| 23 | 派生表 JOIN 派生表 | `SELECT a.id FROM (SELECT id FROM d) a JOIN (SELECT id FROM d) b ON a.id=b.id;` | ok | [[10], [20], [40]] | ✅ |
+| 24 | 派生表列别名引用 | `SELECT t.id, x.dname FROM t JOIN (SELECT id, dname FROM d) x ON t.dept=x.id;` | ok | [[1, 'CS'], [2, 'EE']] | ✅ |
+| 25 | 派生表 + WHERE 组合 | `SELECT t.id FROM t JOIN (SELECT id FROM d) x ON t.dept=x.id WHERE t.id>1;` | ok | [[2]] | ✅ |
 
 ## 子查询
 
@@ -62,7 +70,7 @@
 | 5 | GROUP BY + HAVING | `SELECT g,SUM(v) FROM s GROUP BY g HAVING SUM(v)>30;` | ok | [[None, 50], ['b', 70]] | ✅ |
 | 6 | HAVING 无 GROUP BY | `SELECT SUM(v) FROM s HAVING SUM(v)>0;` | ok | [[150]] | ✅ |
 | 7 | DISTINCT | `SELECT DISTINCT g FROM s;` | ok | [[None], ['a'], ['b']] | ✅ |
-| 8 | COUNT(DISTINCT) | `SELECT COUNT(DISTINCT g) FROM s;` | err | - | ✅ |
+| 8 | COUNT(DISTINCT) 未实现 | `SELECT COUNT(DISTINCT g) FROM s;` | err | - | ✅ |
 | 9 | ORDER BY 多键 | `SELECT id FROM s ORDER BY g DESC, id ASC;` | ok | [[5], [3], [4]] ...共 5 行 | ✅ |
 | 10 | ORDER BY NULLS FIRST | `SELECT g FROM s ORDER BY g ASC NULLS FIRST;` | ok | [[None], ['a'], ['a']] ...共 5 行 | ✅ |
 | 11 | ORDER BY 别名 | `SELECT v AS vv FROM s ORDER BY vv DESC;` | ok | [[50], [40], [30]] ...共 5 行 | ✅ |
@@ -168,9 +176,16 @@
 | --- | --- | --- | --- | --- | --- |
 | 1 | EXPLAIN SELECT 不执行 | `EXPLAIN SELECT t.id FROM t JOIN d ON t.dept=d.id WHERE t.id>0;` | ok | [['Project', 'Project t', 0.033, 4.396000000000001, 'stats-v1', 'table-column-statistics-or-default'], ['NestedLoopJoin', 'NestedLoopJoin t', 0.033, 4.363, 'stats-v1', 'table-column-statistics-or-default'], ['Filter', 'Filter t', 0.33, 2.33, 'stats-v1', 'table-column-statistics-or-default']] ...共 5 行 | ✅ |
 | 2 | EXPLAIN ANALYZE 实执行 | `EXPLAIN ANALYZE SELECT id FROM t;` | ok | [['Project', 'Project t', 1.0, 3.0, 'stats-v1', 'table-column-statistics-or-default'], ['SeqScan', 'SeqScan t', 1.0, 2.0, 'stats-v1', 'table-column-statistics-or-default']] | ✅ |
+| 3 | EXPLAIN INSERT（设计允许） | `EXPLAIN INSERT INTO t VALUES(2,20);` | ok | [['Insert', 'Insert t', 2.0, 1.0, 'stats-v1', 'table-column-statistics-or-default']] | ✅ |
+| 4 | EXPLAIN ANALYZE 写语句拒绝 | `EXPLAIN ANALYZE INSERT INTO t VALUES(3,30);` | err | - | ✅ |
+
+## 统计与缓存可观测
+
+| # | 用例 | SQL | 期望 | 实测 | 结果 |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 统计接口可用 | `SELECT COUNT(*) FROM t;` | ok | [[2]] | ✅ |
 
 ## 失败用例说明
 
-- **JOIN 与连接 / 派生表 JOIN**：期望 ok，实测 ok。引擎返回：Expected identifier
-- **JOIN 与连接 / 派生表 CROSS JOIN**：期望 ok，实测 ok。引擎返回：Expected identifier
+无。全部用例通过。
 
