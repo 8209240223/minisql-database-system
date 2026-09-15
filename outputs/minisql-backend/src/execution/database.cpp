@@ -978,6 +978,29 @@ optimizer::Options Database::optimizerOptions() {
         // 以表名（大小写归一）为键存进选项。
     }
     // 索引元数据收集结束。
+    if (const char* configured = std::getenv("MINISQL_DISABLE_RULES")) {
+    // 演示用开关：按名字关闭若干优化规则，便于对比优化前后的效果。
+    // 多个规则名用逗号分隔；名字与 ruleDescriptors() 里的 ruleId 一致。
+        std::string text(configured);
+        // 复制一份环境变量内容，便于切分。
+        std::size_t begin = 0;
+        // 当前片段起点。
+        while (begin <= text.size()) {
+        // 逐个逗号切分。
+            const auto end = text.find(',', begin);
+            // 找下一个分隔符。
+            const auto piece = text.substr(begin, end == std::string::npos ? std::string::npos : end - begin);
+            // 取出这一段规则名。
+            if (!piece.empty()) options.disabledRules.push_back(piece);
+            // 非空就收进禁用名单。
+            if (end == std::string::npos) break;
+            // 没有更多分隔符就结束。
+            begin = end + 1;
+            // 继续下一段。
+        }
+        // 切分结束。
+    }
+    // 规则禁用解析结束。
     return options;
 }
 std::uint64_t Database::cachedTableRows(std::uint64_t tableId, const sql::Statement& definition) {
@@ -5499,6 +5522,10 @@ void Database::materializeSubqueries(std::vector<sql::LogicalPlan>& plans) {
 // 对每个顶层计划执行重写。
 }
 nlohmann::json Database::execute(const std::string& source, bool optimize) {
+// 演示用开关：设了 MINISQL_NO_OPTIMIZE 就完全不走优化器，作为对比基线。
+// 放在这里而不是调用方，是因为 EXPLAIN 与普通执行都在本函数内部走各自的优化分支。
+    if (std::getenv("MINISQL_NO_OPTIMIZE") != nullptr) optimize = false;
+    // 关闭标志一旦置上，本函数内所有 optimize 分支（含 EXPLAIN）都会按未优化路径执行。
 // 执行整段 SQL 文本：逐条扫描、编译、优化并执行，返回结构化结果。
     std::lock_guard<std::recursive_mutex> guard(mu_);
 // 加数据库全局递归锁，保证整段脚本执行期间状态一致。
@@ -5569,7 +5596,12 @@ nlohmann::json Database::execute(const std::string& source, bool optimize) {
 // EXPLAIN ANALYZE 只允许 SELECT。
                     throw MiniSqlError(ErrorCode::Semantic, "EXPLAIN ANALYZE permits only SELECT", location);
 // 否则抛语义错误。
-                const auto optimized = optimizer::optimize(rawPlans, optimizerOptions());
+                optimizer::Result optimized;
+                // 优化结果容器；下面按是否开启优化决定填什么。
+                if (optimize) optimized = optimizer::optimize(rawPlans, optimizerOptions());
+                // 开启优化时正常跑优化器；关闭时 optimized 保持为空。
+                else { optimized.plans = rawPlans; optimized.converged = true; }
+                // 关闭优化时把原始计划当作“优化后计划”，让 EXPLAIN 展示与实际执行一致。
                 const auto raw = sql::serializePlans(rawPlans);
 // 序列化原始计划，供输出。
                 const auto optimizedJson = sql::serializePlans(optimized.plans);
@@ -6181,7 +6213,8 @@ nlohmann::json Database::executeScript(const std::string& source, bool optimize)
     std::lock_guard<std::recursive_mutex> guard(mu_);
 // 加数据库全局递归锁。
     auto response = execute(source, optimize);
-// 先执行整段脚本。
+    // 演示用开关：MINISQL_NO_OPTIMIZE=1 时完全关闭优化器，作为对比基线。
+
     if (transaction_ != TransactionState::Idle && !unavailable_) {
 // 如果脚本结束时事务仍未提交，且实例可用。
         rollbackBatch();transaction_ = TransactionState::Idle;
