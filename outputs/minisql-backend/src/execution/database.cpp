@@ -854,6 +854,8 @@ Database::Database(const std::filesystem::path& path, std::size_t frames, storag
 }
 // Database 构造函数结束。
 Database::~Database() {
+    persistWorkload();
+    // 析构前把本进程的查询负载落盘，否则本次会话的读负载会随进程消失。
 // 析构：如果起过后台调度线程，先把它干净地停掉再释放其它成员。
     if (backgroundCheckpointMs_ > 0) {
     // 只有真的起过线程才需要停。
@@ -988,6 +990,9 @@ void Database::invalidateRowCountCache() {
     // 统计缓存一并失效：写入会改变行数、最值、直方图等全部统计量。
     // 直接清空：写语句数量远少于读，清空比逐项维护更简单也更不容易出错。
     queryResultCache_.clear();
+    persistWorkload();
+    // 顺便把本次会话累积的负载落盘：写语句是天然的落盘时机，
+    // 不用额外开迟线程，也不会在每条查询后都写磁盘。
     // 结果缓存：数据变了，缓存的结果立即过期，必须全部扔掉。
 }
 
@@ -1147,6 +1152,9 @@ nlohmann::json Database::checkpoint() {
     options.indexVersion = indexVersion_;
     options.fuzzy = fuzzy;
     options.archive = archive;
+        persistWorkload();
+        // 检查点顺带把查询负载固化：检查点的语义就是"把当前状态落盘"，
+        // 读查询没有写语句那样的落盘时机，靠这里保证建议不会随进程退出而丢。
     file_->checkpoint(options);
     pendingAutoCheckpointWrites_ = 0;
     // 重置"待检查点"的写语句计数——刚做过检查点，这些积累都清了。
@@ -2344,6 +2352,9 @@ nlohmann::json Database::statistics() {
         // 没有这组指标，使用者只能看到“变快了”却说不清为什么；
         // 有了它就能直接对比：命中率越高，重复扫描越少。
         {"queryCache", queryCacheDocument()},
+        // 索引建议也一并返回：负载统计存在进程内存里，
+        // 独立进程调 indexAdvisor 模式读不到它，但 statistics 可以同进程取。
+        {"indexAdvisor", buildIndexAdvisor()},
         // 缓存可观测指标：行数缓存、统计缓存与页缓存的命中情况。
         // 单独抽成一个函数构造，避免在这个已经很长的初始化列表里
         // 再套一层嵌套字典，那样很容易写错括号层级。
@@ -2383,6 +2394,265 @@ std::string Database::queryResultCacheKey(const std::vector<sql::Token>& stateme
     }
     return key;
     // 返回缓存键。
+}
+void Database::recordWorkload(const sql::LogicalPlan& plan) {
+// 记录一棵计划里的谓词列，供索引建议器累积查询习惯。
+// 只认“过滤直接架在扫描上”这种形态：那正是全表扫描慢在哪里、
+// 建索引能直接改善的场景。已经走上索引的查询不再计入。
+    std::function<void(const nlohmann::json&, const std::string&, std::size_t)> collect;
+    // 先声明再赋值：lambda 在自己的初始化式里引用自己是不合法的，
+    // 必须先用 std::function 声明一个变量，再把带递归调用的 lambda 赋给它。
+    collect = [&](const nlohmann::json& expression, const std::string& table, std::size_t depth) {
+    // 递归扫描一棵谓词表达式树。
+        if (depth > 64 || !expression.is_object() || table.empty()) return;
+        // 深度与类型保护；没有表名时无法归属。
+        const auto kind = expression.value("kind", std::string{});
+        // 节点种类。
+        if (kind == "Binary") {
+        // 二元比较才可能是可用索引的谓词。
+            const auto op = expression.value("operator", std::string{});
+            // 取运算符。
+            const bool equality = op == "=";
+            // 等值条件。
+            const bool range = op == "<" || op == "<=" || op == ">" || op == ">=";
+            // 范围条件。
+            if (equality || range) {
+            // 只对这两类计数。
+                const auto note = [&](const nlohmann::json& side) {
+                // 只统计列引用那一侧。
+                    if (!side.is_object() || side.value("kind", std::string{}) != "Identifier") return;
+                    // 非列引用（比如字面量）不计。
+                    const auto name = side.value("name", std::string{});
+                    // 列名。
+                    if (name.empty()) return;
+                    // 名字为空时无法归属。
+                    auto& bucket = workload_[key(table)][key(name)];
+                    // 取表名、列名对应的累计桶。
+                    if (equality) ++bucket.equality;
+                    // 等值计数加一。
+                    else ++bucket.range;
+                    // 范围计数加一。
+                };
+                // note lambda 结束。
+                note(expression.contains("left") ? expression.at("left") : nlohmann::json{});
+                // 看左侧。
+                note(expression.contains("right") ? expression.at("right") : nlohmann::json{});
+                // 看右侧。
+            }
+            // 可用谓词处理结束。
+        }
+        // Binary 分支结束。
+        if (expression.contains("left")) collect(expression.at("left"), table, depth + 1);
+        // 递归左子树（AND / OR 链会走这里）。
+        if (expression.contains("right")) collect(expression.at("right"), table, depth + 1);
+        // 递归右子树。
+    };
+    // collect lambda 结束。
+    std::function<void(const sql::LogicalPlan&, std::size_t)> walk;
+    // 同理：遍历也需要递归，一样用 std::function 声明后再赋值。
+    walk = [&](const sql::LogicalPlan& node, std::size_t depth) {
+    // 遍历计划树。
+        if (depth > 64) return;
+        // 计划深度保护。
+        if (node.kind == "Filter" && node.children.size() == 1 && node.children.front().kind == "SeqScan") {
+        // 关键形态：过滤直接架在全表扫描上，建索引最能受益。
+            const auto table = node.children.front().table;
+            // 取被扫描的表名。
+            const auto& predicate = node.predicate;
+            // 取谓词。
+            const bool usable = predicate.is_object() && predicate.value("kind", std::string{}) != "Literal";
+            // 恒真恒假字面量没有列，不会产生建议。
+            if (usable) {
+            // 只有真正带列的谓词才记。
+                bool hasIndexAny = false;
+                // 检查该表是否已有可用索引。
+                if (const auto* definition = catalog_.view().find(table))
+                // 去目录里找表定义。
+                    hasIndexAny = !definition->indexes.empty();
+                    // 已有任意索引就不再反复提建议。
+                if (!hasIndexAny) collect(predicate, table, 0);
+                // 只有表上还没索引时才累积负载。
+            }
+            // 谓词处理结束。
+        }
+        // Filter+SeqScan 分支结束。
+        for (const auto& child : node.children) walk(child, depth + 1);
+        // 递归所有孩子。
+    };
+    // walk lambda 结束。
+    walk(plan, 0);
+    // 从根开始遍历。
+}
+nlohmann::json Database::indexAdvisor() {
+// 对外入口：取索引建议。只读，不改数据。
+    std::lock_guard<std::recursive_mutex> guard(mu_);
+    // 加全局锁，保证读取负载统计时状态稳定。
+    requireAvailable();
+    // 不可用实例拒绝请求。
+    return buildIndexAdvisor();
+    // 委托给实现函数。
+}
+std::filesystem::path Database::workloadPath() const {
+// 负载统计的旁路文件：放在数据库文件旁边，名字由数据库路径加后缀得到。
+    auto path = file_->path();
+    // 取数据库文件路径。
+    path += ".workload.json";
+    // 拼上后缀。
+    return path;
+    // 返回路径。
+}
+nlohmann::json Database::loadWorkload() const {
+// 读历史负载；文件不存在或损坏都当作空历史。
+    std::error_code error;
+    // 用 error_code 版本的存在性查询，避免抛异常。
+    const auto path = workloadPath();
+    // 取路径。
+    if (!std::filesystem::exists(path, error) || error) return nlohmann::json::object();
+    // 不存在就返回空对象。
+    try {
+    // 读取与解析都可能失败。
+        std::ifstream stream(path, std::ios::binary);
+        // 二进制方式打开。
+        if (!stream) return nlohmann::json::object();
+        // 打不开就当空。
+        nlohmann::json document;
+        // 目标对象。
+        stream >> document;
+        // 流式解析。
+        if (!document.is_object()) return nlohmann::json::object();
+        // 结构不对就当空。
+        return document;
+        // 返回读到的文档。
+    } catch (const std::exception&) { return nlohmann::json::object(); }
+    // 任何异常都退回空历史，不让旁路数据影响主流程。
+}
+void Database::persistWorkload() {
+// 把内存负载并入旁路文件，让后续进程（如 indexAdvisor）能读到。
+    if (workload_.empty()) return;
+    // 没有新负载就不必写文件。
+    auto merged = loadWorkload();
+    // 先读历史，在历史基础上累加。
+    for (const auto& [table, columns] : workload_) {
+    // 逐张表合并。
+        auto& bucket = merged[table];
+        // 取该表的累计对象（不存在则新建）。
+        if (!bucket.is_object()) bucket = nlohmann::json::object();
+        // 保证是对象类型。
+        for (const auto& [column, counts] : columns) {
+        // 逐列合并。
+            auto& slot = bucket[column];
+            // 取该列的计数。
+            if (!slot.is_object()) slot = {{"equality", 0}, {"range", 0}};
+            // 新列初始化为 0。
+            slot["equality"] = slot.value("equality", std::uint64_t{0}) + counts.equality;
+            // 等值次数累加。
+            slot["range"] = slot.value("range", std::uint64_t{0}) + counts.range;
+            // 范围次数累加。
+        }
+        // 列合并结束。
+    }
+    // 表合并结束。
+    try {
+    // 写文件可能失败（权限、磁盘满）。
+        std::ofstream stream(workloadPath(), std::ios::binary | std::ios::trunc);
+        // 截断方式打开，整体重写。
+        if (!stream) return;
+        // 打不开就放弃：旁路统计不值得影响主流程。
+        stream << merged.dump();
+        workload_.clear();
+        // 关键：落盘后必须清空内存计数，否则下一次落盘会把同一批次数再累加一遍，
+        // 负载统计会被越放越大，建议随之失真。
+        // 写入合并后的 JSON。
+    } catch (const std::exception&) { /* 旁路数据写入失败不影响查询本身 */ }
+    // 异常吞掉：这只是辅助信息。
+}
+nlohmann::json Database::buildIndexAdvisor() const {
+// 索引建议器：把累积的查询负载整理成可直接采用的建议。
+// 数据源是两份合并：历史旁路文件（跨进程）+ 本进程内存里还没落盘的部分。
+    nlohmann::json merged = loadWorkload();
+    // 先取历史负载快照。
+    for (const auto& [table, columns] : workload_) {
+    // 把本进程还没落盘的负载并进去。
+    // 遍历的是 workload_，修改的是 merged，两者不同对象，
+    // 不会出现“边遍历边往同一个 map 插入”的迭代器失效问题。
+        auto& bucket = merged[table];
+        // 取该表在合并结果里的位置（不存在则新建）。
+        if (!bucket.is_object()) bucket = nlohmann::json::object();
+        // 防止历史文件损坏导致类型不对。
+        for (const auto& [column, counts] : columns) {
+        // 逐列累加。
+            auto& slot = bucket[column];
+            // 取该列的计数对象。
+            if (!slot.is_object()) slot = {{"equality", 0}, {"range", 0}};
+            // 不存在或类型不对时初始化。
+            slot["equality"] = slot.value("equality", std::uint64_t{0}) + counts.equality;
+            // 等值次数累加。
+            slot["range"] = slot.value("range", std::uint64_t{0}) + counts.range;
+            // 范围次数累加。
+        }
+        // 列累加结束。
+    }
+    // 本进程负载合并结束。
+    nlohmann::json recommendations = nlohmann::json::array();
+    // 建议列表。
+    for (auto tableEntry = merged.begin(); tableEntry != merged.end(); ++tableEntry) {
+    // 显式迭代：MSVC 对 json 的结构化绑定支持不完整，统一改手动取键值。
+        const auto& table = tableEntry.key();
+        // 表名。
+        const auto& columns = tableEntry.value();
+        // 已经建有索引的表不再建议：负载是历史累积的，建完索引后旧计数仍在，
+        // 不排除的话会一直提示给同一张表重复建索引。
+        if (const auto* definition = catalog_.view().find(table))
+            if (!definition->indexes.empty()) continue;
+        // 该表已有索引，跳过。
+        // 该表的列计数对象。
+    // 逐张表看。
+        if (!columns.is_object()) continue;
+        // 结构不对就跳过。
+        for (auto entry = columns.begin(); entry != columns.end(); ++entry) {
+        // 显式迭代：MSVC 对 json::items() 的结构化绑定支持有问题，改用手动取键值。
+            const auto& column = entry.key();
+            // 列名。
+            const auto& counts = entry.value();
+            // 该列的计数对象。
+        // 逐个列看。
+            if (!counts.is_object()) continue;
+            // 列的计数必须是对象。
+            const std::uint64_t equality = counts.value("equality", std::uint64_t{0});
+            // 等值次数。
+            const std::uint64_t range = counts.value("range", std::uint64_t{0});
+            // 范围次数。
+            const std::uint64_t total = equality + range;
+            // 总次数。
+            if (total == 0) continue;
+            // 没有被访问过就不建议。
+            recommendations.push_back({
+            // 一条建议。
+                {"table", table}, {"column", column},
+                // 表名与列名。
+                {"equalityScans", equality}, {"rangeScans", range}, {"totalScans", total},
+                // 三种计数，让使用者看得出依据。
+                {"estimatedSpeedup", total >= 3 ? "high" : total >= 2 ? "medium" : "low"},
+                // 粗略分档：访问次数越多，建索引越值得。
+                {"suggestedStatement", "CREATE INDEX idx_" + table + "_" + column + " ON " + table + "(" + column + ");"},
+                // 直接给可执行的建索引语句，拿来就能用。
+            });
+            // 收进建议列表。
+        }
+        // 列遍历结束。
+    }
+    // 表遍历结束。
+    std::sort(recommendations.begin(), recommendations.end(), [](const nlohmann::json& a, const nlohmann::json& b) {
+    // 按访问次数降序排序，最值得建的排在前面。
+        return a.at("totalScans").get<std::uint64_t>() > b.at("totalScans").get<std::uint64_t>();
+        // 次数多的在前。
+    });
+    // 排序结束。
+    return {{"success", true}, {"recommendations", recommendations}, {"scope", "filter-over-seqscan-without-index"},
+    // 带上 success 字段：与 statistics / catalog 等只读接口保持一致。
+    // 返回建议与统计范围，说明这些建议从何而来。
+        {"trackedTables", merged.size()}};
+        // 跟踪的表数（含历史），为 0 时说明还没有负载。
 }
 nlohmann::json Database::queryCacheDocument() const {
 // 汇总三级缓存的命中情况，供 statistics 对外展示。
@@ -5689,6 +5959,9 @@ nlohmann::json Database::execute(const std::string& source, bool optimize) {
             if (optimize) plans = optimizer::optimize(plans, optimizerOptions()).plans;
             materializeSubqueries(plans);
 // 把非相关子查询物化成字面量。
+            for (const auto& plan : plans) recordWorkload(plan);
+            // 记录本次语句的谓词负载：供索引建议器累积用户的查询习惯。
+            // 它只读计划、不改数据，也不影响执行结果。
             for (const auto& plan : plans) {
 // 逐条执行编译出的计划（分号内可能有多条）。
                 auto result = runStatement(plan);

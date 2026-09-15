@@ -430,6 +430,8 @@ int session(minisql::execution::Database& database, minisql::security::AccessCat
             } else if (operation == "statistics") { authorizeRequest(database, access, request, operation); result = database.statistics(); }
             // 统计信息：只读操作，无需 SQL 参数。
             else if (operation == "catalog") { authorizeRequest(database, access, request, operation); result = database.catalog(); }
+            else if (operation == "indexAdvisor") { authorizeRequest(database, access, request, operation); result = database.indexAdvisor(); }
+            // 索引建议器：基于累积的查询负载给出建索引建议。
             // 目录内容：同样只读。
             else if (operation == "indexInspect") {
             // 索引结构检查：针对某张表的某个索引。
@@ -569,10 +571,10 @@ int main(int argc, char** argv) {
         }
         if (positional.size() != 2) throw minisql::MiniSqlError(minisql::ErrorCode::InvalidArgument,
         // 位置参数必须恰好两个：数据库路径与模式。
-            "Usage: minisql_database <database.pages> <execute|compile|diagnostics|statistics|catalog|session|bindAccess|executePlan> [--file <query.sql>]");
+            "Usage: minisql_database <database.pages> <execute|compile|diagnostics|statistics|catalog|indexAdvisor|session|bindAccess|executePlan> [--file <query.sql>]");
         const std::string mode = positional[1];
         // 取出模式。
-        if (mode != "execute" && mode != "compile" && mode != "diagnostics" && mode != "statistics" && mode != "catalog" && mode != "session" && mode != "bindAccess" && mode != "executePlan")
+        if (mode != "execute" && mode != "compile" && mode != "diagnostics" && mode != "statistics" && mode != "catalog" && mode != "indexAdvisor" && mode != "session" && mode != "bindAccess" && mode != "executePlan")
             throw minisql::MiniSqlError(minisql::ErrorCode::InvalidArgument, "Unknown database command");
             // 未知模式直接拒绝，避免误以为执行成功。
         std::filesystem::path path;
@@ -660,7 +662,7 @@ int main(int argc, char** argv) {
             const std::string source = sqlFile.empty() ? std::string{std::istreambuf_iterator<char>(std::cin), {}} : readSqlFile(sqlFile);
             // 没给文件就读标准输入，否则读文件。
             const auto binding = directAccessRequest(database, access, mode, source);
-            result = mode == "execute" ? database.executeScript(source) : mode == "diagnostics" ? database.diagnostics(source) : mode == "statistics" ? database.statistics() : database.compile(source);
+            result = mode == "execute" ? database.executeScript(source) : mode == "diagnostics" ? database.diagnostics(source) : mode == "statistics" ? database.statistics() : mode == "indexAdvisor" ? database.indexAdvisor() : database.compile(source);
             // 依次分派：execute 执行脚本、diagnostics 出诊断、statistics 出统计、compile 只编译。
             attachAccessObjects(result, binding);
         }

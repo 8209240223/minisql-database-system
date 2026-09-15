@@ -54,6 +54,9 @@ public:
     nlohmann::json catalog();
     // 导出目录内容。
     nlohmann::json statistics();
+    nlohmann::json indexAdvisor();
+    // 索引建议器：基于实际查询负载，告诉使用者该给哪些列建索引。
+    // 它不改变任何数据，只读取累积的谓词统计。
     // 导出统计信息（表与列的行数、索引基数等）。
     nlohmann::json checkpoint();
     // 手动触发一次检查点。
@@ -83,6 +86,16 @@ public:
 private:
     nlohmann::json bufferStatus() const;
     nlohmann::json queryCacheDocument() const;
+    void recordWorkload(const sql::LogicalPlan& plan);
+    nlohmann::json buildIndexAdvisor() const;
+    std::filesystem::path workloadPath() const;
+    // 负载统计旁路文件路径（<db>.workload.json）。
+    void persistWorkload();
+    // 把内存里累积的负载并入旁路文件，供后续进程读取。
+    nlohmann::json loadWorkload() const;
+    // 读取旁路文件里的历史负载；不存在时返回空对象。
+    // 记录查询负载：统计每张表、每个列被当作谓词条件的次数。
+    // 只看“过滤直接架在全表扫描上”的形态，因为那正是建索引能改善的场景。
     std::string queryResultCacheKey(const std::vector<sql::Token>& statement, bool optimize) const;
     // 计算某条 SELECT 的结果缓存键：归一化后的语句文本。
     // 大小写与空白不同但语义相同的语句会得到同一个键。
@@ -198,6 +211,17 @@ private:
     bool resultCacheEnabled_ = true;
     // 是否启用结果缓存（MINISQL_RESULT_CACHE=0 可关闭，供 A/B 对比）。
     std::size_t resultCacheMaxRows_ = 1000;
+    // 单条结果可缓存的最大行数。
+    struct WorkloadColumn {
+    // 某列被当作谓词的累计次数。
+        std::uint64_t equality = 0;
+        // 等值条件次数（col = 值）。
+        std::uint64_t range = 0;
+        // 范围条件次数（col < / > / <= / >= ）。
+    };
+    std::unordered_map<std::string, std::unordered_map<std::string, WorkloadColumn>> workload_;
+    // 查询负载：表名 -> 列名 -> 累计计数。
+    // 按会话累积，不随写入失效：它描述的是查询习惯，不是数据内容。
     // 单条结果超过这个行数就不缓存，避免大结果把内存吃光。
     // 统计缓存未命中次数。
     // 行数缓存未命中次数。

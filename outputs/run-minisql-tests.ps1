@@ -80,6 +80,8 @@ $groups = @{
         'tests/correlated-aggregate-smoke.mjs',
         'tests/decorrelate-apply-smoke.mjs',
         'tests/sql-dialect-smoke.mjs'
+        # 索引建议器：基于查询负载给出建索引建议（含建议可执行、建完即消失的闭环）。
+        'tests/index-advisor-smoke.mjs'
     )
     execution = @(
         'tests/database-process.mjs',
