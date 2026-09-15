@@ -688,6 +688,87 @@ bool pushTopNIntoSort(sql::LogicalPlan& limit, json& changes, std::size_t statem
     return true;
     // 报告已改写。
 }
+bool useIndexOrderForSort(sql::LogicalPlan& sort, const Options& options, json& changes, std::size_t statement) {
+// 用索引有序性消除排序：ORDER BY 的键正好是某个单列索引的列，且该列非空时，
+// 按索引顺序扫描即可直接得到有序结果。
+//
+// 为什么要求非空：索引里不含 NULL 行（实测确认）。若该列可为 NULL，
+// 用索引结果代替全表就会漏掉这些行 —— 这是正确性红线，不能碰。
+// 为什么只认单键单列索引：多键排序与复合索引前缀无法只靠一次升序扫描满足。
+    if (sort.kind != "Sort" || sort.children.size() != 1) return false;
+    // 只处理排序节点且有唯一输入。
+    if (sort.sortKeys.size() != 1) return false;
+    // 只处理单键排序。
+    const auto& key = sort.sortKeys.front();
+    // 取唯一的排序键。
+    if (!key.is_object() || !key.contains("index")) return false;
+    // 结构必须完整。
+    const auto sortColumn = key.at("index").get<std::size_t>();
+    // 排序键在输入行中的列下标。
+    auto& child = sort.children.front();
+    // 取排序的输入。
+    if (child.kind != "Project" || child.children.size() != 1) return false;
+    // 需要经过投影，才能把输出列映射回表列。
+    if (child.children.front().kind != "SeqScan") return false;
+    // 目前只处理直接架在全表扫描上的形态。
+    auto& scan = child.children.front();
+    // 取扫描节点。
+    if (scan.orderedScan) return false;
+    // 已经是有序扫描，说明规则已用过，避免反复标记。
+    if (sortColumn >= child.output.size()) return false;
+    // 列下标越界说明计划异常。
+    if (sortColumn >= child.projections.size()) return false;
+    // 需要投影表达式才能追溯到源列。
+    const auto& expression = child.projections[sortColumn];
+    // 排序键对应的投影表达式。
+    if (!expression.is_object() || expression.value("kind", std::string{}) != "Identifier") return false;
+    // 只处理「直接引用某一列」的排序键；表达式排序无法靠索引顺序满足。
+    const auto sourceColumn = expression.at("columnId").get<std::size_t>();
+    // 它在源行里的列下标。
+    if (sourceColumn >= scan.output.size()) return false;
+    // 下标越界说明计划异常。
+    const auto& source = scan.output[sourceColumn];
+    // 取被扫描表里这一列的元数据。
+    if (source.nullable) return false;
+    // 只处理声明为 NOT NULL 的列。
+    //
+    // 原因：索引不包含 NULL 行。若该列可为 NULL，用索引替代全表会漏掉所有 NULL 行，
+    // 结果集就错了。这条限制让优化只在小而确定的场景生效：宁可少优化，也不能算错。
+    const auto columnName = folded(source.name);
+    // 排序键对应的列名（大小写归一，与索引定义一致）。
+    const auto tableName = folded(scan.table);
+    // 被扫描的表名（大小写归一）。
+    const auto found = options.tableIndexColumns.find(tableName);
+    // 查这张表的索引列信息。
+    if (found == options.tableIndexColumns.end()) return false;
+    // 没有索引元数据就无法判断可用性。
+    for (const auto& candidate : found->second) {
+    // 逐个候选索引（每个元素是「索引名 + 它的列名列表」）。
+        if (candidate.second.size() != 1) continue;
+    // 只认单列索引：多列索引的首列虽有序，但前缀相同处的顺序不保证。
+        if (folded(candidate.second.front()) != columnName) continue;
+    // 索引的（唯一）列必须就是排序键那一列。
+        const auto before = sql::serializePlans({sort});
+    // 记录改写前的形态。
+        scan.indexName = candidate.first;
+    // 记下要用的索引名。
+        scan.orderedScan = true;
+    // 打开有序扫描：执行器据此按索引顺序输出行。
+        scan.orderedDescending = key.value("descending", false);
+    // 降序由执行器反转有序结果实现。
+        sql::LogicalPlan promoted = std::move(child);
+    // 把投影节点整体取出（它下面挂着已标记的扫描节点）。
+        sort = std::move(promoted);
+    // 用投影替换排序：排序算子就此消除。
+        record(changes, "index-order-scan", statement, before, sql::serializePlans({sort}));
+    // 记录这次改写。
+        return true;
+    // 报告已改写。
+    }
+    // 候选索引遍历结束。
+    return false;
+    // 没有可用索引。
+}
 void rewritePlan(sql::LogicalPlan& plan, const Options& options, json& changes, std::size_t statement, std::size_t depth = 0, bool selectQuery = false) {
 // 对一棵逻辑计划做规则改写；采用自底向上：先改写所有孩子，再处理本节点。
     if (depth > 256) throw MiniSqlError(ErrorCode::Internal, "Optimizer plan depth exceeded");
@@ -712,6 +793,8 @@ void rewritePlan(sql::LogicalPlan& plan, const Options& options, json& changes, 
         for (auto& expression : row.at("expressions")) expression = rewrite(expression, options, changes, statement);
         // 行内逐个表达式处理。
         if (options.topNSort && pushTopNIntoSort(plan, changes, statement)) return;
+    if (options.indexOrderScan && useIndexOrderForSort(plan, options, changes, statement)) return;
+    // 用索引有序性消除排序：排序键正好是非空单列索引时，改用有序索引扫描。
         // Top-N 下推：在孩子已改写完成后判断，改写成功就结束本节点。
     if (plan.kind != "Filter" && plan.kind != "SemiJoin" && plan.kind != "AntiJoin" && plan.kind != "Apply" &&
         // 下面这些规则都只作用于"带谓词的算子"，
@@ -896,6 +979,9 @@ nlohmann::json ruleDescriptors() {
         {{"ruleId", "prune-columns"}, {"scope", "plan"}, {"precondition", "Project over SeqScan with optional single Filter; projections are explicit"}, {"postcondition", "Scan output metadata contains exactly referenced columns; row values and errors unchanged"}},
         // 列裁剪：前提是投影直接架在扫描上（中间可有一层过滤）且投影是显式写出的；
         // 保证扫描输出只保留被引用的列，行值与错误不变。
+        {{"ruleId", "index-order-scan"}, {"scope", "plan"}, {"precondition", "Single-key Sort over Project over SeqScan, key column is NOT NULL and is the sole column of an index"}, {"postcondition", "Same rows in the same order; the sort is unnecessary because the index already yields that order"}},
+        // 前提：单键排序，排序列非空且恰好是某个单列索引的列。
+        // 保证行集与顺序不变；只是省掉了排序，因为索引本身就是这个顺序。
         {{"ruleId", "top-n-sort"}, {"scope", "plan"}, {"precondition", "Limit with a concrete row count directly above a Sort with sort keys"}, {"postcondition", "Same first limit+offset rows in the same order; only the rows kept in memory change"}},
         // Top-N 下推：前提是带确定条数的 Limit 直接架在有排序键的 Sort 上；
         // 保证输出的前 (limit+offset) 行与顺序不变，变的只是内存中保留哪些行。
@@ -925,6 +1011,8 @@ Result optimize(const std::vector<sql::LogicalPlan>& plans, Options options) {
         // 删除恒假过滤。
         else if (id == "predicate-pushdown") options.predicatePushdown = false;
         else if (id == "top-n-sort") options.topNSort = false;
+        else if (id == "index-order-scan") options.indexOrderScan = false;
+        // 支持单独禁用有序索引扫描，方便 A/B 对比。
         // 支持单独禁用 Top-N 下推，方便 A/B 对比。
         // 谓词下推。
         else if (id == "hash-join") options.hashJoin = false;

@@ -108,6 +108,8 @@ $groups = @{
         'tests/query-result-cache-smoke.mjs'
         # Top-N 排序下推：Limit 下推到 Sort，只保留前 N 行（含并列键稳定性）。
         'tests/top-n-sort-smoke.mjs'
+        # 有序索引扫描：排序键为非空单列索引时用索引顺序替代排序。
+        'tests/index-order-scan-smoke.mjs'
     )
     storage = @(
         'tests/checkpoint-smoke.mjs',

@@ -1301,7 +1301,10 @@ nlohmann::json serializePlans(const std::vector<LogicalPlan>& plans) {
                                         {"end", {{"line", endLine}, {"column", endColumn}}}}},
                         {"catalogFingerprint", plan.catalogFingerprint},
                         {"optimizerDecision", plan.optimizerDecision},
-                        {"indexName", plan.indexName}, {"savepointName", plan.savepointName}, {"subqueryJoinKind", plan.subqueryJoinKind}, {"uniqueIndex", plan.uniqueIndex}, {"indexColumns", plan.indexColumns}, {"indexValues", plan.indexValues}, {"indexRangeOperator", plan.indexRangeOperator}, {"indexRangeValue", plan.indexRangeValue},
+                        {"indexName", plan.indexName}, {"savepointName", plan.savepointName}, {"subqueryJoinKind", plan.subqueryJoinKind}, {"uniqueIndex", plan.uniqueIndex}, {"indexColumns", plan.indexColumns}, {"indexValues", plan.indexValues},
+                        // 索引范围与有序扫描标记；orderedScan 为真时上层可省掉排序。
+                        {"indexRangeOperator", plan.indexRangeOperator}, {"orderedScan", plan.orderedScan}, {"orderedDescending", plan.orderedDescending},
+                        {"indexRangeValue", plan.indexRangeValue},
                         // 索引与事务相关字段：索引名、保存点名、子查询连接种类、是否唯一索引、索引列、索引值、范围运算符与范围值，
                         {"output", output}, {"outputSchema", output}, {"preservesRowId", plan.preservesRowId},
                         {"predicate", plan.predicate}, {"values", plan.values}, {"insertExpressions", plan.insertExpressions}, {"insertRows", plan.insertRows},
@@ -1448,6 +1451,10 @@ std::vector<LogicalPlan> deserializePlans(const nlohmann::json& document) {
         item.plan.indexValues = row.value("indexValues", nlohmann::json::array());
         // 还原索引等值查找值。
         item.plan.indexRangeOperator = row.value("indexRangeOperator", std::string{});
+        item.plan.orderedScan = row.value("orderedScan", false);
+        // 还原有序扫描标记；缺字段时默认 false，兼容旧产物。
+        item.plan.orderedDescending = row.value("orderedDescending", false);
+        // 还原逆序标记。
         // 还原索引范围运算符。
         item.plan.indexRangeValue = row.value("indexRangeValue", nlohmann::json(nullptr));
         // 还原索引范围边界值。

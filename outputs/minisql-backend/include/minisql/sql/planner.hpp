@@ -90,6 +90,12 @@ struct LogicalPlan {
     nlohmann::json indexValues = nlohmann::json::array();
     // 走索引时要匹配的值序列。
     std::string indexRangeOperator{};
+    // 下面是有序索引扫描的标记。
+    bool orderedScan = false;
+    // 置位表示这个扫描按索引键升序返回行，上层可以省掉排序。
+    // 只在“排序键 = 单列索引首列 且该列 NOT NULL”时才会被打开。
+    bool orderedDescending = false;
+    // 是否需要逆序输出（即 ORDER BY 该列 DESC）。
     // 索引范围扫描的比较运算符（如 >、>=、<、<=），空表示等值或整表扫描。
     nlohmann::json indexRangeValue = nullptr;
     // 索引范围扫描的边界值，与 indexRangeOperator 配对使用。

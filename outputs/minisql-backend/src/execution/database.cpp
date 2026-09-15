@@ -964,6 +964,20 @@ optimizer::Options Database::optimizerOptions() {
         // 等于把每条查询都拖成“全库全表扫描”。
         // 现在只有缓存未命中时才扫一次，写语句会使其失效。
     }
+    for (const auto& definition : catalog_.tables()) {
+    // 逐张表收集索引列信息，供优化器判断能否用索引顺序替代排序。
+        const auto* table = catalog_.view().find(definition.definition.table);
+        // 从目录视图取表定义（含索引列表）。
+        if (!table || table->indexes.empty()) continue;
+        // 没有索引就不必记录。
+        std::vector<std::pair<std::string, std::vector<std::string>>> entries;
+        // 该表的索引列表：索引名 + 列名。
+        for (const auto& index : table->indexes) entries.emplace_back(index.name, index.columns);
+        // 逐条索引收进列表。
+        options.tableIndexColumns[key(definition.definition.table)] = std::move(entries);
+        // 以表名（大小写归一）为键存进选项。
+    }
+    // 索引元数据收集结束。
     return options;
 }
 std::uint64_t Database::cachedTableRows(std::uint64_t tableId, const sql::Statement& definition) {
@@ -3293,7 +3307,31 @@ std::unique_ptr<RowStream> Database::openRowStream(const sql::LogicalPlan& plan)
     checkCancelled();
 // 创建任何行流前先检查取消。
     if (!activeResources_) activeResources_ = std::make_shared<QueryResourceManager>(queryMemoryBytes_, tempDiskBytes_);
-    if (plan.kind == "SeqScan") return scanRowStream(plan);
+    if (plan.kind == "SeqScan" && !plan.orderedScan) return scanRowStream(plan);
+    // 普通顺序扫描走原路径；带有序标记的 SeqScan 交给下面的有序分支处理。
+    if (plan.kind == "SeqScan" && plan.orderedScan) {
+    // 有序索引扫描：按索引键升序取出全部行引用，交给行流按序输出。
+    // 上层因此可以省掉排序算子——这正是本优化的收益所在。
+        const catalog::StoredTable* table = nullptr;
+        // 定位表定义。
+        for (const auto& candidate : catalog_.tables()) if (key(candidate.definition.table) == key(plan.table)) table = &candidate;
+        // 按表名做大小写不敏感查找。
+        if (!table) fail("Ordered scan references missing table");
+        // 表不存在属于计划与目录不一致。
+        const RuntimeIndex* index = nullptr;
+        // 找到计划指定的运行期索引。
+        for (const auto& candidate : indexes_)
+            if (key(candidate->table) == key(plan.table) && key(candidate->name) == key(plan.indexName)) index = candidate.get();
+        if (!index) fail("Ordered scan references missing runtime index");
+        // 索引缺失说明未打开或计划过期。
+        auto refs = index->range(std::nullopt, true, std::nullopt, true);
+        // 无界范围查询即「按索引键顺序遍历全索引」；B+ 树叶链天然有序。
+        if (plan.orderedDescending) std::reverse(refs.begin(), refs.end());
+        // 降序只需把有序结果整体反转，无需重新排序。
+        return std::make_unique<ScanRowStream>(heap_, table->id, rowSchema(table->definition), std::move(refs));
+        // 复用现成的按引用列表输出的行流。
+    }
+    // 有序扫描分支结束。
 // 顺序扫描直接交给 scanRowStream。
     if (plan.kind == "IndexScan") {
         const catalog::StoredTable* table = nullptr;

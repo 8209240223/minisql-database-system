@@ -24,6 +24,12 @@ struct Options {
     bool decorrelateSubquery = true;
     // 子查询去关联：把相关子查询改写成可独立执行的连接或聚合形式。
     bool topNSort = true;
+    // Top-N 排序：Limit 直接架在 Sort 上时下推取前 N 行的需求。
+    bool indexOrderScan = true;
+    // 有序索引扫描：排序键恰好是非空单列索引时，用索引顺序代替排序。
+    std::unordered_map<std::string, std::vector<std::pair<std::string, std::vector<std::string>>>> tableIndexColumns{};
+    // 每张表的索引列信息：表名 -> [(索引名, [列名...])]。
+    // 优化器自己看不到目录，需要调用方把它传进来。
     // Top-N 排序：Limit 直接架在 Sort 上时，把取前 N 行的需求下推给 Sort，
     // 子查询去关联：把相关子查询改写成可独立执行的连接或聚合形式。
     double defaultTableRows = 1000.0;
