@@ -83,6 +83,9 @@ public:
 private:
     nlohmann::json bufferStatus() const;
     nlohmann::json queryCacheDocument() const;
+    std::string queryResultCacheKey(const std::vector<sql::Token>& statement, bool optimize) const;
+    // 计算某条 SELECT 的结果缓存键：归一化后的语句文本。
+    // 大小写与空白不同但语义相同的语句会得到同一个键。
     // 把三级缓存（行数、统计、页）的命中情况汇总成一个 JSON 文档，供 statistics 展示。
     // 返回缓冲池状态（帧数、命中率、淘汰记录等）。
     // X18: 实时单遍扫描的表/列/索引统计；ANALYZE 用它生成快照，statistics() 无快照时回退到它。
@@ -183,6 +186,19 @@ private:
     std::uint64_t liveStatsCacheHits_ = 0;
     // 统计缓存命中次数。
     std::uint64_t liveStatsCacheMisses_ = 0;
+    // 统计缓存未命中次数。
+    std::unordered_map<std::string, nlohmann::json> queryResultCache_;
+    // 查询结果缓存：缓存键到已经算好的结果 JSON。
+    // 只对“自动提交状态下的单条 SELECT”生效：事务内读取会看到未提交数据，
+    // 缓存它们会把隔离性弄坏。
+    std::uint64_t queryResultCacheHits_ = 0;
+    // 查询结果缓存命中次数。
+    std::uint64_t queryResultCacheMisses_ = 0;
+    // 查询结果缓存未命中次数。
+    bool resultCacheEnabled_ = true;
+    // 是否启用结果缓存（MINISQL_RESULT_CACHE=0 可关闭，供 A/B 对比）。
+    std::size_t resultCacheMaxRows_ = 1000;
+    // 单条结果超过这个行数就不缓存，避免大结果把内存吃光。
     // 统计缓存未命中次数。
     // 行数缓存未命中次数。
     // 缓存：形状加绑定值到结果行的映射。

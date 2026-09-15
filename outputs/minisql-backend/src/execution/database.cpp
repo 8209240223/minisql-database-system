@@ -812,6 +812,19 @@ Database::Database(const std::filesystem::path& path, std::size_t frames, storag
         // 上限一千万行。
     }
     // 结果行数上限处理结束。
+    if (const char* configured = std::getenv("MINISQL_RESULT_CACHE")) {
+    // 结果缓存开关：显式写 0 关闭，其余值保持默认开启。
+        resultCacheEnabled_ = !(configured[0] == '0' && configured[1] == '\0');
+        // 只有单个字符 '0' 才算关闭；空串等其他值都视为开启。
+    }
+    // 结果缓存开关处理结束。
+    if (const char* configured = std::getenv("MINISQL_RESULT_CACHE_MAX_ROWS")) {
+    // 单条结果可缓存的最大行数。
+        char* end = nullptr;const auto parsed = std::strtoull(configured, &end, 10);
+        if (end && *end == '\0' && parsed > 0 && parsed <= 1000000) resultCacheMaxRows_ = static_cast<std::size_t>(parsed);
+        // 上限一百万行，避免误配导致内存爆掉。
+    }
+    // 结果缓存行数上限处理结束。
     sortTempDirectory_ = std::getenv("MINISQL_TEMP_DIR") ? std::filesystem::path(std::getenv("MINISQL_TEMP_DIR")) : path.parent_path() / ".minisql-sort";
     // 排序溢出目录：可用 MINISQL_TEMP_DIR 指定，默认放在数据库文件旁边的隐藏目录。
     if (const char* configured = std::getenv("MINISQL_SESSION_ID"); configured && *configured) sessionId_ = configured;
@@ -974,6 +987,8 @@ void Database::invalidateRowCountCache() {
     liveStatsCache_ = nullptr;
     // 统计缓存一并失效：写入会改变行数、最值、直方图等全部统计量。
     // 直接清空：写语句数量远少于读，清空比逐项维护更简单也更不容易出错。
+    queryResultCache_.clear();
+    // 结果缓存：数据变了，缓存的结果立即过期，必须全部扔掉。
 }
 
 nlohmann::json Database::cachedLiveTableStatistics() {
@@ -2345,6 +2360,30 @@ nlohmann::json Database::statistics() {
             {"lastRunMs", schedulerLastRunMs_}, {"deferredReasons", schedulerDeferredReasons_}}}};
 // 最近一次真正执行时间，以及这一轮被推迟的原因。
 }
+std::string Database::queryResultCacheKey(const std::vector<sql::Token>& statement, bool optimize) const {
+// 把一条语句的 token 归一化成缓存键。
+// 归一化做两件事：关键字与标识符统一转小写、各 token 用不会出现在 SQL 里的分隔符接起来。
+// 这样 "select id from t" 与 "SELECT  ID  FROM  T" 会得到同一个键。
+    std::string key;
+    // 累加结果。
+    key += optimize ? "opt|" : "raw|";
+    // 把是否走优化器编进键：同一条 SQL 在两种模式下计划不同。
+    for (const auto& token : statement) {
+    // 逐个 token 追加。
+        if (token.type == "END") continue;
+        // 结束标记不参与。
+        std::string piece = token.lexeme;
+        // 取词素。
+        for (char& c : piece) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        // 全部转小写：关键字与标识符都不区分大小写。
+        key += piece;
+        // 追加进键。
+        key += static_cast<char>(0x1f);
+        // 用一个不会出现在 SQL 里的分隔符，避免 "ab"+"c" 与 "a"+"bc" 撞键。
+    }
+    return key;
+    // 返回缓存键。
+}
 nlohmann::json Database::queryCacheDocument() const {
 // 汇总三级缓存的命中情况，供 statistics 对外展示。
 // 三级分别是：行数缓存（优化器估算用）、
@@ -2359,6 +2398,12 @@ nlohmann::json Database::queryCacheDocument() const {
         // 行数缓存：命中与未命中次数。
             {"entries", rowCountCache_.size()}, {"scope", "table-row-counts"}}},
         // 当前缓存的表数与缓存范围。
+        {"queryResult", {{"enabled", resultCacheEnabled_}, {"hits", queryResultCacheHits_},
+        // 结果缓存：命中直接返回已算好的结果，跳过编译与执行。
+            {"misses", queryResultCacheMisses_}, {"entries", queryResultCache_.size()},
+        // 未命中次数与当前缓存条目数。
+            {"maxRows", resultCacheMaxRows_}, {"scope", "single-statement-select-autocommit"}}},
+        // 行数上限与缓存范围：只缓存自动提交下的单条 SELECT。
         {"liveStats", {{"hits", liveStatsCacheHits_}, {"misses", liveStatsCacheMisses_},
         // 统计缓存：命中与未命中次数。
             {"cached", !liveStatsCache_.is_null()}, {"scope", "table-column-histograms"}}},
@@ -5603,6 +5648,37 @@ nlohmann::json Database::execute(const std::string& source, bool optimize) {
             }
 // ANALYZE 特判分支结束。
             auto ast = sql::parse(statement);
+            // 查询结果缓存：只对“单条 SELECT + 事务空闲 + 走优化器”生效。
+            // 事务内不缓存：事务里的读取可能看到未提交数据，缓存会把隔离性弄坏；
+            // 写语句不缓存：把写操作缓存起来等于把它吞掉。
+            std::string resultCacheKey;
+            // 缓存键；为空表示本条不参与缓存。
+            const bool resultCacheable = resultCacheEnabled_ && optimize &&
+            // 开关打开、走优化器、
+                transaction_ == TransactionState::Idle && ast.size() == 1 && ast.front().kind == "Select";
+                // 事务空闲（即自动提交）、只有一条语句、且是 SELECT。
+            if (resultCacheable) {
+            // 符合条件才去算键与查缓存。
+                resultCacheKey = queryResultCacheKey(statement, optimize);
+                // 按归一化语句文本算键。
+                const auto cached = queryResultCache_.find(resultCacheKey);
+                // 先查缓存。
+                if (cached != queryResultCache_.end()) {
+                // 命中：直接返回上次结果，跳过编译、优化与执行。
+                    ++queryResultCacheHits_;
+                    // 命中计数加一。
+                    results.push_back(cached->second);
+                    // 把缓存的结果当作本次结果。
+                    statement.clear();
+                    // 清空当前语句 token，准备下一条。
+                    return;
+                    // 直接结束本条语句的处理。
+                }
+                // 命中分支结束。
+                ++queryResultCacheMisses_;
+                // 未命中：记一次未命中，继续走正常流程。
+            }
+            // 缓存查找结束。
 // 普通语句：先解析 AST。
             if (transaction_ == TransactionState::Aborted && ast.front().kind != "Rollback")
 // 事务已中止时只允许 ROLLBACK。
@@ -5633,6 +5709,14 @@ nlohmann::json Database::execute(const std::string& source, bool optimize) {
 // 如果单条结果超过最大行数预算，直接报错。
                     throw MiniSqlError(ErrorCode::Execution, "Result row budget exceeded");
 // 抛出结果行数超限错误。
+                if (resultCacheable && !resultCacheKey.empty() && result.contains("rows") && result.at("rows").is_array()
+                // 回填条件：本条可缓存、键有效、结果里确实有行数组。
+                    && result.at("rows").size() <= resultCacheMaxRows_) {
+                    // 且结果行数没超过上限：大结果缓存会把内存吃光，得不偿失。
+                    queryResultCache_[resultCacheKey] = result;
+                    // 把结果原样存起来，下次同样的语句直接命中。
+                }
+                // 回填结束。
                 results.push_back(std::move(result));
 // 把本条语句结果加入总结果。
             }
