@@ -107,39 +107,39 @@ private:
                     ++i;expect("(");s.checks.push_back(expression());expect(")");
                 }else if(keyword("PRIMARY")){
                     recordName(columnLabel,"primaryKey",s.columns.size());
-                    if(column.primaryKey)throw MiniSqlError(ErrorCode::Syntax,"Duplicate PRIMARY KEY",t[i].location);
+                    if(column.primaryKey)throw MiniSqlError(ErrorCode::Syntax,"Duplicate PRIMARY KEY on column '"+column.name+"'",t[i].location);
                     ++i;expect("KEY");column.primaryKey=true;
                 }else if(keyword("UNIQUE")){
                     recordName(columnLabel,"unique",s.columns.size());
-                    if(column.unique)throw MiniSqlError(ErrorCode::Syntax,"Duplicate UNIQUE",t[i].location);
+                    if(column.unique)throw MiniSqlError(ErrorCode::Syntax,"Duplicate UNIQUE on column '"+column.name+"'",t[i].location);
                     ++i;column.unique=true;
                 }else if(keyword("REFERENCES")){
                     recordName(columnLabel,"references",s.columns.size());
                     ++i;auto referencedTable=identifier();expect("(");auto referencedColumn=identifier();expect(")");
-                    if(column.references)throw MiniSqlError(ErrorCode::Syntax,"Duplicate REFERENCES",t[i].location);
+                    if(column.references)throw MiniSqlError(ErrorCode::Syntax,"Duplicate REFERENCES on column '"+column.name+"'",t[i].location);
                     column.references=std::make_pair(std::move(referencedTable),std::move(referencedColumn));
                 }else if(keyword("DEFAULT")){
-                    if(!columnLabel.empty())throw MiniSqlError(ErrorCode::Syntax,"Named DEFAULT is not supported",t[i].location);
-                    if(column.defaultValue)throw MiniSqlError(ErrorCode::Syntax,"Duplicate DEFAULT",t[i].location);
+                    if(!columnLabel.empty())throw MiniSqlError(ErrorCode::Syntax,"Named DEFAULT '"+columnLabel+"' is not supported",t[i].location);
+                    if(column.defaultValue)throw MiniSqlError(ErrorCode::Syntax,"Duplicate DEFAULT on column '"+column.name+"'",t[i].location);
                     ++i;column.defaultValue=literal();
                 }else if(keyword("NOT")||keyword("NULL")){
-                    if(!columnLabel.empty()&&!keyword("NOT"))throw MiniSqlError(ErrorCode::Syntax,"Named NULL is not a constraint",t[i].location);
+                    if(!columnLabel.empty()&&!keyword("NOT"))throw MiniSqlError(ErrorCode::Syntax,"Named NULL '"+columnLabel+"' is not a constraint",t[i].location);
                     recordName(columnLabel,"notNull",s.columns.size());
-                    if(seenNull)throw MiniSqlError(ErrorCode::Syntax,"Duplicate nullability declaration",t[i].location);
+                    if(seenNull)throw MiniSqlError(ErrorCode::Syntax,"Duplicate nullability declaration on column '"+column.name+"'",t[i].location);
                     seenNull=true;
                     if(keyword("NOT")){++i;expect("NULL");column.nullable=false;}else ++i;
                 }else throw MiniSqlError(ErrorCode::Syntax,"Expected column constraint (NOT NULL/DEFAULT/PRIMARY KEY/UNIQUE/REFERENCES/CHECK) but found "+describeCurrentToken(),t[i].location);
             }
             if(seenNull&&column.nullable)explicitNull.push_back(column.name);
             if(column.primaryKey){
-                if(seenNull&&column.nullable)throw MiniSqlError(ErrorCode::Syntax,"PRIMARY KEY cannot declare NULL",t[i].location);
+                if(seenNull&&column.nullable)throw MiniSqlError(ErrorCode::Syntax,"PRIMARY KEY on column '"+column.name+"' cannot declare NULL",t[i].location);
                 column.nullable=false;
             }
             s.columns.push_back(std::move(column));
         }while(at(",")&&(++i,true));expect(")");semicolon();
         auto normalized=[](std::string name){for(auto& c:name)c=static_cast<char>(std::toupper(static_cast<unsigned char>(c)));return name;};
         for(const auto& constraint:s.keys)if(constraint.primary)for(const auto& name:constraint.columns){
-            for(const auto& nullable:explicitNull)if(normalized(nullable)==normalized(name))throw MiniSqlError(ErrorCode::Syntax,"PRIMARY KEY cannot declare NULL");
+            for(const auto& nullable:explicitNull)if(normalized(nullable)==normalized(name))throw MiniSqlError(ErrorCode::Syntax,"PRIMARY KEY column '"+name+"' cannot declare NULL");
             for(auto& column:s.columns)if(normalized(column.name)==normalized(name))column.nullable=false;
         }
         return s;
@@ -189,7 +189,7 @@ private:
                 const auto token=take();i+=2;value=std::make_shared<Expr>(Expr{"Wildcard",token.lexeme+".*",{},{},token.location});
             } else value=expression();
             if(keyword("AS")){
-                if(value->kind=="Wildcard")throw MiniSqlError(ErrorCode::Syntax,"Wildcard cannot have an alias",t[i].location);
+                if(value->kind=="Wildcard")throw MiniSqlError(ErrorCode::Syntax,"Wildcard '"+value->value+"' cannot have an alias",t[i].location);
                 ++i;alias=identifier();
             }
             if(value->kind=="Identifier"||value->kind=="Wildcard")s.selectList.push_back(value->value);
@@ -199,7 +199,7 @@ private:
         if(keyword("AS")){++i;s.tableAlias=identifier();}
         else if(i<t.size()&&t[i].type=="IDENTIFIER")s.tableAlias=identifier();
         while(keyword("JOIN")||keyword("INNER")||keyword("LEFT")||keyword("RIGHT")||keyword("FULL")) {
-            if(s.joins.size()>=32)throw MiniSqlError(ErrorCode::Syntax,"Join count exceeds 32",t[i].location);
+            if(s.joins.size()>=32)throw MiniSqlError(ErrorCode::Syntax,"Join count exceeds 32 (got "+std::to_string(s.joins.size())+")",t[i].location);
             Join join;
             if(keyword("LEFT")){++i;join.left=true;if(keyword("OUTER"))++i;}
             else if(keyword("RIGHT")){++i;join.right=true;if(keyword("OUTER"))++i;}
@@ -257,10 +257,10 @@ private:
                 auto subquery=std::make_shared<Expr>(Expr{"InSubquery","",left,{},op.location,text});
                 return negate?std::make_shared<Expr>(Expr{"Unary","NOT",subquery,{},op.location}):subquery;
             }
-            if(at(")"))throw MiniSqlError(ErrorCode::Syntax,"IN requires a non-empty value list",t[i].location);
+            if(at(")"))throw MiniSqlError(ErrorCode::Syntax,"IN requires a non-empty value list for '"+left->value+"'",t[i].location);
             std::vector<std::shared_ptr<Expr>> terms;
             do {
-                if(terms.size()>=128)throw MiniSqlError(ErrorCode::Syntax,"IN list exceeds 128 values",op.location);
+                if(terms.size()>=128)throw MiniSqlError(ErrorCode::Syntax,"IN list exceeds 128 values (got "+std::to_string(terms.size()+1)+")",op.location);
                 terms.push_back(std::make_shared<Expr>(Expr{"Binary","=",left,addition(),op.location}));
             } while(at(",")&&(++i,true));
             expect(")");--depth;
