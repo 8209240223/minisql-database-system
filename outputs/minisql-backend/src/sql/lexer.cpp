@@ -63,7 +63,7 @@ void scanTokens(const std::string& s, const std::function<void(const Token&)>& c
         } else if(c=='\''){
             advance();bool closed=false;
             while(i<s.size()){
-                if(s[i]=='\r'||s[i]=='\n')fail("Newline in string literal is not supported; use '\\n' escape instead");
+                if(s[i]=='\r'||s[i]=='\n')fail("Newline in string literal is not supported; use '\\n' escape instead (found "+describeContext()+")");
                 if(s[i]=='\''){advance();if(i<s.size()&&s[i]=='\''){advance();continue;}closed=true;break;}
                 advance();
             }
