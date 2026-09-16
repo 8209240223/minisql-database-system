@@ -32,7 +32,7 @@ function GrantEditor({ subject, connection, onChanged }: { subject: Subject; con
   return <div className="access-grant">
     <div className="access-grant-row"><label>对象 <input value={object} onChange={event => setObject(event.target.value)} placeholder="* 或表名"/></label></div>
     <div className="access-permissions">{PERMISSIONS.map(permission => <label key={permission} className="perm-chip"><input type="checkbox" checked={selected.includes(permission)} onChange={() => toggle(permission)}/>{permission}</label>)}</div>
-    <div className="access-grant-actions"><button onClick={() => void run(false)} className="grant">授权</button><button onClick={() => void run(true)} className="revoke">撤销</button>{message && <span className="access-message">{message}</span>}</div>
+    <div className="access-grant-actions"><button title="授权" data-tip="按上方勾选的权限和对象，给该用户/角色执行 GRANT。" onClick={() => void run(false)} className="grant">授权</button><button title="撤销" data-tip="收回勾选的权限；一个都不勾则收回全部权限（REVOKE ALL）。" onClick={() => void run(true)} className="revoke">撤销</button>{message && <span className="access-message">{message}</span>}</div>
   </div>;
 }
 
@@ -80,15 +80,15 @@ export function AccessControl({ connection, open, onClose }: { connection: Conne
   };
 
   return <dialog className="settings-dialog access-dialog" open aria-label="权限与审计"><div className="settings-body access-body">
-    <button className="icon-btn settings-close" aria-label="关闭" onClick={onClose}><X size={17}/></button>
+    <button className="icon-btn settings-close" aria-label="关闭" title="关闭" data-tip="关闭权限与审计面板。" onClick={onClose}><X size={17}/></button>
     <h2 className="access-title"><Shield size={16}/> 权限与审计</h2>
     {!apiMode && <div className="storage-info">连接真实 C++ 数据库后可管理用户、角色、授权与查看审计。</div>}
     {error && <div className="access-error">⚠ {error}</div>}
     <div className="access-tabs">
-      <button className={tab === 'users' ? 'selected' : ''} onClick={() => setTab('users')}><Users size={14}/> 用户</button>
-      <button className={tab === 'roles' ? 'selected' : ''} onClick={() => setTab('roles')}><Shield size={14}/> 角色</button>
-      <button className={tab === 'sessions' ? 'selected' : ''} onClick={() => setTab('sessions')}><Activity size={14}/> 会话</button>
-      <button className={tab === 'audit' ? 'selected' : ''} onClick={() => setTab('audit')}><FileSearch size={14}/> 审计</button>
+      <button className={tab === 'users' ? 'selected' : ''} title="用户" data-tip="创建用户、绑定角色、改密、删除；展开用户可做 GRANT 授权。" onClick={() => setTab('users')}><Users size={14}/> 用户</button>
+      <button className={tab === 'roles' ? 'selected' : ''} title="角色" data-tip="创建角色、配置继承关系、删除；展开角色可做 GRANT 授权。" onClick={() => setTab('roles')}><Shield size={14}/> 角色</button>
+      <button className={tab === 'sessions' ? 'selected' : ''} title="会话" data-tip="查看活动会话与锁等待状态，可取消卡住的请求。" onClick={() => setTab('sessions')}><Activity size={14}/> 会话</button>
+      <button className={tab === 'audit' ? 'selected' : ''} title="审计" data-tip="查看引擎记录的操作审计日志（谁在何时访问了什么）。" onClick={() => setTab('audit')}><FileSearch size={14}/> 审计</button>
     </div>
 
     {tab === 'users' && <div className="access-panel">
@@ -96,7 +96,7 @@ export function AccessControl({ connection, open, onClose }: { connection: Conne
         <input aria-label="用户名" placeholder="新用户" value={newUser.name} onChange={e => setNewUser(v => ({ ...v, name: e.target.value }))}/>
         <input aria-label="密码" type="password" placeholder="密码" value={newUser.password} onChange={e => setNewUser(v => ({ ...v, password: e.target.value }))}/>
         <input aria-label="角色" placeholder="角色（逗号分隔）" value={newUser.roles} onChange={e => setNewUser(v => ({ ...v, roles: e.target.value }))}/>
-        <button disabled={!newUser.name} onClick={() => void doAction(() => createUser(connection, { name: newUser.name, password: newUser.password, roles: newUser.roles.split(',').map(s => s.trim()).filter(Boolean) }))}>新增用户</button>
+        <button title="新增用户" data-tip="创建用户；填了密码即启用密码登录，角色用逗号分隔（如 admin,reader）。" disabled={!newUser.name} onClick={() => void doAction(() => createUser(connection, { name: newUser.name, password: newUser.password, roles: newUser.roles.split(',').map(s => s.trim()).filter(Boolean) }))}>新增用户</button>
       </div>
       {(access?.users ?? []).map(user => <UserRow key={user.name} user={user} connection={connection} onChanged={refresh} onAction={doAction}/>)}
     </div>}
@@ -105,14 +105,14 @@ export function AccessControl({ connection, open, onClose }: { connection: Conne
       <div className="access-create">
         <input aria-label="角色名" placeholder="新角色" value={newRole.name} onChange={e => setNewRole(v => ({ ...v, name: e.target.value }))}/>
         <input aria-label="继承" placeholder="继承角色（逗号分隔）" value={newRole.inherits} onChange={e => setNewRole(v => ({ ...v, inherits: e.target.value }))}/>
-        <button disabled={!newRole.name} onClick={() => void doAction(() => createRole(connection, { name: newRole.name, inherits: newRole.inherits.split(',').map(s => s.trim()).filter(Boolean) }))}>新增角色</button>
+        <button title="新增角色" data-tip="创建角色；继承角色用逗号分隔，成员自动获得被继承角色的权限。" disabled={!newRole.name} onClick={() => void doAction(() => createRole(connection, { name: newRole.name, inherits: newRole.inherits.split(',').map(s => s.trim()).filter(Boolean) }))}>新增角色</button>
       </div>
       {(access?.roles ?? []).map(role => <RoleRow key={role.name} role={role} connection={connection} onChanged={refresh} onAction={doAction}/>)}
     </div>}
 
     {tab === 'sessions' && <div className="access-panel">
       {sessionMessage && <div className="access-message">{sessionMessage}</div>}
-      {sessions.length === 0 ? <p className="access-empty">暂无活动会话。</p> : <table className="access-table"><thead><tr><th>会话</th><th>用户</th><th>事务</th><th>活动</th><th>锁等待</th><th>最后活动</th><th>操作</th></tr></thead><tbody>{sessions.map(s => <tr key={s.sessionId} className={s.sessionId === connection.sessionId ? 'current-session' : ''}><td title={s.sessionId}>{s.sessionId === connection.sessionId ? '当前 · ' : ''}{s.sessionId.slice(0, 8)}…</td><td>{s.user}</td><td>{s.transactionState}{s.ownsTransactionLock ? ' · 持锁' : ''}</td><td>{s.activeRequest ? '执行中' : '空闲'}</td><td>{s.waitingForLock ? '等待事务锁' : '否'}</td><td>{new Date(s.lastActiveAt).toLocaleTimeString()}</td><td><button className="revoke" disabled={!s.activeRequest && !s.waitingForLock} onClick={() => void cancel(s.sessionId)}>取消</button></td></tr>)}</tbody></table>}
+      {sessions.length === 0 ? <p className="access-empty">暂无活动会话。</p> : <table className="access-table"><thead><tr><th>会话</th><th>用户</th><th>事务</th><th>活动</th><th>锁等待</th><th>最后活动</th><th>操作</th></tr></thead><tbody>{sessions.map(s => <tr key={s.sessionId} className={s.sessionId === connection.sessionId ? 'current-session' : ''}><td title={s.sessionId}>{s.sessionId === connection.sessionId ? '当前 · ' : ''}{s.sessionId.slice(0, 8)}…</td><td>{s.user}</td><td>{s.transactionState}{s.ownsTransactionLock ? ' · 持锁' : ''}</td><td>{s.activeRequest ? '执行中' : '空闲'}</td><td>{s.waitingForLock ? '等待事务锁' : '否'}</td><td>{new Date(s.lastActiveAt).toLocaleTimeString()}</td><td><button className="revoke" title="取消请求" data-tip="中断这个会话正在执行或等锁的请求。" disabled={!s.activeRequest && !s.waitingForLock} onClick={() => void cancel(s.sessionId)}>取消</button></td></tr>)}</tbody></table>}
     </div>}
 
     {tab === 'audit' && <AuditPanel entries={audit} connection={connection} onChanged={refresh}/>}
@@ -127,15 +127,15 @@ function UserRow({ user, connection, onChanged, onAction }: {
   const [expanded, setExpanded] = useState(false);
   return <div className="access-item">
     <div className="access-item-head">
-      <button className="access-expand" onClick={() => setExpanded(v => !v)}>{expanded ? '▾' : '▸'}</button>
+      <button className="access-expand" title="展开 / 收起" data-tip="展开后可对该用户做 GRANT 授权。" onClick={() => setExpanded(v => !v)}>{expanded ? '▾' : '▸'}</button>
       <strong>{user.name}</strong><span className="access-badge">{user.passwordProtected ? '密码保护' : '无密码'}</span>
       <span className="access-roles">{user.roles.join(', ') || '无角色'}</span>
       <span className="access-spacer"/>
       <input className="access-mini-input" placeholder="绑定角色" value={roleName} onChange={e => setRoleName(e.target.value)}/>
-      <button className="grant" disabled={!roleName} onClick={() => void onAction(() => addUserRole(connection, user.name, roleName), '')}>绑定</button>
-      {user.roles.map(r => <button key={r} className="revoke" title={`移除角色 ${r}`} onClick={() => void onAction(() => removeUserRole(connection, user.name, r), '')}>{r} ×</button>)}
-      <button className="revoke" onClick={() => { const password = window.prompt(`设置 ${user.name} 的新密码`); if (password !== null) void onAction(() => setUserPassword(connection, user.name, password), '已改密'); }}>改密</button>
-      <button className="danger" onClick={() => { if (window.confirm(`删除用户 ${user.name}？`)) void onAction(() => dropUser(connection, user.name), '已删除'); }}>删除</button>
+      <button className="grant" title="绑定角色" data-tip="把左侧输入框里的角色绑定给该用户。" disabled={!roleName} onClick={() => void onAction(() => addUserRole(connection, user.name, roleName), '')}>绑定</button>
+      {user.roles.map(r => <button key={r} className="revoke" title={`移除角色 ${r}`} data-tip="从该用户移除此角色。" onClick={() => void onAction(() => removeUserRole(connection, user.name, r), '')}>{r} ×</button>)}
+      <button className="revoke" title="改密" data-tip="弹出输入框，为该用户设置新密码。" onClick={() => { const password = window.prompt(`设置 ${user.name} 的新密码`); if (password !== null) void onAction(() => setUserPassword(connection, user.name, password), '已改密'); }}>改密</button>
+      <button className="danger" title="删除用户" data-tip="删除该用户及其授权（有确认弹窗）。" onClick={() => { if (window.confirm(`删除用户 ${user.name}？`)) void onAction(() => dropUser(connection, user.name), '已删除'); }}>删除</button>
     </div>
     {expanded && <div className="access-grants"><GrantEditor subject={{ type: 'user', name: user.name }} connection={connection} onChanged={onChanged}/></div>}
   </div>;
@@ -148,11 +148,11 @@ function RoleRow({ role, connection, onChanged, onAction }: {
   const [expanded, setExpanded] = useState(false);
   return <div className="access-item">
     <div className="access-item-head">
-      <button className="access-expand" onClick={() => setExpanded(v => !v)}>{expanded ? '▾' : '▸'}</button>
+      <button className="access-expand" title="展开 / 收起" data-tip="展开后可对该角色做 GRANT 授权。" onClick={() => setExpanded(v => !v)}>{expanded ? '▾' : '▸'}</button>
       <strong>{role.name}</strong>
       <span className="access-roles">继承: {role.inherits.join(', ') || '无'}</span>
       <span className="access-spacer"/>
-      <button className="danger" onClick={() => { if (window.confirm(`删除角色 ${role.name}？`)) void onAction(() => dropRole(connection, role.name), '已删除'); }}>删除</button>
+      <button className="danger" title="删除角色" data-tip="删除该角色（有确认弹窗）；已绑定该角色的用户会失去对应权限。" onClick={() => { if (window.confirm(`删除角色 ${role.name}？`)) void onAction(() => dropRole(connection, role.name), '已删除'); }}>删除</button>
     </div>
     {expanded && <div className="access-grants"><GrantEditor subject={{ type: 'role', name: role.name }} connection={connection} onChanged={onChanged}/></div>}
   </div>;
@@ -163,7 +163,7 @@ function AuditPanel({ entries, connection, onChanged }: { entries: AuditEntry[];
   const [filter, setFilter] = useState('');
   const filtered = entries.filter(e => !filter || e.user.includes(filter) || e.object?.includes(filter) || e.path.includes(filter));
   return <div className="access-panel">
-    <div className="history-search"><FileSearch size={14}/><input aria-label="过滤审计" placeholder="过滤：用户 / 对象 / 路径" value={filter} onChange={e => setFilter(e.target.value)}/></div>
+    <div className="history-search"><FileSearch size={14}/><input aria-label="过滤审计" placeholder="过滤：用户 / 对象 / 路径" title="过滤审计" data-tip="按用户、对象或路径关键字过滤审计记录。" value={filter} onChange={e => setFilter(e.target.value)}/></div>
     {filtered.length === 0 ? <p className="access-empty">暂无审计记录。</p> : <table className="access-table audit-table"><thead><tr><th>时间</th><th>用户</th><th>方法</th><th>路径</th><th>对象</th><th>状态</th><th>耗时</th></tr></thead><tbody>{filtered.map(e => <tr key={e.id}><td>{new Date(e.at).toLocaleTimeString()}</td><td>{e.user}</td><td>{e.method}</td><td>{e.path}</td><td>{e.object ?? '—'}</td><td className={e.success ? 'ok-text' : 'err-text'}>{e.status}</td><td>{e.durationMs.toFixed(0)} ms</td></tr>)}</tbody></table>}
   </div>;
 }

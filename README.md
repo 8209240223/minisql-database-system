@@ -185,7 +185,7 @@ powershell -ExecutionPolicy Bypass -File .\stop-minisql-workbench.ps1
 
 ## 当前阶段边界
 
-已完成并验证：
+已完成并全部验证：
 
 - X22 自动检查点策略扩展、后台调度与五个提交/恢复阶段跨进程故障注入；记录级 WAL 元数据、group commit、模糊检查点、日志归档/安全回收与双写缓冲均有专项回归。
 - X25 传输层 NDJSON 流式结果、只读写保护、HTTP 背压和工作台客户端；鉴权链路已收敛到绑定结果，SQL 文本扫描在 C++、bridge 与 CLI 三处全部移除。
