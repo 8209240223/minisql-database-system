@@ -1,12 +1,17 @@
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { once } from 'node:events';
-import { mkdtempSync } from 'node:fs';
+import { mkdtempSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import assert from 'node:assert/strict';
 const directory = mkdtempSync(join(tmpdir(), 'minisql-legacy-bridge-'));
-const executable = process.env.MINISQL_DATABASE_EXE ?? fileURLToPath(new URL('../build/verification/Release/minisql_database.exe', import.meta.url));
+// 路径约定同其他进程测试：Release 产物在 build/windows/Release，bin/ 是同步镜像。
+// 写死 build/verification 会在按 README/CI 构建时让 bridge 拉起一个不存在的引擎，
+// /execute 因此返回 503（后端不可用），而不是测试真正要断言的转发行为。
+const releaseExecutable = fileURLToPath(new URL('../build/windows/Release/minisql_database.exe', import.meta.url));
+const fallbackExecutable = fileURLToPath(new URL('../bin/minisql_database.exe', import.meta.url));
+const executable = process.env.MINISQL_DATABASE_EXE ?? (existsSync(releaseExecutable) ? releaseExecutable : fallbackExecutable);
 const server = spawn(process.execPath, [fileURLToPath(new URL('../scripts/bridge.mjs', import.meta.url))], {
   env: { ...process.env, PORT: '0', MINISQL_DATABASE_EXE: executable, MINISQL_DB: join(directory, 'database.pages') },
   windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'],

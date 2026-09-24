@@ -13,7 +13,7 @@ if (!Number.isInteger(seed) || seed < 0 || seed > 0xffffffff || !Number.isIntege
   throw new Error('FUZZ_SEED must be UINT32 and FUZZ_CASES must be 1..1000');
 const directory = mkdtempSync(fileURLToPath(new URL('./artifacts/fuzz-', import.meta.url)));
 const database = join(directory, 'database.pages');
-const releaseExecutable = fileURLToPath(new URL('../build/verification/Release/minisql_database.exe', import.meta.url));
+const releaseExecutable = fileURLToPath(new URL('../build/windows/Release/minisql_database.exe', import.meta.url));
 const fallbackExecutable = fileURLToPath(new URL('../bin/minisql_database.exe', import.meta.url));
 const executable = process.env.MINISQL_DATABASE_EXE ?? (existsSync(releaseExecutable) ? releaseExecutable : fallbackExecutable);
 const replayPath = process.env.FUZZ_REPLAY;

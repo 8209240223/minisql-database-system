@@ -1,13 +1,20 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync } from 'node:fs';
+import { existsSync, mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { openSession } from '../scripts/session-process.mjs';
 
 // X25：受权对象、动作与只读判定都来自 C++ 绑定结果，取代旧的 SQL 文本扫描。
 // 本契约直接对会话 bindAccess 操作断言，覆盖字符串字面量、别名、派生表、CTE、
 // 自连接与按对象动作。
-const executable = process.env.MINISQL_DATABASE_EXE ?? './build/verification/Release/minisql_database.exe';
+// 可执行体路径必须与 README / CI 的构建流程一致：Release 产物在
+// build/windows/Release，bin/ 是它的同步镜像（CI 有专门的同步步骤）。
+// 此前这里写死 build/verification —— 只有 verify-clean.ps1 才会创建的目录 ——
+// 于是按 README 或 run-minisql-tests.ps1 执行时直接 spawn ENOENT。
+const releaseExecutable = fileURLToPath(new URL('../build/windows/Release/minisql_database.exe', import.meta.url));
+const fallbackExecutable = fileURLToPath(new URL('../bin/minisql_database.exe', import.meta.url));
+const executable = process.env.MINISQL_DATABASE_EXE ?? (existsSync(releaseExecutable) ? releaseExecutable : fallbackExecutable);
 const root = mkdtempSync(join(tmpdir(), 'minisql-binding-access-'));
 let checks = 0;
 

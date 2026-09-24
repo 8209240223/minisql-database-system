@@ -44,7 +44,12 @@ try {
         & $ctestExe --test-dir $verificationBuild -C Release --output-on-failure --no-tests=error
     }
 
-    $env:MINISQL_EXE = Join-Path $verificationBuild 'Release/minisql_database.exe'
+    # The variable name must be the one the tests actually read (23 process tests
+    # read MINISQL_DATABASE_EXE). It used to set MINISQL_EXE, which no test
+    # consumes, so this "point at the verification build" intent never took
+    # effect; combined with three tests hard-coding build/verification, the two
+    # conflicting path conventions masked each other.
+    $env:MINISQL_DATABASE_EXE = Join-Path $verificationBuild 'Release/minisql_database.exe'
     if (-not $SkipExtended) {
         foreach ($suite in @('compiler', 'execution', 'storage', 'http')) {
             Invoke-Checked "Run $suite regressions" {

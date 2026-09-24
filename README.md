@@ -201,7 +201,10 @@ powershell -ExecutionPolicy Bypass -File .\stop-minisql-workbench.ps1
 - Windows 非 ASCII 路径（中文用户名等）：`snapshot` 会话操作不再把 UTF-8 字符串隐式窄转成 `std::filesystem::path`，快照响应也不再回显 `path::string()` 的 ANSI 字节，因此含中文路径的在线备份不再返回 503；`emit` 的序列化失败也不再逃逸成没有 `id` 的错误帧。
 - WAL 重做校验：损坏的日志页在写入数据文件**之前**就按页自校验和被拒绝（此前会先改数据文件再以误导性的 `file header` 报错）。
 
-全量回归当前状态：**105/105 通过**（`tests/*.mjs` 102 项 + 3 项慢用例）。
+全量回归当前状态：**C++ 注册测试 20/20、Node 回归 113/113**（`tests/**/*.mjs`，含
+`tests/fuzz/` 两项；`fuzz-model.mjs`、`fuzz-process.mjs`、`fuzz-state-machine.mjs`
+是被 import 的库模块，不计入）。`run-minisql-tests.ps1 -Suite all` 与 CI 的
+`engine-regression` 均覆盖这 113 项，工作台单元回归与浏览器回归另行通过。
 
 仍待继续（不把专项测试通过等同于全量验收）：
 
