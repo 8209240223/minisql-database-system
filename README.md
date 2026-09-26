@@ -46,17 +46,57 @@ outputs/
 
 后端依赖由 `outputs/minisql-backend/vcpkg.json` 固定。首次构建需要联网下载依赖。
 
+## 首次运行（从零开始）
+
+仓库不提交编译产物、`node_modules/` 和数据库文件（均在 `.gitignore` 中），
+因此**全新克隆后必须先构建，再启动**。下面三条按顺序执行即可：
+
+```powershell
+# 1. 配置并构建 C++ 内核（首次需联网拉取 vcpkg 依赖，约 10 分钟）
+cd outputs\minisql-backend
+. .\scripts\environment.ps1
+cmake --preset windows --fresh -DBUILD_TESTING=ON
+cmake --build --preset windows-release --parallel 4
+
+# 2. 把 Release 产物同步到 bin/（bridge 与进程测试按这个约定查找可执行体）
+New-Item -ItemType Directory -Force -Path bin | Out-Null
+Copy-Item build\windows\Release\*.exe -Destination bin -Force
+Copy-Item build\windows\Release\*.dll -Destination bin -Force -ErrorAction SilentlyContinue
+
+# 3. 安装工作台依赖
+cd ..\minisql-workbench
+npm.cmd ci
+```
+
+`. .\scripts\environment.ps1` 会自动定位 CMake 与 vcpkg（优先用 `VCPKG_ROOT`，
+其次用 Visual Studio 自带的 vcpkg），并为本项目设置依赖下载与二进制缓存目录。
+若它报 `Set VCPKG_ROOT to an existing vcpkg installation.`，请先设置该变量：
+
+```powershell
+$env:VCPKG_ROOT = 'C:\path\to\vcpkg'
+```
+
+跳过第 1、2 步直接启动，`start-minisql-workbench.ps1` 会因找不到引擎与前端依赖而
+以 `Frontend startup timed out.` 失败（退出码 1）。
+
 ## 构建与验证
+
+已配置过的构建树可直接增量编译：
 
 ```powershell
 cd outputs\minisql-backend
 . .\scripts\environment.ps1
-cmake --build build\windows --config Release --parallel 4
+cmake --build --preset windows-release --parallel 4
+```
 
-# 一键回归（compiler | execution | storage | http | frontend | all）
-cd ..
+一键回归（compiler | execution | storage | http | fuzz | frontend | all）：
+
+```powershell
+cd outputs
 powershell -ExecutionPolicy Bypass -File .\run-minisql-tests.ps1 -Suite all
 ```
+
+`-Suite all` 会先同步构建产物到 `bin/`，再串行执行 113 个后端测试与工作台回归。
 
 关键专项回归（后端目录下执行）：
 
@@ -169,6 +209,9 @@ HTTP 状态映射：`400` 请求格式不合法，`403` 权限拒绝（含身份
 
 ## 启动工作台
 
+前置条件：已完成上文[首次运行](#首次运行从零开始)的三步（内核已构建、产物已同步到
+`bin/`、工作台依赖已安装）。否则启动会以 `Frontend startup timed out.` 失败。
+
 ```powershell
 cd outputs
 powershell -ExecutionPolicy Bypass -File .\start-minisql-workbench.ps1
@@ -177,6 +220,17 @@ powershell -ExecutionPolicy Bypass -File .\start-minisql-workbench.ps1
 浏览器访问 `http://127.0.0.1:4173`。HTTP bridge 默认监听 `http://127.0.0.1:8081/api`。
 
 启动脚本同时会启动独立数据的本地演示 bridge：`http://127.0.0.1:8082/api`。工作台中的“自研 MiniSQL”和“本地演示”分别连接这两个地址，两个数据库文件互不影响。
+
+也可以在仓库根目录直接双击 `Start-MiniSQL.bat`，它会调用同一个启动脚本、做一次前端
+健康检查并自动打开浏览器。
+
+启动成功后可用以下方式确认三个服务都在工作：
+
+```powershell
+Invoke-RestMethod 'http://127.0.0.1:8081/api/health'   # 自研引擎
+Invoke-RestMethod 'http://127.0.0.1:8082/api/health'   # 本地演示
+Invoke-WebRequest  'http://127.0.0.1:4173' -UseBasicParsing   # 前端
+```
 
 停止服务：
 
