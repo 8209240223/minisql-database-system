@@ -84,6 +84,27 @@ equal(readHeader(pagesFile).permissionVersion, 12, 'rewrite bumps the on-disk ve
 // --- 路径推导 -----------------------------------------------------------
 equal(pagesPathFor('/tmp/a/access.catalog.json'), '/tmp/a/access.catalog.pages', 'json suffix replaced');
 equal(pagesPathFor('/tmp/a/access.catalog'), '/tmp/a/access.catalog.pages', 'suffixless path gets .pages');
+// 幂等：`.pages` 不得再追加一次。C++ 侧 accessPagesPath 对 .pages 是幂等的，
+// 两端推导必须一致，否则传 .pages 的调用方（工作台演示库、bridge 回传的
+// accessPagesFile）会写到 .pages.pages 上。
+equal(pagesPathFor('/tmp/a/access.catalog.pages'), '/tmp/a/access.catalog.pages', '.pages suffix is idempotent');
+equal(pagesPathFor('/tmp/a/demo-access.catalog.pages'), '/tmp/a/demo-access.catalog.pages', 'demo .pages path is idempotent');
+// 大小写敏感，与 C++ 侧 path.extension() == ".pages" 对齐。
+// 尾部必须落在 .pages 上，否则引擎会认为扩展名不是 .pages 而再补一次，
+// 两端就会读写不同文件。
+equal(pagesPathFor('/tmp/a/ACCESS.CATALOG.PAGES'), '/tmp/a/ACCESS.CATALOG.PAGES.pages', 'uppercase .PAGES is not treated as .pages (matches C++)');
+
+// 传一个已存在的页式文件路径，必须直接命中"页式文件已存在"分支，
+// 而不是把二进制页文件当旧 JSON 去 JSON.parse（那会抛 SyntaxError）。
+const idempotentDirectory = mkdtempSync(join(tmpdir(), 'minisql-access-idempotent-'));
+const idempotentPages = join(idempotentDirectory, 'demo-access.catalog.pages');
+writeStore(idempotentPages, sample, { permissionVersion: 5 });
+const reopenedByPagesPath = openStore(idempotentPages, { defaults: defaultAccess, normalize: normalizeAccess });
+equal(reopenedByPagesPath.pagesFile, idempotentPages, 'a .pages path maps to itself');
+equal(reopenedByPagesPath.source, 'pages', 'an existing .pages file is read, not re-migrated');
+equal(reopenedByPagesPath.migrated, false, 'no migration is attempted for a .pages path');
+equal(reopenedByPagesPath.permissionVersion, 5, 'the existing permission version is preserved');
+ok(!existsSync(idempotentPages + '.pages'), 'no stray .pages.pages file is created');
 
 // --- 从旧 JSON 迁移 -----------------------------------------------------
 const migrateDirectory = mkdtempSync(join(tmpdir(), 'minisql-access-migrate-'));

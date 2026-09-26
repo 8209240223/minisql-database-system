@@ -273,12 +273,31 @@ export function readHeader(pagesFile) {
   };
 }
 
-/** 由 access 文件路径推导页式文件路径；`.json` 后缀被替换为 `.pages`。 */
-// 例如 access.json → access.pages；其它后缀则直接在末尾追加 .pages。
+/**
+ * 由 access 文件路径推导页式文件路径。必须与 C++ 侧 `accessPagesPath`
+ * （src/security/access_catalog.cpp:242-258）推导出同一个文件名：
+ * bridge 用本函数算出路径去读写，引擎用那边的函数去读。
+ *
+ *   access.json          -> access.pages
+ *   access.catalog       -> access.catalog.pages
+ *   access.catalog.pages -> access.catalog.pages   （幂等）
+ *
+ * `.pages` 分支是必需的：`start-minisql-workbench.ps1` 给演示库传的就是
+ * `demo-access.catalog.pages`，而 database-bridge 又把已经推导过的
+ * `accessPagesFile` 经 MINISQL_ACCESS_FILE 传回本函数。此前只剥离 `.json`，
+ * 两种情况都会得到 `.pages.pages`：文件写到调用方没指定的名字上，
+ * 且「传入路径已存在」永不成立 —— 已存在的二进制页文件会掉进下面的
+ * 旧 JSON 迁移分支，被 JSON.parse 抛 SyntaxError。
+ */
 export function pagesPathFor(accessPath) {
 // 推导页式文件路径。
-  return String(accessPath).replace(/\.json$/i, '') + '.pages';
-  // 去掉结尾的 .json（大小写不敏感），再补上 .pages。
+  const path = String(accessPath).replace(/\.json$/i, '');
+  // 先去掉结尾的 .json（大小写不敏感，保持既有行为）。
+  return /\.pages$/.test(path) ? path : path + '.pages';
+  // 已经以 .pages 结尾就原样返回（幂等），否则补上 .pages。
+  // 这里刻意用大小写敏感判断，与 C++ 侧 path.extension() == ".pages" 一致：
+  // 若换成 /i，`X.PAGES` 会被原样返回，而引擎收到后因扩展名不等于 ".pages"
+  // 会再补一次，两端就会读写不同文件。大小写敏感保证结果是 C++ 侧的不动点。
 }
 
 export function writeStore(pagesFile, catalog, options) {

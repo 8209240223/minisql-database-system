@@ -46,20 +46,23 @@ const enrollments = Array.from({ length: 96 }, (_, i) =>
 ).join(',');
 // 同样拼成一条多值列表。
 
+// 注意：模板字符串内部的注释必须是 SQL 注释（--），不能写 JS 风格的 //。
+// 这些行原样作为 SQL 文本发给引擎，而 MiniSQL 词法器只识别 -- 与 /* */，
+// 遇到 // 会以 "Illegal character" 拒绝整段脚本，演示库因此永远灌不进数据。
 const sql = `BEGIN;
-// 整段装载脚本：先用 BEGIN 显式开启事务，保证要么全成功要么全回滚。
+-- 整段装载脚本：先用 BEGIN 显式开启事务，保证要么全成功要么全回滚。
 CREATE TABLE students (id INT PRIMARY KEY, name VARCHAR NOT NULL, department VARCHAR, age INT, email VARCHAR, status VARCHAR);
-// 建学生表。
+-- 建学生表。
 CREATE TABLE courses (id INT PRIMARY KEY, name VARCHAR NOT NULL, credits INT, teacher VARCHAR);
-// 建课程表。
+-- 建课程表。
 CREATE TABLE enrollments (id INT PRIMARY KEY, student_id INT, course_id INT, score INT);
-// 建选课表。
+-- 建选课表。
 INSERT INTO students VALUES ${students};
-// 灌入学生数据。
+-- 灌入学生数据。
 INSERT INTO courses VALUES ${courses};
-// 灌入课程数据。
+-- 灌入课程数据。
 INSERT INTO enrollments VALUES ${enrollments};
-// 灌入选课数据。
+-- 灌入选课数据。
 COMMIT;`;
 // 提交事务；到这里三条表都建好、数据也灌好了。
 

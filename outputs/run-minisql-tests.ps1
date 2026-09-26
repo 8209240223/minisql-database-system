@@ -1,5 +1,5 @@
 param(
-    [ValidateSet('compiler', 'execution', 'storage', 'http', 'frontend', 'all')]
+    [ValidateSet('compiler', 'execution', 'storage', 'http', 'fuzz', 'frontend', 'all')]
     [string]$Suite = 'compiler',
     [switch]$Build
 )
@@ -14,7 +14,16 @@ function Invoke-NodeTests([string[]]$Files) {
     try {
         foreach ($file in $Files) {
             Write-Host "`n>>> node $file" -ForegroundColor Cyan
-            node $file
+            # generate-corpus.mjs 默认把语料写回 tests/fuzz/，那是受版本控制的目录：
+            # 直接跑会把 6 个 corpus-*.sql 与 manifest.json（含 generatedAt 与
+            # generatorSha256）改脏，工作区平白多出 7 个"已修改"文件。
+            # 它认 FUZZ_CORPUS_DIR，指向临时目录即可，产物仍逐字节校验。
+            $generator = $file -eq 'tests/fuzz/generate-corpus.mjs'
+            $previous = $env:FUZZ_CORPUS_DIR
+            if ($generator) { $env:FUZZ_CORPUS_DIR = Join-Path ([System.IO.Path]::GetTempPath()) ("minisql-corpus-" + [guid]::NewGuid().ToString('N')) }
+            try { node $file } finally {
+                if ($generator) { $env:FUZZ_CORPUS_DIR = $previous }
+            }
             if ($LASTEXITCODE -ne 0) { throw "Test failed: $file" }
         }
     } finally { Pop-Location }
@@ -82,6 +91,13 @@ $groups = @{
         'tests/sql-dialect-smoke.mjs'
         # 索引建议器：基于查询负载给出建索引建议（含建议可执行、建完即消失的闭环）。
         'tests/index-advisor-smoke.mjs'
+        # 派生表、IN 列表与相关子查询执行；聚合的语法/AST/计划三段契约。
+        'tests/derived-smoke.mjs'
+        'tests/correlated-exec-smoke.mjs'
+        'tests/in-list-smoke.mjs'
+        'tests/aggregate-parser.mjs'
+        'tests/aggregate-plan.mjs'
+        'tests/aggregate-execution-gate.mjs'
     )
     execution = @(
         'tests/database-process.mjs',
@@ -110,6 +126,29 @@ $groups = @{
         'tests/top-n-sort-smoke.mjs'
         # 有序索引扫描：排序键为非空单列索引时用索引顺序替代排序。
         'tests/index-order-scan-smoke.mjs'
+        # 类型列、别名、DEFAULT 与 INSERT 形态（列映射/表达式/多行）。
+        'tests/alias-process.mjs'
+        'tests/bigint-process.mjs'
+        'tests/bool-column-process.mjs'
+        'tests/cast-process.mjs'
+        'tests/date-column-process.mjs'
+        'tests/date-literal-process.mjs'
+        'tests/decimal-cast-process.mjs'
+        'tests/decimal-column-process.mjs'
+        'tests/decimal-literal-process.mjs'
+        'tests/default-process.mjs'
+        'tests/varchar-column-process.mjs'
+        'tests/insert-columns-process.mjs'
+        'tests/insert-expression-process.mjs'
+        'tests/multirow-process.mjs'
+        # 约束：CHECK、命名约束、单列/复合键、外键与自引用外键。
+        'tests/check-process.mjs'
+        'tests/named-constraint-process.mjs'
+        'tests/composite-key-process.mjs'
+        'tests/foreign-key-process.mjs'
+        'tests/composite-foreign-key-process.mjs'
+        'tests/self-foreign-key-process.mjs'
+        'tests/unique-process.mjs'
     )
     storage = @(
         'tests/checkpoint-smoke.mjs',
@@ -128,9 +167,15 @@ $groups = @{
         'tests/index-transaction-process.mjs',
         'tests/index-performance-curve.mjs',
         'tests/backup-smoke.mjs',
+        'tests/backup-online-smoke.mjs',
         'tests/external-sort-smoke.mjs',
         'tests/external-aggregate-smoke.mjs',
         'tests/query-resource-process.mjs'
+        # 写批次契约、probe 级差分与索引规模回归（默认 1000 行）。
+        'tests/write-batch-process.mjs'
+        'tests/arithmetic64-differential.mjs'
+        'tests/decimal-journal-process.mjs'
+        'tests/index-scale-smoke.mjs'
     )
     http = @(
         'tests/database-http.mjs',
@@ -144,10 +189,37 @@ $groups = @{
         'tests/result-budget-smoke.mjs',
         'tests/x25-stream-http.mjs'
         'tests/session-stream-process.mjs'
+        # 会话协议与传输：持久会话、分片响应、队列与畸形帧。
+        'tests/session-process.mjs'
+        'tests/session-transport.mjs'
+        # 遗留 bridge 转发与权限感知 CLI。
+        'tests/bridge-regression.mjs'
+        'tests/cli-contract.mjs'
+        # 权限目录：纯 Node 契约 + 引擎入口闭环。
+        'tests/access-store-contract.mjs'
+        'tests/access-catalog-atomic-contract.mjs'
+        'tests/access-atomic-http.mjs'
+        'tests/access-control-process.mjs'
+        # 行流资源回传契约（会话级多帧流）。
+        'tests/x25-row-stream-contract.mjs'
+    )
+    fuzz = @(
+        # X27：固定种子语料的生成、逐字节复现与状态机差分/长跑/压力/崩溃恢复。
+        'tests/fuzz-model-contract.mjs'
+        'tests/fuzz-process-contract.mjs'
+        'tests/fuzz-differential.mjs'
+        'tests/fuzz-state-machine-differential.mjs'
+        'tests/fuzz-state-machine-crash-recovery.mjs'
+        'tests/fuzz-state-machine-long-run.mjs'
+        'tests/fuzz-state-machine-soak.mjs'
+        'tests/fuzz-state-machine-pressure.mjs'
+        'tests/fuzz-state-machine-replay-contract.mjs'
+        'tests/fuzz/generate-corpus.mjs'
+        'tests/fuzz/reproducibility-contract.mjs'
     )
 }
 
-$selected = if ($Suite -eq 'all') { @('compiler', 'execution', 'storage', 'http', 'frontend') } else { @($Suite) }
+$selected = if ($Suite -eq 'all') { @('compiler', 'execution', 'storage', 'http', 'fuzz', 'frontend') } else { @($Suite) }
 foreach ($group in $selected) {
     if ($group -eq 'frontend') { Invoke-FrontendTests; continue }
     Invoke-NodeTests $groups[$group]
